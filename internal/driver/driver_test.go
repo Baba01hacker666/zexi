@@ -27,6 +27,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/strings.zx",
 		"../../tests/drop.zx",
 		"../../tests/string_methods.zx",
+		"../../tests/ergonomics.zx",
 		"../../tests/syntax.zx",
 		"../../tests/pi.zx",
 	}
@@ -111,6 +112,13 @@ func TestRunPrograms(t *testing.T) {
 				"3", "71", "-1", "true", "true", "true", "false", "/index.html",
 				"/index.html HTTP/1.1", "Content-Length: 1527", "1527", "1528",
 				"16", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/ergonomics.zx",
+			want: strings.Join([]string{
+				"30", "5", "5", "total=30", "sum is total=30",
+				"zexi: yes", "4", "4", "5", "",
 			}, "\n"),
 		},
 		{

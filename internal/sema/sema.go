@@ -723,6 +723,12 @@ func (c *checker) inferUnary(x *ast.UnExpr, expected *types.Type) *types.Type {
 	return nil
 }
 
+// isStrLike reports whether t is one of the string types: the borrowed `str`
+// or the owning `String`.
+func isStrLike(t *types.Type) bool {
+	return t != nil && (t.Kind == types.Str || t.Kind == types.StringKind)
+}
+
 func (c *checker) inferBinary(x *ast.BinExpr) *types.Type {
 	if x.Op == token.KindDotDot || x.Op == token.KindDotDotEq {
 		lt := c.checkExpr(x.L, nil)
@@ -735,6 +741,16 @@ func (c *checker) inferBinary(x *ast.BinExpr) *types.Type {
 
 	lt := c.checkExpr(x.L, nil)
 	rt := c.checkExpr(x.R, nil)
+	// String concatenation: `+` over any mix of `str` and `String` produces a
+	// fresh `String`. Both operands are borrowed (their bytes are copied), so
+	// they remain usable afterwards.
+	if x.Op == token.KindPlus && isStrLike(lt) && isStrLike(rt) {
+		return types.StringT
+	}
+	// `==` / `!=` compare the bytes of any two string-like operands.
+	if (x.Op == token.KindEqEq || x.Op == token.KindBangEq) && isStrLike(lt) && isStrLike(rt) {
+		return types.BoolT
+	}
 	// Integer literals adopt the type of the other operand.
 	if !types.Equal(lt, rt) {
 		switch {
@@ -790,7 +806,12 @@ func (c *checker) inferAssign(x *ast.AssignExpr) *types.Type {
 			c.errAt(x.Rhs, "E0308", "mismatched types: expected `%s`, found `%s`", lt, rt)
 		}
 	} else {
-		if !lt.Kind.IsNumeric() {
+		if lt.Kind == types.StringKind && x.Op == token.KindPlusEq {
+			// `s += t` appends to an owning `String`.
+			if !isStrLike(rt) {
+				c.errAt(x.Rhs, "E0308", "cannot append `%s` to a `String`", rt)
+			}
+		} else if !lt.Kind.IsNumeric() {
 			c.errAt(x, "E0308", "compound assignment requires a numeric type, found `%s`", lt)
 		}
 	}
@@ -851,7 +872,7 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 			want = fn.Params[i]
 		}
 		at := c.checkExpr(a, want)
-		if want != nil && !c.assignable(want, at) {
+		if want != nil && !c.argAssignable(want, at) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
 		}
 	}
@@ -885,7 +906,7 @@ func (c *checker) inferStringCtor(x *ast.CallExpr, name string) *types.Type {
 			wt = want[i]
 		}
 		at := c.checkExpr(a, wt)
-		if wt != nil && !c.assignable(wt, at) {
+		if wt != nil && !c.argAssignable(wt, at) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", wt, at)
 		}
 	}
@@ -893,6 +914,17 @@ func (c *checker) inferStringCtor(x *ast.CallExpr, name string) *types.Type {
 }
 
 // stringMethodSig describes a builtin method on `String`.
+// StringMethodParams returns the parameter types of the builtin `String` method
+// name, or nil if there is no such method. Codegen uses it to coerce `String`
+// arguments to `str` parameters.
+func StringMethodParams(name string) []*types.Type {
+	m, ok := stringMethods[name]
+	if !ok {
+		return nil
+	}
+	return m.params
+}
+
 type stringMethodSig struct {
 	params []*types.Type
 	ret    *types.Type
@@ -937,7 +969,7 @@ func (c *checker) inferStringMethod(x *ast.MethodCallExpr) *types.Type {
 			wt = m.params[i]
 		}
 		at := c.checkExpr(a, wt)
-		if wt != nil && !c.assignable(wt, at) {
+		if wt != nil && !c.argAssignable(wt, at) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", wt, at)
 		}
 	}
@@ -954,10 +986,10 @@ func (c *checker) inferLen(x *ast.CallExpr) *types.Type {
 		return types.UsizeT
 	}
 	t := c.checkExpr(x.Args[0], nil)
-	if t != nil && (t.Kind == types.Array || t.Kind == types.Str || t.Kind == types.Slice) {
+	if t != nil && (t.Kind == types.Array || t.Kind == types.Str || t.Kind == types.Slice || t.Kind == types.StringKind) {
 		return types.UsizeT
 	}
-	c.errAt(x.Args[0], "E0308", "`len` expects an array, slice, or `str`, found `%s`", t)
+	c.errAt(x.Args[0], "E0308", "`len` expects an array, slice, `str`, or `String`, found `%s`", t)
 	return types.UsizeT
 }
 
@@ -1043,7 +1075,7 @@ func (c *checker) inferVariantCtor(x *ast.CallExpr, p *ast.PathExpr) *types.Type
 			want = v.Fields[i].Ty
 		}
 		at := c.checkExpr(a, want)
-		if want != nil && !c.assignable(want, at) {
+		if want != nil && !c.argAssignable(want, at) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
 		}
 	}
@@ -1210,6 +1242,10 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 	if base != nil && base.Kind == types.StringKind {
 		return c.inferStringMethod(x)
 	}
+	// `len()` is also available directly on arrays and `str` values.
+	if x.Name == "len" && len(x.Args) == 0 && base != nil && (base.Kind == types.Array || base.Kind == types.Str) {
+		return types.UsizeT
+	}
 	if base == nil || (base.Kind != types.StructKind && base.Kind != types.EnumKind) {
 		c.errAt(x, "E0599", "no method `%s` on type `%s`", x.Name, rt)
 		for _, a := range x.Args {
@@ -1243,7 +1279,7 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 			wt = want[i]
 		}
 		at := c.checkExpr(a, wt)
-		if wt != nil && !c.assignable(wt, at) {
+		if wt != nil && !c.argAssignable(wt, at) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", wt, at)
 		}
 	}
@@ -1394,7 +1430,23 @@ func (c *checker) inferLoop(x *ast.LoopExpr) *types.Type {
 func (c *checker) inferFor(x *ast.LoopExpr) *types.Type {
 	rng, ok := x.Iter.(*ast.BinExpr)
 	if !ok || (rng.Op != token.KindDotDot && rng.Op != token.KindDotDotEq) {
-		c.errAt(x.Iter, "E0900", "only `for i in a..b` is supported by the compiler yet (roadmap M0)")
+		// `for x in arr` iterates an array by value. Elements must be `Copy`,
+		// otherwise the loop binding would alias (and possibly double-free) an
+		// owned element.
+		it := c.checkExpr(x.Iter, nil)
+		if it != nil && it.Kind == types.Array {
+			if !it.Elem.IsCopy() {
+				c.errAt(x.Iter, "E0507", "cannot iterate an array of non-`Copy` element type `%s` by value", it.Elem)
+			}
+			c.pushScope()
+			c.bindPattern(x.Pat, it.Elem, true)
+			c.loopDepth++
+			c.checkBlock(x.Body)
+			c.loopDepth--
+			c.popScope()
+			return types.UnitT
+		}
+		c.errAt(x.Iter, "E0900", "`for` iterates an integer range (`a..b`) or an array (roadmap M0)")
 		c.loopDepth++
 		c.checkBlock(x.Body)
 		c.loopDepth--
@@ -1527,6 +1579,18 @@ func (c *checker) assignable(dst, src *types.Type) bool {
 		return types.Equal(dst.Elem, src.Elem)
 	}
 	return false
+}
+
+// argAssignable is `assignable` plus the borrowed-`str` coercion: an owning
+// `String` may be passed where a `str` is expected, because the callee only
+// borrows it for the duration of the call. It is deliberately *not* used for
+// `let`/field/return positions, where a longer-lived borrow from a temporary
+// could dangle.
+func (c *checker) argAssignable(want, got *types.Type) bool {
+	if c.assignable(want, got) {
+		return true
+	}
+	return want != nil && want.Kind == types.Str && got != nil && got.Kind == types.StringKind
 }
 
 // --- scope helpers --------------------------------------------------------

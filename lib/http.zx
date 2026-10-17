@@ -209,7 +209,7 @@ fn http_get(host: str, port: i32, path: str) -> String {
         return String::new();
     }
     let req = get_request(host, path);
-    c.write(req.as_str());
+    c.write(req);
     let raw = c.read_all();
     c.close();
     return raw;

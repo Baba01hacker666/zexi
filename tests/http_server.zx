@@ -8,11 +8,10 @@
 struct Reply { status: i32, body: String }
 
 fn route(req: &Request) -> Reply {
-    let path = req.path.as_str();
-    if path == "/" {
+    if req.path == "/" {
         return Reply { status: 200, body: String::from("index") };
     }
-    if path == "/pi" {
+    if req.path == "/pi" {
         return Reply { status: 200, body: String::from("3.141592653589793238462643383279") };
     }
     return Reply { status: 404, body: String::from("not found") };
@@ -37,13 +36,13 @@ fn main() -> i32 {
             continue;
         }
         let req = parse_request(&raw);
-        print(req.method.as_str());
+        print(req.method);
         print(" ");
-        println(req.path.as_str());
+        println(req.path);
 
         let reply = route(&req);
-        let resp = response(reply.status, reason_phrase(reply.status), reply.body.as_str());
-        c.write(resp.as_str());
+        let resp = response(reply.status, reason_phrase(reply.status), reply.body);
+        c.write(resp);
         c.close();
         served += 1;
     }

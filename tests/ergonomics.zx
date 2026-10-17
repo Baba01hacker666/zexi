@@ -1,0 +1,43 @@
+// tests/ergonomics.zx
+// Shorthand that makes ordinary code shorter:
+//   * `for x in array` value iteration
+//   * `+` / `+=` string concatenation
+//   * passing a `String` where a borrowed `str` is expected
+//   * `len(x)` / `x.len()` on arrays, `str`, and the owning `String`
+
+fn describe(name: str, ok: bool) -> String {
+    if ok {
+        return name + ": yes";
+    }
+    return name + ": no";
+}
+
+fn sum(xs: [i32; 5]) -> i32 {
+    let mut total = 0;
+    for x in xs {
+        total += x;
+    }
+    return total;
+}
+
+fn main() -> i32 {
+    let xs: [i32; 5] = [2, 4, 6, 8, 10];
+    println(sum(xs));
+    println(xs.len());
+    println(len(xs));
+
+    let mut msg = String::from("total=");
+    msg += "30";
+    println(msg);
+    println("sum is " + msg);
+
+    let name = String::from("zexi");
+    println(describe(name, name == "zexi"));
+    println(name.len());
+    println(len(name));
+
+    let word: str = "hello";
+    println(word.len());
+
+    0
+}

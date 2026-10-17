@@ -773,7 +773,11 @@ func (g *gen) loopStmt(x *ast.LoopExpr) {
 }
 
 func (g *gen) forStmt(x *ast.LoopExpr) {
-	rng, _ := x.Iter.(*ast.BinExpr)
+	rng, ok := x.Iter.(*ast.BinExpr)
+	if !ok || (rng.Op != token.KindDotDot && rng.Op != token.KindDotDotEq) {
+		g.forArray(x)
+		return
+	}
 	lt := g.info.TypeOf(rng.L)
 	op := "<"
 	if rng.Op == token.KindDotDotEq {
@@ -789,6 +793,34 @@ func (g *gen) forStmt(x *ast.LoopExpr) {
 	}
 	g.w.line("for (%s %s = %s; %s %s %s; %s++) {", ctype(lt), name, g.value(rng.L), name, op, g.value(rng.R), name)
 	g.w.indent++
+	g.openLoop()
+	g.blockStmts(x.Body, nil)
+	g.closeLoop()
+	g.w.indent--
+	g.w.line("}")
+	g.popScope()
+}
+
+// forArray lowers `for x in arr`: the array is evaluated once into a temporary,
+// then each element (a `Copy` value, enforced by sema) is bound in turn.
+func (g *gen) forArray(x *ast.LoopExpr) {
+	it := g.info.TypeOf(x.Iter)
+	if it == nil || it.Kind != types.Array {
+		return // sema already diagnosed a non-array iterable
+	}
+	arr := g.tmpName()
+	g.w.line("%s %s = %s;", ctype(it), arr, g.value(x.Iter))
+	g.pushScope()
+	name := ""
+	switch p := x.Pat.(type) {
+	case *ast.BindPat:
+		name = g.bind(p.Name)
+	default:
+		name = g.fresh("x")
+	}
+	g.w.line("for (size_t zx_i = 0; zx_i < %d; zx_i++) {", it.Len)
+	g.w.indent++
+	g.w.line("%s %s = %s.e[zx_i];", ctype(it.Elem), name, arr)
 	g.openLoop()
 	g.blockStmts(x.Body, nil)
 	g.closeLoop()
@@ -906,18 +938,141 @@ func (g *gen) value(e ast.Expr) string {
 	}
 }
 
+// isStrType reports whether t is the borrowed `str` or the owning `String`.
+func isStrType(t *types.Type) bool {
+	return t != nil && (t.Kind == types.Str || t.Kind == types.StringKind)
+}
+
+// withStrArgs evaluates each argument as a C `const char *`, binding temporary
+// `String` operands to locals so their buffers outlive the generated call, then
+// dropping those temporaries. `str` operands and `String` places are passed
+// through directly (`String` places by address). When retType is "", the call is
+// emitted as a statement (its value is discarded); otherwise its result is
+// returned from a GNU statement expression.
+func (g *gen) withStrArgs(args []ast.Expr, retType string, call func(ps []string) string) string {
+	ps := make([]string, len(args))
+	var decls, drops []string
+	for i, e := range args {
+		t := g.info.TypeOf(e)
+		if t != nil && t.Kind == types.StringKind {
+			if !isPlaceExpr(e) {
+				tm := g.tmpName()
+				decls = append(decls, "zx_String "+tm+" = "+g.value(e)+";")
+				ps[i] = "zx_string_as_str(&" + tm + ")"
+				drops = append(drops, "zx_drop_String(&"+tm+");")
+				continue
+			}
+			ps[i] = "zx_string_as_str(&" + g.value(e) + ")"
+			continue
+		}
+		ps[i] = g.value(e)
+	}
+	if len(decls) == 0 {
+		return call(ps)
+	}
+	var b strings.Builder
+	b.WriteString("({ ")
+	for _, d := range decls {
+		b.WriteString(d + " ")
+	}
+	if retType != "" {
+		r := g.tmpName()
+		b.WriteString(retType + " " + r + " = " + call(ps) + "; ")
+		for _, d := range drops {
+			b.WriteString(d + " ")
+		}
+		b.WriteString(r + "; })")
+		return b.String()
+	}
+	b.WriteString(call(ps) + "; ")
+	for _, d := range drops {
+		b.WriteString(d + " ")
+	}
+	b.WriteString("(void)0; })")
+	return b.String()
+}
+
+// withArgs emits a call, coercing each argument whose parameter type is `str`
+// from an owning `String`. Temporary `String` arguments are bound to locals
+// inside a statement expression so their buffers outlive the call and are then
+// freed. When retType is "", the call is emitted as a statement.
+func (g *gen) withArgs(args []ast.Expr, wants []*types.Type, retType string, call func(ps []string) string) string {
+	ps := make([]string, len(args))
+	var decls, drops []string
+	for i, e := range args {
+		wantStr := i < len(wants) && wants[i] != nil && wants[i].Kind == types.Str
+		t := g.info.TypeOf(e)
+		if wantStr && t != nil && t.Kind == types.StringKind {
+			if !isPlaceExpr(e) {
+				tm := g.tmpName()
+				decls = append(decls, "zx_String "+tm+" = "+g.value(e)+";")
+				ps[i] = "zx_string_as_str(&" + tm + ")"
+				drops = append(drops, "zx_drop_String(&"+tm+");")
+				continue
+			}
+			ps[i] = "zx_string_as_str(&" + g.value(e) + ")"
+			continue
+		}
+		ps[i] = g.consume(e)
+	}
+	if len(decls) == 0 {
+		return call(ps)
+	}
+	var b strings.Builder
+	b.WriteString("({ ")
+	for _, d := range decls {
+		b.WriteString(d + " ")
+	}
+	if retType != "" {
+		r := g.tmpName()
+		b.WriteString(retType + " " + r + " = " + call(ps) + "; ")
+		for _, d := range drops {
+			b.WriteString(d + " ")
+		}
+		b.WriteString(r + "; })")
+		return b.String()
+	}
+	b.WriteString(call(ps) + "; ")
+	for _, d := range drops {
+		b.WriteString(d + " ")
+	}
+	b.WriteString("(void)0; })")
+	return b.String()
+}
+
+// exprStmtType returns the C type used to capture an expression's value when it
+// must be wrapped in a statement expression, or "" when it yields no value.
+func (g *gen) exprStmtType(x ast.Expr) string {
+	t := g.info.TypeOf(x)
+	if t == nil || t.Kind == types.Unit || t.Kind == types.Never {
+		return ""
+	}
+	return ctype(t)
+}
+
 func (g *gen) binValue(x *ast.BinExpr) string {
 	if x.Op == token.KindDotDot || x.Op == token.KindDotDotEq {
 		return "0 /* range outside of for */"
 	}
-	// `str` equality compares bytes, not pointers.
-	if lt := g.info.TypeOf(x.L); lt != nil && lt.Kind == types.Str {
-		if x.Op == token.KindEqEq || x.Op == token.KindBangEq {
-			cmp := "strcmp(" + g.value(x.L) + ", " + g.value(x.R) + ")"
-			if x.Op == token.KindEqEq {
-				return "(" + cmp + " == 0)"
-			}
-			return "(" + cmp + " != 0)"
+	// String concatenation: `+` over `str`/`String` operands allocates a fresh
+	// `String`. Operands are borrowed (their bytes copied), so temporaries are
+	// freed only after the result is built.
+	if x.Op == token.KindPlus && isStrType(g.info.TypeOf(x.L)) && isStrType(g.info.TypeOf(x.R)) {
+		return g.withStrArgs([]ast.Expr{x.L, x.R}, "zx_String", func(ps []string) string {
+			return "zx_string_concat(" + ps[0] + ", " + ps[1] + ")"
+		})
+	}
+	// String equality compares bytes, not pointers, for any mix of `str` and
+	// `String`.
+	if x.Op == token.KindEqEq || x.Op == token.KindBangEq {
+		if isStrType(g.info.TypeOf(x.L)) && isStrType(g.info.TypeOf(x.R)) {
+			return g.withStrArgs([]ast.Expr{x.L, x.R}, "bool", func(ps []string) string {
+				cmp := "strcmp(" + ps[0] + ", " + ps[1] + ")"
+				if x.Op == token.KindEqEq {
+					return "(" + cmp + " == 0)"
+				}
+				return "(" + cmp + " != 0)"
+			})
 		}
 	}
 	return "(" + g.value(x.L) + " " + x.Op.String() + " " + g.value(x.R) + ")"
@@ -1016,11 +1171,9 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 		return g.enumConstruct(ctor, x.Args)
 	}
 	if fn := g.info.Resolved[x]; fn != nil {
-		var args []string
-		for _, a := range x.Args {
-			args = append(args, g.consume(a))
-		}
-		return funcName(fn) + "(" + strings.Join(args, ", ") + ")"
+		return g.withArgs(x.Args, fn.Params, g.exprStmtType(x), func(ps []string) string {
+			return funcName(fn) + "(" + strings.Join(ps, ", ") + ")"
+		})
 	}
 	name := ""
 	switch c := x.Callee.(type) {
@@ -1041,20 +1194,20 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 	if !ok {
 		return "0 /* call to unknown function */"
 	}
-	var args []string
-	for _, a := range x.Args {
-		args = append(args, g.consume(a))
-	}
-	return funcName(fn) + "(" + strings.Join(args, ", ") + ")"
+	return g.withArgs(x.Args, fn.Params, g.exprStmtType(x), func(ps []string) string {
+		return funcName(fn) + "(" + strings.Join(ps, ", ") + ")"
+	})
 }
 
 // stringCtorValue emits the builtin `String` constructors.
 func (g *gen) stringCtorValue(x *ast.CallExpr, name string) string {
-	var args []string
-	for _, a := range x.Args {
-		args = append(args, g.value(a))
+	var wants []*types.Type
+	if name == "from" {
+		wants = []*types.Type{types.StrT}
 	}
-	return "zx_string_" + name + "(" + strings.Join(args, ", ") + ")"
+	return g.withArgs(x.Args, wants, "zx_String", func(ps []string) string {
+		return "zx_string_" + name + "(" + strings.Join(ps, ", ") + ")"
+	})
 }
 
 func (g *gen) printfCall(x *ast.CallExpr, name string) string {
@@ -1120,37 +1273,54 @@ func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
 	if base := recvBase(g.info.TypeOf(x.Recv)); base != nil && base.Kind == types.StringKind {
 		return g.stringMethodCall(x)
 	}
+	// `arr.len()` / `s.len()` mirror the builtin `len`.
+	if x.Name == "len" && len(x.Args) == 0 {
+		if base := recvBase(g.info.TypeOf(x.Recv)); base != nil {
+			if base.Kind == types.Array {
+				return strconv.FormatInt(base.Len, 10)
+			}
+			if base.Kind == types.Str {
+				return "strlen(" + g.value(x.Recv) + ")"
+			}
+		}
+	}
 	m := g.info.Resolved[x]
 	if m == nil {
 		return "0 /* unresolved method */"
 	}
+	var wants []*types.Type
+	if m.Self != nil && len(m.Params) > 0 {
+		wants = m.Params[1:]
+	} else {
+		wants = m.Params
+	}
 	rt := g.info.TypeOf(x.Recv)
-	var args []string
-	if m.Self != nil {
-		isPtr := rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr)
-		if m.Self.ByRef {
-			recv := g.value(x.Recv)
-			if isPtr {
-				args = append(args, recv)
-			} else {
-				args = append(args, "(&"+recv+")")
-			}
-		} else {
-			if isPtr {
-				if t := g.info.TypeOf(x.Recv); t != nil && t.NeedsDrop() {
-					args = append(args, "zx_move_"+typeMangle(t)+"("+g.value(x.Recv)+")")
+	return g.withArgs(x.Args, wants, g.exprStmtType(x), func(ps []string) string {
+		var args []string
+		if m.Self != nil {
+			isPtr := rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr)
+			if m.Self.ByRef {
+				recv := g.value(x.Recv)
+				if isPtr {
+					args = append(args, recv)
 				} else {
-					args = append(args, "(*"+g.value(x.Recv)+")")
+					args = append(args, "(&"+recv+")")
 				}
 			} else {
-				args = append(args, g.consume(x.Recv))
+				if isPtr {
+					if t := g.info.TypeOf(x.Recv); t != nil && t.NeedsDrop() {
+						args = append(args, "zx_move_"+typeMangle(t)+"("+g.value(x.Recv)+")")
+					} else {
+						args = append(args, "(*"+g.value(x.Recv)+")")
+					}
+				} else {
+					args = append(args, g.consume(x.Recv))
+				}
 			}
 		}
-	}
-	for _, a := range x.Args {
-		args = append(args, g.consume(a))
-	}
-	return funcName(m) + "(" + strings.Join(args, ", ") + ")"
+		args = append(args, ps...)
+		return funcName(m) + "(" + strings.Join(args, ", ") + ")"
+	})
 }
 
 // stringMethodCall emits a builtin `String` method. Borrowing a place passes its
@@ -1158,32 +1328,83 @@ func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
 // materialized inside a statement expression.
 func (g *gen) stringMethodCall(x *ast.MethodCallExpr) string {
 	fn := "zx_string_" + x.Name
-	var rest string
-	for _, a := range x.Args {
-		rest += ", " + g.value(a)
+
+	// Coerce `String` arguments passed to `str` parameters, binding temporaries
+	// so their buffers outlive the call.
+	wants := sema.StringMethodParams(x.Name)
+	var specs, decls, drops []string
+	for i, a := range x.Args {
+		wantStr := i < len(wants) && wants[i] != nil && wants[i].Kind == types.Str
+		t := g.info.TypeOf(a)
+		if wantStr && t != nil && t.Kind == types.StringKind {
+			if !isPlaceExpr(a) {
+				tm := g.tmpName()
+				decls = append(decls, "zx_String "+tm+" = "+g.value(a)+";")
+				specs = append(specs, "zx_string_as_str(&"+tm+")")
+				drops = append(drops, "zx_drop_String(&"+tm+");")
+				continue
+			}
+			specs = append(specs, "zx_string_as_str(&"+g.value(a)+")")
+			continue
+		}
+		specs = append(specs, g.value(a))
 	}
-	// A `&String` / `*String` receiver is already a pointer to the String:
-	// pass it through instead of taking its address again.
-	if rt := g.info.TypeOf(x.Recv); rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr) {
-		return fn + "(" + g.value(x.Recv) + rest + ")"
+	rest := ""
+	for _, s := range specs {
+		rest += ", " + s
 	}
-	if isPlaceExpr(x.Recv) {
-		return fn + "(&" + g.value(x.Recv) + rest + ")"
-	}
-	t := g.tmpName()
-	call := fn + "(&" + t + rest + ")"
+
 	rt := g.info.TypeOf(x)
-	prologue := "zx_String " + t + " = " + g.value(x.Recv) + "; "
-	if rt == nil || rt.Kind == types.Unit || rt.Kind == types.Never {
-		return "({ " + prologue + call + "; zx_drop_String(&" + t + "); (void)0; })"
+	recv := g.info.TypeOf(x.Recv)
+	recvIsPtr := recv != nil && (recv.Kind == types.Ref || recv.Kind == types.Ptr)
+
+	var core string
+	switch {
+	case recvIsPtr:
+		// A `&String` / `*String` receiver is already a pointer to the String.
+		core = fn + "(" + g.value(x.Recv) + rest + ")"
+	case isPlaceExpr(x.Recv):
+		core = fn + "(&" + g.value(x.Recv) + rest + ")"
+	default:
+		t := g.tmpName()
+		call := fn + "(&" + t + rest + ")"
+		prologue := "zx_String " + t + " = " + g.value(x.Recv) + "; "
+		switch {
+		case rt == nil || rt.Kind == types.Unit || rt.Kind == types.Never:
+			core = "({ " + prologue + call + "; zx_drop_String(&" + t + "); (void)0; })"
+		case x.Name == "as_str":
+			// The result borrows the temporary's buffer, so the buffer cannot be
+			// released until the enclosing statement finishes (M0 limitation).
+			core = "({ " + prologue + call + "; })"
+		default:
+			r := g.tmpName()
+			core = "({ " + prologue + ctype(rt) + " " + r + " = " + call + "; zx_drop_String(&" + t + "); " + r + "; })"
+		}
 	}
-	if x.Name == "as_str" {
-		// The result borrows the temporary's buffer, so the buffer cannot be
-		// released until the enclosing statement finishes (M0 limitation).
-		return "({ " + prologue + call + "; })"
+
+	if len(decls) == 0 {
+		return core
+	}
+	var b strings.Builder
+	b.WriteString("({ ")
+	for _, d := range decls {
+		b.WriteString(d + " ")
+	}
+	if rt == nil || rt.Kind == types.Unit || rt.Kind == types.Never {
+		b.WriteString(core + "; ")
+		for _, d := range drops {
+			b.WriteString(d + " ")
+		}
+		b.WriteString("(void)0; })")
+		return b.String()
 	}
 	r := g.tmpName()
-	return "({ " + prologue + ctype(rt) + " " + r + " = " + call + "; zx_drop_String(&" + t + "); " + r + "; })"
+	b.WriteString(ctype(rt) + " " + r + " = " + core + "; ")
+	for _, d := range drops {
+		b.WriteString(d + " ")
+	}
+	b.WriteString(r + "; })")
+	return b.String()
 }
 
 // structLitValue emits a C compound literal, using designated initializers so
@@ -1309,6 +1530,13 @@ func (g *gen) lenValue(x *ast.CallExpr) string {
 		return strconv.FormatInt(t.Len, 10)
 	case t != nil && t.Kind == types.Str:
 		return "strlen(" + g.value(x.Args[0]) + ")"
+	case t != nil && t.Kind == types.StringKind:
+		if isPlaceExpr(x.Args[0]) {
+			return "zx_string_len(&" + g.value(x.Args[0]) + ")"
+		}
+		tm := g.tmpName()
+		return "({ zx_String " + tm + " = " + g.value(x.Args[0]) +
+			"; size_t zx_n = zx_string_len(&" + tm + "); zx_drop_String(&" + tm + "); zx_n; })"
 	}
 	return "0"
 }
@@ -1729,6 +1957,14 @@ func (g *gen) emitReturn(val ast.Expr) {
 // assignValue emits an assignment; for resource-owning targets the old value is
 // dropped first, and resource-owning sources are moved.
 func (g *gen) assignValue(x *ast.AssignExpr) string {
+	if x.Op == token.KindPlusEq {
+		if lt := g.info.TypeOf(x.Lhs); lt != nil && lt.Kind == types.StringKind {
+			lhs := g.value(x.Lhs)
+			return g.withStrArgs([]ast.Expr{x.Rhs}, "", func(ps []string) string {
+				return "zx_string_push_str(&" + lhs + ", " + ps[0] + ")"
+			})
+		}
+	}
 	if x.Op != token.KindEq {
 		return "(" + g.value(x.Lhs) + " " + x.Op.String() + " " + g.value(x.Rhs) + ")"
 	}
@@ -1921,6 +2157,21 @@ static zx_String zx_string_with_capacity(size_t n) {
     if (!s.ptr) { fputs("zexi: out of memory\n", stderr); abort(); }
     s.ptr[0] = 0;
     return s;
+}
+
+// Concatenate two C strings into a fresh owning String (a + b). Both inputs
+// are borrowed, so the caller's values remain valid.
+static zx_String zx_string_concat(const char *a, const char *b) {
+    size_t la = a ? strlen(a) : 0;
+    size_t lb = b ? strlen(b) : 0;
+    zx_String r;
+    r.len = la + lb;
+    r.ptr = (char *)malloc(la + lb + 1);
+    if (!r.ptr) { fputs("zexi: out of memory\n", stderr); abort(); }
+    if (la) memcpy(r.ptr, a, la);
+    if (lb) memcpy(r.ptr + la, b, lb);
+    r.ptr[la + lb] = 0;
+    return r;
 }
 
 static size_t zx_string_len(const zx_String *s) { return s->len; }

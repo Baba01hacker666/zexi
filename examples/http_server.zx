@@ -14,21 +14,20 @@
 struct Reply { status: i32, body: String }
 
 fn route(req: &Request) -> Reply {
-    let path = req.path.as_str();
-    if path == "/" {
+    if req.path == "/" {
         return Reply { status: 200, body: String::from("Welcome to a server written in Zexi!\n") };
     }
-    if path == "/health" {
+    if req.path == "/health" {
         return Reply { status: 200, body: String::from("ok\n") };
     }
-    if path == "/pi" {
+    if req.path == "/pi" {
         return Reply { status: 200, body: String::from("3.141592653589793238462643383279\n") };
     }
-    if path == "/echo" {
+    if req.path == "/echo" {
         let mut body = String::from("you sent ");
         push_int(&mut body, req.body.len() as i64);
         body.push_str(" byte(s): ");
-        body.push_str(req.body.as_str());
+        body.push_str(req.body);
         body.push_str("\n");
         return Reply { status: 200, body: body };
     }
@@ -51,8 +50,8 @@ fn main() -> i32 {
         let raw = c.read_head();
         let req = parse_request(&raw);
         let reply = route(&req);
-        let resp = response(reply.status, reason_phrase(reply.status), reply.body.as_str());
-        c.write(resp.as_str());
+        let resp = response(reply.status, reason_phrase(reply.status), reply.body);
+        c.write(resp);
         c.close();
     }
     0

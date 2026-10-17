@@ -119,8 +119,12 @@ match d {
 let xs: [i32; 3] = [10, 20, 30];
 let zeros = [0; 4];        // repeat form
 println(len(xs));          // 3
+println(xs.len());         // 3    (method form)
 println(xs[1]);            // 20, bounds-checked at run time
 xs[0] = 99;                // needs `let mut xs`
+for x in xs {              // iterate the elements (element type must be `Copy`)
+    println(x);
+}
 ```
 
 ## 7.10 `String` and ownership
@@ -129,11 +133,16 @@ xs[0] = 99;                // needs `let mut xs`
 let mut s = String::from("zexi");  // owning, heap-allocated, not `Copy`
 s.push_str("!");
 s.push('?');
-println(s);            // zexi!?
-println(s.len());      // 6
+s += " done";          // `+=` appends
+println(s);            // zexi!? done
+println(s.len());      // 11
+let greeting = "hi, " + s + "!";   // `+` concatenates any mix of `str`/`String`
 let t = s.clone();     // deep copy
 let u = s;             // move: `s` is unusable afterwards (E0382)
 ```
+
+A `String` may be passed wherever a borrowed `str` is expected (for example a
+function parameter, `push_str`, or `==`), so `.as_str()` is usually unnecessary.
 
 Values move by default; a moved-out value is a compile error if used again.
 Buffers are freed exactly once at scope exit (including on early `return` /
