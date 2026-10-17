@@ -58,6 +58,7 @@ func (w *writer) write(format string, a ...any) { fmt.Fprintf(&w.b, format, a...
 func Generate(info *sema.Info, opts Options) (string, error) {
 	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}}
 	g.preamble()
+	g.structDefs()
 	g.constants()
 	g.prototypes()
 	for _, fn := range info.FnOrder {
@@ -79,11 +80,7 @@ func (g *gen) preamble() {
 	g.w.line("")
 }
 
-func (g *gen) constants() {
-	if len(g.info.Consts) == 0 {
-		return
-	}
-	// Emit in source order for stable output.
+func (g *gen) constants() { // Emit in source order for stable output.
 	for _, it := range g.info.File.Items {
 		d, ok := it.(*ast.ConstDecl)
 		if !ok {
@@ -96,6 +93,81 @@ func (g *gen) constants() {
 		g.w.line("static const %s %s = %s;", ctype(cn.Ty), cname(cn.Name), constLiteral(cn.Val, cn.Ty))
 	}
 	g.w.line("")
+}
+
+// structDefs emits C struct declarations for every Zexi struct, in
+// dependency order so that by-value fields refer to complete types. All names
+// are forward-declared first, which also permits self-referential pointers.
+func (g *gen) structDefs() {
+	if len(g.info.StructOrd) == 0 {
+		return
+	}
+	for _, s := range g.info.StructOrd {
+		g.w.line("typedef struct %s %s;", typeName(s.Name), typeName(s.Name))
+	}
+	g.w.line("")
+	for _, s := range g.structOrder() {
+		g.w.line("struct %s {", typeName(s.Name))
+		g.w.indent++
+		if len(s.Fields) == 0 {
+			g.w.line("char zx_empty;")
+		}
+		for _, f := range s.Fields {
+			g.w.line("%s %s;", ctype(f.Ty), fieldName(f.Name))
+		}
+		g.w.indent--
+		g.w.line("};")
+	}
+	g.w.line("")
+}
+
+// structOrder returns structs sorted so dependencies come first.
+func (g *gen) structOrder() []*types.Struct {
+	state := map[string]int{} // 0 unvisited, 1 visiting, 2 done
+	var out []*types.Struct
+	var visit func(s *types.Struct)
+	visit = func(s *types.Struct) {
+		if state[s.Name] != 0 {
+			return
+		}
+		state[s.Name] = 1
+		for _, f := range s.Fields {
+			for _, dep := range valueStructDeps(f.Ty) {
+				if d, ok := g.info.Structs[dep]; ok {
+					visit(d)
+				}
+			}
+		}
+		state[s.Name] = 2
+		out = append(out, s)
+	}
+	for _, s := range g.info.StructOrd {
+		visit(s)
+	}
+	return out
+}
+
+// valueStructDeps lists structs that must be complete for a value of type t:
+// the struct itself, or any struct reachable through by-value aggregates.
+func valueStructDeps(t *types.Type) []string {
+	if t == nil {
+		return nil
+	}
+	switch t.Kind {
+	case types.StructKind:
+		if t.St != nil {
+			return []string{t.St.Name}
+		}
+	case types.Array:
+		return valueStructDeps(t.Elem)
+	case types.Tuple:
+		var out []string
+		for _, e := range t.Elems {
+			out = append(out, valueStructDeps(e)...)
+		}
+		return out
+	}
+	return nil
 }
 
 func (g *gen) prototypes() {
@@ -389,6 +461,15 @@ func (g *gen) value(e ast.Expr) string {
 		}
 		return "0"
 
+	case *ast.FieldExpr:
+		return g.fieldValue(x)
+
+	case *ast.MethodCallExpr:
+		return g.methodCallValue(x)
+
+	case *ast.StructLitExpr:
+		return g.structLitValue(x)
+
 	case *ast.JumpExpr:
 		// A jump used in value position only occurs in a diverging tail; emit
 		// it as a statement expression so it type-checks.
@@ -498,6 +579,13 @@ func (g *gen) identValue(name string, _ token.Span) string {
 }
 
 func (g *gen) callValue(x *ast.CallExpr) string {
+	if fn := g.info.Resolved[x]; fn != nil {
+		var args []string
+		for _, a := range x.Args {
+			args = append(args, g.value(a))
+		}
+		return funcName(fn) + "(" + strings.Join(args, ", ") + ")"
+	}
 	name := ""
 	switch c := x.Callee.(type) {
 	case *ast.IdentExpr:
@@ -558,6 +646,77 @@ func printFormat(t *types.Type) (format string, cast func(string) string) {
 	}
 }
 
+// fieldValue emits a field access, auto-dereferencing a reference or pointer
+// receiver so that `p.x` and `r.x` (where `r: &Point`) both work.
+func (g *gen) fieldValue(x *ast.FieldExpr) string {
+	rt := g.info.TypeOf(x.Recv)
+	recv := g.value(x.Recv)
+	if rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr) {
+		return "(" + recv + ")->" + fieldName(x.Field)
+	}
+	return "(" + recv + ")." + fieldName(x.Field)
+}
+
+// methodCallValue emits a resolved method call, passing the receiver by value
+// or by address according to the method's `self` parameter.
+func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
+	m := g.info.Resolved[x]
+	if m == nil {
+		return "0 /* unresolved method */"
+	}
+	rt := g.info.TypeOf(x.Recv)
+	recv := g.value(x.Recv)
+	var args []string
+	if m.Self != nil {
+		isPtr := rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr)
+		if m.Self.ByRef {
+			if isPtr {
+				args = append(args, recv)
+			} else {
+				args = append(args, "(&"+recv+")")
+			}
+		} else {
+			if isPtr {
+				args = append(args, "(*"+recv+")")
+			} else {
+				args = append(args, recv)
+			}
+		}
+	}
+	for _, a := range x.Args {
+		args = append(args, g.value(a))
+	}
+	return funcName(m) + "(" + strings.Join(args, ", ") + ")"
+}
+
+// structLitValue emits a C compound literal, using designated initializers so
+// field order in source does not matter.
+func (g *gen) structLitValue(x *ast.StructLitExpr) string {
+	if len(x.Path) != 1 {
+		return "0 /* invalid struct literal */"
+	}
+	st, ok := g.info.Structs[x.Path[0]]
+	if !ok {
+		return "0 /* unknown struct */"
+	}
+	inits := map[string]ast.Expr{}
+	for _, fi := range x.Fields {
+		inits[fi.Name] = fi.Val
+	}
+	if len(st.Fields) == 0 {
+		return "((" + typeName(st.Name) + "){ 0 })"
+	}
+	var parts []string
+	for _, f := range st.Fields {
+		v, ok := inits[f.Name]
+		if !ok {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf(".%s = %s", fieldName(f.Name), g.value(v)))
+	}
+	return "((" + typeName(st.Name) + "){ " + strings.Join(parts, ", ") + " })"
+}
+
 func (g *gen) literal(x *ast.LiteralExpr) string {
 	switch x.Kind {
 	case token.KindInteger:
@@ -607,12 +766,28 @@ var cKeywords = map[string]bool{
 
 // funcName mangles a Zexi function name into C. `main` and `extern` functions
 // keep their names (the latter must, to match the C ABI); every other function
-// is prefixed to avoid clashing with libc.
+// is prefixed to avoid clashing with libc. Methods are prefixed with their
+// struct name.
 func funcName(fn *sema.Fn) string {
+	if fn.Recv != nil {
+		return "zx_" + safeIdent(fn.Recv.Name) + "_" + safeIdent(fn.Name)
+	}
 	if fn.Name == "main" || fn.Extern {
 		return safeIdent(fn.Name)
 	}
 	return "zx_" + safeIdent(fn.Name)
+}
+
+// typeName is the C name of a Zexi struct.
+func typeName(name string) string { return "zx_" + safeIdent(name) }
+
+// fieldName is the C name of a struct field. Tuple-struct fields (named "0",
+// "1", ...) become f0, f1, ... so they are valid C identifiers.
+func fieldName(name string) string {
+	if name != "" && name[0] >= '0' && name[0] <= '9' {
+		return "f" + name
+	}
+	return safeIdent(name)
 }
 
 func cname(name string) string { return "ZX_" + safeIdent(name) }
@@ -711,6 +886,11 @@ func ctype(t *types.Type) string {
 		return ctype(t.Elem) + " *"
 	case types.Slice:
 		return "const void *"
+	case types.StructKind:
+		if t.St != nil {
+			return typeName(t.St.Name)
+		}
+		return "void"
 	case types.Fn:
 		return "void *"
 	}
@@ -728,6 +908,8 @@ func zeroValue(t *types.Type) string {
 		return "0.0"
 	case t.Kind == types.Str, t.Kind == types.Ptr, t.Kind == types.Ref:
 		return "0"
+	case t.Kind == types.StructKind && t.St != nil:
+		return "((" + typeName(t.St.Name) + "){ 0 })"
 	default:
 		return "0"
 	}

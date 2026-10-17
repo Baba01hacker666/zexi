@@ -21,12 +21,21 @@ import (
 
 // Fn is a checked function.
 type Fn struct {
-	Decl   *ast.FnDecl
-	Name   string
-	Params []*types.Type
-	Ret    *types.Type
-	Extern bool
-	ABI    string
+	Decl     *ast.FnDecl
+	Name     string
+	QualName string // "Point::len_sq" for methods, else Name
+	Params   []*types.Type
+	Ret      *types.Type
+	Self     *SelfParam
+	Recv     *types.Struct // non-nil for methods
+	Extern   bool
+	ABI      string
+}
+
+// SelfParam describes a method receiver.
+type SelfParam struct {
+	ByRef bool
+	Mut   bool
 }
 
 // Sig renders the function's signature for diagnostics.
@@ -35,7 +44,7 @@ func (f *Fn) Sig() string {
 	for i, p := range f.Params {
 		parts[i] = p.String()
 	}
-	return fmt.Sprintf("%s(%s) -> %s", f.Name, strings.Join(parts, ", "), f.Ret)
+	return fmt.Sprintf("%s(%s) -> %s", f.QualName, strings.Join(parts, ", "), f.Ret)
 }
 
 // Const is a compile-time constant.
@@ -52,6 +61,10 @@ type Info struct {
 	Fns       map[string]*Fn
 	FnOrder   []*Fn
 	Consts    map[string]*Const
+	Structs   map[string]*types.Struct
+	StructOrd []*types.Struct
+	Methods   map[string]map[string]*Fn // struct name -> method name -> fn
+	Resolved  map[ast.Expr]*Fn          // resolved call / method target
 	Types     map[ast.Expr]*types.Type
 	DeclTypes map[ast.Stmt]*types.Type
 	Main      *Fn
@@ -67,6 +80,9 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 			File:      file,
 			Fns:       map[string]*Fn{},
 			Consts:    map[string]*Const{},
+			Structs:   map[string]*types.Struct{},
+			Methods:   map[string]map[string]*Fn{},
+			Resolved:  map[ast.Expr]*Fn{},
 			Types:     map[ast.Expr]*types.Type{},
 			DeclTypes: map[ast.Stmt]*types.Type{},
 		},
@@ -104,18 +120,29 @@ func (c *checker) errAt(e ast.Expr, code, format string, args ...any) {
 // --- collection pass ------------------------------------------------------
 
 func (c *checker) collect() {
+	// Pass 1: register struct names so fields can refer to one another.
+	for _, it := range c.info.File.Items {
+		if d, ok := it.(*ast.StructDecl); ok {
+			c.registerStruct(d)
+		}
+	}
+	// Pass 2: fill in struct fields.
+	for _, it := range c.info.File.Items {
+		if d, ok := it.(*ast.StructDecl); ok {
+			c.collectStructFields(d)
+		}
+	}
+	// Constants, functions, then impl blocks (methods need their struct).
 	for _, it := range c.info.File.Items {
 		switch d := it.(type) {
-		case *ast.FnDecl:
-			c.collectFn(d, false, "")
 		case *ast.ConstDecl:
 			c.collectConst(d)
-		case *ast.StructDecl:
-			c.errf(d.Sp, "E0900", "`struct` is not supported by the compiler yet (roadmap M0)")
+		case *ast.FnDecl:
+			c.collectFn(d, false, "")
 		case *ast.EnumDecl:
 			c.errf(d.Sp, "E0900", "`enum` is not supported by the compiler yet (roadmap M0)")
 		case *ast.ImplBlock:
-			c.errf(d.Sp, "E0900", "`impl` is not supported by the compiler yet (roadmap M1)")
+			c.collectImpl(d)
 		case *ast.TypeAlias:
 			c.errf(d.Sp, "E0900", "`type` aliases are not supported by the compiler yet (roadmap M1)")
 		case *ast.ModDecl:
@@ -126,19 +153,106 @@ func (c *checker) collect() {
 	}
 }
 
+func (c *checker) registerStruct(d *ast.StructDecl) {
+	if _, dup := c.info.Structs[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the struct `%s` is defined multiple times", d.Name)
+		return
+	}
+	st := &types.Struct{Name: d.Name, Tuple: d.Tuple}
+	c.info.Structs[d.Name] = st
+	c.info.StructOrd = append(c.info.StructOrd, st)
+}
+
+func (c *checker) collectStructFields(d *ast.StructDecl) {
+	st, ok := c.info.Structs[d.Name]
+	if !ok || len(st.Fields) > 0 {
+		return // duplicate or already filled
+	}
+	for i, f := range d.Fields {
+		name := f.Name
+		if d.Tuple {
+			name = fmt.Sprintf("%d", i)
+		}
+		ft := c.resolveType(f.Ty)
+		if ft == nil {
+			ft = &types.Type{Kind: types.Invalid}
+		}
+		st.Fields = append(st.Fields, types.Field{Name: name, Ty: ft, Pub: bool(f.Vis)})
+	}
+}
+
+func (c *checker) collectImpl(d *ast.ImplBlock) {
+	if d.Trait != nil {
+		c.errf(d.Sp, "E0900", "trait impls are not supported by the compiler yet (roadmap M1)")
+		return
+	}
+	name := typePathName(d.SelfTy)
+	st, ok := c.info.Structs[name]
+	if !ok {
+		c.errf(d.Sp, "E0118", "no struct named `%s` in this scope", name)
+		return
+	}
+	if c.info.Methods[name] == nil {
+		c.info.Methods[name] = map[string]*Fn{}
+	}
+	for _, m := range d.Fns {
+		fn := c.makeFn(m, st)
+		if fn == nil {
+			continue
+		}
+		if _, dup := c.info.Methods[name][m.Name]; dup {
+			c.errf(m.Sp, "E0592", "duplicate method `%s` on `%s`", m.Name, name)
+			continue
+		}
+		c.info.Methods[name][m.Name] = fn
+		c.info.FnOrder = append(c.info.FnOrder, fn)
+	}
+}
+
 func (c *checker) collectFn(d *ast.FnDecl, extern bool, abi string) {
 	if _, dup := c.info.Fns[d.Name]; dup {
 		c.errf(d.Sp, "E0428", "the function `%s` is defined multiple times", d.Name)
 		return
 	}
-	fn := &Fn{Decl: d, Name: d.Name, Extern: extern || d.Extern != "" || d.Body == nil, ABI: abi}
-	if d.Extern != "" {
-		fn.ABI = d.Extern
+	fn := c.makeFn(d, nil)
+	if fn == nil {
+		return
+	}
+	if extern || d.Extern != "" || d.Body == nil {
+		fn.Extern = true
+	}
+	if abi != "" {
+		fn.ABI = abi
+	}
+	c.info.Fns[d.Name] = fn
+	c.info.FnOrder = append(c.info.FnOrder, fn)
+}
+
+// makeFn builds a checked function header, handling method receivers.
+func (c *checker) makeFn(d *ast.FnDecl, recv *types.Struct) *Fn {
+	fn := &Fn{Decl: d, Name: d.Name, Recv: recv}
+	if recv != nil {
+		fn.QualName = recv.Name + "::" + d.Name
+	} else {
+		fn.QualName = d.Name
 	}
 	for _, p := range d.Params {
+		if p.Self {
+			if recv == nil {
+				c.errf(p.Sp, "E0424", "`self` can only be used in an `impl` block")
+				continue
+			}
+			fn.Self = &SelfParam{ByRef: p.SelfRef, Mut: p.SelfMut}
+			selfT := &types.Type{Kind: types.StructKind, St: recv}
+			if p.SelfRef {
+				selfT = types.RefTo(selfT, p.SelfMut)
+			}
+			fn.Params = append(fn.Params, selfT)
+			continue
+		}
 		pt := c.resolveType(p.Ty)
 		if pt == nil {
-			continue
+			pt = &types.Type{Kind: types.Invalid}
 		}
 		fn.Params = append(fn.Params, pt)
 	}
@@ -152,8 +266,15 @@ func (c *checker) collectFn(d *ast.FnDecl, extern bool, abi string) {
 	if d.Body == nil && d.Extern == "" {
 		c.errf(d.Sp, "E0204", "function `%s` has no body; only `extern` functions may omit it", d.Name)
 	}
-	c.info.Fns[d.Name] = fn
-	c.info.FnOrder = append(c.info.FnOrder, fn)
+	return fn
+}
+
+// typePathName returns the single-segment name of a path type, or "<error>".
+func typePathName(t ast.Type) string {
+	if pt, ok := t.(*ast.PathType); ok && len(pt.Segments) > 0 {
+		return pt.Segments[0]
+	}
+	return "<error>"
 }
 
 func (c *checker) collectConst(d *ast.ConstDecl) {
@@ -386,19 +507,16 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		c.errf(x.Sp, "E0900", "`match` is not supported by the compiler yet (roadmap M0)")
 		return nil
 	case *ast.FieldExpr:
-		c.errf(x.Sp, "E0900", "field access is not supported by the compiler yet (roadmap M0)")
-		return nil
+		return c.inferField(x)
 	case *ast.MethodCallExpr:
-		c.errf(x.Sp, "E0900", "method calls are not supported by the compiler yet (roadmap M0)")
-		return nil
+		return c.inferMethodCall(x)
+	case *ast.StructLitExpr:
+		return c.inferStructLit(x)
 	case *ast.IndexExpr:
 		c.errf(x.Sp, "E0900", "indexing is not supported by the compiler yet (roadmap M0)")
 		return nil
 	case *ast.TryExpr:
 		c.errf(x.Sp, "E0900", "the `?` operator is not supported by the compiler yet (roadmap M0)")
-		return nil
-	case *ast.StructLitExpr:
-		c.errf(x.Sp, "E0900", "struct literals are not supported by the compiler yet (roadmap M0)")
 		return nil
 	}
 	c.errf(e.Span(), "E0900", "unsupported expression")
@@ -585,6 +703,7 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 		}
 		return nil
 	}
+	c.info.Resolved[x] = fn
 	if len(x.Args) != len(fn.Params) {
 		c.errAt(x, "E0061", "function `%s` takes %d argument(s) but %d were supplied", name, len(fn.Params), len(x.Args))
 	}
@@ -599,6 +718,108 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 		}
 	}
 	return fn.Ret
+}
+
+// recvBase strips references and pointers to find the underlying type, which is
+// how `p.x` and `p.method()` auto-deref.
+func recvBase(t *types.Type) *types.Type {
+	for t != nil && (t.Kind == types.Ref || t.Kind == types.Ptr) {
+		t = t.Elem
+	}
+	return t
+}
+
+func (c *checker) inferField(x *ast.FieldExpr) *types.Type {
+	rt := c.checkExpr(x.Recv, nil)
+	base := recvBase(rt)
+	if base == nil || base.Kind != types.StructKind {
+		c.errAt(x, "E0609", "no field `%s` on type `%s`", x.Field, rt)
+		return nil
+	}
+	f, ok := base.St.Field(x.Field)
+	if !ok {
+		c.errAt(x, "E0609", "no field `%s` on type `%s`", x.Field, base)
+		return nil
+	}
+	return f.Ty
+}
+
+func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
+	rt := c.checkExpr(x.Recv, nil)
+	base := recvBase(rt)
+	if base == nil || base.Kind != types.StructKind {
+		c.errAt(x, "E0599", "no method `%s` on type `%s`", x.Name, rt)
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return nil
+	}
+	m, ok := c.info.Methods[base.St.Name][x.Name]
+	if !ok {
+		c.errAt(x, "E0599", "no method `%s` on type `%s`", x.Name, base)
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return nil
+	}
+	if m.Self != nil && m.Self.ByRef && rt.Kind != types.Ref && rt.Kind != types.Ptr {
+		// Taking `&self` from a value receiver is allowed (a temporary is
+		// addressed); nothing to check here.
+	}
+	c.info.Resolved[x] = m
+	want := m.Params
+	if m.Self != nil && len(want) > 0 {
+		want = want[1:] // skip the receiver
+	}
+	if len(x.Args) != len(want) {
+		c.errAt(x, "E0061", "method `%s::%s` takes %d argument(s) but %d were supplied", base.St.Name, x.Name, len(want), len(x.Args))
+	}
+	for i, a := range x.Args {
+		var wt *types.Type
+		if i < len(want) {
+			wt = want[i]
+		}
+		at := c.checkExpr(a, wt)
+		if wt != nil && !c.assignable(wt, at) {
+			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", wt, at)
+		}
+	}
+	return m.Ret
+}
+
+func (c *checker) inferStructLit(x *ast.StructLitExpr) *types.Type {
+	if len(x.Path) != 1 {
+		c.errAt(x, "E0900", "path-qualified struct literals are not supported yet (roadmap M1)")
+		return nil
+	}
+	st, ok := c.info.Structs[x.Path[0]]
+	if !ok {
+		c.errAt(x, "E0412", "cannot find type `%s` in this scope", x.Path[0])
+		return nil
+	}
+	seen := map[string]bool{}
+	for _, fi := range x.Fields {
+		f, ok := st.Field(fi.Name)
+		if !ok {
+			c.errf(fi.Sp, "E0560", "struct `%s` has no field named `%s`", st.Name, fi.Name)
+			c.checkExpr(fi.Val, nil)
+			continue
+		}
+		if seen[fi.Name] {
+			c.errf(fi.Sp, "E0062", "field `%s` specified more than once", fi.Name)
+		}
+		seen[fi.Name] = true
+		vt := c.checkExpr(fi.Val, f.Ty)
+		if !c.assignable(f.Ty, vt) {
+			c.errAt(fi.Val, "E0308", "mismatched types in field `%s`: expected `%s`, found `%s`", fi.Name, f.Ty, vt)
+		}
+	}
+	for _, f := range st.Fields {
+		if !seen[f.Name] {
+			c.errf(x.Sp, "E0063", "missing field `%s` in initializer of `%s`", f.Name, st.Name)
+		}
+	}
+	return &types.Type{Kind: types.StructKind, St: st}
 }
 
 func (c *checker) inferPrint(x *ast.CallExpr, name string) *types.Type {
@@ -742,6 +963,9 @@ func (c *checker) resolveType(t ast.Type) *types.Type {
 		}
 		if bt, ok := types.Builtins[x.Segments[0]]; ok {
 			return bt
+		}
+		if st, ok := c.info.Structs[x.Segments[0]]; ok {
+			return &types.Type{Kind: types.StructKind, St: st}
 		}
 		c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope", x.Segments[0])
 		return nil

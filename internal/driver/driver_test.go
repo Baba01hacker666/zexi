@@ -11,11 +11,12 @@ import (
 )
 
 // TestTypeCheckExamples ensures every shipped example that targets the
-// M0-alpha subset type-checks cleanly.
+// supported subset type-checks cleanly.
 func TestTypeCheckExamples(t *testing.T) {
 	files := []string{
 		"../../examples/hello.zx",
 		"../../tests/tour.zx",
+		"../../tests/structs.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -25,9 +26,9 @@ func TestTypeCheckExamples(t *testing.T) {
 	}
 }
 
-// TestTourEndToEnd compiles and runs tests/tour.zx, asserting its output. It is
+// TestRunPrograms compiles and runs each program, asserting its output. It is
 // skipped when no C compiler is available or in short mode.
-func TestTourEndToEnd(t *testing.T) {
+func TestRunPrograms(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping end-to-end build in short mode")
 	}
@@ -35,31 +36,47 @@ func TestTourEndToEnd(t *testing.T) {
 		t.Skip("no C compiler available")
 	}
 
-	out := filepath.Join(t.TempDir(), "tour")
-	em := diag.NewEmitter()
-	if _, ok := driver.Build("../../tests/tour.zx", out, driver.Options{}, em); !ok {
-		t.Fatal("build failed")
+	cases := []struct {
+		file string
+		want string
+	}{
+		{
+			file: "../../tests/tour.zx",
+			want: strings.Join([]string{
+				"hello from zexi",
+				"0 1 1 2 3 5 8 13 21 34 ",
+				"55",
+				"zero",
+				"9000000000",
+				"7",
+				"true",
+				"Z",
+				"410065408",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/structs.zx",
+			want: strings.Join([]string{
+				"25", "4", "6", "2.5", "3.5", "15", "0", "30", "",
+			}, "\n"),
+		},
 	}
 
-	cmd := exec.Command(out)
-	raw, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("running %s: %v", out, err)
-	}
-	got := string(raw)
-	want := strings.Join([]string{
-		"hello from zexi",
-		"0 1 1 2 3 5 8 13 21 34 ",
-		"55",
-		"zero",
-		"9000000000",
-		"7",
-		"true",
-		"Z",
-		"410065408",
-		"",
-	}, "\n")
-	if got != want {
-		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	for _, tc := range cases {
+		t.Run(filepath.Base(tc.file), func(t *testing.T) {
+			out := filepath.Join(t.TempDir(), "prog")
+			em := diag.NewEmitter()
+			if _, ok := driver.Build(tc.file, out, driver.Options{}, em); !ok {
+				t.Fatal("build failed")
+			}
+			raw, err := exec.Command(out).Output()
+			if err != nil {
+				t.Fatalf("running %s: %v", out, err)
+			}
+			if got := string(raw); got != tc.want {
+				t.Fatalf("output mismatch\n got: %q\nwant: %q", got, tc.want)
+			}
+		})
 	}
 }

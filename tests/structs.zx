@@ -1,0 +1,58 @@
+// tests/structs.zx
+// Structs, struct literals, field access, tuple-free methods with `self` and
+// `&mut self`, nested structs, and passing structs by value.
+
+struct Point { x: f64, y: f64 }
+
+struct Rect { lo: Point, hi: Point }
+
+impl Point {
+    fn len_sq(self) -> f64 {
+        return self.x * self.x + self.y * self.y;
+    }
+
+    fn shift(&mut self, dx: f64, dy: f64) {
+        self.x += dx;
+        self.y += dy;
+    }
+}
+
+impl Rect {
+    fn area(&self) -> f64 {
+        let w = self.hi.x - self.lo.x;
+        let h = self.hi.y - self.lo.y;
+        return w * h;
+    }
+}
+
+fn new_point(x: f64, y: f64) -> Point {
+    return Point { x: x, y: y };
+}
+
+fn midpoint(a: Point, b: Point) -> Point {
+    Point { x: (a.x + b.x) / 2.0, y: (a.y + b.y) / 2.0 }
+}
+
+fn main() -> i32 {
+    let mut p = Point { x: 3.0, y: 4.0 };
+    println(p.len_sq());
+
+    p.shift(1.0, 2.0);
+    println(p.x);
+    println(p.y);
+
+    let q = new_point(1.0, 1.0);
+    let m = midpoint(p, q);
+    println(m.x);
+    println(m.y);
+
+    let r = Rect { lo: Point { x: 0.0, y: 0.0 }, hi: Point { x: 3.0, y: 5.0 } };
+    println(r.area());
+    println(r.lo.x);
+
+    let mut r2 = r;
+    r2.hi.y = 10.0;
+    println(r2.area());
+
+    0
+}

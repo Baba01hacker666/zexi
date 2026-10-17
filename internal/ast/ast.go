@@ -54,7 +54,12 @@ type Param struct {
 	Mut  bool
 	Name string
 	Ty   Type
-	Sp   token.Span
+	// Self marks the receiver parameter of a method. When set, Ty is nil for
+	// `self`, or a reference type for `&self` / `&mut self`.
+	Self    bool
+	SelfRef bool
+	SelfMut bool
+	Sp      token.Span
 }
 
 // GenericParam is a type parameter with optional trait bounds.

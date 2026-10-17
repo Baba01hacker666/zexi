@@ -21,6 +21,9 @@ type parser struct {
 	toks   []token.Token
 	pos    int
 	errs   []diag.Diagnostic
+	// noStructLit is >0 while parsing a context where `{` starts a block and
+	// must not be taken as the start of a struct literal (if/while/for/match).
+	noStructLit int
 }
 
 // Parse lexes and parses src, returning the AST and diagnostics. A partial AST
@@ -212,6 +215,26 @@ func (p *parser) parseParams() []ast.Param {
 	}
 	for !p.at(token.KindRParen) && !p.at(token.KindEOF) {
 		start := p.cur().Pos.Offset
+		if p.atSelfParam() {
+			pr := ast.Param{Self: true, Name: "self"}
+			if p.accept(token.KindAmp) {
+				pr.SelfRef = true
+				pr.SelfMut = p.accept(token.KindMut)
+			}
+			if _, ok := p.expectIdent("`self`"); !ok {
+				p.skipTo(token.KindComma, token.KindRParen)
+				if !p.accept(token.KindComma) {
+					break
+				}
+				continue
+			}
+			pr.Sp = p.spanFrom(start)
+			params = append(params, pr)
+			if !p.accept(token.KindComma) {
+				break
+			}
+			continue
+		}
 		mut := p.accept(token.KindMut)
 		name, ok := p.expectIdent("parameter name")
 		if !ok {
@@ -517,6 +540,62 @@ func isBlockLike(e ast.Expr) bool {
 	return false
 }
 
+// atSelfParam reports whether the cursor is at a method receiver: `self`,
+// `&self`, or `&mut self`.
+func (p *parser) atSelfParam() bool {
+	c := p.cur()
+	if c.Kind == token.KindIdentifier && c.Lit == "self" {
+		return true
+	}
+	if c.Kind != token.KindAmp {
+		return false
+	}
+	switch n := p.tokAt(1); n.Kind {
+	case token.KindIdentifier:
+		return n.Lit == "self"
+	case token.KindMut:
+		m := p.tokAt(2)
+		return m.Kind == token.KindIdentifier && m.Lit == "self"
+	}
+	return false
+}
+
+// tokAt returns the token n positions ahead of the cursor, clamped to EOF.
+func (p *parser) tokAt(n int) token.Token {
+	i := p.pos + n
+	if i >= len(p.toks) {
+		return p.toks[len(p.toks)-1] // EOF
+	}
+	return p.toks[i]
+}
+
+// parseStructLit parses `Path { field: value, .. }` or `Path { field, .. }`.
+func (p *parser) parseStructLit(path []string, start token.Pos) ast.Expr {
+	lit := &ast.StructLitExpr{Path: path}
+	p.bump() // {
+	for !p.at(token.KindRBrace) && !p.at(token.KindEOF) {
+		fstart := p.cur().Pos.Offset
+		if p.at(token.KindDotDot) {
+			p.bump()
+			break
+		}
+		name := p.expectIdentPath("field name")
+		var val ast.Expr
+		if p.accept(token.KindColon) {
+			val = p.parseExpr()
+		} else {
+			val = &ast.IdentExpr{Name: name, Sp: p.spanFrom(fstart)}
+		}
+		lit.Fields = append(lit.Fields, ast.FieldInit{Name: name, Val: val, Sp: p.spanFrom(fstart)})
+		if !p.accept(token.KindComma) {
+			break
+		}
+	}
+	p.expect(token.KindRBrace, " to close struct literal")
+	lit.Sp = p.spanFrom(start)
+	return lit
+}
+
 func (p *parser) parseLet() ast.Stmt {
 	start := p.cur().Pos.Offset
 	p.bump() // let
@@ -726,7 +805,12 @@ func (p *parser) parsePostfix() ast.Expr {
 		switch p.cur().Kind {
 		case token.KindDot:
 			p.bump()
-			name := p.expectIdentPath("field or method name")
+			name := ""
+			if p.at(token.KindInteger) {
+				name = p.bump().Lit // tuple-struct field: `.0`
+			} else {
+				name = p.expectIdentPath("field or method name")
+			}
 			if p.at(token.KindLParen) {
 				args := p.parseArgs()
 				e = &ast.MethodCallExpr{Recv: e, Name: name, Args: args, Sp: token.Span{Start: e.Span().Start, End: p.prevEnd()}}
@@ -774,14 +858,17 @@ func (p *parser) parsePrimary() ast.Expr {
 
 	case token.KindIdentifier:
 		p.bump()
-		if p.at(token.KindColonColon) {
-			path := []string{t.Lit}
-			for p.accept(token.KindColonColon) {
-				path = append(path, p.expectIdentPath("path segment"))
-			}
-			return &ast.PathExpr{Segments: path, Sp: p.spanFrom(start)}
+		path := []string{t.Lit}
+		for p.accept(token.KindColonColon) {
+			path = append(path, p.expectIdentPath("path segment"))
 		}
-		return &ast.IdentExpr{Name: t.Lit, Sp: p.spanFrom(start)}
+		if p.at(token.KindLBrace) && p.noStructLit == 0 {
+			return p.parseStructLit(path, start)
+		}
+		if len(path) == 1 {
+			return &ast.IdentExpr{Name: path[0], Sp: p.spanFrom(start)}
+		}
+		return &ast.PathExpr{Segments: path, Sp: p.spanFrom(start)}
 
 	case token.KindLParen:
 		p.bump()
@@ -819,7 +906,9 @@ func (p *parser) parsePrimary() ast.Expr {
 
 	case token.KindWhile:
 		p.bump()
+		p.noStructLit++
 		cond := p.parseExpr()
+		p.noStructLit--
 		body := p.parseBlock()
 		return &ast.LoopExpr{Kind: token.KindWhile, Cond: cond, Body: body, Sp: p.spanFrom(start)}
 
@@ -827,7 +916,9 @@ func (p *parser) parsePrimary() ast.Expr {
 		p.bump()
 		pat := p.parsePattern()
 		p.expect(token.KindIn, " in `for` loop")
+		p.noStructLit++
 		iter := p.parseExpr()
+		p.noStructLit--
 		body := p.parseBlock()
 		return &ast.LoopExpr{Kind: token.KindFor, Pat: pat, Iter: iter, Body: body, Sp: p.spanFrom(start)}
 
@@ -860,7 +951,9 @@ func (p *parser) parsePrimary() ast.Expr {
 func (p *parser) parseIf() ast.Expr {
 	start := p.cur().Pos.Offset
 	p.bump() // if
+	p.noStructLit++
 	cond := p.parseExpr()
+	p.noStructLit--
 	then := p.parseBlock()
 	e := &ast.IfExpr{Cond: cond, Then: then}
 	if p.accept(token.KindElse) {
@@ -877,7 +970,9 @@ func (p *parser) parseIf() ast.Expr {
 func (p *parser) parseMatch() ast.Expr {
 	start := p.cur().Pos.Offset
 	p.bump() // match
+	p.noStructLit++
 	scrut := p.parseExpr()
+	p.noStructLit--
 	m := &ast.MatchExpr{Scrutinee: scrut}
 	if _, ok := p.expect(token.KindLBrace, " to begin match arms"); !ok {
 		m.Sp = p.spanFrom(start)

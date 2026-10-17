@@ -32,12 +32,13 @@ const (
 	F32
 	F64
 
-	Ptr   // *T
-	Ref   // &T, &mut T
-	Array // [T; N]
-	Slice // [T]
-	Tuple // (A, B, ...)
-	Fn    // fn(A, B) -> R
+	Ptr        // *T
+	Ref        // &T, &mut T
+	Array      // [T; N]
+	Slice      // [T]
+	Tuple      // (A, B, ...)
+	Fn         // fn(A, B) -> R
+	StructKind // nominal product type
 )
 
 // Type is a semantic type. Only the fields relevant to Kind are set.
@@ -50,6 +51,32 @@ type Type struct {
 	// Fn
 	Params []*Type
 	Ret    *Type
+	// Struct
+	St *Struct
+}
+
+// Struct is a nominal product type.
+type Struct struct {
+	Name   string
+	Fields []Field
+	Tuple  bool
+}
+
+// Field is one struct field.
+type Field struct {
+	Name string
+	Ty   *Type
+	Pub  bool
+}
+
+// Field returns the named field, if present.
+func (s *Struct) Field(name string) (*Field, bool) {
+	for i := range s.Fields {
+		if s.Fields[i].Name == name {
+			return &s.Fields[i], true
+		}
+	}
+	return nil, false
 }
 
 // Shorthands for the primitive types.
@@ -129,6 +156,9 @@ func Equal(a, b *Type) bool {
 	if a.Kind != b.Kind || a.Mut != b.Mut || a.Len != b.Len {
 		return false
 	}
+	if a.Kind == StructKind {
+		return a.St != nil && b.St != nil && a.St.Name == b.St.Name
+	}
 	if !Equal(a.Elem, b.Elem) || !Equal(a.Ret, b.Ret) {
 		return false
 	}
@@ -146,6 +176,40 @@ func Equal(a, b *Type) bool {
 		}
 	}
 	return true
+}
+
+// IsCopy reports whether values of this type are copied on assignment rather
+// than moved. Primitives, references, pointers, and function pointers are
+// copyable; aggregates are copyable iff all of their components are.
+func (t *Type) IsCopy() bool {
+	if t == nil {
+		return true
+	}
+	switch t.Kind {
+	case StructKind:
+		if t.St == nil {
+			return true
+		}
+		for _, f := range t.St.Fields {
+			if !f.Ty.IsCopy() {
+				return false
+			}
+		}
+		return true
+	case Array:
+		return t.Elem.IsCopy()
+	case Tuple:
+		for _, e := range t.Elems {
+			if !e.IsCopy() {
+				return false
+			}
+		}
+		return true
+	case Invalid:
+		return true
+	default:
+		return true
+	}
 }
 
 // String renders a type for diagnostics.
@@ -166,6 +230,11 @@ func (t *Type) String() string {
 		return "str"
 	case Never:
 		return "never"
+	case StructKind:
+		if t.St != nil {
+			return t.St.Name
+		}
+		return "<struct>"
 	case I8:
 		return "i8"
 	case I16:
