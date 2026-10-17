@@ -144,7 +144,14 @@ func (c *checker) collect() {
 			c.registerEnum(d)
 		}
 	}
-	// Pass 2: fill in struct fields and enum variants.
+	// Pass 2: constants, so their values are available to array lengths and
+	// other constant positions in the declarations below.
+	for _, it := range c.info.File.Items {
+		if d, ok := it.(*ast.ConstDecl); ok {
+			c.collectConst(d)
+		}
+	}
+	// Pass 3: fill in struct fields and enum variants.
 	for _, it := range c.info.File.Items {
 		switch d := it.(type) {
 		case *ast.StructDecl:
@@ -153,11 +160,9 @@ func (c *checker) collect() {
 			c.collectEnumVariants(d)
 		}
 	}
-	// Constants, functions, then impl blocks (methods need their struct).
+	// Functions, then impl blocks (methods need their struct).
 	for _, it := range c.info.File.Items {
 		switch d := it.(type) {
-		case *ast.ConstDecl:
-			c.collectConst(d)
 		case *ast.FnDecl:
 			c.collectFn(d, false, "")
 		case *ast.ImplBlock:
@@ -393,11 +398,14 @@ func (c *checker) collectConst(d *ast.ConstDecl) {
 		return
 	}
 	if declared != nil {
-		if !c.assignable(declared, val.Ty) {
+		if val.Untyped && declared.Kind.IsInt() && declared.Kind != types.Invalid {
+			val.Ty = declared
+		} else if !c.assignable(declared, val.Ty) {
 			c.errf(d.Val.Span(), "E0308", "mismatched types: expected `%s`, found `%s`", declared, val.Ty)
 			return
+		} else {
+			val.Ty = declared
 		}
-		val.Ty = declared
 	}
 	c.info.Consts[d.Name] = &Const{Decl: d, Name: d.Name, Ty: val.Ty, Val: val}
 }
@@ -633,7 +641,7 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 	case *ast.IndexExpr:
 		return c.inferIndex(x)
 	case *ast.ArrayLitExpr:
-		return c.inferArrayLit(x)
+		return c.inferArrayLit(x, expected)
 	case *ast.TryExpr:
 		c.errf(x.Sp, "E0900", "the `?` operator is not supported by the compiler yet (roadmap M0)")
 		return nil
@@ -966,23 +974,27 @@ func (c *checker) inferIndex(x *ast.IndexExpr) *types.Type {
 
 // inferArrayLit checks `[a, b, c]` and `[value; count]`, using the expected
 // type for the element type when available.
-func (c *checker) inferArrayLit(x *ast.ArrayLitExpr) *types.Type {
+func (c *checker) inferArrayLit(x *ast.ArrayLitExpr, expected *types.Type) *types.Type {
+	var wantElem *types.Type
+	if expected != nil && expected.Kind == types.Array {
+		wantElem = expected.Elem
+	}
 	if x.Repeat {
 		c.checkExpr(x.Count, types.UsizeT)
 		n, ok := c.evalConst(x.Count)
 		if !ok || n.Ty == nil || !n.Ty.Kind.IsInt() {
 			c.errAt(x.Count, "E0308", "array repeat count must be an integer constant")
-			c.checkExpr(x.Value, nil)
+			c.checkExpr(x.Value, wantElem)
 			return &types.Type{Kind: types.Array, Elem: types.I32T, Len: 0}
 		}
-		v := c.checkExpr(x.Value, nil)
+		v := c.checkExpr(x.Value, wantElem)
 		return &types.Type{Kind: types.Array, Elem: v, Len: n.Int}
 	}
 	if len(x.Elems) == 0 {
 		c.errAt(x, "E0283", "cannot infer the element type of an empty array; annotate it")
 		return &types.Type{Kind: types.Array, Elem: types.I32T, Len: 0}
 	}
-	var elemT *types.Type
+	elemT := wantElem
 	for _, e := range x.Elems {
 		et := c.checkExpr(e, elemT)
 		if elemT == nil {
@@ -1571,6 +1583,9 @@ type ConstVal struct {
 	IsFloat bool
 	IsStr   bool
 	IsBool  bool
+	// Untyped marks an integer value that came from a bare literal (defaulting
+	// to `i32`) and may still adopt an explicit integer type.
+	Untyped bool
 }
 
 // evalConst folds a constant expression, supporting literals, unary minus, and
@@ -1579,6 +1594,18 @@ func (c *checker) evalConst(e ast.Expr) (ConstVal, bool) {
 	switch x := e.(type) {
 	case *ast.LiteralExpr:
 		return c.evalConstLiteral(x)
+	case *ast.IdentExpr:
+		if cn, ok := c.info.Consts[x.Name]; ok {
+			return cn.Val, true
+		}
+		return ConstVal{}, false
+	case *ast.PathExpr:
+		if len(x.Segments) == 1 {
+			if cn, ok := c.info.Consts[x.Segments[0]]; ok {
+				return cn.Val, true
+			}
+		}
+		return ConstVal{}, false
 	case *ast.UnExpr:
 		if x.Op != token.KindMinus && x.Op != token.KindBang {
 			return ConstVal{}, false
@@ -1618,7 +1645,7 @@ func (c *checker) evalConstLiteral(x *ast.LiteralExpr) (ConstVal, bool) {
 	case token.KindInteger:
 		s := strings.ReplaceAll(x.Text, "_", "")
 		if i, err := strconv.ParseInt(s, 0, 64); err == nil {
-			return ConstVal{Ty: types.I32T, Int: i, Uint: uint64(i)}, true
+			return ConstVal{Ty: types.I32T, Int: i, Uint: uint64(i), Untyped: true}, true
 		}
 		if u, err := strconv.ParseUint(s, 0, 64); err == nil {
 			v := ConstVal{Ty: &types.Type{Kind: types.U64}, Uint: u, Int: int64(u)}
@@ -1712,7 +1739,7 @@ func (c *checker) evalConstBinary(x *ast.BinExpr) (ConstVal, bool) {
 	default:
 		return ConstVal{}, false
 	}
-	return ConstVal{Ty: types.I32T, Int: out, Uint: uint64(out)}, true
+	return ConstVal{Ty: types.I32T, Int: out, Uint: uint64(out), Untyped: l.Untyped && r.Untyped}, true
 }
 
 // firstRune decodes the first decoded rune of a char literal's inner text.

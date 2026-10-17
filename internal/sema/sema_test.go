@@ -184,3 +184,37 @@ fn main() -> i32 {
 		t.Fatalf("expected E0900, got %v", codes)
 	}
 }
+
+func TestConstAdaptsToDeclaredIntType(t *testing.T) {
+	src := `const N: usize = 4;
+fn main() -> i32 {
+    let xs: [i32; N] = [0; N];
+    println(len(xs));
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestConstMismatchedTypeRejected(t *testing.T) {
+	src := `const N: i32 = true;
+fn main() -> i32 { 0 }`
+	ok, codes := check(t, src)
+	if ok || !has(codes, "E0308") {
+		t.Fatalf("expected E0308, got %v", codes)
+	}
+}
+
+func TestArrayLitAdoptsExpectedElemType(t *testing.T) {
+	src := `fn main() -> i32 {
+    let xs: [i64; 3] = [0; 3];
+    println(xs[0]);
+    let ys: [i64; 2] = [1, 2];
+    println(ys[1]);
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
