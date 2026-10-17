@@ -1,0 +1,51 @@
+// tests/arrays.zx
+// First-class arrays: literals, repeat form, indexing with bounds checks,
+// `len`, arrays as struct fields and function parameters, and mutation.
+
+struct Vec4 { v: [f64; 4] }
+
+fn sum(xs: [i32; 5]) -> i32 {
+    let mut total: i32 = 0;
+    let mut i: i32 = 0;
+    while i < (len(xs) as i32) {
+        total += xs[(i as usize)];
+        i += 1;
+    }
+    return total;
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let mut acc: f64 = 0.0;
+    let mut i: usize = 0;
+    while i < len(a) {
+        acc += a[i] * b[i];
+        i += 1;
+    }
+    return acc;
+}
+
+fn main() -> i32 {
+    let xs: [i32; 5] = [1, 2, 3, 4, 5];
+    println(len(xs));
+    println(sum(xs));
+
+    let zeros = [0; 4];
+    println(len(zeros));
+    println(zeros[2]);
+
+    let mut ys = xs;
+    ys[0] = 100;
+    println(xs[0]);
+    println(ys[0]);
+    println(ys[4]);
+
+    let a: [f64; 3] = [1.0, 2.0, 3.0];
+    let b = [4.0, 5.0, 6.0];
+    println(dot(a, b));
+
+    let mut v = Vec4 { v: [0.0; 4] };
+    v.v[1] = 9.0;
+    println(v.v[1]);
+
+    0
+}

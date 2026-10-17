@@ -584,8 +584,9 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 	case *ast.StructLitExpr:
 		return c.inferStructLit(x)
 	case *ast.IndexExpr:
-		c.errf(x.Sp, "E0900", "indexing is not supported by the compiler yet (roadmap M0)")
-		return nil
+		return c.inferIndex(x)
+	case *ast.ArrayLitExpr:
+		return c.inferArrayLit(x)
 	case *ast.TryExpr:
 		c.errf(x.Sp, "E0900", "the `?` operator is not supported by the compiler yet (roadmap M0)")
 		return nil
@@ -770,6 +771,9 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 	if name == "print" || name == "println" {
 		return c.inferPrint(x, name)
 	}
+	if name == "len" {
+		return c.inferLen(x)
+	}
 	fn, ok := c.info.Fns[name]
 	if !ok {
 		c.errAt(x.Callee, "E0425", "cannot find function `%s` in this scope", name)
@@ -793,6 +797,73 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 		}
 	}
 	return fn.Ret
+}
+
+// inferLen checks the builtin `len(x)` for arrays and strings.
+func (c *checker) inferLen(x *ast.CallExpr) *types.Type {
+	if len(x.Args) != 1 {
+		c.errAt(x, "E0061", "`len` takes exactly 1 argument but %d were supplied", len(x.Args))
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return types.UsizeT
+	}
+	t := c.checkExpr(x.Args[0], nil)
+	if t != nil && (t.Kind == types.Array || t.Kind == types.Str || t.Kind == types.Slice) {
+		return types.UsizeT
+	}
+	c.errAt(x.Args[0], "E0308", "`len` expects an array, slice, or `str`, found `%s`", t)
+	return types.UsizeT
+}
+
+// inferIndex checks `xs[i]` for arrays and slices.
+func (c *checker) inferIndex(x *ast.IndexExpr) *types.Type {
+	rt := c.checkExpr(x.Recv, nil)
+	it := c.checkExpr(x.Index, nil)
+	if rt == nil || (rt.Kind != types.Array && rt.Kind != types.Slice) {
+		c.errAt(x, "E0608", "cannot index a value of type `%s`", rt)
+		return nil
+	}
+	if it != nil && !it.Kind.IsInt() {
+		c.errAt(x.Index, "E0308", "array index must be an integer, found `%s`", it)
+	}
+	// Constant indices are bounds-checked at compile time.
+	if n, ok := c.evalConst(x.Index); ok && n.Ty != nil && n.Ty.Kind.IsInt() {
+		if rt.Kind == types.Array && (n.Int < 0 || n.Int >= rt.Len) {
+			c.errAt(x.Index, "E0502", "index %d is out of bounds for array of length %d", n.Int, rt.Len)
+		}
+	}
+	return rt.Elem
+}
+
+// inferArrayLit checks `[a, b, c]` and `[value; count]`, using the expected
+// type for the element type when available.
+func (c *checker) inferArrayLit(x *ast.ArrayLitExpr) *types.Type {
+	if x.Repeat {
+		c.checkExpr(x.Count, types.UsizeT)
+		n, ok := c.evalConst(x.Count)
+		if !ok || n.Ty == nil || !n.Ty.Kind.IsInt() {
+			c.errAt(x.Count, "E0308", "array repeat count must be an integer constant")
+			c.checkExpr(x.Value, nil)
+			return &types.Type{Kind: types.Array, Elem: types.I32T, Len: 0}
+		}
+		v := c.checkExpr(x.Value, nil)
+		return &types.Type{Kind: types.Array, Elem: v, Len: n.Int}
+	}
+	if len(x.Elems) == 0 {
+		c.errAt(x, "E0283", "cannot infer the element type of an empty array; annotate it")
+		return &types.Type{Kind: types.Array, Elem: types.I32T, Len: 0}
+	}
+	var elemT *types.Type
+	for _, e := range x.Elems {
+		et := c.checkExpr(e, elemT)
+		if elemT == nil {
+			elemT = et
+		} else if et != nil && !types.Equal(elemT, et) {
+			c.errAt(e, "E0308", "array elements have incompatible types: `%s` and `%s`", elemT, et)
+		}
+	}
+	return &types.Type{Kind: types.Array, Elem: elemT, Len: int64(len(x.Elems))}
 }
 
 // inferVariantCtor checks `Enum::Variant(args)`.

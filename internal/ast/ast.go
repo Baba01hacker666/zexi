@@ -367,6 +367,18 @@ type TupleExpr struct {
 func (*TupleExpr) exprNode()          {}
 func (e *TupleExpr) Span() token.Span { return e.Sp }
 
+// ArrayLitExpr is `[e0, e1, ...]` or the repeat form `[value; count]`.
+type ArrayLitExpr struct {
+	Elems  []Expr
+	Value  Expr
+	Count  Expr
+	Repeat bool
+	Sp     token.Span
+}
+
+func (*ArrayLitExpr) exprNode()          {}
+func (e *ArrayLitExpr) Span() token.Span { return e.Sp }
+
 // CallExpr is `f(args)`.
 type CallExpr struct {
 	Callee Expr

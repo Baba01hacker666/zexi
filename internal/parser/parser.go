@@ -834,6 +834,35 @@ func (p *parser) parsePostfix() ast.Expr {
 	}
 }
 
+// parseArrayLit parses `[a, b, c]` and the repeat form `[value; count]`.
+func (p *parser) parseArrayLit() ast.Expr {
+	start := p.cur().Pos.Offset
+	p.bump() // [
+	lit := &ast.ArrayLitExpr{}
+	if p.at(token.KindRBracket) {
+		p.bump()
+		lit.Sp = p.spanFrom(start)
+		return lit
+	}
+	first := p.parseExpr()
+	if p.accept(token.KindSemicolon) {
+		lit.Repeat = true
+		lit.Value = first
+		lit.Count = p.parseExpr()
+	} else {
+		lit.Elems = append(lit.Elems, first)
+		for p.accept(token.KindComma) {
+			if p.at(token.KindRBracket) {
+				break
+			}
+			lit.Elems = append(lit.Elems, p.parseExpr())
+		}
+	}
+	p.expect(token.KindRBracket, " to close array literal")
+	lit.Sp = p.spanFrom(start)
+	return lit
+}
+
 func (p *parser) parseArgs() []ast.Expr {
 	var args []ast.Expr
 	p.bump() // (
@@ -892,6 +921,9 @@ func (p *parser) parsePrimary() ast.Expr {
 
 	case token.KindLBrace:
 		return p.parseBlock()
+
+	case token.KindLBracket:
+		return p.parseArrayLit()
 
 	case token.KindIf:
 		return p.parseIf()

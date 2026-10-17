@@ -31,12 +31,15 @@ type Options struct {
 }
 
 type gen struct {
-	info   *sema.Info
-	w      *writer
-	opts   Options
-	tmp    int
-	counts map[string]int
-	scopes []map[string]string
+	info       *sema.Info
+	w          *writer
+	opts       Options
+	tmp        int
+	counts     map[string]int
+	scopes     []map[string]string
+	arrays     map[string]*types.Type // array type name -> array type
+	arrSeen    map[string]bool
+	arrayOrder []string
 }
 
 type writer struct {
@@ -56,8 +59,9 @@ func (w *writer) write(format string, a ...any) { fmt.Fprintf(&w.b, format, a...
 
 // Generate emits a complete C translation unit for the program.
 func Generate(info *sema.Info, opts Options) (string, error) {
-	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}}
+	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}, arrays: map[string]*types.Type{}, arrSeen: map[string]bool{}}
 	g.preamble()
+	g.collectArrayTypes()
 	g.typeDefs()
 	g.constants()
 	g.prototypes()
@@ -77,6 +81,16 @@ func (g *gen) preamble() {
 	g.w.line("#include <stdio.h>")
 	g.w.line("#include <stdlib.h>")
 	g.w.line("#include <string.h>")
+	g.w.line("")
+	g.w.line("// Bounds-checked array index: aborts with a message instead of reading")
+	g.w.line("// out of bounds. (M0-alpha: no backtrace yet.)")
+	g.w.line("static inline int64_t zx_bounds(int64_t i, int64_t n) {")
+	g.w.line("    if (i < 0 || i >= n) {")
+	g.w.line(`        fprintf(stderr, "zexi: index %%lld out of bounds (len %%lld)\n", (long long)i, (long long)n);`)
+	g.w.line("        abort();")
+	g.w.line("    }")
+	g.w.line("    return i;")
+	g.w.line("}")
 	g.w.line("")
 }
 
@@ -99,7 +113,7 @@ func (g *gen) constants() { // Emit in source order for stable output.
 // order so that by-value fields refer to complete types. All names are
 // forward-declared first, which also permits self-referential pointers.
 func (g *gen) typeDefs() {
-	if len(g.info.StructOrd) == 0 && len(g.info.EnumOrd) == 0 {
+	if len(g.info.StructOrd) == 0 && len(g.info.EnumOrd) == 0 && len(g.arrayOrder) == 0 {
 		return
 	}
 	for _, s := range g.info.StructOrd {
@@ -108,15 +122,93 @@ func (g *gen) typeDefs() {
 	for _, e := range g.info.EnumOrd {
 		g.w.line("typedef struct %s %s;", typeName(e.Name), typeName(e.Name))
 	}
+	for _, name := range g.arrayOrder {
+		g.w.line("typedef struct %s %s;", name, name)
+	}
 	g.w.line("")
 	for _, name := range g.typeOrder() {
-		if s, ok := g.info.Structs[name]; ok {
-			g.emitStructDef(s)
-		} else if e, ok := g.info.Enums[name]; ok {
-			g.emitEnumDef(e)
+		switch {
+		case g.info.Structs[name] != nil:
+			g.emitStructDef(g.info.Structs[name])
+		case g.info.Enums[name] != nil:
+			g.emitEnumDef(g.info.Enums[name])
+		case g.arrays[name] != nil:
+			g.emitArrayDef(name, g.arrays[name])
 		}
 	}
 	g.w.line("")
+}
+
+// emitArrayDef emits a struct wrapping a C array so that Zexi arrays are
+// first-class values (assignable, returnable) rather than decaying pointers.
+func (g *gen) emitArrayDef(name string, t *types.Type) {
+	g.w.line("struct %s {", name)
+	g.w.indent++
+	if t.Len <= 0 {
+		g.w.line("char e;")
+	} else {
+		g.w.line("%s e[%d];", ctype(t.Elem), t.Len)
+	}
+	g.w.indent--
+	g.w.line("};")
+}
+
+// collectArrayTypes walks every type reachable from the program and records the
+// array types that need a C wrapper struct.
+func (g *gen) collectArrayTypes() {
+	var walk func(t *types.Type)
+	walk = func(t *types.Type) {
+		if t == nil {
+			return
+		}
+		switch t.Kind {
+		case types.Array:
+			name := arrayTypeName(t)
+			if g.arrSeen[name] {
+				return
+			}
+			g.arrSeen[name] = true
+			walk(t.Elem)
+			g.arrays[name] = t
+			g.arrayOrder = append(g.arrayOrder, name)
+		case types.Ptr, types.Ref, types.Slice:
+			walk(t.Elem)
+		case types.StructKind:
+			if t.St == nil || g.arrSeen["#"+t.St.Name] {
+				return
+			}
+			g.arrSeen["#"+t.St.Name] = true
+			for _, f := range t.St.Fields {
+				walk(f.Ty)
+			}
+		case types.EnumKind:
+			if t.En == nil || g.arrSeen["#"+t.En.Name] {
+				return
+			}
+			g.arrSeen["#"+t.En.Name] = true
+			for _, v := range t.En.Variants {
+				for _, f := range v.Fields {
+					walk(f.Ty)
+				}
+			}
+		case types.Tuple:
+			for _, e := range t.Elems {
+				walk(e)
+			}
+		}
+	}
+	for _, f := range g.info.FnOrder {
+		for _, p := range f.Params {
+			walk(p)
+		}
+		walk(f.Ret)
+	}
+	for _, t := range g.info.Types {
+		walk(t)
+	}
+	for _, t := range g.info.DeclTypes {
+		walk(t)
+	}
 }
 
 func (g *gen) emitStructDef(s *types.Struct) {
@@ -183,10 +275,13 @@ func (g *gen) typeOrder() []string {
 	for _, e := range g.info.EnumOrd {
 		visit(e.Name)
 	}
+	for _, name := range g.arrayOrder {
+		visit(name)
+	}
 	return out
 }
 
-// typeDeps lists struct/enum names that must be complete for `name`.
+// typeDeps lists struct/enum/array names that must be complete for `name`.
 func (g *gen) typeDeps(name string) []string {
 	var out []string
 	if s, ok := g.info.Structs[name]; ok {
@@ -201,21 +296,32 @@ func (g *gen) typeDeps(name string) []string {
 			}
 		}
 	}
+	if a, ok := g.arrays[name]; ok {
+		out = append(out, valueTypeDeps(a.Elem)...)
+	}
 	// Keep only names we actually define.
 	kept := out[:0]
 	for _, n := range out {
-		if _, ok := g.info.Structs[n]; ok {
-			kept = append(kept, n)
-			continue
-		}
-		if _, ok := g.info.Enums[n]; ok {
+		if g.defined(n) {
 			kept = append(kept, n)
 		}
 	}
 	return kept
 }
 
-// valueTypeDeps lists struct/enum names that a by-value type t requires to be
+// defined reports whether a generated type name exists in this translation unit.
+func (g *gen) defined(name string) bool {
+	if _, ok := g.info.Structs[name]; ok {
+		return true
+	}
+	if _, ok := g.info.Enums[name]; ok {
+		return true
+	}
+	_, ok := g.arrays[name]
+	return ok
+}
+
+// valueTypeDeps lists nominal type names that a by-value type t requires to be
 // complete: the nominal type itself, or any reachable through aggregates.
 func valueTypeDeps(t *types.Type) []string {
 	if t == nil {
@@ -231,7 +337,7 @@ func valueTypeDeps(t *types.Type) []string {
 			return []string{t.En.Name}
 		}
 	case types.Array:
-		return valueTypeDeps(t.Elem)
+		return []string{arrayTypeName(t)}
 	case types.Tuple:
 		var out []string
 		for _, e := range t.Elems {
@@ -240,6 +346,48 @@ func valueTypeDeps(t *types.Type) []string {
 		return out
 	}
 	return nil
+}
+
+// arrayTypeName is the deterministic C name of an array wrapper struct.
+func arrayTypeName(t *types.Type) string {
+	return "zx_arr" + strconv.FormatInt(t.Len, 10) + "_" + typeMangle(t.Elem)
+}
+
+// typeMangle renders a type as an identifier fragment for generated names.
+func typeMangle(t *types.Type) string {
+	if t == nil {
+		return "void"
+	}
+	switch t.Kind {
+	case types.StructKind:
+		if t.St != nil {
+			return safeIdent(t.St.Name)
+		}
+	case types.EnumKind:
+		if t.En != nil {
+			return safeIdent(t.En.Name)
+		}
+	case types.Array:
+		return arrayTypeName(t)
+	case types.Ptr:
+		return "p_" + typeMangle(t.Elem)
+	case types.Ref:
+		return "r_" + typeMangle(t.Elem)
+	case types.Slice:
+		return "s_" + typeMangle(t.Elem)
+	case types.Tuple:
+		parts := make([]string, len(t.Elems))
+		for i, e := range t.Elems {
+			parts[i] = typeMangle(e)
+		}
+		return "t_" + strings.Join(parts, "_")
+	}
+	return strings.Map(func(r rune) rune {
+		if r == '_' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			return r
+		}
+		return '_'
+	}, t.String())
 }
 
 func (g *gen) prototypes() {
@@ -547,6 +695,12 @@ func (g *gen) value(e ast.Expr) string {
 	case *ast.StructLitExpr:
 		return g.structLitValue(x)
 
+	case *ast.ArrayLitExpr:
+		return g.arrayLitValue(x)
+
+	case *ast.IndexExpr:
+		return g.indexValue(x)
+
 	case *ast.MatchExpr:
 		return g.matchValue(x)
 
@@ -680,6 +834,9 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 	}
 	if name == "print" || name == "println" {
 		return g.printfCall(x, name)
+	}
+	if name == "len" {
+		return g.lenValue(x)
 	}
 	fn, ok := g.info.Fns[name]
 	if !ok {
@@ -846,6 +1003,57 @@ func (g *gen) enumConstruct(ctor *sema.Ctor, args []ast.Expr) string {
 	}
 	return "((" + typeName(en.Name) + "){ .tag = " + tag +
 		", .u.v" + tag + " = { " + strings.Join(inits, ", ") + " } })"
+}
+
+// arrayLitValue emits a compound literal for an array wrapper struct.
+func (g *gen) arrayLitValue(x *ast.ArrayLitExpr) string {
+	t := g.info.TypeOf(x)
+	if t == nil || t.Kind != types.Array {
+		return "0 /* invalid array literal */"
+	}
+	name := arrayTypeName(t)
+	if t.Len <= 0 {
+		return "((" + name + "){ 0 })"
+	}
+	if x.Repeat {
+		v := g.value(x.Value)
+		parts := make([]string, t.Len)
+		for i := range parts {
+			parts[i] = v
+		}
+		return "((" + name + "){ .e = { " + strings.Join(parts, ", ") + " } })"
+	}
+	var vals []string
+	for _, e := range x.Elems {
+		vals = append(vals, g.value(e))
+	}
+	return "((" + name + "){ .e = { " + strings.Join(vals, ", ") + " } })"
+}
+
+// indexValue emits a bounds-checked array index.
+func (g *gen) indexValue(x *ast.IndexExpr) string {
+	rt := g.info.TypeOf(x.Recv)
+	recv := g.value(x.Recv)
+	idx := g.value(x.Index)
+	if rt != nil && rt.Kind == types.Array {
+		return "(" + recv + ").e[zx_bounds(" + idx + ", " + strconv.FormatInt(rt.Len, 10) + ")]"
+	}
+	return "(" + recv + ")[" + idx + "]"
+}
+
+// lenValue emits the builtin `len(x)`.
+func (g *gen) lenValue(x *ast.CallExpr) string {
+	if len(x.Args) != 1 {
+		return "0"
+	}
+	t := g.info.TypeOf(x.Args[0])
+	switch {
+	case t != nil && t.Kind == types.Array:
+		return strconv.FormatInt(t.Len, 10)
+	case t != nil && t.Kind == types.Str:
+		return "strlen(" + g.value(x.Args[0]) + ")"
+	}
+	return "0"
 }
 
 // matchValue emits a `match` in expression position as a statement expression.
@@ -1205,7 +1413,7 @@ func ctype(t *types.Type) string {
 	case types.Ptr, types.Ref:
 		return ctype(t.Elem) + " *"
 	case types.Array:
-		return ctype(t.Elem) + " *"
+		return arrayTypeName(t)
 	case types.Slice:
 		return "const void *"
 	case types.StructKind:
@@ -1239,6 +1447,8 @@ func zeroValue(t *types.Type) string {
 		return "((" + typeName(t.St.Name) + "){ 0 })"
 	case t.Kind == types.EnumKind && t.En != nil:
 		return "((" + typeName(t.En.Name) + "){ 0 })"
+	case t.Kind == types.Array:
+		return "((" + arrayTypeName(t) + "){ 0 })"
 	default:
 		return "0"
 	}
