@@ -1,0 +1,58 @@
+// tests/drop.zx
+// Deterministic destruction across control flow: `String`s are freed exactly
+// once no matter which path leaves a scope — early `return`, `break`, the end of
+// a loop iteration, or the end of a function.
+
+struct Pair { a: String, b: String }
+
+// Every path drops the string it does not return.
+fn pick(flag: bool) -> String {
+    let first = String::from("first");
+    let second = String::from("second");
+    if flag {
+        return first; // `second` is dropped on this path
+    }
+    return second; // `first` is dropped on this path
+}
+
+fn sum_lengths() -> i64 {
+    let mut total: i64 = 0;
+    let mut i = 0;
+    while i < 4 {
+        let piece = String::from("abcd"); // dropped at the end of each iteration
+        total += piece.len() as i64;
+        i += 1;
+    }
+    return total;
+}
+
+fn main() -> i32 {
+    println(pick(true));
+    println(pick(false));
+
+    println(sum_lengths());
+
+    // Dropping a struct drops each owning field.
+    let p = Pair { a: String::from("left"), b: String::from("right") };
+    println(p.a);
+    println(p.b);
+
+    // `break` runs the destructors of every live local in the loop body.
+    let mut i = 0;
+    loop {
+        let scratch = String::from("scratch");
+        if i == 2 {
+            break;
+        }
+        i += 1;
+        println(scratch.len());
+    }
+
+    // A value moved out of a struct leaves that field empty, so the struct's
+    // destructor does not free it a second time; `b` is freed when `q` drops.
+    let q = Pair { a: String::from("moved"), b: String::from("stays") };
+    let moved = q.a;
+    println(moved);
+
+    0
+}

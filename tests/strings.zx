@@ -1,0 +1,54 @@
+// tests/strings.zx
+// The builtin owning heap type `String` and deterministic destruction (`Drop`).
+// `String` is not `Copy`: it owns a heap buffer that is freed exactly once when
+// its owner goes out of scope or is overwritten. Moves transfer the buffer.
+
+struct Person { name: String, age: i64 }
+
+// `String` is passed and returned by value (a move in and out).
+fn greet(name: String) -> String {
+    let mut s = String::from("Hello, ");
+    s.push_str(name.as_str());
+    s.push('!');
+    return s;
+}
+
+fn main() -> i32 {
+    // Construction, borrowing methods, and mutation through `&mut self`.
+    let mut s = String::from("zexi");
+    println(s.len());
+    println(s.is_empty());
+    s.push_str(" lang");
+    s.push('!');
+    println(s);
+    println(s.as_str());
+
+    // A struct that contains an owning field is itself non-`Copy`; its
+    // destructor frees the field. Accessing the field only borrows it.
+    let p = Person { name: String::from("Ada"), age: 36 };
+    println(p.name);
+    println(p.age);
+
+    // Moving a `String` into and out of a function.
+    let g = greet(String::from("world"));
+    println(g);
+
+    // `clone` makes an independent deep copy.
+    let mut c = s.clone();
+    c.push_str("!!");
+    println(c);
+    println(s);
+
+    // Arrays of owning values drop each element.
+    let mut words = [String::from("alpha"), String::from("beta")];
+    words[0].push_str("!");
+    println(words[0]);
+    println(words[1]);
+
+    // Reassignment drops the old value before installing the new one.
+    let mut msg = String::from("first");
+    msg = String::from("second");
+    println(msg);
+
+    0
+}

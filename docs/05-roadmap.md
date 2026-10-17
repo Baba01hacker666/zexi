@@ -9,9 +9,15 @@
 > `print`/`println`; `len`; structs (named and tuple) with `impl` methods
 > (`self`, `&self`, `&mut self`); enums (unit/tuple/struct variants) with
 > `match` and exhaustiveness checking; first-class arrays with bounds-checked
-> indexing; and use-after-move errors for non-`Copy` values (`#[copy]` opts in).
-> Not yet implemented: generics, traits, modules/`use`, heap types
-> (`Box`/`Vec`/`String`), `Drop`, borrow-lifetime analysis, and `Result`/`?`.
+> indexing; use-after-move errors for non-`Copy` values (`#[copy]` opts in);
+> and the built-in owning heap type **`String`** with **deterministic
+> destruction (`Drop`)** — buffers are freed exactly once at scope exit, on
+> early `return`/`break`/`continue`, and on reassignment, while moves transfer
+> ownership and leave the source empty.
+> Not yet implemented: generics, traits, modules/`use`, `Vec`/`Box`, user-defined
+> `Drop`, borrow-lifetime analysis (so bound `&`/`*` aliases are not tracked), and
+> `Result`/`?`. Enum variants may not carry resource-owning payloads yet (a
+> `match` binding would alias an owned value; see §5.2).
 > See `docs/06-backend-strategy.md` for the backend status.
 
 The MVP is milestone **M0**: enough language to compile real, safe, small
@@ -55,10 +61,20 @@ M1/M2 are additive.
 
 **Ownership (M0, conservative)**
 - Move semantics for non-`Copy` types; use-after-move = error.
-- Borrows by lexical scope (a borrow lives until end of block) — stricter than
-  needed, deliberately simple.
-- `Drop`/destructor calls inserted at scope exit.
-- Explicit heap only via a built-in `Box<T>` in the `alloc` feature.
+- Deterministic destruction (`Drop`): a destructor runs for every live local at
+  scope exit, on early `return`/`break`/`continue`, and before an overwritten
+  value. Moves transfer ownership and null the source, so a moved-out value is
+  never freed twice.
+- The one heap type is the built-in `String` (an owning UTF-8 buffer). A
+  `struct` or array containing a `String` is itself an owning value and gets a
+  generated destructor; dropping it drops each field/element.
+- **Known M0 gaps (documented, not yet closed):** enum variants cannot carry
+  owning payloads (a `match` binding would alias an owned value, which needs the
+  borrow checker); a `str` borrowed from a temporary `String` prolongs that
+  temporary until the end of the statement; bound `&`/`*` aliases are not tracked
+  across moves (no lifetime analysis). Full handling arrives with M1/M2.
+- Explicit heap only via built-in heap types (`String` now, `Box<T>`/`Vec<T>` at
+  M1).
 
 **Codegen**
 - MIR → C11 for x86-64 and AArch64 via the system `cc`.

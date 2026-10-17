@@ -202,6 +202,12 @@ func (c *checker) collectEnumVariants(d *ast.EnumDecl) {
 			if ft == nil {
 				ft = &types.Type{Kind: types.Invalid}
 			}
+			if ft.NeedsDrop() {
+				// Binding a payload in a `match` aliases the owned value, so a
+				// payload that owns heap memory could be freed twice. Until the
+				// borrow checker lands, keep enum payloads resource-free.
+				c.errf(v.Sp, "E0900", "enum variant `%s` cannot carry the resource-owning type `%s` yet: match bindings would alias owned values (roadmap M2)", v.Name, ft)
+			}
 			tv.Fields = append(tv.Fields, types.Field{Name: name, Ty: ft})
 		}
 		en.Variants = append(en.Variants, tv)
@@ -797,8 +803,12 @@ func (c *checker) isPlace(e ast.Expr) bool {
 }
 
 func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
-	// `Enum::Variant(args)` is a variant constructor, not a function call.
+	// `Enum::Variant(args)` is a variant constructor, and `String::new()` /
+	// `String::from(..)` are builtin constructors.
 	if p, ok := x.Callee.(*ast.PathExpr); ok && len(p.Segments) == 2 {
+		if p.Segments[0] == "String" {
+			return c.inferStringCtor(x, p.Segments[1])
+		}
 		return c.inferVariantCtor(x, p)
 	}
 	name, ok := calleeName(x.Callee)
@@ -838,6 +848,83 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 		}
 	}
 	return fn.Ret
+}
+
+// stringCtorSig describes a builtin `String` constructor.
+var stringCtorSig = map[string][]*types.Type{
+	"new":           nil,
+	"from":          {types.StrT},
+	"with_capacity": {types.UsizeT},
+}
+
+// inferStringCtor checks `String::new()`, `String::from(str)`, and
+// `String::with_capacity(usize)`.
+func (c *checker) inferStringCtor(x *ast.CallExpr, name string) *types.Type {
+	want, ok := stringCtorSig[name]
+	if !ok {
+		c.errf(x.Callee.Span(), "E0599", "no function `String::%s`", name)
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return types.StringT
+	}
+	if len(x.Args) != len(want) {
+		c.errAt(x, "E0061", "`String::%s` takes %d argument(s) but %d were supplied", name, len(want), len(x.Args))
+	}
+	for i, a := range x.Args {
+		var wt *types.Type
+		if i < len(want) {
+			wt = want[i]
+		}
+		at := c.checkExpr(a, wt)
+		if wt != nil && !c.assignable(wt, at) {
+			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", wt, at)
+		}
+	}
+	return types.StringT
+}
+
+// stringMethodSig describes a builtin method on `String`.
+type stringMethodSig struct {
+	params []*types.Type
+	ret    *types.Type
+	mut    bool // takes `&mut self`
+}
+
+var stringMethods = map[string]stringMethodSig{
+	"len":      {nil, types.UsizeT, false},
+	"is_empty": {nil, types.BoolT, false},
+	"as_str":   {nil, types.StrT, false},
+	"clone":    {nil, types.StringT, false},
+	"clear":    {nil, types.UnitT, true},
+	"push":     {[]*types.Type{types.CharT}, types.UnitT, true},
+	"push_str": {[]*types.Type{types.StrT}, types.UnitT, true},
+}
+
+// inferStringMethod type-checks a builtin method call on a `String`.
+func (c *checker) inferStringMethod(x *ast.MethodCallExpr) *types.Type {
+	m, ok := stringMethods[x.Name]
+	if !ok {
+		c.errAt(x, "E0599", "no method `%s` on type `String`", x.Name)
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return nil
+	}
+	if len(x.Args) != len(m.params) {
+		c.errAt(x, "E0061", "method `String::%s` takes %d argument(s) but %d were supplied", x.Name, len(m.params), len(x.Args))
+	}
+	for i, a := range x.Args {
+		var wt *types.Type
+		if i < len(m.params) {
+			wt = m.params[i]
+		}
+		at := c.checkExpr(a, wt)
+		if wt != nil && !c.assignable(wt, at) {
+			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", wt, at)
+		}
+	}
+	return m.ret
 }
 
 // inferLen checks the builtin `len(x)` for arrays and strings.
@@ -1099,6 +1186,9 @@ func (c *checker) inferField(x *ast.FieldExpr) *types.Type {
 func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 	rt := c.checkExpr(x.Recv, nil)
 	base := recvBase(rt)
+	if base != nil && base.Kind == types.StringKind {
+		return c.inferStringMethod(x)
+	}
 	if base == nil || (base.Kind != types.StructKind && base.Kind != types.EnumKind) {
 		c.errAt(x, "E0599", "no method `%s` on type `%s`", x.Name, rt)
 		for _, a := range x.Args {
@@ -1450,7 +1540,7 @@ func isPrintable(t *types.Type) bool {
 		return false
 	}
 	switch t.Kind {
-	case types.Str, types.Char, types.Bool:
+	case types.Str, types.Char, types.Bool, types.StringKind:
 		return true
 	}
 	return t.Kind.IsNumeric()

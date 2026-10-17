@@ -20,6 +20,8 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/enums.zx",
 		"../../tests/arrays.zx",
 		"../../tests/ownership.zx",
+		"../../tests/strings.zx",
+		"../../tests/drop.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -80,6 +82,20 @@ func TestRunPrograms(t *testing.T) {
 			file: "../../tests/ownership.zx",
 			want: strings.Join([]string{
 				"7", "7", "84", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/strings.zx",
+			want: strings.Join([]string{
+				"4", "false", "zexi lang!", "zexi lang!", "Ada", "36",
+				"Hello, world!", "zexi lang!!!", "zexi lang!", "alpha!", "beta",
+				"second", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/drop.zx",
+			want: strings.Join([]string{
+				"first", "second", "16", "left", "right", "7", "7", "moved", "",
 			}, "\n"),
 		},
 	}

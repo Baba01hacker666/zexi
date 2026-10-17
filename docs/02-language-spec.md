@@ -153,6 +153,37 @@ fn(A, B) -> R function pointer
   except niche optimizations in M2.
 - `impl` — inherent and trait methods.
 
+### Heap types
+
+The only heap type implemented today is **`String`**: an owning, growable UTF-8
+buffer. It is *not* `Copy` — it owns heap memory and is freed by its destructor.
+
+```zexi
+let mut s = String::from("hello");
+s.push_str(", world");
+s.push('!');
+println(s.len());
+println(s.as_str());     // borrows a `str` (valid while `s` lives)
+let t = s.clone();       // independent deep copy
+```
+
+| method | signature | notes |
+| --- | --- | --- |
+| `String::new()` | `-> String` | empty |
+| `String::from(str)` | `-> String` | allocates and copies |
+| `String::with_capacity(usize)` | `-> String` | pre-sized buffer |
+| `len(&self)` | `-> usize` | byte length |
+| `is_empty(&self)` | `-> bool` | |
+| `as_str(&self)` | `-> str` | borrowed view |
+| `clone(&self)` | `-> String` | deep copy |
+| `clear(&mut self)` | | truncate to empty |
+| `push(&mut self, char)` | | append one code point (UTF-8) |
+| `push_str(&mut self, str)` | | append a string slice |
+
+Owning values compose: a `struct` (or array) containing a `String` is itself an
+owning type and gets a generated destructor, so dropping it drops each
+field/element. `Vec<T>` and `Box<T>` arrive with generics (M1).
+
 ### Generics (M1)
 
 Generics are **monomorphized**: each concrete instantiation is a separate
@@ -211,7 +242,7 @@ fn main() {
     consume(s);                      // move; s is now unusable
     // println(s) would be a compile error: use of moved value
 
-    let mut v = Vec::new();
+    let mut v = Vec::new();          // (M1; today the owning type is String)
     v.push(1);
     let r = &v[0];                   // shared borrow
     // v.push(2) would be a compile error while r is live
@@ -227,11 +258,26 @@ Rules:
   `Copy`; arrays/tuples are `Copy` when their components are. **Structs and
   enums are move-only by default** and opt into copying with `#[copy]` (all
   fields must then be `Copy`), mirroring Rust's `derive(Copy)`.
-- A value is dropped (its `Drop::drop` runs, then its memory is freed if owned)
-  at the end of its owner's scope, or at the last use (**non-lexical lifetimes**,
-  M1; M0 uses lexical scopes).
+- **Destruction (`Drop`) is deterministic.** A destructor runs for every live
+  local at the end of its scope, on early `return`/`break`/`continue`, and
+  before an overwritten value. A move transfers ownership and empties the
+  source, so the moved-out value is never freed twice. Destructors for a
+  `struct`/array recurse into their fields/elements.
 - `&T` / `&mut T` borrows must satisfy: any number of `&T`, **or** exactly one
-  `&mut T`; a borrow cannot outlive its referent.
+  `&mut T`; a borrow cannot outlive its referent. *(Target rule; today the
+  checker validates moves/use-after-move but does not yet track borrow
+  lifetimes — bound aliases are not checked, and non-lexical lifetimes arrive in
+  M1.)*
+
+### Implemented today vs. target
+
+| Aspect | Implemented (M0) | Target (M1/M2) |
+| --- | --- | --- |
+| Moves | yes; use-after-move = `E0382` | + conditional/partial moves tracked precisely |
+| Drop | yes for `String`, and for `struct`/array values that contain one | user-defined `Drop`, drop flags, drop elision |
+| Heap types | `String` | `Box<T>`, `Vec<T>`, collections |
+| Enum payloads | `Copy` only (owning payloads rejected: `E0900`) | owning payloads once `match` borrows instead of aliasing |
+| Borrows | `&`/`&mut self` param passing; no lifetime tracking | full NLL borrow checker, lifetimes |
 
 ## 2.7 Error handling
 

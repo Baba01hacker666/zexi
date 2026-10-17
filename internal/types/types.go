@@ -40,6 +40,7 @@ const (
 	Fn         // fn(A, B) -> R
 	StructKind // nominal product type
 	EnumKind   // nominal tagged union
+	StringKind // builtin owning heap string
 )
 
 // Type is a semantic type. Only the fields relevant to Kind are set.
@@ -130,26 +131,31 @@ var (
 	F64T   = &Type{Kind: F64}
 	U32T   = &Type{Kind: U32}
 	UsizeT = &Type{Kind: Usize}
+
+	// StringT is the builtin owning heap string. It is not `Copy`: it owns a
+	// heap buffer that is freed by its destructor.
+	StringT = &Type{Kind: StringKind}
 )
 
 // Builtins maps predeclared type names to types.
 var Builtins = map[string]*Type{
-	"i8":    {Kind: I8},
-	"i16":   {Kind: I16},
-	"i32":   I32T,
-	"i64":   I64T,
-	"isize": {Kind: Isize},
-	"u8":    {Kind: U8},
-	"u16":   {Kind: U16},
-	"u32":   U32T,
-	"u64":   {Kind: U64},
-	"usize": UsizeT,
-	"f32":   {Kind: F32},
-	"f64":   F64T,
-	"bool":  BoolT,
-	"char":  CharT,
-	"str":   StrT,
-	"never": NeverT,
+	"i8":     {Kind: I8},
+	"i16":    {Kind: I16},
+	"i32":    I32T,
+	"i64":    I64T,
+	"isize":  {Kind: Isize},
+	"u8":     {Kind: U8},
+	"u16":    {Kind: U16},
+	"u32":    U32T,
+	"u64":    {Kind: U64},
+	"usize":  UsizeT,
+	"f32":    {Kind: F32},
+	"f64":    F64T,
+	"bool":   BoolT,
+	"char":   CharT,
+	"str":    StrT,
+	"never":  NeverT,
+	"String": StringT,
 }
 
 // PtrTo returns *T.
@@ -260,11 +266,55 @@ func (t *Type) IsCopy() bool {
 			}
 		}
 		return true
+	case StringKind:
+		return false
 	case Invalid:
 		return true
 	default:
 		return true
 	}
+}
+
+// NeedsDrop reports whether values of this type own a heap resource that must
+// be released by a destructor. It is true for `String` and for any aggregate
+// that transitively contains one. Types that need dropping are never `Copy`.
+func (t *Type) NeedsDrop() bool {
+	if t == nil {
+		return false
+	}
+	switch t.Kind {
+	case StringKind:
+		return true
+	case StructKind:
+		if t.St == nil {
+			return false
+		}
+		for _, f := range t.St.Fields {
+			if f.Ty.NeedsDrop() {
+				return true
+			}
+		}
+	case EnumKind:
+		if t.En == nil {
+			return false
+		}
+		for _, v := range t.En.Variants {
+			for _, f := range v.Fields {
+				if f.Ty.NeedsDrop() {
+					return true
+				}
+			}
+		}
+	case Array:
+		return t.Elem.NeedsDrop()
+	case Tuple:
+		for _, e := range t.Elems {
+			if e.NeedsDrop() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // CopyAttr reports whether an attribute list opts a type into `Copy`.
@@ -293,6 +343,8 @@ func (t *Type) String() string {
 		return "char"
 	case Str:
 		return "str"
+	case StringKind:
+		return "String"
 	case Never:
 		return "never"
 	case StructKind:

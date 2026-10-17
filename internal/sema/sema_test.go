@@ -119,3 +119,68 @@ fn main() -> i32 { let s = S { x: 1 }; println(s.nope()); 0 }`
 		t.Fatalf("expected E0599, got %v", codes)
 	}
 }
+
+func TestStringUseAfterMove(t *testing.T) {
+	src := `fn main() -> i32 {
+    let a = String::from("x");
+    let b = a;
+    println(b.len());
+    println(a.len());
+    0
+}`
+	ok, codes := check(t, src)
+	if ok || !has(codes, "E0382") {
+		t.Fatalf("expected E0382, got %v", codes)
+	}
+}
+
+func TestStringBorrowDoesNotMove(t *testing.T) {
+	src := `fn main() -> i32 {
+    let mut a = String::from("x");
+    a.push_str("y");
+    println(a.len());
+    println(a.as_str());
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestStringMethodArgType(t *testing.T) {
+	src := `fn main() -> i32 {
+    let mut s = String::from("x");
+    s.push_str(5);
+    0
+}`
+	ok, codes := check(t, src)
+	if ok || !has(codes, "E0308") {
+		t.Fatalf("expected E0308, got %v", codes)
+	}
+}
+
+func TestStringNotCopyable(t *testing.T) {
+	src := `#[copy]
+struct S { name: String }
+fn main() -> i32 {
+    let s = S { name: String::from("x") };
+    0
+}`
+	ok, codes := check(t, src)
+	if ok || !has(codes, "E0204") {
+		t.Fatalf("expected E0204, got %v", codes)
+	}
+}
+
+func TestEnumOwningPayloadRejected(t *testing.T) {
+	src := `enum E { S(String), A }
+fn main() -> i32 {
+    let e = E::S(String::from("x"));
+    match e { E::A => println(0), E::S(s) => println(s.len()) }
+    0
+}`
+	ok, codes := check(t, src)
+	if ok || !has(codes, "E0900") {
+		t.Fatalf("expected E0900, got %v", codes)
+	}
+}

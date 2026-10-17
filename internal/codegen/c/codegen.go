@@ -40,6 +40,27 @@ type gen struct {
 	arrays     map[string]*types.Type // array type name -> array type
 	arrSeen    map[string]bool
 	arrayOrder []string
+	dropFrames []*dropFrame
+	dropTypes  []*dropType
+	dropSeen   map[string]bool
+	loopFrames []int // drop-frame depth at the start of each active loop body
+}
+
+// dropFrame is the set of locals declared in one lexical scope, in declaration
+// order; destructors run in reverse.
+type dropFrame struct {
+	vars []dropVar
+}
+
+type dropVar struct {
+	cname string
+	ty    *types.Type
+}
+
+// dropType is a type that needs generated destructor/move helpers.
+type dropType struct {
+	name string // mangled, used as `zx_drop_<name>`
+	t    *types.Type
 }
 
 type writer struct {
@@ -57,12 +78,17 @@ func (w *writer) line(format string, a ...any) {
 
 func (w *writer) write(format string, a ...any) { fmt.Fprintf(&w.b, format, a...) }
 
+// raw appends already-formatted text (including its own newlines/indentation).
+func (w *writer) raw(s string) { w.b.WriteString(s) }
+
 // Generate emits a complete C translation unit for the program.
 func Generate(info *sema.Info, opts Options) (string, error) {
-	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}, arrays: map[string]*types.Type{}, arrSeen: map[string]bool{}}
+	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}, arrays: map[string]*types.Type{}, arrSeen: map[string]bool{}, dropSeen: map[string]bool{}}
 	g.preamble()
 	g.collectArrayTypes()
+	g.collectDropTypes()
 	g.typeDefs()
+	g.dropFuncs()
 	g.constants()
 	g.prototypes()
 	for _, fn := range info.FnOrder {
@@ -92,6 +118,7 @@ func (g *gen) preamble() {
 	g.w.line("    return i;")
 	g.w.line("}")
 	g.w.line("")
+	g.w.raw(zxStringRuntime)
 }
 
 func (g *gen) constants() { // Emit in source order for stable output.
@@ -209,6 +236,124 @@ func (g *gen) collectArrayTypes() {
 	for _, t := range g.info.DeclTypes {
 		walk(t)
 	}
+}
+
+// collectDropTypes records every type that owns a heap resource and therefore
+// needs a generated destructor and move helper. `String` is built into the
+// runtime; structs, enums, and arrays containing one are emitted here.
+func (g *gen) collectDropTypes() {
+	var walk func(t *types.Type)
+	walk = func(t *types.Type) {
+		if t == nil || !t.NeedsDrop() {
+			return
+		}
+		if t.Kind == types.StringKind {
+			return // provided by the runtime
+		}
+		name := typeMangle(t)
+		if g.dropSeen[name] {
+			return
+		}
+		g.dropSeen[name] = true
+		g.dropTypes = append(g.dropTypes, &dropType{name: name, t: t})
+		switch t.Kind {
+		case types.StructKind:
+			for _, f := range t.St.Fields {
+				walk(f.Ty)
+			}
+		case types.EnumKind:
+			for _, v := range t.En.Variants {
+				for _, f := range v.Fields {
+					walk(f.Ty)
+				}
+			}
+		case types.Array:
+			walk(t.Elem)
+		}
+	}
+	for _, f := range g.info.FnOrder {
+		for _, p := range f.Params {
+			walk(p)
+		}
+		walk(f.Ret)
+	}
+	for _, t := range g.info.Types {
+		walk(t)
+	}
+	for _, t := range g.info.DeclTypes {
+		walk(t)
+	}
+}
+
+// dropFuncs emits forward declarations and definitions for the destructor and
+// move helper of every resource-owning type.
+func (g *gen) dropFuncs() {
+	if len(g.dropTypes) == 0 {
+		return
+	}
+	for _, d := range g.dropTypes {
+		ct := ctype(d.t)
+		g.w.line("static void zx_drop_%s(%s *v);", d.name, ct)
+		g.w.line("static %s zx_move_%s(%s *v);", ct, d.name, ct)
+	}
+	g.w.line("")
+	for _, d := range g.dropTypes {
+		g.emitDropFunc(d)
+	}
+	g.w.line("")
+}
+
+func (g *gen) emitDropFunc(d *dropType) {
+	t := d.t
+	ct := ctype(t)
+	g.w.line("static void zx_drop_%s(%s *v) {", d.name, ct)
+	g.w.indent++
+	switch t.Kind {
+	case types.StructKind:
+		for _, f := range t.St.Fields {
+			if f.Ty.NeedsDrop() {
+				g.w.line("zx_drop_%s(&v->%s);", typeMangle(f.Ty), fieldName(f.Name))
+			}
+		}
+	case types.EnumKind:
+		g.w.line("switch (v->tag) {")
+		g.w.indent++
+		for _, v := range t.En.Variants {
+			any := false
+			for _, f := range v.Fields {
+				if f.Ty.NeedsDrop() {
+					any = true
+				}
+			}
+			if !any {
+				continue
+			}
+			g.w.line("case %d: {", v.Index)
+			g.w.indent++
+			for _, f := range v.Fields {
+				if f.Ty.NeedsDrop() {
+					g.w.line("zx_drop_%s(&v->u.v%d.%s);", typeMangle(f.Ty), v.Index, fieldName(f.Name))
+				}
+			}
+			g.w.line("break;")
+			g.w.indent--
+			g.w.line("}")
+		}
+		g.w.indent--
+		g.w.line("}")
+		g.w.line("v->tag = -1;")
+	case types.Array:
+		if t.Len > 0 {
+			g.w.line("for (int64_t i = 0; i < %d; i++) {", t.Len)
+			g.w.indent++
+			g.w.line("zx_drop_%s(&v->e[i]);", typeMangle(t.Elem))
+			g.w.indent--
+			g.w.line("}")
+		}
+	}
+	g.w.indent--
+	g.w.line("}")
+	g.w.line("static %s zx_move_%s(%s *v) { %s t = *v; memset(v, 0, sizeof *v); return t; }", ct, d.name, ct, ct)
 }
 
 func (g *gen) emitStructDef(s *types.Struct) {
@@ -430,13 +575,16 @@ func (g *gen) funcDef(fn *sema.Fn) {
 	// signature is written so the two always agree.
 	g.counts = map[string]int{}
 	g.pushScope()
+	g.openDropFrame() // function frame: parameters
 	var params []string
 	for i, p := range fn.Decl.Params {
 		pt := types.UnitT
 		if i < len(fn.Params) {
 			pt = fn.Params[i]
 		}
-		params = append(params, ctype(pt)+" "+g.bind(p.Name))
+		cn := g.bind(p.Name)
+		params = append(params, ctype(pt)+" "+cn)
+		g.registerDrop(cn, pt)
 	}
 	if len(params) == 0 {
 		params = []string{"void"}
@@ -444,7 +592,10 @@ func (g *gen) funcDef(fn *sema.Fn) {
 
 	g.w.line("%s%s %s(%s) {", staticPrefix(fn), retC, funcName(fn), strings.Join(params, ", "))
 	g.w.indent++
+	g.openDropFrame() // body frame
 	g.blockStmts(fn.Decl.Body, ret)
+	g.closeDropFrame()
+	g.closeDropFrame()
 	g.w.indent--
 	g.popScope()
 	g.w.line("}")
@@ -469,7 +620,7 @@ func (g *gen) blockStmts(b *ast.Block, ret *types.Type) {
 		wantValue := ret != nil && ret.Kind != types.Unit &&
 			tt != nil && tt.Kind != types.Unit && tt.Kind != types.Never
 		if wantValue {
-			g.w.line("return %s;", g.value(b.Tail))
+			g.emitReturn(b.Tail)
 		} else {
 			g.stmtExpr(b.Tail)
 		}
@@ -511,10 +662,12 @@ func (g *gen) letStmt(st *ast.LetStmt) {
 	}
 	ct := ctype(ty)
 	if st.Val != nil {
-		g.w.line("%s %s = %s;", ct, name, g.value(st.Val))
+		g.w.line("%s %s = %s;", ct, name, g.consume(st.Val))
 	} else {
-		g.w.line("%s %s;", ct, name)
+		// Zero-initialize so the end-of-scope destructor is safe.
+		g.w.line("%s %s = %s;", ct, name, zeroValue(ty))
 	}
+	g.registerDrop(name, ty)
 }
 
 func (g *gen) stmtExpr(e ast.Expr) {
@@ -530,7 +683,9 @@ func (g *gen) stmtExpr(e ast.Expr) {
 	case *ast.Block:
 		g.w.line("{")
 		g.w.indent++
+		g.openDropFrame()
 		g.blockStmts(x, nil)
+		g.closeDropFrame()
 		g.w.indent--
 		g.w.line("}")
 	default:
@@ -544,14 +699,18 @@ func (g *gen) stmtExpr(e ast.Expr) {
 func (g *gen) ifStmt(x *ast.IfExpr) {
 	g.w.write("if (%s) {\n", g.value(x.Cond))
 	g.w.indent++
+	g.openDropFrame()
 	g.blockStmts(x.Then, nil)
+	g.closeDropFrame()
 	g.w.indent--
 	cur := x
 	for cur.Else != nil {
 		if elif, ok := cur.Else.(*ast.IfExpr); ok {
 			g.w.write("} else if (%s) {\n", g.value(elif.Cond))
 			g.w.indent++
+			g.openDropFrame()
 			g.blockStmts(elif.Then, nil)
+			g.closeDropFrame()
 			g.w.indent--
 			cur = elif
 			continue
@@ -559,7 +718,9 @@ func (g *gen) ifStmt(x *ast.IfExpr) {
 		g.w.write("} else {\n")
 		g.w.indent++
 		if blk, ok := cur.Else.(*ast.Block); ok {
+			g.openDropFrame()
 			g.blockStmts(blk, nil)
+			g.closeDropFrame()
 		} else {
 			g.stmtExpr(cur.Else)
 		}
@@ -575,13 +736,17 @@ func (g *gen) loopStmt(x *ast.LoopExpr) {
 	case token.KindLoop:
 		g.w.line("for (;;) {")
 		g.w.indent++
+		g.openLoop()
 		g.blockStmts(x.Body, nil)
+		g.closeLoop()
 		g.w.indent--
 		g.w.line("}")
 	case token.KindWhile:
 		g.w.line("while (%s) {", g.value(x.Cond))
 		g.w.indent++
+		g.openLoop()
 		g.blockStmts(x.Body, nil)
+		g.closeLoop()
 		g.w.indent--
 		g.w.line("}")
 	case token.KindFor:
@@ -606,7 +771,9 @@ func (g *gen) forStmt(x *ast.LoopExpr) {
 	}
 	g.w.line("for (%s %s = %s; %s %s %s; %s++) {", ctype(lt), name, g.value(rng.L), name, op, g.value(rng.R), name)
 	g.w.indent++
+	g.openLoop()
 	g.blockStmts(x.Body, nil)
+	g.closeLoop()
 	g.w.indent--
 	g.w.line("}")
 	g.popScope()
@@ -615,14 +782,16 @@ func (g *gen) forStmt(x *ast.LoopExpr) {
 func (g *gen) jumpStmt(x *ast.JumpExpr) {
 	switch x.Kind {
 	case token.KindReturn:
-		if x.Val != nil {
-			g.w.line("return %s;", g.value(x.Val))
-		} else {
-			g.w.line("return;")
-		}
+		g.emitReturn(x.Val)
 	case token.KindBreak:
+		if len(g.loopFrames) > 0 {
+			g.emitDropsFrom(g.loopFrames[len(g.loopFrames)-1])
+		}
 		g.w.line("break;")
 	case token.KindContinue:
+		if len(g.loopFrames) > 0 {
+			g.emitDropsFrom(g.loopFrames[len(g.loopFrames)-1])
+		}
 		g.w.line("continue;")
 	}
 }
@@ -665,7 +834,7 @@ func (g *gen) value(e ast.Expr) string {
 		return g.binValue(x)
 
 	case *ast.AssignExpr:
-		return "(" + g.value(x.Lhs) + " " + x.Op.String() + " " + g.value(x.Rhs) + ")"
+		return g.assignValue(x)
 
 	case *ast.CastExpr:
 		dst := g.info.TypeOf(x)
@@ -786,15 +955,24 @@ func (g *gen) blockValue(b *ast.Block) string {
 	save := g.w
 	g.w = sub
 	g.pushScope()
+	g.openDropFrame()
 	for _, s := range b.Stmts {
 		g.stmt(s)
 	}
-	g.popScope()
+	final := "(void)0"
 	if b.Tail != nil {
-		sub.line("%s;", g.value(b.Tail))
-	} else {
-		sub.line("(void)0;")
+		t := g.info.TypeOf(b.Tail)
+		if t != nil && t.NeedsDrop() && isPlaceExpr(b.Tail) {
+			tm := g.tmpName()
+			g.w.line("%s %s = zx_move_%s(&%s);", ctype(t), tm, typeMangle(t), g.value(b.Tail))
+			final = tm
+		} else {
+			final = g.value(b.Tail)
+		}
 	}
+	g.closeDropFrame()
+	g.popScope()
+	sub.line("%s;", final)
 	g.w = save
 	return "({ " + sub.b.String() + " })"
 }
@@ -813,13 +991,16 @@ func (g *gen) identValue(name string, _ token.Span) string {
 }
 
 func (g *gen) callValue(x *ast.CallExpr) string {
+	if p, ok := x.Callee.(*ast.PathExpr); ok && len(p.Segments) == 2 && p.Segments[0] == "String" {
+		return g.stringCtorValue(x, p.Segments[1])
+	}
 	if ctor := g.info.Ctors[x]; ctor != nil {
 		return g.enumConstruct(ctor, x.Args)
 	}
 	if fn := g.info.Resolved[x]; fn != nil {
 		var args []string
 		for _, a := range x.Args {
-			args = append(args, g.value(a))
+			args = append(args, g.consume(a))
 		}
 		return funcName(fn) + "(" + strings.Join(args, ", ") + ")"
 	}
@@ -844,9 +1025,18 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 	}
 	var args []string
 	for _, a := range x.Args {
-		args = append(args, g.value(a))
+		args = append(args, g.consume(a))
 	}
 	return funcName(fn) + "(" + strings.Join(args, ", ") + ")"
+}
+
+// stringCtorValue emits the builtin `String` constructors.
+func (g *gen) stringCtorValue(x *ast.CallExpr, name string) string {
+	var args []string
+	for _, a := range x.Args {
+		args = append(args, g.value(a))
+	}
+	return "zx_string_" + name + "(" + strings.Join(args, ", ") + ")"
 }
 
 func (g *gen) printfCall(x *ast.CallExpr, name string) string {
@@ -859,6 +1049,15 @@ func (g *gen) printfCall(x *ast.CallExpr, name string) string {
 	}
 	arg := x.Args[0]
 	t := g.info.TypeOf(arg)
+	if t != nil && t.Kind == types.StringKind {
+		if isPlaceExpr(arg) {
+			return fmt.Sprintf(`printf("%%s%s", zx_string_as_str(&%s))`, nl, g.value(arg))
+		}
+		// A temporary owner is released as soon as it has been printed.
+		tm := g.tmpName()
+		return fmt.Sprintf(`({ zx_String %s = %s; printf("%%s%s", zx_string_as_str(&%s)); zx_drop_String(&%s); (void)0; })`,
+			tm, g.value(arg), nl, tm, tm)
+	}
 	v := g.value(arg)
 	format, cast := printFormat(t)
 	return fmt.Sprintf(`printf("%s%s", %s)`, format, nl, cast(v))
@@ -900,16 +1099,19 @@ func (g *gen) fieldValue(x *ast.FieldExpr) string {
 // methodCallValue emits a resolved method call, passing the receiver by value
 // or by address according to the method's `self` parameter.
 func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
+	if base := recvBase(g.info.TypeOf(x.Recv)); base != nil && base.Kind == types.StringKind {
+		return g.stringMethodCall(x)
+	}
 	m := g.info.Resolved[x]
 	if m == nil {
 		return "0 /* unresolved method */"
 	}
 	rt := g.info.TypeOf(x.Recv)
-	recv := g.value(x.Recv)
 	var args []string
 	if m.Self != nil {
 		isPtr := rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr)
 		if m.Self.ByRef {
+			recv := g.value(x.Recv)
 			if isPtr {
 				args = append(args, recv)
 			} else {
@@ -917,16 +1119,48 @@ func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
 			}
 		} else {
 			if isPtr {
-				args = append(args, "(*"+recv+")")
+				if t := g.info.TypeOf(x.Recv); t != nil && t.NeedsDrop() {
+					args = append(args, "zx_move_"+typeMangle(t)+"("+g.value(x.Recv)+")")
+				} else {
+					args = append(args, "(*"+g.value(x.Recv)+")")
+				}
 			} else {
-				args = append(args, recv)
+				args = append(args, g.consume(x.Recv))
 			}
 		}
 	}
 	for _, a := range x.Args {
-		args = append(args, g.value(a))
+		args = append(args, g.consume(a))
 	}
 	return funcName(m) + "(" + strings.Join(args, ", ") + ")"
+}
+
+// stringMethodCall emits a builtin `String` method. Borrowing a place passes its
+// address (so `&mut self` methods observe the original); a temporary receiver is
+// materialized inside a statement expression.
+func (g *gen) stringMethodCall(x *ast.MethodCallExpr) string {
+	fn := "zx_string_" + x.Name
+	var rest string
+	for _, a := range x.Args {
+		rest += ", " + g.value(a)
+	}
+	if isPlaceExpr(x.Recv) {
+		return fn + "(&" + g.value(x.Recv) + rest + ")"
+	}
+	t := g.tmpName()
+	call := fn + "(&" + t + rest + ")"
+	rt := g.info.TypeOf(x)
+	prologue := "zx_String " + t + " = " + g.value(x.Recv) + "; "
+	if rt == nil || rt.Kind == types.Unit || rt.Kind == types.Never {
+		return "({ " + prologue + call + "; zx_drop_String(&" + t + "); (void)0; })"
+	}
+	if x.Name == "as_str" {
+		// The result borrows the temporary's buffer, so the buffer cannot be
+		// released until the enclosing statement finishes (M0 limitation).
+		return "({ " + prologue + call + "; })"
+	}
+	r := g.tmpName()
+	return "({ " + prologue + ctype(rt) + " " + r + " = " + call + "; zx_drop_String(&" + t + "); " + r + "; })"
 }
 
 // structLitValue emits a C compound literal, using designated initializers so
@@ -958,7 +1192,7 @@ func (g *gen) structLitValue(x *ast.StructLitExpr) string {
 		if !ok {
 			continue
 		}
-		parts = append(parts, fmt.Sprintf(".%s = %s", fieldName(f.Name), g.value(v)))
+		parts = append(parts, fmt.Sprintf(".%s = %s", fieldName(f.Name), g.consume(v)))
 	}
 	return "((" + typeName(st.Name) + "){ " + strings.Join(parts, ", ") + " })"
 }
@@ -980,7 +1214,7 @@ func (g *gen) enumStructValue(ctor *sema.Ctor, fields []ast.FieldInit) string {
 		if !ok {
 			continue
 		}
-		parts = append(parts, "."+fieldName(f.Name)+" = "+g.value(e))
+		parts = append(parts, "."+fieldName(f.Name)+" = "+g.consume(e))
 	}
 	return "((" + typeName(en.Name) + "){ .tag = " + tag +
 		", .u.v" + tag + " = { " + strings.Join(parts, ", ") + " } })"
@@ -997,7 +1231,7 @@ func (g *gen) enumConstruct(ctor *sema.Ctor, args []ast.Expr) string {
 	for i, f := range v.Fields {
 		s := zeroValue(f.Ty)
 		if i < len(args) {
-			s = g.value(args[i])
+			s = g.consume(args[i])
 		}
 		inits = append(inits, "."+fieldName(f.Name)+" = "+s)
 	}
@@ -1025,7 +1259,7 @@ func (g *gen) arrayLitValue(x *ast.ArrayLitExpr) string {
 	}
 	var vals []string
 	for _, e := range x.Elems {
-		vals = append(vals, g.value(e))
+		vals = append(vals, g.consume(e))
 	}
 	return "((" + name + "){ .e = { " + strings.Join(vals, ", ") + " } })"
 }
@@ -1113,7 +1347,7 @@ func (g *gen) emitSwitch(x *ast.MatchExpr, st *types.Type, m, result string, w *
 		g.pushScope()
 		g.bindArm(w, arm.Pat, st, m, isEnum)
 		if result != "" {
-			w.line("%s = %s;", result, g.value(arm.Body))
+			w.line("%s = %s;", result, g.consume(arm.Body))
 		} else {
 			save := g.w
 			g.w = w
@@ -1371,6 +1605,119 @@ func (g *gen) tmpName() string {
 	return fmt.Sprintf("zx_t%d", g.tmp)
 }
 
+// --- drop frames ----------------------------------------------------------
+
+func (g *gen) openDropFrame() { g.dropFrames = append(g.dropFrames, &dropFrame{}) }
+
+// openLoop opens the lexical scope of a loop body and marks it so that `break`
+// and `continue` know which frames to run destructors for.
+func (g *gen) openLoop() {
+	g.openDropFrame()
+	g.loopFrames = append(g.loopFrames, len(g.dropFrames)-1)
+}
+
+func (g *gen) closeLoop() {
+	if len(g.loopFrames) > 0 {
+		g.loopFrames = g.loopFrames[:len(g.loopFrames)-1]
+	}
+	g.closeDropFrame()
+}
+
+func (g *gen) closeDropFrame() {
+	if len(g.dropFrames) == 0 {
+		return
+	}
+	f := g.dropFrames[len(g.dropFrames)-1]
+	g.emitDrops(f)
+	g.dropFrames = g.dropFrames[:len(g.dropFrames)-1]
+}
+
+func (g *gen) emitDrops(f *dropFrame) {
+	for i := len(f.vars) - 1; i >= 0; i-- {
+		v := f.vars[i]
+		g.w.line("zx_drop_%s(&%s);", typeMangle(v.ty), v.cname)
+	}
+}
+
+// emitDropsFrom runs destructors for every frame from the innermost down to and
+// including frame `start`. Used on `return`, `break`, and `continue`.
+func (g *gen) emitDropsFrom(start int) {
+	for i := len(g.dropFrames) - 1; i >= start; i-- {
+		g.emitDrops(g.dropFrames[i])
+	}
+}
+
+func (g *gen) registerDrop(cname string, t *types.Type) {
+	if t == nil || !t.NeedsDrop() || len(g.dropFrames) == 0 {
+		return
+	}
+	f := g.dropFrames[len(g.dropFrames)-1]
+	f.vars = append(f.vars, dropVar{cname: cname, ty: t})
+}
+
+// --- moves ----------------------------------------------------------------
+
+func isPlaceExpr(e ast.Expr) bool {
+	switch e.(type) {
+	case *ast.IdentExpr, *ast.FieldExpr, *ast.IndexExpr:
+		return true
+	}
+	return false
+}
+
+// recvBase strips references and pointers to find the underlying nominal type.
+func recvBase(t *types.Type) *types.Type {
+	for t != nil && (t.Kind == types.Ref || t.Kind == types.Ptr) {
+		t = t.Elem
+	}
+	return t
+}
+
+// consume emits e in a by-value context: a resource-owning place is moved (the
+// buffer transfers to the new owner and the source is left empty, so its later
+// destructor is a no-op); everything else is simply evaluated.
+func (g *gen) consume(e ast.Expr) string {
+	if t := g.info.TypeOf(e); t != nil && t.NeedsDrop() && isPlaceExpr(e) {
+		return "zx_move_" + typeMangle(t) + "(&" + g.value(e) + ")"
+	}
+	return g.value(e)
+}
+
+// emitReturn emits a `return`, first moving the value out (so it is not dropped
+// with the locals) and then running the destructors of every live local.
+func (g *gen) emitReturn(val ast.Expr) {
+	if val == nil {
+		g.emitDropsFrom(0)
+		g.w.line("return;")
+		return
+	}
+	t := g.info.TypeOf(val)
+	if t != nil && t.NeedsDrop() {
+		tmp := g.tmpName()
+		g.w.line("%s %s = %s;", ctype(t), tmp, g.consume(val))
+		g.emitDropsFrom(0)
+		g.w.line("return %s;", tmp)
+		return
+	}
+	g.emitDropsFrom(0)
+	g.w.line("return %s;", g.value(val))
+}
+
+// assignValue emits an assignment; for resource-owning targets the old value is
+// dropped first, and resource-owning sources are moved.
+func (g *gen) assignValue(x *ast.AssignExpr) string {
+	if x.Op != token.KindEq {
+		return "(" + g.value(x.Lhs) + " " + x.Op.String() + " " + g.value(x.Rhs) + ")"
+	}
+	lt := g.info.TypeOf(x.Lhs)
+	rhs := g.consume(x.Rhs)
+	if lt != nil && lt.NeedsDrop() && isPlaceExpr(x.Lhs) {
+		lhs := g.value(x.Lhs)
+		return "({ zx_drop_" + typeMangle(lt) + "(&" + lhs + "); " + lhs + " = " + rhs + "; })"
+	}
+	return "(" + g.value(x.Lhs) + " = " + rhs + ")"
+}
+
 // --- types and literals ---------------------------------------------------
 
 func ctype(t *types.Type) string {
@@ -1386,6 +1733,8 @@ func ctype(t *types.Type) string {
 		return "uint32_t"
 	case types.Str:
 		return "const char *"
+	case types.StringKind:
+		return "zx_String"
 	case types.I8:
 		return "int8_t"
 	case types.I16:
@@ -1443,6 +1792,8 @@ func zeroValue(t *types.Type) string {
 		return "0.0"
 	case t.Kind == types.Str, t.Kind == types.Ptr, t.Kind == types.Ref:
 		return "0"
+	case t.Kind == types.StringKind:
+		return "((zx_String){ 0 })"
 	case t.Kind == types.StructKind && t.St != nil:
 		return "((" + typeName(t.St.Name) + "){ 0 })"
 	case t.Kind == types.EnumKind && t.En != nil:
@@ -1517,3 +1868,80 @@ func firstRune(inner string) rune {
 	}
 	return 0
 }
+
+// zxStringRuntime is the built-in owning heap string. `String` values own a
+// malloc'd buffer; the generated move helper transfers ownership and clears the
+// source, and the destructor frees the buffer (nulling the fields so a second
+// destructor run is a no-op). This is emitted once at the top of every program.
+const zxStringRuntime = `
+// --- builtin String: an owning, UTF-8 heap string -------------------------
+typedef struct { char *ptr; size_t len; } zx_String;
+
+static zx_String zx_string_new(void) {
+    zx_String s; s.ptr = NULL; s.len = 0; return s;
+}
+
+static zx_String zx_string_from(const char *p) {
+    zx_String s;
+    if (!p) p = "";
+    s.len = strlen(p);
+    s.ptr = (char *)malloc(s.len + 1);
+    if (!s.ptr) { fputs("zexi: out of memory\n", stderr); abort(); }
+    memcpy(s.ptr, p, s.len + 1);
+    return s;
+}
+
+static zx_String zx_string_with_capacity(size_t n) {
+    zx_String s;
+    s.len = 0;
+    s.ptr = (char *)malloc(n + 1);
+    if (!s.ptr) { fputs("zexi: out of memory\n", stderr); abort(); }
+    s.ptr[0] = 0;
+    return s;
+}
+
+static size_t zx_string_len(const zx_String *s) { return s->len; }
+static bool zx_string_is_empty(const zx_String *s) { return s->len == 0; }
+static const char *zx_string_as_str(const zx_String *s) { return s->ptr ? s->ptr : ""; }
+static void zx_string_clear(zx_String *s) { if (s->ptr) s->ptr[0] = 0; s->len = 0; }
+
+static void zx_string_push_str(zx_String *s, const char *p) {
+    if (!p) return;
+    size_t n = strlen(p);
+    char *np = (char *)realloc(s->ptr, s->len + n + 1);
+    if (!np) { fputs("zexi: out of memory\n", stderr); abort(); }
+    s->ptr = np;
+    memcpy(s->ptr + s->len, p, n + 1);
+    s->len += n;
+}
+
+static int zx_utf8_encode(unsigned int c, char *out) {
+    if (c < 0x80) { out[0] = (char)c; return 1; }
+    if (c < 0x800) { out[0] = (char)(0xC0 | (c >> 6)); out[1] = (char)(0x80 | (c & 0x3F)); return 2; }
+    if (c < 0x10000) { out[0] = (char)(0xE0 | (c >> 12)); out[1] = (char)(0x80 | ((c >> 6) & 0x3F)); out[2] = (char)(0x80 | (c & 0x3F)); return 3; }
+    out[0] = (char)(0xF0 | (c >> 18)); out[1] = (char)(0x80 | ((c >> 12) & 0x3F)); out[2] = (char)(0x80 | ((c >> 6) & 0x3F)); out[3] = (char)(0x80 | (c & 0x3F)); return 4;
+}
+
+static void zx_string_push(zx_String *s, uint32_t c) {
+    char buf[4];
+    int n = zx_utf8_encode(c, buf);
+    char *np = (char *)realloc(s->ptr, s->len + (size_t)n + 1);
+    if (!np) { fputs("zexi: out of memory\n", stderr); abort(); }
+    s->ptr = np;
+    memcpy(s->ptr + s->len, buf, (size_t)n);
+    s->len += (size_t)n;
+    s->ptr[s->len] = 0;
+}
+
+static zx_String zx_string_clone(const zx_String *s) {
+    zx_String r;
+    r.len = s->len;
+    r.ptr = (char *)malloc(r.len + 1);
+    if (!r.ptr) { fputs("zexi: out of memory\n", stderr); abort(); }
+    if (s->ptr) memcpy(r.ptr, s->ptr, r.len + 1); else r.ptr[0] = 0;
+    return r;
+}
+
+static void zx_drop_String(zx_String *s) { free(s->ptr); s->ptr = NULL; s->len = 0; }
+static zx_String zx_move_String(zx_String *v) { zx_String t = *v; v->ptr = NULL; v->len = 0; return t; }
+`

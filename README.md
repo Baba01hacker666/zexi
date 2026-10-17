@@ -14,12 +14,14 @@ This repository contains the **initial design and specification** of Zexi: the v
 > **structs** (named and tuple) with **`impl` methods** (`self`, `&self`,
 > `&mut self`); **enums** with tuple/struct/unit variants and **`match`** with
 > exhaustiveness checking; **first-class arrays** with bounds-checked indexing;
-> and a **use-after-move checker** for non-`Copy` values (opt into copying with
-> `#[copy]`).
+> a **use-after-move checker** for non-`Copy` values (opt into copying with
+> `#[copy]`); and the built-in owning heap type **`String`** with **deterministic
+> destruction (`Drop`)**.
 >
-> Not yet implemented: generics, traits/`impl Trait`, modules/`use`, heap types
-> (`Box`/`Vec`/`String`), `Drop`/destructors, borrow-lifetime analysis, and
-> `Result`/`?`. See `docs/05-roadmap.md`.
+> Not yet implemented: generics, traits/`impl Trait`, modules/`use`, `Box`/`Vec`,
+> user-defined `Drop`, borrow-lifetime analysis (bound `&`/`*` aliases are not yet
+> tracked), and `Result`/`?`. Enum variants cannot carry owning payloads yet. See
+> `docs/05-roadmap.md`.
 
 ## Try it
 
@@ -29,6 +31,8 @@ go run ./cmd/zexic run tests/tour.zx      # compile + run a real program
 go run ./cmd/zexic run tests/structs.zx   # structs, methods, #[copy]
 go run ./cmd/zexic run tests/enums.zx     # enums + match
 go run ./cmd/zexic run tests/arrays.zx    # arrays + bounds checks
+go run ./cmd/zexic run tests/strings.zx   # owning heap String + methods
+go run ./cmd/zexic run tests/drop.zx      # deterministic destruction across control flow
 go run ./cmd/zexic run examples/hello.zx
 go run ./cmd/zexic emit --emit=c tests/tour.zx   # inspect the generated C
 ```
