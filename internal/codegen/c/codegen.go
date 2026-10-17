@@ -44,6 +44,7 @@ type gen struct {
 	dropTypes  []*dropType
 	dropSeen   map[string]bool
 	loopFrames []int // drop-frame depth at the start of each active loop body
+	hasString  bool  // whether the program uses the builtin `String`
 }
 
 // dropFrame is the set of locals declared in one lexical scope, in declaration
@@ -87,6 +88,7 @@ func Generate(info *sema.Info, opts Options) (string, error) {
 	g.preamble()
 	g.collectArrayTypes()
 	g.collectDropTypes()
+	g.runtime()
 	g.typeDefs()
 	g.dropFuncs()
 	g.constants()
@@ -108,6 +110,21 @@ func (g *gen) preamble() {
 	g.w.line("#include <stdlib.h>")
 	g.w.line("#include <string.h>")
 	g.w.line("")
+}
+
+// runtime emits helpers that the generated code may call. Each is emitted only
+// when the program actually uses the corresponding feature, so trivial programs
+// produce minimal C.
+func (g *gen) runtime() {
+	if len(g.arrayOrder) > 0 {
+		g.boundsHelper()
+	}
+	if g.hasString {
+		g.w.raw(zxStringRuntime)
+	}
+}
+
+func (g *gen) boundsHelper() {
 	g.w.line("// Bounds-checked array index: aborts with a message instead of reading")
 	g.w.line("// out of bounds. (M0-alpha: no backtrace yet.)")
 	g.w.line("static inline int64_t zx_bounds(int64_t i, int64_t n) {")
@@ -118,7 +135,6 @@ func (g *gen) preamble() {
 	g.w.line("    return i;")
 	g.w.line("}")
 	g.w.line("")
-	g.w.raw(zxStringRuntime)
 }
 
 func (g *gen) constants() { // Emit in source order for stable output.
@@ -222,6 +238,8 @@ func (g *gen) collectArrayTypes() {
 			for _, e := range t.Elems {
 				walk(e)
 			}
+		case types.StringKind:
+			g.hasString = true
 		}
 	}
 	for _, f := range g.info.FnOrder {

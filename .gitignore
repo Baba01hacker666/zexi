@@ -1,6 +1,7 @@
 # Build output
 /zexic
 /zexi
+/build/
 *.exe
 *.out
 *.o
