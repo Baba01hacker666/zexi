@@ -27,7 +27,7 @@ type Fn struct {
 	Params   []*types.Type
 	Ret      *types.Type
 	Self     *SelfParam
-	Recv     *types.Struct // non-nil for methods
+	Recv     *types.Type // receiver type for methods (struct or enum), else nil
 	Extern   bool
 	ABI      string
 }
@@ -258,16 +258,16 @@ func (c *checker) collectImpl(d *ast.ImplBlock) {
 		return
 	}
 	name := typePathName(d.SelfTy)
-	st, ok := c.info.Structs[name]
-	if !ok {
-		c.errf(d.Sp, "E0118", "no struct named `%s` in this scope", name)
+	recvT := c.nominalType(name)
+	if recvT == nil {
+		c.errf(d.Sp, "E0118", "no type named `%s` in this scope", name)
 		return
 	}
 	if c.info.Methods[name] == nil {
 		c.info.Methods[name] = map[string]*Fn{}
 	}
 	for _, m := range d.Fns {
-		fn := c.makeFn(m, st)
+		fn := c.makeFn(m, recvT)
 		if fn == nil {
 			continue
 		}
@@ -278,6 +278,17 @@ func (c *checker) collectImpl(d *ast.ImplBlock) {
 		c.info.Methods[name][m.Name] = fn
 		c.info.FnOrder = append(c.info.FnOrder, fn)
 	}
+}
+
+// nominalType resolves a bare type name to a struct or enum type, or nil.
+func (c *checker) nominalType(name string) *types.Type {
+	if st, ok := c.info.Structs[name]; ok {
+		return &types.Type{Kind: types.StructKind, St: st}
+	}
+	if en, ok := c.info.Enums[name]; ok {
+		return &types.Type{Kind: types.EnumKind, En: en}
+	}
+	return nil
 }
 
 func (c *checker) collectFn(d *ast.FnDecl, extern bool, abi string) {
@@ -300,10 +311,10 @@ func (c *checker) collectFn(d *ast.FnDecl, extern bool, abi string) {
 }
 
 // makeFn builds a checked function header, handling method receivers.
-func (c *checker) makeFn(d *ast.FnDecl, recv *types.Struct) *Fn {
+func (c *checker) makeFn(d *ast.FnDecl, recv *types.Type) *Fn {
 	fn := &Fn{Decl: d, Name: d.Name, Recv: recv}
 	if recv != nil {
-		fn.QualName = recv.Name + "::" + d.Name
+		fn.QualName = nominalName(recv) + "::" + d.Name
 	} else {
 		fn.QualName = d.Name
 	}
@@ -314,7 +325,7 @@ func (c *checker) makeFn(d *ast.FnDecl, recv *types.Struct) *Fn {
 				continue
 			}
 			fn.Self = &SelfParam{ByRef: p.SelfRef, Mut: p.SelfMut}
-			selfT := &types.Type{Kind: types.StructKind, St: recv}
+			selfT := recv
 			if p.SelfRef {
 				selfT = types.RefTo(selfT, p.SelfMut)
 			}
@@ -338,6 +349,19 @@ func (c *checker) makeFn(d *ast.FnDecl, recv *types.Struct) *Fn {
 		c.errf(d.Sp, "E0204", "function `%s` has no body; only `extern` functions may omit it", d.Name)
 	}
 	return fn
+}
+
+// nominalName returns the name of a struct or enum type, or "".
+func nominalName(t *types.Type) string {
+	switch {
+	case t == nil:
+		return ""
+	case t.Kind == types.StructKind && t.St != nil:
+		return t.St.Name
+	case t.Kind == types.EnumKind && t.En != nil:
+		return t.En.Name
+	}
+	return ""
 }
 
 // typePathName returns the single-segment name of a path type, or "<error>".
@@ -1075,14 +1099,14 @@ func (c *checker) inferField(x *ast.FieldExpr) *types.Type {
 func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 	rt := c.checkExpr(x.Recv, nil)
 	base := recvBase(rt)
-	if base == nil || base.Kind != types.StructKind {
+	if base == nil || (base.Kind != types.StructKind && base.Kind != types.EnumKind) {
 		c.errAt(x, "E0599", "no method `%s` on type `%s`", x.Name, rt)
 		for _, a := range x.Args {
 			c.checkExpr(a, nil)
 		}
 		return nil
 	}
-	m, ok := c.info.Methods[base.St.Name][x.Name]
+	m, ok := c.info.Methods[nominalName(base)][x.Name]
 	if !ok {
 		c.errAt(x, "E0599", "no method `%s` on type `%s`", x.Name, base)
 		for _, a := range x.Args {

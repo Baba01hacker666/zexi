@@ -23,6 +23,16 @@ fn area(s: Shape) -> f64 {
     }
 }
 
+impl Shape {
+    // Methods on enums are supported, including matching through `&self`.
+    fn is_point(&self) -> bool {
+        match *self {
+            Shape::Point => true,
+            _ => false,
+        }
+    }
+}
+
 fn describe(n: i32) -> str {
     match n {
         0 => "zero",
@@ -43,6 +53,9 @@ fn main() -> i32 {
     let a = Shape::Circle(2.0);
     let b = Shape::Rect(3.0, 4.0);
     let c = Shape::Point;
+
+    println(a.is_point());
+    println(c.is_point());
 
     println(area(a));
     println(area(b));

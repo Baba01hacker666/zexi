@@ -67,7 +67,7 @@ func TestRunPrograms(t *testing.T) {
 		{
 			file: "../../tests/enums.zx",
 			want: strings.Join([]string{
-				"12.5664", "12", "0", "zero", "one", "many", "0", "7", "-1", "10", "",
+				"false", "true", "12.5664", "12", "0", "zero", "one", "many", "0", "7", "-1", "10", "",
 			}, "\n"),
 		},
 		{

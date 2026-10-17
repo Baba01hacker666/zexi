@@ -1300,7 +1300,7 @@ var cKeywords = map[string]bool{
 // struct name.
 func funcName(fn *sema.Fn) string {
 	if fn.Recv != nil {
-		return "zx_" + safeIdent(fn.Recv.Name) + "_" + safeIdent(fn.Name)
+		return "zx_" + safeIdent(fn.Recv.String()) + "_" + safeIdent(fn.Name)
 	}
 	if fn.Name == "main" || fn.Extern {
 		return safeIdent(fn.Name)
