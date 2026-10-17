@@ -1,0 +1,173 @@
+// tests/pi.zx
+// Print the first 30 decimal digits of π.
+//
+// This is a deliberately "real" program: a fixed-point big integer implemented
+// as a struct with a base-10 digit array, Machin's formula
+//
+//     π/4 = 4·arctan(1/5) − arctan(1/239)
+//
+// evaluated by summing the arctangent series, and a digit-by-digit printer.
+// It exercises structs with array fields, `#[copy]` value semantics, `impl`
+// methods (`&self` and `&mut self`), `while`/`loop`, `if`/`else`, and integer
+// arithmetic. All numbers are computed at scale 10^40 so the 30 printed digits
+// are exact (the extra low digits absorb truncation error).
+
+const DIGITS: usize = 44; // capacity, in decimal digits
+const SCALE: usize = 40;  // fixed point: stored value = digits · 10^-SCALE
+const SHOW: usize = 30;   // decimal digits to print
+
+// A non-negative fixed-point number as base-10 digits, least significant first.
+// Every field is `Copy`, so big values behave like plain values.
+#[copy]
+struct Big { d: [i64; DIGITS] }
+
+impl Big {
+    fn zero(&mut self) {
+        let mut i: usize = 0;
+        while i < DIGITS {
+            self.d[i] = 0;
+            i += 1;
+        }
+    }
+
+    // self = 10^k
+    fn pow10(&mut self, k: usize) {
+        self.zero();
+        self.d[k] = 1;
+    }
+
+    fn is_zero(&self) -> bool {
+        let mut i: usize = 0;
+        while i < DIGITS {
+            if self.d[i] != 0 {
+                return false;
+            }
+            i += 1;
+        }
+        return true;
+    }
+
+    // self += o
+    fn add_assign(&mut self, o: &Big) {
+        let mut carry: i64 = 0;
+        let mut i: usize = 0;
+        while i < DIGITS {
+            let s: i64 = self.d[i] + o.d[i] + carry;
+            self.d[i] = s % 10;
+            carry = s / 10;
+            i += 1;
+        }
+    }
+
+    // self *= m, for a small non-negative m
+    fn mul_small(&mut self, m: i64) {
+        let mut carry: i64 = 0;
+        let mut i: usize = 0;
+        while i < DIGITS {
+            let s: i64 = self.d[i] * m + carry;
+            self.d[i] = s % 10;
+            carry = s / 10;
+            i += 1;
+        }
+    }
+
+    // self = floor(self / div), for a small positive divisor
+    fn div_small(&mut self, div: i64) {
+        let mut rem: i64 = 0;
+        let mut i: i64 = (DIGITS as i64) - 1;
+        while i >= 0 {
+            let cur: i64 = rem * 10 + self.d[(i as usize)];
+            self.d[(i as usize)] = cur / div;
+            rem = cur % div;
+            i -= 1;
+        }
+    }
+
+    // self − o, requiring self >= o
+    fn sub(&self, o: &Big) -> Big {
+        let mut r = Big { d: [0; DIGITS] };
+        let mut borrow: i64 = 0;
+        let mut i: usize = 0;
+        while i < DIGITS {
+            let s: i64 = self.d[i] - o.d[i] - borrow;
+            if s < 0 {
+                r.d[i] = s + 10;
+                borrow = 1;
+            } else {
+                r.d[i] = s;
+                borrow = 0;
+            }
+            i += 1;
+        }
+        return r;
+    }
+}
+
+// The alternating series arctan(1/x) = 1/x − 1/(3x^3) + 1/(5x^5) − …  is kept
+// as two non-negative magnitudes so no signed big integers are needed.
+// The true value is `pos - neg`.
+#[copy]
+struct Atan { pos: Big, neg: Big }
+
+fn atan_inv(x: i64) -> Atan {
+    let mut pos = Big { d: [0; DIGITS] };
+    let mut neg = Big { d: [0; DIGITS] };
+
+    let mut term = Big { d: [0; DIGITS] };
+    term.pow10(SCALE);
+    term.div_small(x); // ≈ 10^SCALE / x
+
+    let x2: i64 = x * x;
+    let mut k: i64 = 0;
+    loop {
+        let mut part = term; // copy
+        part.div_small(2 * k + 1);
+        if part.is_zero() {
+            break;
+        }
+        if k % 2 == 0 {
+            pos.add_assign(&part);
+        } else {
+            neg.add_assign(&part);
+        }
+        term.div_small(x2);
+        k += 1;
+    }
+    return Atan { pos: pos, neg: neg };
+}
+
+fn print_pi(v: &Big) {
+    print(v.d[SCALE]); // integer part
+    print(".");
+    let mut i: i64 = (SCALE as i64) - 1;
+    let stop: i64 = (SCALE as i64) - (SHOW as i64);
+    while i >= stop {
+        print(v.d[(i as usize)]);
+        i -= 1;
+    }
+    println("");
+}
+
+fn main() -> i32 {
+    let a = atan_inv(5);   // arctan(1/5)
+    let b = atan_inv(239); // arctan(1/239)
+
+    // π = 16·(a.pos − a.neg) − 4·(b.pos − b.neg)
+    //   = (16·a.pos + 4·b.neg) − (16·a.neg + 4·b.pos)
+    let mut high = a.pos;
+    high.mul_small(16);
+    let mut t1 = b.neg;
+    t1.mul_small(4);
+    high.add_assign(&t1);
+
+    let mut low = a.neg;
+    low.mul_small(16);
+    let mut t2 = b.pos;
+    t2.mul_small(4);
+    low.add_assign(&t2);
+
+    let pi = high.sub(&low);
+    print_pi(&pi);
+
+    0
+}

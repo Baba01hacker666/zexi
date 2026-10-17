@@ -33,6 +33,8 @@ go run ./cmd/zexic run tests/enums.zx     # enums + match
 go run ./cmd/zexic run tests/arrays.zx    # arrays + bounds checks
 go run ./cmd/zexic run tests/strings.zx   # owning heap String + methods
 go run ./cmd/zexic run tests/drop.zx      # deterministic destruction across control flow
+go run ./cmd/zexic run tests/syntax.zx    # a runnable tour of the whole syntax
+go run ./cmd/zexic run tests/pi.zx        # 30 digits of π: big-int + Machin's formula
 go run ./cmd/zexic run examples/hello.zx
 go run ./cmd/zexic emit --emit=c tests/tour.zx   # inspect the generated C
 ```
@@ -63,8 +65,10 @@ for why, its real costs, and the plan to replace it with a native backend.
 - [`docs/04-compiler-architecture.md`](docs/04-compiler-architecture.md) — Go pipeline, IRs, passes, backends.
 - [`docs/05-roadmap.md`](docs/05-roadmap.md) — M0/M1/M2 milestones and the minimal viable feature set.
 - [`docs/06-backend-strategy.md`](docs/06-backend-strategy.md) — the C backend, its costs, and the road to a native backend.
+- [`docs/07-cheatsheet.md`](docs/07-cheatsheet.md) — a one-page tour of the language as it exists today.
 - [`examples/`](examples/) — illustrative Zexi programs (aspirational; only the M0-alpha subset compiles today).
 - [`tests/tour.zx`](tests/tour.zx) — the end-to-end program the test suite compiles and runs.
+- [`tests/syntax.zx`](tests/syntax.zx) — a runnable syntax tour; [`tests/pi.zx`](tests/pi.zx) — 30 digits of π.
 
 ## Repository layout
 
