@@ -1,10 +1,14 @@
 package driver_test
 
 import (
+	"bytes"
+	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"zexi/internal/diag"
 	"zexi/internal/driver"
@@ -22,6 +26,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/ownership.zx",
 		"../../tests/strings.zx",
 		"../../tests/drop.zx",
+		"../../tests/string_methods.zx",
 		"../../tests/syntax.zx",
 		"../../tests/pi.zx",
 	}
@@ -101,6 +106,14 @@ func TestRunPrograms(t *testing.T) {
 			}, "\n"),
 		},
 		{
+			file: "../../tests/string_methods.zx",
+			want: strings.Join([]string{
+				"3", "71", "-1", "true", "true", "true", "false", "/index.html",
+				"/index.html HTTP/1.1", "Content-Length: 1527", "1527", "1528",
+				"16", "",
+			}, "\n"),
+		},
+		{
 			file: "../../tests/syntax.zx",
 			want: strings.Join([]string{
 				"42", "14", "20", "3", "2", "16", "8", "14", "false", "true",
@@ -133,4 +146,96 @@ func TestRunPrograms(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestHTTPServerAndClient builds the Zexi HTTP library (lib/http.zx) into both
+// a server and a client, runs the server on a loopback port, and checks that
+// the client's parsed responses and the server's request log agree. It is
+// skipped when no C compiler is available or in short mode.
+func TestHTTPServerAndClient(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end network test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+
+	dir := t.TempDir()
+	lib := "../../lib/http.zx"
+	srvBin := filepath.Join(dir, "http_server")
+	cliBin := filepath.Join(dir, "http_client")
+
+	em := diag.NewEmitter()
+	if _, ok := driver.BuildFiles([]string{"../../tests/http_server.zx", lib}, srvBin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build the HTTP server")
+	}
+	em = diag.NewEmitter()
+	if _, ok := driver.BuildFiles([]string{"../../tests/http_client.zx", lib}, cliBin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build the HTTP client")
+	}
+
+	var srvOut bytes.Buffer
+	server := exec.Command(srvBin)
+	server.Stdout = &srvOut
+	server.Stderr = &srvOut
+	if err := server.Start(); err != nil {
+		t.Fatalf("starting server: %v", err)
+	}
+	defer server.Process.Kill()
+
+	if !waitPort("127.0.0.1:18081", 5*time.Second) {
+		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
+	}
+
+	out, err := exec.Command(cliBin).Output()
+	if err != nil {
+		t.Fatalf("running client: %v", err)
+	}
+	wantClient := "200 index\n200 3.141592653589793238462643383279\n"
+	if string(out) != wantClient {
+		t.Fatalf("client output mismatch\n got: %q\nwant: %q", string(out), wantClient)
+	}
+
+	done := make(chan struct{})
+	go func() { server.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not exit after serving two requests")
+	}
+	wantLog := "GET /\nGET /pi\n"
+	if got := srvOut.String(); got != wantLog {
+		t.Fatalf("server log mismatch\n got: %q\nwant: %q", got, wantLog)
+	}
+}
+
+// TestHTTPExamplesTypeCheck ensures the HTTP examples compile against the
+// library (no C compiler needed).
+func TestHTTPExamplesTypeCheck(t *testing.T) {
+	for _, f := range []string{
+		"../../examples/http_server.zx",
+		"../../examples/http_client.zx",
+	} {
+		em := diag.NewEmitter()
+		if _, ok := driver.FrontEndFiles([]string{f, "../../lib/http.zx"}, driver.Options{}, em); !ok {
+			em.Render(os.Stderr, em.FirstFileID())
+			t.Errorf("%s + lib/http.zx: front end reported errors", f)
+		}
+	}
+}
+
+// waitPort reports whether addr accepts a TCP connection within d.
+func waitPort(addr string, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			return true
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	return false
 }

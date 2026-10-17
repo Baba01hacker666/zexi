@@ -1,0 +1,340 @@
+// lib/http.zx
+//
+// A small HTTP/1.x library for Zexi.
+//
+// The lowest layer talks to the C ABI: `struct sockaddr_in` is modelled as a
+// plain Zexi struct with the same memory layout as the C one, and the BSD
+// socket calls are declared with `extern "C"`. Everything above that — request
+// and response formatting, parsing, a connection type and a tiny server — is
+// ordinary Zexi code.
+//
+// There is no module system yet, so compile a program *with* this file:
+//
+//     zexic run app.zx lib/http.zx
+//
+// The first file is the program (it owns `main`); the rest are compiled into
+// it. See docs/08-networking.md.
+
+// ---------------------------------------------------------------------------
+// TCP over the C ABI
+// ---------------------------------------------------------------------------
+
+// Linux `struct sockaddr_in`, laid out so it can be passed to the socket calls
+// as if it were a `struct sockaddr` (both are 16 bytes for IPv4).
+struct SockAddrIn { family: u16, port: u16, addr: u32, pad: i64 }
+
+extern "C" fn socket(domain: i32, typ: i32, protocol: i32) -> i32;
+extern "C" fn connect(fd: i32, addr: &SockAddrIn, len: u32) -> i32;
+extern "C" fn bind(fd: i32, addr: &SockAddrIn, len: u32) -> i32;
+extern "C" fn listen(fd: i32, backlog: i32) -> i32;
+extern "C" fn accept(fd: i32, addr: &SockAddrIn, len: &u32) -> i32;
+extern "C" fn send(fd: i32, buf: str, n: usize, flags: i32) -> i64;
+extern "C" fn recv(fd: i32, buf: &mut [u8; 8192], n: usize, flags: i32) -> i64;
+extern "C" fn close(fd: i32) -> i32;
+extern "C" fn setsockopt(fd: i32, level: i32, opt: i32, val: &i32, len: u32) -> i32;
+extern "C" fn inet_addr(s: str) -> u32;
+
+const AF_INET: i32 = 2;
+const SOCK_STREAM: i32 = 1;
+const SOL_SOCKET: i32 = 1;
+const SO_REUSEADDR: i32 = 2;
+const SOCKADDR_LEN: u32 = 16;
+const RECV_BUF: usize = 8192;
+
+/// Host byte order -> network byte order for a 16-bit value.
+fn htons(p: u16) -> u16 {
+    return (p >> 8) | (p << 8);
+}
+
+fn sockaddr(host: str, port: i32) -> SockAddrIn {
+    return SockAddrIn { family: 2, port: htons(port as u16), addr: inet_addr(host), pad: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Connections
+// ---------------------------------------------------------------------------
+
+/// An open TCP connection. The file descriptor is owned by the value; call
+/// `close` when finished.
+#[copy]
+struct Conn { fd: i32 }
+
+impl Conn {
+    /// Send a whole buffer. (M0: a single `send`; fine for headers and small
+    /// bodies.)
+    fn write(&self, data: str) -> i64 {
+        return send(self.fd, data, len(data), 0);
+    }
+
+    /// Read until the peer closes the connection. Used by the client, where we
+    /// requested `Connection: close`.
+    fn read_all(&self) -> String {
+        let mut out = String::with_capacity(RECV_BUF);
+        let mut buf: [u8; 8192] = [0; 8192];
+        loop {
+            let n = recv(self.fd, &mut buf, RECV_BUF, 0);
+            if n <= 0 {
+                break;
+            }
+            let mut i: usize = 0;
+            while i < (n as usize) {
+                out.push_byte(buf[i]);
+                i += 1;
+            }
+        }
+        return out;
+    }
+
+    /// Read until the end of the request head (`\r\n\r\n`). Used by the server,
+    /// which must not wait for EOF because the client keeps the connection
+    /// open for the response.
+    fn read_head(&self) -> String {
+        let mut out = String::with_capacity(1024);
+        let mut buf: [u8; 8192] = [0; 8192];
+        loop {
+            let n = recv(self.fd, &mut buf, RECV_BUF, 0);
+            if n <= 0 {
+                break;
+            }
+            let mut i: usize = 0;
+            while i < (n as usize) {
+                out.push_byte(buf[i]);
+                i += 1;
+            }
+            if out.contains("\r\n\r\n") || out.len() > 262144 {
+                break;
+            }
+        }
+        return out;
+    }
+
+    fn close(&self) {
+        close(self.fd);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP model
+// ---------------------------------------------------------------------------
+
+struct Request {
+    method: String,
+    path: String,
+    version: String,
+    body: String,
+}
+
+struct Response {
+    status: i32,
+    reason: String,
+    body: String,
+}
+
+/// Append an integer as decimal text, e.g. `push_int(&mut s, 1527)`.
+fn push_int(s: &mut String, n: i64) {
+    if n == 0 {
+        s.push_byte(48); // '0'
+        return;
+    }
+    let neg = n < 0;
+    let mut v = n;
+    if neg {
+        v = 0 - v;
+    }
+    let mut digits: [u8; 24] = [0; 24];
+    let mut i: usize = 0;
+    while v > 0 {
+        digits[i] = ((v % 10) as u8) + (48 as u8);
+        v = v / 10;
+        i += 1;
+    }
+    if neg {
+        s.push_byte(45); // '-'
+    }
+    while i > 0 {
+        i -= 1;
+        s.push_byte(digits[i]);
+    }
+}
+
+/// Render an integer as decimal text.
+fn int_to_str(n: i64) -> String {
+    let mut s = String::new();
+    push_int(&mut s, n);
+    return s;
+}
+
+/// The index just past the blank line separating head and body, or -1.
+fn head_end(raw: &String) -> i64 {
+    let at = raw.find("\r\n\r\n");
+    if at < 0 {
+        return -1;
+    }
+    return at + 4;
+}
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+/// Build a `GET` request.
+fn get_request(host: str, path: str) -> String {
+    let mut r = String::new();
+    r.push_str("GET ");
+    r.push_str(path);
+    r.push_str(" HTTP/1.1\r\nHost: ");
+    r.push_str(host);
+    r.push_str("\r\nUser-Agent: zexi-http/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+    return r;
+}
+
+/// Open a connection to `host:port`. `Conn.fd` is negative on failure.
+fn tcp_connect(host: str, port: i32) -> Conn {
+    let fd = socket(AF_INET, SOCK_STREAM, 0);
+    if fd < 0 {
+        return Conn { fd: fd };
+    }
+    let addr = sockaddr(host, port);
+    if connect(fd, &addr, SOCKADDR_LEN) != 0 {
+        close(fd);
+        return Conn { fd: -1 };
+    }
+    return Conn { fd: fd };
+}
+
+/// Perform a `GET` and return the raw response text (`""` on failure).
+fn http_get(host: str, port: i32, path: str) -> String {
+    let c = tcp_connect(host, port);
+    if c.fd < 0 {
+        return String::new();
+    }
+    let req = get_request(host, path);
+    c.write(req.as_str());
+    let raw = c.read_all();
+    c.close();
+    return raw;
+}
+
+/// Split the status line `HTTP/1.1 200 OK` and the body out of a response.
+fn parse_response(raw: &String) -> Response {
+    let end = raw.find("\r\n");
+    if end < 0 {
+        return Response { status: 0, reason: String::new(), body: raw.clone() };
+    }
+    let line = raw.substr(0, end as usize);
+
+    // "HTTP/1.1 200 OK"
+    let sp1 = line.find(" ");
+    let rest = if sp1 < 0 { String::new() } else { line.substr((sp1 + 1) as usize, 4294967295) };
+    let sp2 = rest.find(" ");
+    let code = if sp2 < 0 { rest.clone() } else { rest.substr(0, sp2 as usize) };
+    let reason = if sp2 < 0 { String::new() } else { rest.substr((sp2 + 1) as usize, 4294967295).trim() };
+
+    let he = head_end(raw);
+    let body = if he < 0 { String::new() } else { raw.substr(he as usize, 4294967295) };
+    return Response { status: code.parse_i64() as i32, reason: reason, body: body };
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+#[copy]
+struct Server { fd: i32 }
+
+/// Bind and listen on `host:port`. `Server.fd` is negative on failure.
+fn http_listen(host: str, port: i32) -> Server {
+    let fd = socket(AF_INET, SOCK_STREAM, 0);
+    if fd < 0 {
+        return Server { fd: fd };
+    }
+    let on: i32 = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, 4);
+    let addr = sockaddr(host, port);
+    if bind(fd, &addr, SOCKADDR_LEN) != 0 {
+        close(fd);
+        return Server { fd: -1 };
+    }
+    if listen(fd, 128) != 0 {
+        close(fd);
+        return Server { fd: -1 };
+    }
+    return Server { fd: fd };
+}
+
+impl Server {
+    /// Accept one pending connection. Returns a `Conn` whose fd is negative on
+    /// failure.
+    fn accept(&self) -> Conn {
+        let mut peer = SockAddrIn { family: 0, port: 0, addr: 0, pad: 0 };
+        let mut len: u32 = SOCKADDR_LEN;
+        let cfd = accept(self.fd, &peer, &len);
+        return Conn { fd: cfd };
+    }
+
+    fn close(&self) {
+        close(self.fd);
+    }
+}
+
+/// Parse a request head into method, path, version and body.
+fn parse_request(raw: &String) -> Request {
+    let end = raw.find("\r\n");
+    if end < 0 {
+        return Request {
+            method: String::new(), path: String::new(),
+            version: String::new(), body: String::new(),
+        };
+    }
+    let line = raw.substr(0, end as usize);
+    let sp1 = line.find(" ");
+    let method = if sp1 < 0 { line.clone() } else { line.substr(0, sp1 as usize) };
+    let rest = if sp1 < 0 { String::new() } else { line.substr((sp1 + 1) as usize, 4294967295) };
+    let sp2 = rest.find(" ");
+    let path = if sp2 < 0 { rest.clone() } else { rest.substr(0, sp2 as usize) };
+    let version = if sp2 < 0 { String::new() } else { rest.substr((sp2 + 1) as usize, 4294967295).trim() };
+
+    let he = head_end(raw);
+    let body = if he < 0 { String::new() } else { raw.substr(he as usize, 4294967295) };
+    return Request { method: method, path: path, version: version, body: body };
+}
+
+/// The conventional reason phrase for a status code.
+fn reason_phrase(status: i32) -> str {
+    if status == 200 {
+        return "OK";
+    }
+    if status == 201 {
+        return "Created";
+    }
+    if status == 204 {
+        return "No Content";
+    }
+    if status == 301 {
+        return "Moved Permanently";
+    }
+    if status == 400 {
+        return "Bad Request";
+    }
+    if status == 404 {
+        return "Not Found";
+    }
+    if status == 500 {
+        return "Internal Server Error";
+    }
+    return "OK";
+}
+
+/// Format a response with `Connection: close`.
+fn response(status: i32, reason: str, body: str) -> String {
+    let mut r = String::new();
+    r.push_str("HTTP/1.1 ");
+    push_int(&mut r, status as i64);
+    r.push_str(" ");
+    r.push_str(reason);
+    r.push_str("\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ");
+    push_int(&mut r, len(body) as i64);
+    r.push_str("\r\nConnection: close\r\n\r\n");
+    r.push_str(body);
+    return r;
+}

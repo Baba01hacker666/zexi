@@ -1,0 +1,32 @@
+// tests/string_methods.zx
+// The parsing and searching methods on the builtin owning `String`:
+// find, byte_at, contains, starts_with, ends_with, substr, trim, parse_i64.
+
+fn find_from_ref(s: &String, needle: str) -> i64 {
+    return s.find(needle);
+}
+
+fn main() -> i32 {
+    let s = String::from("GET /index.html HTTP/1.1");
+    println(s.find(" "));          // 3
+    println(s.byte_at(0));         // 71  ('G')
+    println(s.byte_at(999));       // -1  (out of range)
+    println(s.starts_with("GET")); // true
+    println(s.ends_with("1.1"));   // true
+    println(s.contains("HTTP"));   // true
+    println(s.contains("POST"));   // false
+    println(s.substr(4, 11));      // /index.html
+    println(s.substr(4, 9999));    // /index.html HTTP/1.1
+
+    let header = String::from("  Content-Length: 1527  ");
+    println(header.trim());        // Content-Length: 1527
+
+    let n = String::from("1527");
+    println(n.parse_i64());        // 1527
+    println(n.parse_i64() + 1);    // 1528
+
+    // The same methods work through a `&String` receiver.
+    println(find_from_ref(&s, "HTTP")); // 16
+
+    0
+}

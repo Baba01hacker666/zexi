@@ -104,6 +104,16 @@ func requireFile(c cli, cmd string) (string, bool) {
 	return c.positional[0], true
 }
 
+// requireFiles returns all positional inputs. The first is the program; the
+// rest are usually library files compiled into it.
+func requireFiles(c cli, cmd string) ([]string, bool) {
+	if len(c.positional) == 0 {
+		fmt.Fprintf(os.Stderr, "zexic %s: expected a .zx file argument\n", cmd)
+		return nil, false
+	}
+	return c.positional, true
+}
+
 func cmdTokenize(c cli) int {
 	path, ok := requireFile(c, "tokenize")
 	if !ok {
@@ -126,27 +136,27 @@ func cmdTokenize(c cli) int {
 }
 
 func cmdCheck(c cli) int {
-	path, ok := requireFile(c, "check")
+	paths, ok := requireFiles(c, "check")
 	if !ok {
 		return 2
 	}
 	em := diag.NewEmitter()
-	art, ok := driver.FrontEnd(path, c.opts(), em)
+	art, ok := driver.FrontEndFiles(paths, c.opts(), em)
 	if !ok {
 		em.Render(os.Stderr, emFileID(em))
 		return 1
 	}
-	fmt.Printf("%s: ok (%d function(s), %d constant(s))\n", filepath.Base(path), len(art.Info.FnOrder), len(art.Info.Consts))
+	fmt.Printf("%s: ok (%d function(s), %d constant(s))\n", filepath.Base(paths[0]), len(art.Info.FnOrder), len(art.Info.Consts))
 	return 0
 }
 
 func cmdBuild(c cli) int {
-	path, ok := requireFile(c, "build")
+	paths, ok := requireFiles(c, "build")
 	if !ok {
 		return 2
 	}
 	em := diag.NewEmitter()
-	out, ok := driver.Build(path, c.out, c.opts(), em)
+	out, ok := driver.BuildFiles(paths, c.out, c.opts(), em)
 	if !ok {
 		em.Render(os.Stderr, emFileID(em))
 		return 1
@@ -156,7 +166,7 @@ func cmdBuild(c cli) int {
 }
 
 func cmdRun(c cli) int {
-	path, ok := requireFile(c, "run")
+	paths, ok := requireFiles(c, "run")
 	if !ok {
 		return 2
 	}
@@ -168,8 +178,8 @@ func cmdRun(c cli) int {
 	}
 	defer os.RemoveAll(dir)
 
-	out := filepath.Join(dir, driver.DefaultOutput(path))
-	if _, ok := driver.Build(path, out, c.opts(), em); !ok {
+	out := filepath.Join(dir, driver.DefaultOutput(paths[0]))
+	if _, ok := driver.BuildFiles(paths, out, c.opts(), em); !ok {
 		em.Render(os.Stderr, emFileID(em))
 		return 1
 	}
@@ -189,7 +199,7 @@ func cmdRun(c cli) int {
 }
 
 func cmdEmit(c cli) int {
-	path, ok := requireFile(c, "emit")
+	paths, ok := requireFiles(c, "emit")
 	if !ok {
 		return 2
 	}
@@ -201,7 +211,7 @@ func cmdEmit(c cli) int {
 		return 2
 	}
 	em := diag.NewEmitter()
-	art, ok := driver.FrontEnd(path, c.opts(), em)
+	art, ok := driver.FrontEndFiles(paths, c.opts(), em)
 	if !ok {
 		em.Render(os.Stderr, emFileID(em))
 		return 1
@@ -217,7 +227,7 @@ func usage(w *os.File) {
 	fmt.Fprint(w, `zexi - the Zexi programming language compiler
 
 usage:
-  zexic <command> [options] <file.zx>
+  zexic <command> [options] <file.zx> [lib.zx ...]
 
 commands:
   check      parse, typecheck, and validate (no code generation)
@@ -226,6 +236,9 @@ commands:
   emit       print an intermediate form (--emit=c)
   tokenize   print the token stream
   version    print the compiler version
+
+Multiple .zx files are compiled together into one program (the first is the
+entry file; the rest are usually library files).
 
 options:
   -o <path>                  output path for build

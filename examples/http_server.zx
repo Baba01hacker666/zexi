@@ -1,0 +1,59 @@
+// examples/http_server.zx
+//
+// A tiny HTTP server written in Zexi. It serves a few routes and echoes the
+// length of any request body. Run it with:
+//
+//     zexic run examples/http_server.zx lib/http.zx
+//
+// then, from another terminal:
+//
+//     curl http://127.0.0.1:9090/
+//     curl http://127.0.0.1:9090/pi
+//     curl -d 'hello' http://127.0.0.1:9090/echo
+
+struct Reply { status: i32, body: String }
+
+fn route(req: &Request) -> Reply {
+    let path = req.path.as_str();
+    if path == "/" {
+        return Reply { status: 200, body: String::from("Welcome to a server written in Zexi!\n") };
+    }
+    if path == "/health" {
+        return Reply { status: 200, body: String::from("ok\n") };
+    }
+    if path == "/pi" {
+        return Reply { status: 200, body: String::from("3.141592653589793238462643383279\n") };
+    }
+    if path == "/echo" {
+        let mut body = String::from("you sent ");
+        push_int(&mut body, req.body.len() as i64);
+        body.push_str(" byte(s): ");
+        body.push_str(req.body.as_str());
+        body.push_str("\n");
+        return Reply { status: 200, body: body };
+    }
+    return Reply { status: 404, body: String::from("not found\n") };
+}
+
+fn main() -> i32 {
+    let srv = http_listen("127.0.0.1", 9090);
+    if srv.fd < 0 {
+        println("error: could not bind 127.0.0.1:9090");
+        return 1;
+    }
+    println("zexi server listening on http://127.0.0.1:9090/");
+
+    loop {
+        let c = srv.accept();
+        if c.fd < 0 {
+            continue;
+        }
+        let raw = c.read_head();
+        let req = parse_request(&raw);
+        let reply = route(&req);
+        let resp = response(reply.status, reason_phrase(reply.status), reply.body.as_str());
+        c.write(resp.as_str());
+        c.close();
+    }
+    0
+}

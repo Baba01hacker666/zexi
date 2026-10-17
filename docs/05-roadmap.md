@@ -13,7 +13,10 @@
 > and the built-in owning heap type **`String`** with **deterministic
 > destruction (`Drop`)** — buffers are freed exactly once at scope exit, on
 > early `return`/`break`/`continue`, and on reassignment, while moves transfer
-> ownership and leave the source empty.
+> ownership and leave the source empty. `extern "C"` declarations bind C
+> functions (libc), and several `.zx` files compile together into one program;
+> on top of that, `lib/http.zx` is a working HTTP/1.x client and server
+> (see docs/08).
 > Not yet implemented: generics, traits, modules/`use`, `Vec`/`Box`, user-defined
 > `Drop`, borrow-lifetime analysis (so bound `&`/`*` aliases are not tracked), and
 > `Result`/`?`. Enum variants may not carry resource-owning payloads yet (a

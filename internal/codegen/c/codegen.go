@@ -1162,6 +1162,11 @@ func (g *gen) stringMethodCall(x *ast.MethodCallExpr) string {
 	for _, a := range x.Args {
 		rest += ", " + g.value(a)
 	}
+	// A `&String` / `*String` receiver is already a pointer to the String:
+	// pass it through instead of taking its address again.
+	if rt := g.info.TypeOf(x.Recv); rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr) {
+		return fn + "(" + g.value(x.Recv) + rest + ")"
+	}
 	if isPlaceExpr(x.Recv) {
 		return fn + "(&" + g.value(x.Recv) + rest + ")"
 	}
@@ -1951,6 +1956,17 @@ static void zx_string_push(zx_String *s, uint32_t c) {
     s->ptr[s->len] = 0;
 }
 
+// Append one raw byte (no UTF-8 encoding), used when copying binary or
+// already-encoded data into a String (e.g. a socket read).
+static void zx_string_push_byte(zx_String *s, uint8_t b) {
+    char *np = (char *)realloc(s->ptr, s->len + 2);
+    if (!np) { fputs("zexi: out of memory\n", stderr); abort(); }
+    s->ptr = np;
+    s->ptr[s->len] = (char)b;
+    s->len += 1;
+    s->ptr[s->len] = 0;
+}
+
 static zx_String zx_string_clone(const zx_String *s) {
     zx_String r;
     r.len = s->len;
@@ -1958,6 +1974,70 @@ static zx_String zx_string_clone(const zx_String *s) {
     if (!r.ptr) { fputs("zexi: out of memory\n", stderr); abort(); }
     if (s->ptr) memcpy(r.ptr, s->ptr, r.len + 1); else r.ptr[0] = 0;
     return r;
+}
+
+static int64_t zx_string_byte_at(const zx_String *s, size_t i) {
+    if (i >= s->len || !s->ptr) return -1;
+    return (int64_t)(unsigned char)s->ptr[i];
+}
+
+static int64_t zx_string_find(const zx_String *s, const char *needle) {
+    if (!s->ptr || !needle) return -1;
+    size_t nl = strlen(needle);
+    if (nl == 0) return 0;
+    if (nl > s->len) return -1;
+    for (size_t i = 0; i + nl <= s->len; i++) {
+        if (memcmp(s->ptr + i, needle, nl) == 0) return (int64_t)i;
+    }
+    return -1;
+}
+
+static bool zx_string_contains(const zx_String *s, const char *needle) {
+    return zx_string_find(s, needle) >= 0;
+}
+
+static bool zx_string_starts_with(const zx_String *s, const char *prefix) {
+    if (!s->ptr || !prefix) return false;
+    size_t pl = strlen(prefix);
+    if (pl > s->len) return false;
+    return memcmp(s->ptr, prefix, pl) == 0;
+}
+
+static bool zx_string_ends_with(const zx_String *s, const char *suffix) {
+    if (!s->ptr || !suffix) return false;
+    size_t sl = strlen(suffix);
+    if (sl > s->len) return false;
+    return memcmp(s->ptr + (s->len - sl), suffix, sl) == 0;
+}
+
+static zx_String zx_string_substr(const zx_String *s, size_t start, size_t n) {
+    if (start > s->len) start = s->len;
+    if (n > s->len - start) n = s->len - start;
+    zx_String r;
+    r.len = n;
+    r.ptr = (char *)malloc(n + 1);
+    if (!r.ptr) { fputs("zexi: out of memory\n", stderr); abort(); }
+    if (n && s->ptr) memcpy(r.ptr, s->ptr + start, n);
+    r.ptr[n] = 0;
+    return r;
+}
+
+static zx_String zx_string_trim(const zx_String *s) {
+    size_t a = 0, b = s->ptr ? s->len : 0;
+    while (a < b && (unsigned char)s->ptr[a] <= ' ') a++;
+    while (b > a && (unsigned char)s->ptr[b - 1] <= ' ') b--;
+    zx_String r;
+    r.len = b - a;
+    r.ptr = (char *)malloc(r.len + 1);
+    if (!r.ptr) { fputs("zexi: out of memory\n", stderr); abort(); }
+    if (r.len) memcpy(r.ptr, s->ptr + a, r.len);
+    r.ptr[r.len] = 0;
+    return r;
+}
+
+static int64_t zx_string_parse_i64(const zx_String *s) {
+    if (!s->ptr) return 0;
+    return (int64_t)strtoll(s->ptr, NULL, 10);
 }
 
 static void zx_drop_String(zx_String *s) { free(s->ptr); s->ptr = NULL; s->len = 0; }

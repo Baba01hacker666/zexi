@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"zexi/internal/ast"
 	zenc "zexi/internal/codegen/c"
 	"zexi/internal/diag"
 	"zexi/internal/lexer"
@@ -39,20 +40,42 @@ type Artifacts struct {
 // the artifacts and whether the program is error-free. Diagnostics are
 // reported to em; callers render them.
 func FrontEnd(path string, opts Options, em *diag.Emitter) (*Artifacts, bool) {
-	src, err := os.ReadFile(path)
-	if err != nil {
-		em.Report(diag.New("E9020", "cannot read %s: %v", path, err))
+	return FrontEndFiles([]string{path}, opts, em)
+}
+
+// FrontEndFiles is FrontEnd for a program split across several source files.
+// The files are parsed independently (each keeps its own identity for
+// diagnostics) and their items are combined into one module, so a program can
+// be written against a library file without a module system. The first path is
+// treated as the program; later paths are typically `lib/*.zx`.
+func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, bool) {
+	if len(paths) == 0 {
+		em.Report(diag.New("E9021", "no input files"))
 		return nil, false
 	}
-	fileID := em.AddFile(path, src)
-
-	file, parseDiags := parser.Parse(fileID, src)
-	em.Report(parseDiags...)
+	merged := &ast.File{}
+	firstID := 0
+	for i, path := range paths {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			em.Report(diag.New("E9020", "cannot read %s: %v", path, err))
+			return nil, false
+		}
+		fileID := em.AddFile(path, src)
+		if i == 0 {
+			firstID = fileID
+		}
+		file, parseDiags := parser.Parse(fileID, src)
+		em.Report(parseDiags...)
+		if file != nil {
+			merged.Items = append(merged.Items, file.Items...)
+		}
+	}
 	if em.HasErrors() {
 		return nil, false
 	}
 
-	info, semaDiags := sema.Check(file)
+	info, semaDiags := sema.Check(merged)
 	em.Report(semaDiags...)
 	if em.HasErrors() {
 		return nil, false
@@ -63,7 +86,7 @@ func FrontEnd(path string, opts Options, em *diag.Emitter) (*Artifacts, bool) {
 		em.Report(diag.New("E9001", "code generation failed: %v", cerr))
 		return nil, false
 	}
-	return &Artifacts{Info: info, CSrc: csrc, FileID: fileID}, true
+	return &Artifacts{Info: info, CSrc: csrc, FileID: firstID}, true
 }
 
 // Tokens returns the token stream for a file, for the `tokenize` command.
@@ -83,12 +106,18 @@ func Tokens(path string, em *diag.Emitter) ([]token.Token, int, bool) {
 // Build compiles a source file to a native binary at outPath, returning the
 // path of the emitted binary.
 func Build(path, outPath string, opts Options, em *diag.Emitter) (string, bool) {
-	art, ok := FrontEnd(path, opts, em)
+	return BuildFiles([]string{path}, outPath, opts, em)
+}
+
+// BuildFiles compiles a program made of several source files (see
+// FrontEndFiles) to a native binary at outPath.
+func BuildFiles(paths []string, outPath string, opts Options, em *diag.Emitter) (string, bool) {
+	art, ok := FrontEndFiles(paths, opts, em)
 	if !ok {
 		return "", false
 	}
 	if outPath == "" {
-		outPath = DefaultOutput(path)
+		outPath = DefaultOutput(paths[0])
 	}
 	if err := CompileC(art.CSrc, outPath, opts); err != nil {
 		em.Report(diag.New("E9002", "%v", err))

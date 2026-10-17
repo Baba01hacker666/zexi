@@ -900,13 +900,22 @@ type stringMethodSig struct {
 }
 
 var stringMethods = map[string]stringMethodSig{
-	"len":      {nil, types.UsizeT, false},
-	"is_empty": {nil, types.BoolT, false},
-	"as_str":   {nil, types.StrT, false},
-	"clone":    {nil, types.StringT, false},
-	"clear":    {nil, types.UnitT, true},
-	"push":     {[]*types.Type{types.CharT}, types.UnitT, true},
-	"push_str": {[]*types.Type{types.StrT}, types.UnitT, true},
+	"len":         {nil, types.UsizeT, false},
+	"is_empty":    {nil, types.BoolT, false},
+	"as_str":      {nil, types.StrT, false},
+	"clone":       {nil, types.StringT, false},
+	"clear":       {nil, types.UnitT, true},
+	"push":        {[]*types.Type{types.CharT}, types.UnitT, true},
+	"push_str":    {[]*types.Type{types.StrT}, types.UnitT, true},
+	"push_byte":   {[]*types.Type{types.U8T}, types.UnitT, true},
+	"byte_at":     {[]*types.Type{types.UsizeT}, types.I64T, false},
+	"find":        {[]*types.Type{types.StrT}, types.I64T, false},
+	"contains":    {[]*types.Type{types.StrT}, types.BoolT, false},
+	"starts_with": {[]*types.Type{types.StrT}, types.BoolT, false},
+	"ends_with":   {[]*types.Type{types.StrT}, types.BoolT, false},
+	"substr":      {[]*types.Type{types.UsizeT, types.UsizeT}, types.StringT, false},
+	"trim":        {nil, types.StringT, false},
+	"parse_i64":   {nil, types.I64T, false},
 }
 
 // inferStringMethod type-checks a builtin method call on a `String`.

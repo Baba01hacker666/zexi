@@ -129,6 +129,7 @@ var (
 	I32T   = &Type{Kind: I32}
 	I64T   = &Type{Kind: I64}
 	F64T   = &Type{Kind: F64}
+	U8T    = &Type{Kind: U8}
 	U32T   = &Type{Kind: U32}
 	UsizeT = &Type{Kind: Usize}
 

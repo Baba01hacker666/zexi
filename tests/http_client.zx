@@ -1,0 +1,20 @@
+// tests/http_client.zx
+//
+// Used by the end-to-end test in internal/driver: fetch two paths from the
+// test server and print the parsed status and body.
+
+fn main() -> i32 {
+    let a = http_get("127.0.0.1", 18081, "/");
+    let ra = parse_response(&a);
+    print(ra.status);
+    print(" ");
+    println(ra.body.trim());
+
+    let b = http_get("127.0.0.1", 18081, "/pi");
+    let rb = parse_response(&b);
+    print(rb.status);
+    print(" ");
+    println(rb.body.trim());
+
+    0
+}

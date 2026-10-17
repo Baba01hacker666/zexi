@@ -15,8 +15,11 @@ This repository contains the **initial design and specification** of Zexi: the v
 > `&mut self`); **enums** with tuple/struct/unit variants and **`match`** with
 > exhaustiveness checking; **first-class arrays** with bounds-checked indexing;
 > a **use-after-move checker** for non-`Copy` values (opt into copying with
-> `#[copy]`); and the built-in owning heap type **`String`** with **deterministic
-> destruction (`Drop`)**.
+> `#[copy]`); the built-in owning heap type **`String`** with **deterministic
+> destruction (`Drop`)** and string-parsing methods; **`extern "C"` FFI** for
+> calling libc; and compiling **several source files into one binary** — enough
+> to ship an HTTP client/server in [`lib/http.zx`](lib/http.zx) (see
+> [`docs/08-networking.md`](docs/08-networking.md)).
 >
 > Not yet implemented: generics, traits/`impl Trait`, modules/`use`, `Box`/`Vec`,
 > user-defined `Drop`, borrow-lifetime analysis (bound `&`/`*` aliases are not yet
@@ -35,6 +38,8 @@ go run ./cmd/zexic run tests/strings.zx   # owning heap String + methods
 go run ./cmd/zexic run tests/drop.zx      # deterministic destruction across control flow
 go run ./cmd/zexic run tests/syntax.zx    # a runnable tour of the whole syntax
 go run ./cmd/zexic run tests/pi.zx        # 30 digits of π: big-int + Machin's formula
+go run ./cmd/zexic run examples/http_server.zx lib/http.zx   # an HTTP server, in Zexi
+go run ./cmd/zexic run examples/http_client.zx lib/http.zx   # an HTTP client (needs the server)
 go run ./cmd/zexic run examples/hello.zx
 go run ./cmd/zexic emit --emit=c tests/tour.zx   # inspect the generated C
 ```
@@ -66,6 +71,7 @@ for why, its real costs, and the plan to replace it with a native backend.
 - [`docs/05-roadmap.md`](docs/05-roadmap.md) — M0/M1/M2 milestones and the minimal viable feature set.
 - [`docs/06-backend-strategy.md`](docs/06-backend-strategy.md) — the C backend, its costs, and the road to a native backend.
 - [`docs/07-cheatsheet.md`](docs/07-cheatsheet.md) — a one-page tour of the language as it exists today.
+- [`docs/08-networking.md`](docs/08-networking.md) — FFI via `extern "C"`, and the HTTP library in `lib/http.zx`.
 - [`examples/`](examples/) — illustrative Zexi programs (aspirational; only the M0-alpha subset compiles today).
 - [`tests/tour.zx`](tests/tour.zx) — the end-to-end program the test suite compiles and runs.
 - [`tests/syntax.zx`](tests/syntax.zx) — a runnable syntax tour; [`tests/pi.zx`](tests/pi.zx) — 30 digits of π.

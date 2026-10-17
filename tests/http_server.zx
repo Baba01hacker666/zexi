@@ -1,0 +1,52 @@
+// tests/http_server.zx
+//
+// Used by the end-to-end test in internal/driver. Serves exactly two real
+// requests on 127.0.0.1:18081 and logs each request line to stdout. Bare TCP
+// probes (empty request head) are ignored and do not count against the budget,
+// which keeps the test's readiness check from consuming a request.
+
+struct Reply { status: i32, body: String }
+
+fn route(req: &Request) -> Reply {
+    let path = req.path.as_str();
+    if path == "/" {
+        return Reply { status: 200, body: String::from("index") };
+    }
+    if path == "/pi" {
+        return Reply { status: 200, body: String::from("3.141592653589793238462643383279") };
+    }
+    return Reply { status: 404, body: String::from("not found") };
+}
+
+fn main() -> i32 {
+    let srv = http_listen("127.0.0.1", 18081);
+    if srv.fd < 0 {
+        println("bind failed");
+        return 1;
+    }
+
+    let mut served: i32 = 0;
+    while served < 2 {
+        let c = srv.accept();
+        if c.fd < 0 {
+            continue;
+        }
+        let raw = c.read_head();
+        if raw.len() == 0 {
+            c.close();
+            continue;
+        }
+        let req = parse_request(&raw);
+        print(req.method.as_str());
+        print(" ");
+        println(req.path.as_str());
+
+        let reply = route(&req);
+        let resp = response(reply.status, reason_phrase(reply.status), reply.body.as_str());
+        c.write(resp.as_str());
+        c.close();
+        served += 1;
+    }
+    srv.close();
+    0
+}
