@@ -58,7 +58,7 @@ func (w *writer) write(format string, a ...any) { fmt.Fprintf(&w.b, format, a...
 func Generate(info *sema.Info, opts Options) (string, error) {
 	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}}
 	g.preamble()
-	g.structDefs()
+	g.typeDefs()
 	g.constants()
 	g.prototypes()
 	for _, fn := range info.FnOrder {
@@ -95,61 +95,129 @@ func (g *gen) constants() { // Emit in source order for stable output.
 	g.w.line("")
 }
 
-// structDefs emits C struct declarations for every Zexi struct, in
-// dependency order so that by-value fields refer to complete types. All names
-// are forward-declared first, which also permits self-referential pointers.
-func (g *gen) structDefs() {
-	if len(g.info.StructOrd) == 0 {
+// typeDefs emits C declarations for every Zexi struct and enum, in dependency
+// order so that by-value fields refer to complete types. All names are
+// forward-declared first, which also permits self-referential pointers.
+func (g *gen) typeDefs() {
+	if len(g.info.StructOrd) == 0 && len(g.info.EnumOrd) == 0 {
 		return
 	}
 	for _, s := range g.info.StructOrd {
 		g.w.line("typedef struct %s %s;", typeName(s.Name), typeName(s.Name))
 	}
+	for _, e := range g.info.EnumOrd {
+		g.w.line("typedef struct %s %s;", typeName(e.Name), typeName(e.Name))
+	}
 	g.w.line("")
-	for _, s := range g.structOrder() {
-		g.w.line("struct %s {", typeName(s.Name))
-		g.w.indent++
-		if len(s.Fields) == 0 {
-			g.w.line("char zx_empty;")
+	for _, name := range g.typeOrder() {
+		if s, ok := g.info.Structs[name]; ok {
+			g.emitStructDef(s)
+		} else if e, ok := g.info.Enums[name]; ok {
+			g.emitEnumDef(e)
 		}
-		for _, f := range s.Fields {
-			g.w.line("%s %s;", ctype(f.Ty), fieldName(f.Name))
-		}
-		g.w.indent--
-		g.w.line("};")
 	}
 	g.w.line("")
 }
 
-// structOrder returns structs sorted so dependencies come first.
-func (g *gen) structOrder() []*types.Struct {
+func (g *gen) emitStructDef(s *types.Struct) {
+	g.w.line("struct %s {", typeName(s.Name))
+	g.w.indent++
+	if len(s.Fields) == 0 {
+		g.w.line("char zx_empty;")
+	}
+	for _, f := range s.Fields {
+		g.w.line("%s %s;", ctype(f.Ty), fieldName(f.Name))
+	}
+	g.w.indent--
+	g.w.line("};")
+}
+
+// emitEnumDef emits a tagged union: an int32 tag plus a union of per-variant
+// payload structs. Enums with no payload are just a tag.
+func (g *gen) emitEnumDef(e *types.Enum) {
+	g.w.line("struct %s {", typeName(e.Name))
+	g.w.indent++
+	g.w.line("int32_t tag;")
+	if e.HasPayload() {
+		g.w.line("union {")
+		g.w.indent++
+		for _, v := range e.Variants {
+			if len(v.Fields) == 0 {
+				continue
+			}
+			g.w.line("struct {")
+			g.w.indent++
+			for _, f := range v.Fields {
+				g.w.line("%s %s;", ctype(f.Ty), fieldName(f.Name))
+			}
+			g.w.indent--
+			g.w.line("} v%d;", v.Index)
+		}
+		g.w.indent--
+		g.w.line("} u;")
+	}
+	g.w.indent--
+	g.w.line("};")
+}
+
+// typeOrder returns struct and enum names sorted so by-value dependencies come
+// before their dependents.
+func (g *gen) typeOrder() []string {
 	state := map[string]int{} // 0 unvisited, 1 visiting, 2 done
-	var out []*types.Struct
-	var visit func(s *types.Struct)
-	visit = func(s *types.Struct) {
-		if state[s.Name] != 0 {
+	var out []string
+	var visit func(name string)
+	visit = func(name string) {
+		if state[name] != 0 {
 			return
 		}
-		state[s.Name] = 1
-		for _, f := range s.Fields {
-			for _, dep := range valueStructDeps(f.Ty) {
-				if d, ok := g.info.Structs[dep]; ok {
-					visit(d)
-				}
-			}
+		state[name] = 1
+		for _, dep := range g.typeDeps(name) {
+			visit(dep)
 		}
-		state[s.Name] = 2
-		out = append(out, s)
+		state[name] = 2
+		out = append(out, name)
 	}
 	for _, s := range g.info.StructOrd {
-		visit(s)
+		visit(s.Name)
+	}
+	for _, e := range g.info.EnumOrd {
+		visit(e.Name)
 	}
 	return out
 }
 
-// valueStructDeps lists structs that must be complete for a value of type t:
-// the struct itself, or any struct reachable through by-value aggregates.
-func valueStructDeps(t *types.Type) []string {
+// typeDeps lists struct/enum names that must be complete for `name`.
+func (g *gen) typeDeps(name string) []string {
+	var out []string
+	if s, ok := g.info.Structs[name]; ok {
+		for _, f := range s.Fields {
+			out = append(out, valueTypeDeps(f.Ty)...)
+		}
+	}
+	if e, ok := g.info.Enums[name]; ok {
+		for _, v := range e.Variants {
+			for _, f := range v.Fields {
+				out = append(out, valueTypeDeps(f.Ty)...)
+			}
+		}
+	}
+	// Keep only names we actually define.
+	kept := out[:0]
+	for _, n := range out {
+		if _, ok := g.info.Structs[n]; ok {
+			kept = append(kept, n)
+			continue
+		}
+		if _, ok := g.info.Enums[n]; ok {
+			kept = append(kept, n)
+		}
+	}
+	return kept
+}
+
+// valueTypeDeps lists struct/enum names that a by-value type t requires to be
+// complete: the nominal type itself, or any reachable through aggregates.
+func valueTypeDeps(t *types.Type) []string {
 	if t == nil {
 		return nil
 	}
@@ -158,12 +226,16 @@ func valueStructDeps(t *types.Type) []string {
 		if t.St != nil {
 			return []string{t.St.Name}
 		}
+	case types.EnumKind:
+		if t.En != nil {
+			return []string{t.En.Name}
+		}
 	case types.Array:
-		return valueStructDeps(t.Elem)
+		return valueTypeDeps(t.Elem)
 	case types.Tuple:
 		var out []string
 		for _, e := range t.Elems {
-			out = append(out, valueStructDeps(e)...)
+			out = append(out, valueTypeDeps(e)...)
 		}
 		return out
 	}
@@ -305,6 +377,8 @@ func (g *gen) stmtExpr(e ast.Expr) {
 		g.loopStmt(x)
 	case *ast.JumpExpr:
 		g.jumpStmt(x)
+	case *ast.MatchExpr:
+		g.matchStmt(x)
 	case *ast.Block:
 		g.w.line("{")
 		g.w.indent++
@@ -421,6 +495,9 @@ func (g *gen) value(e ast.Expr) string {
 		if len(x.Segments) == 1 {
 			return g.identValue(x.Segments[0], x.Sp)
 		}
+		if ctor := g.info.Ctors[x]; ctor != nil {
+			return g.enumConstruct(ctor, nil)
+		}
 		return "0 /* unresolved path */"
 
 	case *ast.UnExpr:
@@ -469,6 +546,9 @@ func (g *gen) value(e ast.Expr) string {
 
 	case *ast.StructLitExpr:
 		return g.structLitValue(x)
+
+	case *ast.MatchExpr:
+		return g.matchValue(x)
 
 	case *ast.JumpExpr:
 		// A jump used in value position only occurs in a diverging tail; emit
@@ -579,6 +659,9 @@ func (g *gen) identValue(name string, _ token.Span) string {
 }
 
 func (g *gen) callValue(x *ast.CallExpr) string {
+	if ctor := g.info.Ctors[x]; ctor != nil {
+		return g.enumConstruct(ctor, x.Args)
+	}
 	if fn := g.info.Resolved[x]; fn != nil {
 		var args []string
 		for _, a := range x.Args {
@@ -692,6 +775,12 @@ func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
 // structLitValue emits a C compound literal, using designated initializers so
 // field order in source does not matter.
 func (g *gen) structLitValue(x *ast.StructLitExpr) string {
+	if len(x.Path) == 2 {
+		if ctor := g.info.Ctors[x]; ctor != nil {
+			return g.enumStructValue(ctor, x.Fields)
+		}
+		return "0 /* unknown variant */"
+	}
 	if len(x.Path) != 1 {
 		return "0 /* invalid struct literal */"
 	}
@@ -715,6 +804,239 @@ func (g *gen) structLitValue(x *ast.StructLitExpr) string {
 		parts = append(parts, fmt.Sprintf(".%s = %s", fieldName(f.Name), g.value(v)))
 	}
 	return "((" + typeName(st.Name) + "){ " + strings.Join(parts, ", ") + " })"
+}
+
+// enumStructValue emits a struct-variant construction using designated fields.
+func (g *gen) enumStructValue(ctor *sema.Ctor, fields []ast.FieldInit) string {
+	en, v := ctor.Enum, ctor.Variant
+	tag := strconv.Itoa(v.Index)
+	if len(v.Fields) == 0 {
+		return "((" + typeName(en.Name) + "){ .tag = " + tag + " })"
+	}
+	inits := map[string]ast.Expr{}
+	for _, fi := range fields {
+		inits[fi.Name] = fi.Val
+	}
+	var parts []string
+	for _, f := range v.Fields {
+		e, ok := inits[f.Name]
+		if !ok {
+			continue
+		}
+		parts = append(parts, "."+fieldName(f.Name)+" = "+g.value(e))
+	}
+	return "((" + typeName(en.Name) + "){ .tag = " + tag +
+		", .u.v" + tag + " = { " + strings.Join(parts, ", ") + " } })"
+}
+
+// enumConstruct emits a tagged-union value for an enum variant.
+func (g *gen) enumConstruct(ctor *sema.Ctor, args []ast.Expr) string {
+	en, v := ctor.Enum, ctor.Variant
+	tag := strconv.Itoa(v.Index)
+	if len(v.Fields) == 0 {
+		return "((" + typeName(en.Name) + "){ .tag = " + tag + " })"
+	}
+	var inits []string
+	for i, f := range v.Fields {
+		s := zeroValue(f.Ty)
+		if i < len(args) {
+			s = g.value(args[i])
+		}
+		inits = append(inits, "."+fieldName(f.Name)+" = "+s)
+	}
+	return "((" + typeName(en.Name) + "){ .tag = " + tag +
+		", .u.v" + tag + " = { " + strings.Join(inits, ", ") + " } })"
+}
+
+// matchValue emits a `match` in expression position as a statement expression.
+func (g *gen) matchValue(x *ast.MatchExpr) string {
+	t := g.info.TypeOf(x)
+	sub := &writer{indent: g.w.indent + 1}
+	save := g.w
+	g.w = sub
+	g.pushScope()
+	st := g.info.TypeOf(x.Scrutinee)
+	scrut := g.value(x.Scrutinee)
+	m := g.fresh("m")
+	sub.line("%s %s = %s;", ctype(st), m, scrut)
+	result := ""
+	if t != nil && t.Kind != types.Unit && t.Kind != types.Never {
+		result = g.fresh("r")
+		sub.line("%s %s;", ctype(t), result)
+	}
+	g.emitSwitch(x, st, m, result, sub)
+	if result != "" {
+		sub.line("%s;", result)
+	}
+	g.popScope()
+	g.w = save
+	return "({ " + sub.b.String() + " })"
+}
+
+// matchStmt emits a `match` in statement position.
+func (g *gen) matchStmt(x *ast.MatchExpr) {
+	g.pushScope()
+	st := g.info.TypeOf(x.Scrutinee)
+	scrut := g.value(x.Scrutinee)
+	m := g.fresh("m")
+	g.w.line("%s %s = %s;", ctype(st), m, scrut)
+	g.emitSwitch(x, st, m, "", g.w)
+	g.popScope()
+}
+
+// emitSwitch lowers match arms to a C switch over the tag (enums) or the value
+// (integers). Arm bodies are wrapped in braces so their bindings are scoped.
+func (g *gen) emitSwitch(x *ast.MatchExpr, st *types.Type, m, result string, w *writer) {
+	isEnum := st != nil && st.Kind == types.EnumKind
+	disc := m
+	if isEnum {
+		disc = m + ".tag"
+	}
+	w.line("switch (%s) {", disc)
+	w.indent++
+	for _, arm := range x.Arms {
+		label, isDefault := g.armLabel(arm.Pat, isEnum)
+		if isDefault {
+			w.line("default: {")
+		} else {
+			w.line("case %s: {", label)
+		}
+		w.indent++
+		g.pushScope()
+		g.bindArm(w, arm.Pat, st, m, isEnum)
+		if result != "" {
+			w.line("%s = %s;", result, g.value(arm.Body))
+		} else {
+			save := g.w
+			g.w = w
+			g.stmtExpr(arm.Body)
+			g.w = save
+		}
+		g.popScope()
+		w.line("break;")
+		w.indent--
+		w.line("}")
+	}
+	w.indent--
+	w.line("}")
+}
+
+// armLabel returns the C case label for a match arm, and whether it is the
+// default arm.
+func (g *gen) armLabel(p ast.Pattern, isEnum bool) (string, bool) {
+	switch pt := p.(type) {
+	case *ast.WildcardPat, *ast.BindPat:
+		return "", true
+	case *ast.PathPat:
+		if v := g.info.PatVariant[pt]; v != nil && isEnum {
+			return strconv.Itoa(v.Index), false
+		}
+		return "", true
+	case *ast.LitPat:
+		return litPatLabel(pt), false
+	}
+	return "", true
+}
+
+// bindArm declares the variables a pattern introduces, hoisting payload fields
+// out of the tagged union into locals.
+func (g *gen) bindArm(w *writer, p ast.Pattern, st *types.Type, m string, isEnum bool) {
+	switch pt := p.(type) {
+	case *ast.BindPat:
+		if pt.Name != "_" {
+			w.line("%s %s = %s;", ctype(st), g.bind(pt.Name), m)
+		}
+	case *ast.PathPat:
+		v := g.info.PatVariant[pt]
+		if v == nil || !isEnum || len(v.Fields) == 0 {
+			return
+		}
+		base := m + ".u.v" + strconv.Itoa(v.Index)
+		for i, sub := range pt.Sub {
+			if i >= len(v.Fields) {
+				break
+			}
+			f := v.Fields[i]
+			g.bindPatTo(w, sub, base+"."+fieldName(f.Name), f.Ty)
+		}
+		for _, fp := range pt.Fields {
+			f, ok := variantFieldOf(v, fp.Name)
+			if !ok {
+				continue
+			}
+			sub := fp.Pat
+			if sub == nil {
+				sub = &ast.BindPat{Name: fp.Name}
+			}
+			g.bindPatTo(w, sub, base+"."+fieldName(f.Name), f.Ty)
+		}
+	}
+}
+
+// bindPatTo recursively declares bindings for a sub-pattern.
+func (g *gen) bindPatTo(w *writer, p ast.Pattern, cExpr string, ty *types.Type) {
+	switch pt := p.(type) {
+	case *ast.BindPat:
+		if pt.Name != "_" {
+			w.line("%s %s = %s;", ctype(ty), g.bind(pt.Name), cExpr)
+		}
+	case *ast.PathPat:
+		v := g.info.PatVariant[pt]
+		if v == nil || ty == nil || ty.Kind != types.EnumKind || len(v.Fields) == 0 {
+			return
+		}
+		base := cExpr + ".u.v" + strconv.Itoa(v.Index)
+		for i, sub := range pt.Sub {
+			if i >= len(v.Fields) {
+				break
+			}
+			f := v.Fields[i]
+			g.bindPatTo(w, sub, base+"."+fieldName(f.Name), f.Ty)
+		}
+		for _, fp := range pt.Fields {
+			f, ok := variantFieldOf(v, fp.Name)
+			if !ok {
+				continue
+			}
+			sub := fp.Pat
+			if sub == nil {
+				sub = &ast.BindPat{Name: fp.Name}
+			}
+			g.bindPatTo(w, sub, base+"."+fieldName(f.Name), f.Ty)
+		}
+	}
+}
+
+func variantFieldOf(v *types.Variant, name string) (*types.Field, bool) {
+	for i := range v.Fields {
+		if v.Fields[i].Name == name {
+			return &v.Fields[i], true
+		}
+	}
+	return nil, false
+}
+
+// litPatLabel renders a literal pattern as a C case label.
+func litPatLabel(p *ast.LitPat) string {
+	switch p.Kind {
+	case token.KindInteger:
+		return strings.ReplaceAll(p.Text, "_", "")
+	case token.KindTrue:
+		return "1"
+	case token.KindFalse:
+		return "0"
+	case token.KindChar:
+		s := strings.Trim(p.Text, "'")
+		if len(s) > 0 {
+			return strconv.FormatInt(int64([]rune(s)[0]), 10)
+		}
+	case token.KindByteChar:
+		s := strings.Trim(p.Text, "'")
+		if len(s) > 0 {
+			return strconv.FormatInt(int64([]rune(s)[0]), 10)
+		}
+	}
+	return "0"
 }
 
 func (g *gen) literal(x *ast.LiteralExpr) string {
@@ -891,6 +1213,11 @@ func ctype(t *types.Type) string {
 			return typeName(t.St.Name)
 		}
 		return "void"
+	case types.EnumKind:
+		if t.En != nil {
+			return typeName(t.En.Name)
+		}
+		return "void"
 	case types.Fn:
 		return "void *"
 	}
@@ -910,6 +1237,8 @@ func zeroValue(t *types.Type) string {
 		return "0"
 	case t.Kind == types.StructKind && t.St != nil:
 		return "((" + typeName(t.St.Name) + "){ 0 })"
+	case t.Kind == types.EnumKind && t.En != nil:
+		return "((" + typeName(t.En.Name) + "){ 0 })"
 	default:
 		return "0"
 	}

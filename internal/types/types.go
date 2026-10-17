@@ -39,6 +39,7 @@ const (
 	Tuple      // (A, B, ...)
 	Fn         // fn(A, B) -> R
 	StructKind // nominal product type
+	EnumKind   // nominal tagged union
 )
 
 // Type is a semantic type. Only the fields relevant to Kind are set.
@@ -53,6 +54,8 @@ type Type struct {
 	Ret    *Type
 	// Struct
 	St *Struct
+	// Enum
+	En *Enum
 }
 
 // Struct is a nominal product type.
@@ -77,6 +80,40 @@ func (s *Struct) Field(name string) (*Field, bool) {
 		}
 	}
 	return nil, false
+}
+
+// Enum is a nominal tagged union.
+type Enum struct {
+	Name     string
+	Variants []Variant
+}
+
+// Variant is one case of an enum. Variants with no fields are unit variants.
+type Variant struct {
+	Name   string
+	Fields []Field
+	Tuple  bool
+	Index  int
+}
+
+// Variant returns the named variant, if present.
+func (e *Enum) Variant(name string) (*Variant, bool) {
+	for i := range e.Variants {
+		if e.Variants[i].Name == name {
+			return &e.Variants[i], true
+		}
+	}
+	return nil, false
+}
+
+// HasPayload reports whether any variant carries data.
+func (e *Enum) HasPayload() bool {
+	for _, v := range e.Variants {
+		if len(v.Fields) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Shorthands for the primitive types.
@@ -159,6 +196,9 @@ func Equal(a, b *Type) bool {
 	if a.Kind == StructKind {
 		return a.St != nil && b.St != nil && a.St.Name == b.St.Name
 	}
+	if a.Kind == EnumKind {
+		return a.En != nil && b.En != nil && a.En.Name == b.En.Name
+	}
 	if !Equal(a.Elem, b.Elem) || !Equal(a.Ret, b.Ret) {
 		return false
 	}
@@ -193,6 +233,18 @@ func (t *Type) IsCopy() bool {
 		for _, f := range t.St.Fields {
 			if !f.Ty.IsCopy() {
 				return false
+			}
+		}
+		return true
+	case EnumKind:
+		if t.En == nil {
+			return true
+		}
+		for _, v := range t.En.Variants {
+			for _, f := range v.Fields {
+				if !f.Ty.IsCopy() {
+					return false
+				}
 			}
 		}
 		return true
@@ -235,6 +287,11 @@ func (t *Type) String() string {
 			return t.St.Name
 		}
 		return "<struct>"
+	case EnumKind:
+		if t.En != nil {
+			return t.En.Name
+		}
+		return "<enum>"
 	case I8:
 		return "i8"
 	case I16:

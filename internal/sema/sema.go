@@ -57,17 +57,27 @@ type Const struct {
 
 // Info is the result of type checking.
 type Info struct {
-	File      *ast.File
-	Fns       map[string]*Fn
-	FnOrder   []*Fn
-	Consts    map[string]*Const
-	Structs   map[string]*types.Struct
-	StructOrd []*types.Struct
-	Methods   map[string]map[string]*Fn // struct name -> method name -> fn
-	Resolved  map[ast.Expr]*Fn          // resolved call / method target
-	Types     map[ast.Expr]*types.Type
-	DeclTypes map[ast.Stmt]*types.Type
-	Main      *Fn
+	File       *ast.File
+	Fns        map[string]*Fn
+	FnOrder    []*Fn
+	Consts     map[string]*Const
+	Structs    map[string]*types.Struct
+	StructOrd  []*types.Struct
+	Enums      map[string]*types.Enum
+	EnumOrd    []*types.Enum
+	Methods    map[string]map[string]*Fn // struct name -> method name -> fn
+	Resolved   map[ast.Expr]*Fn          // resolved call / method target
+	Ctors      map[ast.Expr]*Ctor        // resolved enum-variant construction
+	PatVariant map[ast.Pattern]*types.Variant
+	Types      map[ast.Expr]*types.Type
+	DeclTypes  map[ast.Stmt]*types.Type
+	Main       *Fn
+}
+
+// Ctor is a resolved enum-variant constructor.
+type Ctor struct {
+	Enum    *types.Enum
+	Variant *types.Variant
 }
 
 // TypeOf returns the inferred type of an expression, or nil.
@@ -77,14 +87,17 @@ func (in *Info) TypeOf(e ast.Expr) *types.Type { return in.Types[e] }
 func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 	c := &checker{
 		info: &Info{
-			File:      file,
-			Fns:       map[string]*Fn{},
-			Consts:    map[string]*Const{},
-			Structs:   map[string]*types.Struct{},
-			Methods:   map[string]map[string]*Fn{},
-			Resolved:  map[ast.Expr]*Fn{},
-			Types:     map[ast.Expr]*types.Type{},
-			DeclTypes: map[ast.Stmt]*types.Type{},
+			File:       file,
+			Fns:        map[string]*Fn{},
+			Consts:     map[string]*Const{},
+			Structs:    map[string]*types.Struct{},
+			Enums:      map[string]*types.Enum{},
+			Methods:    map[string]map[string]*Fn{},
+			Resolved:   map[ast.Expr]*Fn{},
+			Ctors:      map[ast.Expr]*Ctor{},
+			PatVariant: map[ast.Pattern]*types.Variant{},
+			Types:      map[ast.Expr]*types.Type{},
+			DeclTypes:  map[ast.Stmt]*types.Type{},
 		},
 	}
 	c.collect()
@@ -120,16 +133,23 @@ func (c *checker) errAt(e ast.Expr, code, format string, args ...any) {
 // --- collection pass ------------------------------------------------------
 
 func (c *checker) collect() {
-	// Pass 1: register struct names so fields can refer to one another.
+	// Pass 1: register struct and enum names so fields can refer to one
+	// another.
 	for _, it := range c.info.File.Items {
-		if d, ok := it.(*ast.StructDecl); ok {
+		switch d := it.(type) {
+		case *ast.StructDecl:
 			c.registerStruct(d)
+		case *ast.EnumDecl:
+			c.registerEnum(d)
 		}
 	}
-	// Pass 2: fill in struct fields.
+	// Pass 2: fill in struct fields and enum variants.
 	for _, it := range c.info.File.Items {
-		if d, ok := it.(*ast.StructDecl); ok {
+		switch d := it.(type) {
+		case *ast.StructDecl:
 			c.collectStructFields(d)
+		case *ast.EnumDecl:
+			c.collectEnumVariants(d)
 		}
 	}
 	// Constants, functions, then impl blocks (methods need their struct).
@@ -139,8 +159,6 @@ func (c *checker) collect() {
 			c.collectConst(d)
 		case *ast.FnDecl:
 			c.collectFn(d, false, "")
-		case *ast.EnumDecl:
-			c.errf(d.Sp, "E0900", "`enum` is not supported by the compiler yet (roadmap M0)")
 		case *ast.ImplBlock:
 			c.collectImpl(d)
 		case *ast.TypeAlias:
@@ -150,6 +168,42 @@ func (c *checker) collect() {
 		case *ast.UseDecl:
 			c.errf(d.Sp, "E0900", "`use` is not supported by the compiler yet (roadmap M1)")
 		}
+	}
+}
+
+func (c *checker) registerEnum(d *ast.EnumDecl) {
+	if _, dup := c.info.Enums[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the enum `%s` is defined multiple times", d.Name)
+		return
+	}
+	en := &types.Enum{Name: d.Name}
+	c.info.Enums[d.Name] = en
+	c.info.EnumOrd = append(c.info.EnumOrd, en)
+}
+
+func (c *checker) collectEnumVariants(d *ast.EnumDecl) {
+	en, ok := c.info.Enums[d.Name]
+	if !ok || len(en.Variants) > 0 {
+		return
+	}
+	for i, v := range d.Variants {
+		if _, dup := en.Variant(v.Name); dup {
+			c.errf(v.Sp, "E0428", "the variant `%s` is defined multiple times", v.Name)
+			continue
+		}
+		tv := types.Variant{Name: v.Name, Tuple: v.Tup, Index: i}
+		for j, f := range v.Fields {
+			name := f.Name
+			if v.Tup {
+				name = fmt.Sprintf("%d", j)
+			}
+			ft := c.resolveType(f.Ty)
+			if ft == nil {
+				ft = &types.Type{Kind: types.Invalid}
+			}
+			tv.Fields = append(tv.Fields, types.Field{Name: name, Ty: ft})
+		}
+		en.Variants = append(en.Variants, tv)
 	}
 }
 
@@ -454,6 +508,24 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		if len(x.Segments) == 1 {
 			return c.inferIdent(x.Segments[0], x.Sp)
 		}
+		if len(x.Segments) == 2 {
+			en, ok := c.info.Enums[x.Segments[0]]
+			if !ok {
+				c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope", x.Segments[0])
+				return nil
+			}
+			v, ok := en.Variant(x.Segments[1])
+			if !ok {
+				c.errf(x.Sp, "E0599", "no variant `%s` on enum `%s`", x.Segments[1], en.Name)
+				return nil
+			}
+			if len(v.Fields) > 0 {
+				c.errf(x.Sp, "E0061", "variant `%s::%s` requires %d argument(s)", en.Name, v.Name, len(v.Fields))
+				return nil
+			}
+			c.info.Ctors[x] = &Ctor{Enum: en, Variant: v}
+			return &types.Type{Kind: types.EnumKind, En: en}
+		}
 		c.errf(x.Sp, "E0900", "paths are not supported by the compiler yet (roadmap M1)")
 		return nil
 
@@ -504,8 +576,7 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		return c.inferJump(x)
 
 	case *ast.MatchExpr:
-		c.errf(x.Sp, "E0900", "`match` is not supported by the compiler yet (roadmap M0)")
-		return nil
+		return c.inferMatch(x)
 	case *ast.FieldExpr:
 		return c.inferField(x)
 	case *ast.MethodCallExpr:
@@ -684,6 +755,10 @@ func (c *checker) isPlace(e ast.Expr) bool {
 }
 
 func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
+	// `Enum::Variant(args)` is a variant constructor, not a function call.
+	if p, ok := x.Callee.(*ast.PathExpr); ok && len(p.Segments) == 2 {
+		return c.inferVariantCtor(x, p)
+	}
 	name, ok := calleeName(x.Callee)
 	if !ok {
 		c.errAt(x.Callee, "E0618", "expression is not callable")
@@ -718,6 +793,171 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 		}
 	}
 	return fn.Ret
+}
+
+// inferVariantCtor checks `Enum::Variant(args)`.
+func (c *checker) inferVariantCtor(x *ast.CallExpr, p *ast.PathExpr) *types.Type {
+	en, ok := c.info.Enums[p.Segments[0]]
+	if !ok {
+		c.errf(p.Sp, "E0412", "cannot find type `%s` in this scope", p.Segments[0])
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return nil
+	}
+	v, ok := en.Variant(p.Segments[1])
+	if !ok {
+		c.errf(p.Sp, "E0599", "no variant `%s` on enum `%s`", p.Segments[1], en.Name)
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return nil
+	}
+	c.info.Ctors[x] = &Ctor{Enum: en, Variant: v}
+	if len(x.Args) != len(v.Fields) {
+		c.errAt(x, "E0061", "variant `%s::%s` takes %d field(s) but %d were supplied", en.Name, v.Name, len(v.Fields), len(x.Args))
+	}
+	for i, a := range x.Args {
+		var want *types.Type
+		if i < len(v.Fields) {
+			want = v.Fields[i].Ty
+		}
+		at := c.checkExpr(a, want)
+		if want != nil && !c.assignable(want, at) {
+			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
+		}
+	}
+	return &types.Type{Kind: types.EnumKind, En: en}
+}
+
+// isCatchAll reports whether a pattern matches every value (a binding or `_`).
+func isCatchAll(p ast.Pattern) bool {
+	switch p.(type) {
+	case *ast.WildcardPat, *ast.BindPat:
+		return true
+	}
+	return false
+}
+
+func (c *checker) inferMatch(x *ast.MatchExpr) *types.Type {
+	st := c.checkExpr(x.Scrutinee, nil)
+	base := recvBase(st)
+	var result *types.Type
+	covered := map[string]bool{}
+	catchAll := false
+	for _, arm := range x.Arms {
+		if isCatchAll(arm.Pat) {
+			catchAll = true
+		}
+		c.pushScope()
+		c.checkPattern(arm.Pat, st)
+		if pp, ok := arm.Pat.(*ast.PathPat); ok {
+			if v := c.info.PatVariant[pp]; v != nil {
+				covered[v.Name] = true
+			}
+		}
+		if arm.Guard != nil {
+			gt := c.checkExpr(arm.Guard, types.BoolT)
+			if gt == nil || gt.Kind != types.Bool {
+				c.errAt(arm.Guard, "E0308", "match guard must be `bool`, found `%s`", gt)
+			}
+			c.errAt(arm.Guard, "E0900", "match guards are not supported by the compiler yet (roadmap M0)")
+		}
+		bt := c.checkExpr(arm.Body, result)
+		switch {
+		case result == nil:
+			result = bt
+		case result.Kind == types.Never:
+			result = bt
+		case bt != nil && bt.Kind == types.Never:
+			// diverging arm does not constrain the result
+		case bt != nil && !types.Equal(result, bt):
+			c.errf(arm.Sp, "E0308", "match arms have incompatible types: `%s` and `%s`", result, bt)
+		}
+		c.popScope()
+	}
+	if base != nil && base.Kind == types.EnumKind && !catchAll {
+		var missing []string
+		for _, v := range base.En.Variants {
+			if !covered[v.Name] {
+				missing = append(missing, v.Name)
+			}
+		}
+		if len(missing) > 0 {
+			c.errAt(x, "E0004", "non-exhaustive match: missing `%s`", strings.Join(missing, "`, `"))
+		}
+	} else if base != nil && base.Kind.IsInt() && !catchAll {
+		c.errAt(x, "E0004", "non-exhaustive match: add a `_` arm")
+	}
+	if result == nil {
+		result = types.UnitT
+	}
+	return result
+}
+
+// checkPattern type-checks a pattern against the scrutinee type and declares its
+// bindings in the current scope.
+func (c *checker) checkPattern(p ast.Pattern, st *types.Type) {
+	switch pt := p.(type) {
+	case *ast.WildcardPat:
+		return
+	case *ast.BindPat:
+		if pt.Name != "_" {
+			c.declare(pt.Sp, pt.Name, st)
+		}
+		return
+	case *ast.LitPat:
+		if st == nil || !st.Kind.IsInt() {
+			c.errf(pt.Sp, "E0308", "literal patterns require an integer scrutinee, found `%s`", st)
+		}
+		return
+	case *ast.PathPat:
+		base := recvBase(st)
+		if base == nil || base.Kind != types.EnumKind {
+			c.errf(pt.Sp, "E0308", "variant patterns require an enum scrutinee, found `%s`", st)
+			return
+		}
+		name := pt.Path[len(pt.Path)-1]
+		v, ok := base.En.Variant(name)
+		if !ok {
+			c.errf(pt.Sp, "E0599", "no variant `%s` on enum `%s`", name, base.En.Name)
+			return
+		}
+		c.info.PatVariant[pt] = v
+		if len(pt.Sub) > 0 && len(pt.Sub) != len(v.Fields) {
+			c.errf(pt.Sp, "E0027", "pattern for `%s::%s` has %d field(s) but the variant has %d", base.En.Name, v.Name, len(pt.Sub), len(v.Fields))
+		}
+		for i, sub := range pt.Sub {
+			if i >= len(v.Fields) {
+				break
+			}
+			c.checkPattern(sub, v.Fields[i].Ty)
+		}
+		for _, fp := range pt.Fields {
+			f, ok := variantField(v, fp.Name)
+			if !ok {
+				c.errf(fp.Sp, "E0026", "variant `%s` has no field named `%s`", v.Name, fp.Name)
+				continue
+			}
+			sub := fp.Pat
+			if sub == nil {
+				sub = &ast.BindPat{Name: fp.Name, Sp: fp.Sp}
+			}
+			c.checkPattern(sub, f.Ty)
+		}
+		return
+	default:
+		c.errf(p.Span(), "E0900", "this pattern is not supported by the compiler yet (roadmap M0)")
+	}
+}
+
+func variantField(v *types.Variant, name string) (*types.Field, bool) {
+	for i := range v.Fields {
+		if v.Fields[i].Name == name {
+			return &v.Fields[i], true
+		}
+	}
+	return nil, false
 }
 
 // recvBase strips references and pointers to find the underlying type, which is
@@ -788,6 +1028,9 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 }
 
 func (c *checker) inferStructLit(x *ast.StructLitExpr) *types.Type {
+	if len(x.Path) == 2 {
+		return c.inferEnumStructLit(x)
+	}
 	if len(x.Path) != 1 {
 		c.errAt(x, "E0900", "path-qualified struct literals are not supported yet (roadmap M1)")
 		return nil
@@ -820,6 +1063,44 @@ func (c *checker) inferStructLit(x *ast.StructLitExpr) *types.Type {
 		}
 	}
 	return &types.Type{Kind: types.StructKind, St: st}
+}
+
+// inferEnumStructLit checks `Enum::Variant { field: value, .. }`.
+func (c *checker) inferEnumStructLit(x *ast.StructLitExpr) *types.Type {
+	en, ok := c.info.Enums[x.Path[0]]
+	if !ok {
+		c.errAt(x, "E0412", "cannot find type `%s` in this scope", x.Path[0])
+		return nil
+	}
+	v, ok := en.Variant(x.Path[1])
+	if !ok {
+		c.errAt(x, "E0599", "no variant `%s` on enum `%s`", x.Path[1], en.Name)
+		return nil
+	}
+	c.info.Ctors[x] = &Ctor{Enum: en, Variant: v}
+	seen := map[string]bool{}
+	for _, fi := range x.Fields {
+		f, ok := variantField(v, fi.Name)
+		if !ok {
+			c.errf(fi.Sp, "E0560", "variant `%s::%s` has no field named `%s`", en.Name, v.Name, fi.Name)
+			c.checkExpr(fi.Val, nil)
+			continue
+		}
+		if seen[fi.Name] {
+			c.errf(fi.Sp, "E0062", "field `%s` specified more than once", fi.Name)
+		}
+		seen[fi.Name] = true
+		vt := c.checkExpr(fi.Val, f.Ty)
+		if !c.assignable(f.Ty, vt) {
+			c.errAt(fi.Val, "E0308", "mismatched types in field `%s`: expected `%s`, found `%s`", fi.Name, f.Ty, vt)
+		}
+	}
+	for _, f := range v.Fields {
+		if !seen[f.Name] {
+			c.errf(x.Sp, "E0063", "missing field `%s` in initializer of `%s::%s`", f.Name, en.Name, v.Name)
+		}
+	}
+	return &types.Type{Kind: types.EnumKind, En: en}
 }
 
 func (c *checker) inferPrint(x *ast.CallExpr, name string) *types.Type {
@@ -966,6 +1247,9 @@ func (c *checker) resolveType(t ast.Type) *types.Type {
 		}
 		if st, ok := c.info.Structs[x.Segments[0]]; ok {
 			return &types.Type{Kind: types.StructKind, St: st}
+		}
+		if en, ok := c.info.Enums[x.Segments[0]]; ok {
+			return &types.Type{Kind: types.EnumKind, En: en}
 		}
 		c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope", x.Segments[0])
 		return nil

@@ -1,0 +1,64 @@
+// tests/enums.zx
+// Enums (tagged unions) and `match`: tuple variants, unit variants, struct
+// variants, binding payloads, exhaustiveness with a wildcard, and integer
+// matching.
+
+enum Shape {
+    Circle(f64),
+    Rect(f64, f64),
+    Point,
+}
+
+enum Message {
+    Quit,
+    Move { x: i32, y: i32 },
+    Write(str),
+}
+
+fn area(s: Shape) -> f64 {
+    match s {
+        Shape::Circle(r) => 3.14159 * r * r,
+        Shape::Rect(w, h) => w * h,
+        Shape::Point => 0.0,
+    }
+}
+
+fn describe(n: i32) -> str {
+    match n {
+        0 => "zero",
+        1 => "one",
+        _ => "many",
+    }
+}
+
+fn handle(m: Message) -> i32 {
+    match m {
+        Message::Quit => 0,
+        Message::Move { x, y } => x + y,
+        Message::Write(_) => -1,
+    }
+}
+
+fn main() -> i32 {
+    let a = Shape::Circle(2.0);
+    let b = Shape::Rect(3.0, 4.0);
+    let c = Shape::Point;
+
+    println(area(a));
+    println(area(b));
+    println(area(c));
+
+    println(describe(0));
+    println(describe(1));
+    println(describe(7));
+
+    println(handle(Message::Quit));
+    println(handle(Message::Move { x: 3, y: 4 }));
+    println(handle(Message::Write("hi")));
+
+    let mut s = Shape::Circle(1.0);
+    s = Shape::Rect(2.0, 5.0);
+    println(area(s));
+
+    0
+}
