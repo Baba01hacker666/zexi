@@ -331,6 +331,37 @@ type UnExpr struct {
 func (*UnExpr) exprNode()          {}
 func (e *UnExpr) Span() token.Span { return e.Sp }
 
+// AssignExpr is `place = value` or a compound assignment such as `place += v`.
+type AssignExpr struct {
+	Op  token.Kind // KindEq or a compound operator
+	Lhs Expr
+	Rhs Expr
+	Sp  token.Span
+}
+
+func (*AssignExpr) exprNode()          {}
+func (e *AssignExpr) Span() token.Span { return e.Sp }
+
+// CastExpr is `expr as Ty`.
+type CastExpr struct {
+	X  Expr
+	Ty Type
+	Sp token.Span
+}
+
+func (*CastExpr) exprNode()          {}
+func (e *CastExpr) Span() token.Span { return e.Sp }
+
+// TupleExpr represents `(e)`, `(a, b)` and the unit literal `()`. A
+// parenthesized single expression is represented by that expression itself.
+type TupleExpr struct {
+	Elems []Expr
+	Sp    token.Span
+}
+
+func (*TupleExpr) exprNode()          {}
+func (e *TupleExpr) Span() token.Span { return e.Sp }
+
 // CallExpr is `f(args)`.
 type CallExpr struct {
 	Callee Expr
@@ -496,6 +527,16 @@ type PathPat struct {
 
 func (*PathPat) patternNode()       {}
 func (p *PathPat) Span() token.Span { return p.Sp }
+
+// LitPat is a literal pattern such as `42`, `"s"`, or `true`.
+type LitPat struct {
+	Kind token.Kind
+	Text string
+	Sp   token.Span
+}
+
+func (*LitPat) patternNode()       {}
+func (p *LitPat) Span() token.Span { return p.Sp }
 
 // FieldPat is `name: pat` inside a struct pattern.
 type FieldPat struct {

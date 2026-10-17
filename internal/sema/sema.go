@@ -1,0 +1,1096 @@
+// Package sema resolves names and infers types for a parsed Zexi file. It is
+// the M0-alpha checker: it validates enough to generate correct C, and reports
+// the language constructs that are designed but not yet implemented with a
+// precise diagnostic rather than a crash.
+//
+// The output, Info, is a typed view of the program: function signatures, the
+// value of each constant, and the inferred type of every expression. Codegen
+// consumes Info; it never re-derives types.
+package sema
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	"zexi/internal/ast"
+	"zexi/internal/diag"
+	"zexi/internal/token"
+	"zexi/internal/types"
+)
+
+// Fn is a checked function.
+type Fn struct {
+	Decl   *ast.FnDecl
+	Name   string
+	Params []*types.Type
+	Ret    *types.Type
+	Extern bool
+	ABI    string
+}
+
+// Sig renders the function's signature for diagnostics.
+func (f *Fn) Sig() string {
+	parts := make([]string, len(f.Params))
+	for i, p := range f.Params {
+		parts[i] = p.String()
+	}
+	return fmt.Sprintf("%s(%s) -> %s", f.Name, strings.Join(parts, ", "), f.Ret)
+}
+
+// Const is a compile-time constant.
+type Const struct {
+	Decl *ast.ConstDecl
+	Name string
+	Ty   *types.Type
+	Val  ConstVal
+}
+
+// Info is the result of type checking.
+type Info struct {
+	File      *ast.File
+	Fns       map[string]*Fn
+	FnOrder   []*Fn
+	Consts    map[string]*Const
+	Types     map[ast.Expr]*types.Type
+	DeclTypes map[ast.Stmt]*types.Type
+	Main      *Fn
+}
+
+// TypeOf returns the inferred type of an expression, or nil.
+func (in *Info) TypeOf(e ast.Expr) *types.Type { return in.Types[e] }
+
+// Check resolves names and infers types across the file.
+func Check(file *ast.File) (*Info, []diag.Diagnostic) {
+	c := &checker{
+		info: &Info{
+			File:      file,
+			Fns:       map[string]*Fn{},
+			Consts:    map[string]*Const{},
+			Types:     map[ast.Expr]*types.Type{},
+			DeclTypes: map[ast.Stmt]*types.Type{},
+		},
+	}
+	c.collect()
+	c.checkBodies()
+	c.info.Main = c.info.Fns["main"]
+	if c.info.Main == nil {
+		c.errf(token.Span{}, "E0601", "no `main` function found")
+	} else if len(c.info.Main.Params) != 0 {
+		c.errf(c.info.Main.Decl.Sp, "E0601", "`main` must take no parameters, found %s", c.info.Main.Sig())
+	} else if !c.info.Main.Ret.Kind.IsInt() && c.info.Main.Ret.Kind != types.Unit {
+		c.errf(c.info.Main.Decl.Sp, "E0601", "`main` must return an integer or `()`, found %s", c.info.Main.Ret)
+	}
+	return c.info, c.errs
+}
+
+type checker struct {
+	info *Info
+	errs []diag.Diagnostic
+
+	scope     []map[string]*types.Type // local bindings, innermost last
+	cur       *Fn
+	loopDepth int
+}
+
+func (c *checker) errf(sp token.Span, code, format string, args ...any) {
+	c.errs = append(c.errs, diag.New(code, format, args...).WithSpan(sp))
+}
+
+func (c *checker) errAt(e ast.Expr, code, format string, args ...any) {
+	c.errf(e.Span(), code, format, args...)
+}
+
+// --- collection pass ------------------------------------------------------
+
+func (c *checker) collect() {
+	for _, it := range c.info.File.Items {
+		switch d := it.(type) {
+		case *ast.FnDecl:
+			c.collectFn(d, false, "")
+		case *ast.ConstDecl:
+			c.collectConst(d)
+		case *ast.StructDecl:
+			c.errf(d.Sp, "E0900", "`struct` is not supported by the compiler yet (roadmap M0)")
+		case *ast.EnumDecl:
+			c.errf(d.Sp, "E0900", "`enum` is not supported by the compiler yet (roadmap M0)")
+		case *ast.ImplBlock:
+			c.errf(d.Sp, "E0900", "`impl` is not supported by the compiler yet (roadmap M1)")
+		case *ast.TypeAlias:
+			c.errf(d.Sp, "E0900", "`type` aliases are not supported by the compiler yet (roadmap M1)")
+		case *ast.ModDecl:
+			c.errf(d.Sp, "E0900", "`mod` is not supported by the compiler yet (roadmap M1)")
+		case *ast.UseDecl:
+			c.errf(d.Sp, "E0900", "`use` is not supported by the compiler yet (roadmap M1)")
+		}
+	}
+}
+
+func (c *checker) collectFn(d *ast.FnDecl, extern bool, abi string) {
+	if _, dup := c.info.Fns[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the function `%s` is defined multiple times", d.Name)
+		return
+	}
+	fn := &Fn{Decl: d, Name: d.Name, Extern: extern || d.Extern != "" || d.Body == nil, ABI: abi}
+	if d.Extern != "" {
+		fn.ABI = d.Extern
+	}
+	for _, p := range d.Params {
+		pt := c.resolveType(p.Ty)
+		if pt == nil {
+			continue
+		}
+		fn.Params = append(fn.Params, pt)
+	}
+	if d.Ret != nil {
+		fn.Ret = c.resolveType(d.Ret)
+	}
+	if fn.Ret == nil {
+		fn.Ret = types.UnitT
+	}
+	// A body-less function must be extern/FFI.
+	if d.Body == nil && d.Extern == "" {
+		c.errf(d.Sp, "E0204", "function `%s` has no body; only `extern` functions may omit it", d.Name)
+	}
+	c.info.Fns[d.Name] = fn
+	c.info.FnOrder = append(c.info.FnOrder, fn)
+}
+
+func (c *checker) collectConst(d *ast.ConstDecl) {
+	if _, dup := c.info.Consts[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the constant `%s` is defined multiple times", d.Name)
+		return
+	}
+	var declared *types.Type
+	if d.Ty != nil {
+		declared = c.resolveType(d.Ty)
+	}
+	val, ok := c.evalConst(d.Val)
+	if !ok {
+		c.errf(d.Val.Span(), "E0602", "constant `%s` is not a compile-time constant expression", d.Name)
+		return
+	}
+	if declared != nil {
+		if !c.assignable(declared, val.Ty) {
+			c.errf(d.Val.Span(), "E0308", "mismatched types: expected `%s`, found `%s`", declared, val.Ty)
+			return
+		}
+		val.Ty = declared
+	}
+	c.info.Consts[d.Name] = &Const{Decl: d, Name: d.Name, Ty: val.Ty, Val: val}
+}
+
+// --- body checking --------------------------------------------------------
+
+func (c *checker) checkBodies() {
+	for _, fn := range c.info.FnOrder {
+		if fn.Decl.Body == nil {
+			continue
+		}
+		c.cur = fn
+		c.scope = c.scope[:0]
+		c.pushScope()
+		for i, p := range fn.Decl.Params {
+			if i >= len(fn.Params) {
+				break
+			}
+			c.declare(p.Sp, p.Name, fn.Params[i])
+		}
+		bt := c.checkBlock(fn.Decl.Body)
+		if fn.Ret.Kind != types.Unit {
+			if !c.exprAlwaysReturns(fn.Decl.Body) && bt.Kind != types.Never {
+				if !c.assignable(fn.Ret, bt) {
+					c.errf(fn.Decl.Body.Sp, "E0308", "function `%s` returns `%s` but its body has type `%s`", fn.Name, fn.Ret, bt)
+				}
+			}
+		}
+		c.popScope()
+	}
+}
+
+// exprAlwaysReturns reports whether evaluating e diverges via `return`.
+func (c *checker) exprAlwaysReturns(e ast.Expr) bool {
+	switch x := e.(type) {
+	case *ast.JumpExpr:
+		return x.Kind == token.KindReturn
+	case *ast.Block:
+		return c.blockAlwaysReturns(x)
+	case *ast.IfExpr:
+		if x.Else == nil {
+			return false
+		}
+		return c.blockAlwaysReturns(x.Then) && c.exprAlwaysReturns(x.Else)
+	}
+	return false
+}
+
+// blockAlwaysReturns reports whether the block always diverges via `return`.
+func (c *checker) blockAlwaysReturns(b *ast.Block) bool {
+	if b.Tail != nil {
+		return c.exprAlwaysReturns(b.Tail)
+	}
+	if len(b.Stmts) > 0 {
+		if es, ok := b.Stmts[len(b.Stmts)-1].(*ast.ExprStmt); ok {
+			return c.exprAlwaysReturns(es.X)
+		}
+	}
+	return false
+}
+
+func (c *checker) checkBlock(b *ast.Block) *types.Type {
+	c.pushScope()
+	defer c.popScope()
+	for _, s := range b.Stmts {
+		c.checkStmt(s)
+	}
+	if b.Tail != nil {
+		t := c.checkExpr(b.Tail, nil)
+		c.info.Types[b] = t
+		return t
+	}
+	// A block whose last statement diverges has type `never`.
+	if len(b.Stmts) > 0 {
+		if es, ok := b.Stmts[len(b.Stmts)-1].(*ast.ExprStmt); ok && c.exprAlwaysReturns(es.X) {
+			c.info.Types[b] = types.NeverT
+			return types.NeverT
+		}
+	}
+	c.info.Types[b] = types.UnitT
+	return types.UnitT
+}
+
+func (c *checker) checkStmt(s ast.Stmt) {
+	switch st := s.(type) {
+	case *ast.LetStmt:
+		var declared *types.Type
+		if st.Ty != nil {
+			declared = c.resolveType(st.Ty)
+		}
+		var initT *types.Type
+		if st.Val != nil {
+			initT = c.checkExpr(st.Val, declared)
+		}
+		ty := declared
+		if ty == nil {
+			ty = initT
+		}
+		if ty == nil {
+			c.errf(st.Sp, "E0282", "type annotations needed for this binding")
+			ty = &types.Type{Kind: types.Invalid}
+		}
+		if ty.Kind == types.Unit {
+			c.errf(st.Sp, "E0308", "cannot bind a value of type `()`")
+		}
+		if declared != nil && initT != nil && !c.assignable(declared, initT) {
+			c.errf(st.Val.Span(), "E0308", "mismatched types: expected `%s`, found `%s`", declared, initT)
+		}
+		c.info.DeclTypes[st] = ty
+		c.bindPattern(st.Pat, ty, true)
+	case *ast.ExprStmt:
+		c.checkExpr(st.X, nil)
+	default:
+		c.errf(s.Span(), "E0900", "unsupported statement")
+	}
+}
+
+func (c *checker) bindPattern(p ast.Pattern, ty *types.Type, let bool) {
+	switch pt := p.(type) {
+	case *ast.BindPat:
+		if let && pt.Name == "" {
+			return
+		}
+		if pt.Name != "_" {
+			c.declare(pt.Sp, pt.Name, ty)
+		}
+	case *ast.WildcardPat:
+	case *ast.TuplePat:
+		c.errf(pt.Sp, "E0900", "tuple patterns are not supported by the compiler yet")
+	default:
+		c.errf(p.Span(), "E0900", "this pattern is not supported by the compiler yet")
+	}
+}
+
+// --- expression checking --------------------------------------------------
+
+func (c *checker) checkExpr(e ast.Expr, expected *types.Type) *types.Type {
+	t := c.infer(e, expected)
+	if t == nil {
+		t = &types.Type{Kind: types.Invalid}
+	}
+	c.info.Types[e] = t
+	return t
+}
+
+func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
+	switch x := e.(type) {
+	case *ast.LiteralExpr:
+		return c.inferLiteral(x, expected)
+
+	case *ast.IdentExpr:
+		return c.inferIdent(x.Name, x.Sp)
+
+	case *ast.PathExpr:
+		if len(x.Segments) == 1 {
+			return c.inferIdent(x.Segments[0], x.Sp)
+		}
+		c.errf(x.Sp, "E0900", "paths are not supported by the compiler yet (roadmap M1)")
+		return nil
+
+	case *ast.TupleExpr:
+		if len(x.Elems) == 0 {
+			return types.UnitT
+		}
+		c.errf(x.Sp, "E0900", "tuples are not supported by the compiler yet (roadmap M1)")
+		return nil
+
+	case *ast.Block:
+		return c.checkBlock(x)
+
+	case *ast.UnExpr:
+		return c.inferUnary(x, expected)
+
+	case *ast.BinExpr:
+		return c.inferBinary(x)
+
+	case *ast.AssignExpr:
+		return c.inferAssign(x)
+
+	case *ast.CastExpr:
+		srcT := c.checkExpr(x.X, nil)
+		dstT := c.resolveType(x.Ty)
+		if dstT == nil {
+			return nil
+		}
+		if !srcT.Kind.IsNumeric() && srcT.Kind != types.Char && srcT.Kind != types.Bool {
+			c.errAt(x.X, "E0308", "cannot cast `%s` with `as`", srcT)
+			return dstT
+		}
+		if !dstT.Kind.IsNumeric() && dstT.Kind != types.Char {
+			c.errAt(x, "E0308", "cannot cast to `%s`", dstT)
+		}
+		return dstT
+
+	case *ast.CallExpr:
+		return c.inferCall(x)
+
+	case *ast.IfExpr:
+		return c.inferIf(x)
+
+	case *ast.LoopExpr:
+		return c.inferLoop(x)
+
+	case *ast.JumpExpr:
+		return c.inferJump(x)
+
+	case *ast.MatchExpr:
+		c.errf(x.Sp, "E0900", "`match` is not supported by the compiler yet (roadmap M0)")
+		return nil
+	case *ast.FieldExpr:
+		c.errf(x.Sp, "E0900", "field access is not supported by the compiler yet (roadmap M0)")
+		return nil
+	case *ast.MethodCallExpr:
+		c.errf(x.Sp, "E0900", "method calls are not supported by the compiler yet (roadmap M0)")
+		return nil
+	case *ast.IndexExpr:
+		c.errf(x.Sp, "E0900", "indexing is not supported by the compiler yet (roadmap M0)")
+		return nil
+	case *ast.TryExpr:
+		c.errf(x.Sp, "E0900", "the `?` operator is not supported by the compiler yet (roadmap M0)")
+		return nil
+	case *ast.StructLitExpr:
+		c.errf(x.Sp, "E0900", "struct literals are not supported by the compiler yet (roadmap M0)")
+		return nil
+	}
+	c.errf(e.Span(), "E0900", "unsupported expression")
+	return nil
+}
+
+func (c *checker) inferLiteral(x *ast.LiteralExpr, expected *types.Type) *types.Type {
+	switch x.Kind {
+	case token.KindInteger:
+		if expected != nil && expected.Kind.IsInt() {
+			return expected
+		}
+		return types.I32T
+	case token.KindFloat:
+		if expected != nil && expected.Kind.IsFloat() {
+			return expected
+		}
+		return types.F64T
+	case token.KindTrue, token.KindFalse:
+		return types.BoolT
+	case token.KindString, token.KindRawString:
+		return types.StrT
+	case token.KindChar:
+		return types.CharT
+	case token.KindByteChar:
+		return &types.Type{Kind: types.U8}
+	}
+	return nil
+}
+
+func (c *checker) inferIdent(name string, sp token.Span) *types.Type {
+	if name == "_" {
+		c.errf(sp, "E0425", "cannot use `_` as a value")
+		return nil
+	}
+	for i := len(c.scope) - 1; i >= 0; i-- {
+		if t, ok := c.scope[i][name]; ok {
+			return t
+		}
+	}
+	if cn, ok := c.info.Consts[name]; ok {
+		return cn.Ty
+	}
+	if fn, ok := c.info.Fns[name]; ok {
+		return &types.Type{Kind: types.Fn, Params: fn.Params, Ret: fn.Ret}
+	}
+	c.errf(sp, "E0425", "cannot find `%s` in this scope", name)
+	return nil
+}
+
+func (c *checker) inferUnary(x *ast.UnExpr, expected *types.Type) *types.Type {
+	switch x.Op {
+	case token.KindMinus:
+		t := c.checkExpr(x.X, expected)
+		if !t.Kind.IsNumeric() {
+			c.errAt(x, "E0308", "cannot apply unary `-` to `%s`", t)
+		}
+		return t
+	case token.KindBang:
+		t := c.checkExpr(x.X, nil)
+		if t.Kind == types.Bool || t.Kind.IsInt() {
+			return t
+		}
+		c.errAt(x, "E0308", "cannot apply unary `!` to `%s`", t)
+		return t
+	case token.KindStar:
+		t := c.checkExpr(x.X, nil)
+		if t.Kind == types.Ptr || t.Kind == types.Ref {
+			return t.Elem
+		}
+		c.errAt(x, "E0308", "cannot dereference `%s`", t)
+		return nil
+	case token.KindAmp:
+		t := c.checkExpr(x.X, nil)
+		return types.RefTo(t, x.Mut)
+	}
+	return nil
+}
+
+func (c *checker) inferBinary(x *ast.BinExpr) *types.Type {
+	if x.Op == token.KindDotDot || x.Op == token.KindDotDotEq {
+		lt := c.checkExpr(x.L, nil)
+		c.checkExpr(x.R, lt)
+		if !lt.Kind.IsInt() {
+			c.errAt(x, "E0308", "range bounds must be integers, found `%s`", lt)
+		}
+		return types.UnitT
+	}
+
+	lt := c.checkExpr(x.L, nil)
+	rt := c.checkExpr(x.R, nil)
+	// Integer literals adopt the type of the other operand.
+	if !types.Equal(lt, rt) {
+		switch {
+		case isIntLiteral(x.L) && rt.Kind.IsNumeric():
+			lt = c.checkExpr(x.L, rt)
+		case isIntLiteral(x.R) && lt.Kind.IsNumeric():
+			rt = c.checkExpr(x.R, lt)
+		}
+	}
+	if !types.Equal(lt, rt) {
+		c.errAt(x, "E0308", "mismatched types in binary expression: `%s` and `%s`", lt, rt)
+		return nil
+	}
+
+	switch x.Op {
+	case token.KindAmpAmp, token.KindPipePipe:
+		if lt.Kind != types.Bool {
+			c.errAt(x, "E0308", "logical operators require `bool`, found `%s`", lt)
+		}
+		return types.BoolT
+	case token.KindEqEq, token.KindBangEq:
+		if !lt.Kind.IsNumeric() && lt.Kind != types.Bool && lt.Kind != types.Char && lt.Kind != types.Str {
+			c.errAt(x, "E0308", "cannot compare values of type `%s`", lt)
+		}
+		return types.BoolT
+	case token.KindLt, token.KindLe, token.KindGt, token.KindGe:
+		if !lt.Kind.IsNumeric() && lt.Kind != types.Char {
+			c.errAt(x, "E0308", "cannot order values of type `%s`", lt)
+		}
+		return types.BoolT
+	case token.KindShl, token.KindShr, token.KindAmp, token.KindPipe, token.KindCaret:
+		if !lt.Kind.IsInt() {
+			c.errAt(x, "E0308", "bitwise operators require integers, found `%s`", lt)
+		}
+		return lt
+	case token.KindPlus, token.KindMinus, token.KindStar, token.KindSlash, token.KindPercent:
+		if !lt.Kind.IsNumeric() {
+			c.errAt(x, "E0308", "arithmetic operators require numbers, found `%s`", lt)
+		}
+		return lt
+	}
+	return lt
+}
+
+func (c *checker) inferAssign(x *ast.AssignExpr) *types.Type {
+	if !c.isPlace(x.Lhs) {
+		c.errAt(x.Lhs, "E0384", "cannot assign to this expression")
+	}
+	lt := c.checkExpr(x.Lhs, nil)
+	rt := c.checkExpr(x.Rhs, lt)
+	if x.Op == token.KindEq {
+		if !c.assignable(lt, rt) {
+			c.errAt(x.Rhs, "E0308", "mismatched types: expected `%s`, found `%s`", lt, rt)
+		}
+	} else {
+		if !lt.Kind.IsNumeric() {
+			c.errAt(x, "E0308", "compound assignment requires a numeric type, found `%s`", lt)
+		}
+	}
+	return types.UnitT
+}
+
+// isPlace reports whether e is a valid assignment target.
+func (c *checker) isPlace(e ast.Expr) bool {
+	switch x := e.(type) {
+	case *ast.IdentExpr:
+		return x.Name != "_"
+	case *ast.UnExpr:
+		return x.Op == token.KindStar
+	case *ast.FieldExpr, *ast.IndexExpr:
+		return true
+	}
+	return false
+}
+
+func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
+	name, ok := calleeName(x.Callee)
+	if !ok {
+		c.errAt(x.Callee, "E0618", "expression is not callable")
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return nil
+	}
+	if name == "print" || name == "println" {
+		return c.inferPrint(x, name)
+	}
+	fn, ok := c.info.Fns[name]
+	if !ok {
+		c.errAt(x.Callee, "E0425", "cannot find function `%s` in this scope", name)
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return nil
+	}
+	if len(x.Args) != len(fn.Params) {
+		c.errAt(x, "E0061", "function `%s` takes %d argument(s) but %d were supplied", name, len(fn.Params), len(x.Args))
+	}
+	for i, a := range x.Args {
+		var want *types.Type
+		if i < len(fn.Params) {
+			want = fn.Params[i]
+		}
+		at := c.checkExpr(a, want)
+		if want != nil && !c.assignable(want, at) {
+			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
+		}
+	}
+	return fn.Ret
+}
+
+func (c *checker) inferPrint(x *ast.CallExpr, name string) *types.Type {
+	if len(x.Args) > 1 {
+		c.errAt(x, "E0061", "`%s` takes at most 1 argument but %d were supplied", name, len(x.Args))
+	}
+	for _, a := range x.Args {
+		at := c.checkExpr(a, nil)
+		if !isPrintable(at) {
+			c.errAt(a, "E0277", "`%s` cannot be printed", at)
+		}
+	}
+	return types.UnitT
+}
+
+func (c *checker) inferIf(x *ast.IfExpr) *types.Type {
+	ct := c.checkExpr(x.Cond, types.BoolT)
+	if ct.Kind != types.Bool {
+		c.errAt(x.Cond, "E0308", "`if` condition must be `bool`, found `%s`", ct)
+	}
+	thenT := c.checkBlock(x.Then)
+	if x.Else == nil {
+		if thenT.Kind != types.Unit && thenT.Kind != types.Never {
+			c.errf(x.Sp, "E0317", "`if` without `else` must have type `()`; found `%s`", thenT)
+		}
+		return types.UnitT
+	}
+	elseT := c.checkExpr(x.Else, thenT)
+	// A diverging branch takes on the type of the other branch.
+	if thenT.Kind == types.Never && elseT.Kind == types.Never {
+		return types.NeverT
+	}
+	if thenT.Kind == types.Never {
+		return elseT
+	}
+	if elseT.Kind == types.Never {
+		return thenT
+	}
+	if !types.Equal(thenT, elseT) {
+		c.errf(x.Sp, "E0308", "`if` and `else` have incompatible types: `%s` and `%s`", thenT, elseT)
+		return nil
+	}
+	return thenT
+}
+
+func (c *checker) inferLoop(x *ast.LoopExpr) *types.Type {
+	switch x.Kind {
+	case token.KindLoop:
+		c.loopDepth++
+		c.checkBlock(x.Body)
+		c.loopDepth--
+		return types.UnitT
+	case token.KindWhile:
+		ct := c.checkExpr(x.Cond, types.BoolT)
+		if ct.Kind != types.Bool {
+			c.errAt(x.Cond, "E0308", "`while` condition must be `bool`, found `%s`", ct)
+		}
+		c.loopDepth++
+		c.checkBlock(x.Body)
+		c.loopDepth--
+		return types.UnitT
+	case token.KindFor:
+		return c.inferFor(x)
+	}
+	return types.UnitT
+}
+
+func (c *checker) inferFor(x *ast.LoopExpr) *types.Type {
+	rng, ok := x.Iter.(*ast.BinExpr)
+	if !ok || (rng.Op != token.KindDotDot && rng.Op != token.KindDotDotEq) {
+		c.errAt(x.Iter, "E0900", "only `for i in a..b` is supported by the compiler yet (roadmap M0)")
+		c.loopDepth++
+		c.checkBlock(x.Body)
+		c.loopDepth--
+		return types.UnitT
+	}
+	lt := c.checkExpr(rng.L, nil)
+	c.checkExpr(rng.R, lt)
+	if !lt.Kind.IsInt() {
+		c.errAt(x.Iter, "E0308", "range bounds must be integers, found `%s`", lt)
+		lt = types.I32T
+	}
+	c.pushScope()
+	c.bindPattern(x.Pat, lt, true)
+	c.loopDepth++
+	c.checkBlock(x.Body)
+	c.loopDepth--
+	c.popScope()
+	return types.UnitT
+}
+
+func (c *checker) inferJump(x *ast.JumpExpr) *types.Type {
+	switch x.Kind {
+	case token.KindReturn:
+		if c.cur == nil {
+			return types.NeverT
+		}
+		if x.Val == nil {
+			if c.cur.Ret.Kind != types.Unit {
+				c.errf(x.Sp, "E0308", "this function must return a value of type `%s`", c.cur.Ret)
+			}
+			return types.NeverT
+		}
+		vt := c.checkExpr(x.Val, c.cur.Ret)
+		if c.cur.Ret.Kind != types.Unit && !c.assignable(c.cur.Ret, vt) {
+			c.errAt(x.Val, "E0308", "mismatched types: expected `%s`, found `%s`", c.cur.Ret, vt)
+		}
+		return types.NeverT
+	case token.KindBreak:
+		if c.loopDepth == 0 {
+			c.errf(x.Sp, "E0268", "`break` outside of a loop")
+		}
+		if x.Val != nil {
+			c.errAt(x.Val, "E0900", "`break` with a value is not supported by the compiler yet")
+		}
+		return types.NeverT
+	case token.KindContinue:
+		if c.loopDepth == 0 {
+			c.errf(x.Sp, "E0268", "`continue` outside of a loop")
+		}
+		return types.NeverT
+	}
+	return types.NeverT
+}
+
+// --- type resolution ------------------------------------------------------
+
+func (c *checker) resolveType(t ast.Type) *types.Type {
+	switch x := t.(type) {
+	case *ast.PathType:
+		if len(x.Segments) == 0 {
+			return nil
+		}
+		if x.Segments[0] == "_" {
+			c.errf(x.Sp, "E0121", "the type placeholder `_` is not allowed here")
+			return nil
+		}
+		if len(x.Segments) > 1 {
+			c.errf(x.Sp, "E0900", "type paths are not supported by the compiler yet (roadmap M1)")
+			return nil
+		}
+		if bt, ok := types.Builtins[x.Segments[0]]; ok {
+			return bt
+		}
+		c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope", x.Segments[0])
+		return nil
+	case *ast.RefType:
+		return types.RefTo(c.resolveType(x.Elem), x.Mut)
+	case *ast.PtrType:
+		return types.PtrTo(c.resolveType(x.Elem))
+	case *ast.TupleType:
+		if len(x.Elems) == 0 {
+			return types.UnitT
+		}
+		c.errf(x.Sp, "E0900", "tuple types are not supported by the compiler yet (roadmap M1)")
+		return nil
+	case *ast.SliceType:
+		return &types.Type{Kind: types.Slice, Elem: c.resolveType(x.Elem)}
+	case *ast.ArrayType:
+		elem := c.resolveType(x.Elem)
+		n, ok := c.evalConst(x.Len)
+		if !ok || n.Ty == nil || !n.Ty.Kind.IsInt() {
+			c.errf(x.Sp, "E0308", "array length must be an integer constant")
+			return &types.Type{Kind: types.Array, Elem: elem}
+		}
+		return &types.Type{Kind: types.Array, Elem: elem, Len: n.Int}
+	case *ast.FnType:
+		f := &types.Type{Kind: types.Fn}
+		for _, p := range x.Params {
+			f.Params = append(f.Params, c.resolveType(p))
+		}
+		if x.Ret != nil {
+			f.Ret = c.resolveType(x.Ret)
+		} else {
+			f.Ret = types.UnitT
+		}
+		return f
+	}
+	return nil
+}
+
+// assignable reports whether a value of type src may be used where dst is
+// expected. Zexi has no implicit conversions, so this is equality plus the
+// `never`-coerces-to-anything rule and literal-driven types already unified by
+// the caller.
+func (c *checker) assignable(dst, src *types.Type) bool {
+	if dst == nil || src == nil {
+		return true
+	}
+	if src.Kind == types.Never || types.Equal(dst, src) {
+		return true
+	}
+	// `&mut T` coerces to `&T`.
+	if dst.Kind == types.Ref && src.Kind == types.Ref && dst.Mut == false && src.Mut == true {
+		return types.Equal(dst.Elem, src.Elem)
+	}
+	return false
+}
+
+// --- scope helpers --------------------------------------------------------
+
+func (c *checker) pushScope() { c.scope = append(c.scope, map[string]*types.Type{}) }
+func (c *checker) popScope() {
+	if len(c.scope) > 0 {
+		c.scope = c.scope[:len(c.scope)-1]
+	}
+}
+
+func (c *checker) declare(sp token.Span, name string, ty *types.Type) {
+	if len(c.scope) == 0 {
+		return
+	}
+	if _, dup := c.scope[len(c.scope)-1][name]; dup {
+		// Shadowing is allowed in Zexi; this only guards against a completely
+		// identical re-declaration, which is still legal but noisy. Do nothing.
+	}
+	c.scope[len(c.scope)-1][name] = ty
+}
+
+// --- helpers --------------------------------------------------------------
+
+func isIntLiteral(e ast.Expr) bool {
+	l, ok := e.(*ast.LiteralExpr)
+	return ok && l.Kind == token.KindInteger
+}
+
+func isPrintable(t *types.Type) bool {
+	if t == nil {
+		return false
+	}
+	switch t.Kind {
+	case types.Str, types.Char, types.Bool:
+		return true
+	}
+	return t.Kind.IsNumeric()
+}
+
+func calleeName(e ast.Expr) (string, bool) {
+	switch x := e.(type) {
+	case *ast.IdentExpr:
+		return x.Name, true
+	case *ast.PathExpr:
+		if len(x.Segments) == 1 {
+			return x.Segments[0], true
+		}
+	}
+	return "", false
+}
+
+// --- constant evaluation --------------------------------------------------
+
+// ConstVal is a compile-time constant value.
+type ConstVal struct {
+	Ty      *types.Type
+	Int     int64
+	Uint    uint64
+	Float   float64
+	Str     string
+	Bool    bool
+	IsFloat bool
+	IsStr   bool
+	IsBool  bool
+}
+
+// evalConst folds a constant expression, supporting literals, unary minus, and
+// the arithmetic and bitwise binary operators over integer and float values.
+func (c *checker) evalConst(e ast.Expr) (ConstVal, bool) {
+	switch x := e.(type) {
+	case *ast.LiteralExpr:
+		return c.evalConstLiteral(x)
+	case *ast.UnExpr:
+		if x.Op != token.KindMinus && x.Op != token.KindBang {
+			return ConstVal{}, false
+		}
+		v, ok := c.evalConst(x.X)
+		if !ok {
+			return ConstVal{}, false
+		}
+		if v.IsFloat {
+			if x.Op == token.KindMinus {
+				v.Float = -v.Float
+			}
+			return v, true
+		}
+		if v.IsBool {
+			if x.Op == token.KindBang {
+				v.Bool = !v.Bool
+			}
+			return v, true
+		}
+		if x.Op == token.KindMinus {
+			v.Int = -v.Int
+			v.Uint = uint64(v.Int)
+		} else {
+			v.Int = ^v.Int
+			v.Uint = ^v.Uint
+		}
+		return v, true
+	case *ast.BinExpr:
+		return c.evalConstBinary(x)
+	}
+	return ConstVal{}, false
+}
+
+func (c *checker) evalConstLiteral(x *ast.LiteralExpr) (ConstVal, bool) {
+	switch x.Kind {
+	case token.KindInteger:
+		s := strings.ReplaceAll(x.Text, "_", "")
+		if i, err := strconv.ParseInt(s, 0, 64); err == nil {
+			return ConstVal{Ty: types.I32T, Int: i, Uint: uint64(i)}, true
+		}
+		if u, err := strconv.ParseUint(s, 0, 64); err == nil {
+			v := ConstVal{Ty: &types.Type{Kind: types.U64}, Uint: u, Int: int64(u)}
+			return v, true
+		}
+		return ConstVal{}, false
+	case token.KindFloat:
+		s := strings.ReplaceAll(x.Text, "_", "")
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return ConstVal{}, false
+		}
+		return ConstVal{Ty: types.F64T, Float: f, IsFloat: true}, true
+	case token.KindTrue:
+		return ConstVal{Ty: types.BoolT, Bool: true, IsBool: true}, true
+	case token.KindFalse:
+		return ConstVal{Ty: types.BoolT, Bool: false, IsBool: true}, true
+	case token.KindString, token.KindRawString:
+		return ConstVal{Ty: types.StrT, Str: x.Text, IsStr: true}, true
+	case token.KindChar:
+		r := firstRune(x.Text)
+		return ConstVal{Ty: types.CharT, Int: int64(r), Uint: uint64(r)}, true
+	case token.KindByteChar:
+		r := firstRune(x.Text)
+		return ConstVal{Ty: &types.Type{Kind: types.U8}, Int: int64(r), Uint: uint64(r)}, true
+	}
+	return ConstVal{}, false
+}
+
+func (c *checker) evalConstBinary(x *ast.BinExpr) (ConstVal, bool) {
+	l, ok := c.evalConst(x.L)
+	if !ok {
+		return ConstVal{}, false
+	}
+	r, ok := c.evalConst(x.R)
+	if !ok {
+		return ConstVal{}, false
+	}
+	if l.IsFloat || r.IsFloat {
+		lf, rf := l.Float, r.Float
+		if !l.IsFloat {
+			lf = float64(l.Int)
+		}
+		if !r.IsFloat {
+			rf = float64(r.Int)
+		}
+		var f float64
+		switch x.Op {
+		case token.KindPlus:
+			f = lf + rf
+		case token.KindMinus:
+			f = lf - rf
+		case token.KindStar:
+			f = lf * rf
+		case token.KindSlash:
+			f = lf / rf
+		default:
+			return ConstVal{}, false
+		}
+		return ConstVal{Ty: types.F64T, Float: f, IsFloat: true}, true
+	}
+	a, b := l.Int, r.Int
+	var out int64
+	switch x.Op {
+	case token.KindPlus:
+		out = a + b
+	case token.KindMinus:
+		out = a - b
+	case token.KindStar:
+		out = a * b
+	case token.KindSlash:
+		if b == 0 {
+			return ConstVal{}, false
+		}
+		out = a / b
+	case token.KindPercent:
+		if b == 0 {
+			return ConstVal{}, false
+		}
+		out = a % b
+	case token.KindAmp:
+		out = a & b
+	case token.KindPipe:
+		out = a | b
+	case token.KindCaret:
+		out = a ^ b
+	case token.KindShl:
+		out = a << uint(b)
+	case token.KindShr:
+		out = a >> uint(b)
+	default:
+		return ConstVal{}, false
+	}
+	return ConstVal{Ty: types.I32T, Int: out, Uint: uint64(out)}, true
+}
+
+// firstRune decodes the first decoded rune of a char literal's inner text.
+func firstRune(s string) rune {
+	r, _ := decodeCharInner(s)
+	return r
+}
+
+// decodeCharInner decodes one character (with escapes) from a char literal's
+// inner text.
+func decodeCharInner(s string) (rune, bool) {
+	if s == "" {
+		return 0, false
+	}
+	if s[0] != '\\' {
+		for _, r := range s {
+			return r, true
+		}
+		return 0, false
+	}
+	return decodeEscape(s[1:])
+}
+
+func decodeEscape(s string) (rune, bool) {
+	if s == "" {
+		return 0, false
+	}
+	switch s[0] {
+	case 'n':
+		return '\n', true
+	case 't':
+		return '\t', true
+	case 'r':
+		return '\r', true
+	case '0':
+		return 0, true
+	case '\\':
+		return '\\', true
+	case '\'':
+		return '\'', true
+	case '"':
+		return '"', true
+	case 'x':
+		if len(s) >= 3 {
+			if v, err := strconv.ParseUint(s[1:3], 16, 8); err == nil {
+				return rune(v), true
+			}
+		}
+	case 'u':
+		if len(s) >= 2 && s[1] == '{' {
+			if i := strings.IndexByte(s, '}'); i > 2 {
+				if v, err := strconv.ParseUint(s[2:i], 16, 32); err == nil {
+					return rune(v), true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+// DecodeString decodes the inner text of a string literal into its runtime
+// bytes, resolving the standard escapes.
+func DecodeString(s string) (string, bool) {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] != '\\' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		r, ok := decodeEscape(s[i+1:])
+		if !ok {
+			return "", false
+		}
+		b.WriteRune(r)
+		// Advance past the escape sequence.
+		i += 2
+		switch s[i-1] {
+		case 'x':
+			i += 2
+		case 'u':
+			if i < len(s) && s[i] == '{' {
+				for i < len(s) && s[i] != '}' {
+					i++
+				}
+				i++ // consume '}'
+			}
+		}
+	}
+	return b.String(), true
+}

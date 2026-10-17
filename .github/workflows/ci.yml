@@ -38,3 +38,6 @@ jobs:
 
       - name: Smoke test the front end
         run: go run ./cmd/zexic tokenize examples/hello.zx > /dev/null
+
+      - name: Compile and run a program
+        run: go run ./cmd/zexic run tests/tour.zx

@@ -1,30 +1,67 @@
-// Command zexic is the Zexi compiler driver. It is deliberately thin: argument
-// parsing, pipeline orchestration, and diagnostic rendering live here; every
-// stage lives in internal/.
+// Command zexic is the Zexi compiler driver. It parses the command line and
+// orchestrates the pipeline in internal/driver; every compiler stage lives
+// under internal/.
 //
 // Usage:
 //
 //	zexic <command> [options] <file.zx>
 //
-// Commands: check, build, run, tokenize, version.
-// See docs/04 §4.9 for the full planned CLI.
+// Commands: check, build, run, emit, tokenize, version.
+// See docs/04 §4.9 for the planned CLI surface.
 package main
 
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"zexi/internal/diag"
-	"zexi/internal/lexer"
-	"zexi/internal/parser"
+	"zexi/internal/driver"
 	"zexi/internal/token"
 )
 
-const version = "zexi 0.0.1 (design preview)"
+const version = "zexi 0.1.0 (M0-alpha: functions, control flow, printing)"
 
-func main() {
-	os.Exit(run(os.Args[1:]))
+func main() { os.Exit(run(os.Args[1:])) }
+
+// cli holds parsed command-line options.
+type cli struct {
+	positional []string
+	out        string
+	emit       string
+	optLevel   string
+	cc         string
+}
+
+func parseArgs(args []string) cli {
+	var c cli
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-o" && i+1 < len(args):
+			i++
+			c.out = args[i]
+		case strings.HasPrefix(a, "--output="):
+			c.out = strings.TrimPrefix(a, "--output=")
+		case strings.HasPrefix(a, "--emit="):
+			c.emit = strings.TrimPrefix(a, "--emit=")
+		case strings.HasPrefix(a, "--opt-level="):
+			c.optLevel = strings.TrimPrefix(a, "--opt-level=")
+		case strings.HasPrefix(a, "--cc="):
+			c.cc = strings.TrimPrefix(a, "--cc=")
+		case strings.HasPrefix(a, "-"):
+			// Unknown flag: ignore for forward compatibility.
+		default:
+			c.positional = append(c.positional, a)
+		}
+	}
+	return c
+}
+
+func (c cli) opts() driver.Options {
+	return driver.Options{OptLevel: c.optLevel, CC: c.cc}
 }
 
 func run(args []string) int {
@@ -32,9 +69,8 @@ func run(args []string) int {
 		usage(os.Stderr)
 		return 2
 	}
-
 	cmd := args[0]
-	rest := args[1:]
+	c := parseArgs(args[1:])
 
 	switch cmd {
 	case "version", "--version", "-V":
@@ -44,9 +80,15 @@ func run(args []string) int {
 		usage(os.Stdout)
 		return 0
 	case "tokenize":
-		return cmdTokenize(rest)
-	case "check", "build", "run":
-		return cmdPipeline(cmd, rest)
+		return cmdTokenize(c)
+	case "check":
+		return cmdCheck(c)
+	case "build":
+		return cmdBuild(c)
+	case "run":
+		return cmdRun(c)
+	case "emit":
+		return cmdEmit(c)
 	default:
 		fmt.Fprintf(os.Stderr, "zexic: unknown command %q\n", cmd)
 		usage(os.Stderr)
@@ -54,81 +96,122 @@ func run(args []string) int {
 	}
 }
 
-// cmdTokenize prints the token stream. It is the one end-to-end command that
-// works today and doubles as a debugging aid for the lexer.
-func cmdTokenize(args []string) int {
-	path, ok := firstFileArg(args)
-	if !ok {
-		fmt.Fprintln(os.Stderr, "zexic tokenize: expected a .zx file argument")
-		return 2
+func requireFile(c cli, cmd string) (string, bool) {
+	if len(c.positional) == 0 {
+		fmt.Fprintf(os.Stderr, "zexic %s: expected a .zx file argument\n", cmd)
+		return "", false
 	}
-	src, err := os.ReadFile(path)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "zexic: cannot read %s: %v\n", path, err)
-		return 2
-	}
+	return c.positional[0], true
+}
 
+func cmdTokenize(c cli) int {
+	path, ok := requireFile(c, "tokenize")
+	if !ok {
+		return 2
+	}
 	em := diag.NewEmitter()
-	fileID := em.AddFile(path, src)
-	lx := lexer.New(fileID, src)
-	for _, t := range lx.All() {
+	toks, fileID, ok := driver.Tokens(path, em)
+	if !ok {
+		em.Render(os.Stderr, fileID)
+		return 1
+	}
+	for _, t := range toks {
 		if t.Kind == token.KindEOF {
 			fmt.Printf("%d:%-3d  %s\n", t.Pos.Line, t.Pos.Col, t.Kind)
 			break
 		}
 		fmt.Printf("%d:%-3d  %s\n", t.Pos.Line, t.Pos.Col, t)
 	}
-	em.Report(lx.Errors()...)
-	if em.HasErrors() {
-		em.Render(os.Stderr, fileID)
-		return 1
-	}
 	return 0
 }
 
-// cmdPipeline runs the shared front end for check/build/run. Build and run are
-// gated on the parser/backends landing (docs/05).
-func cmdPipeline(cmd string, args []string) int {
-	path, ok := firstFileArg(args)
+func cmdCheck(c cli) int {
+	path, ok := requireFile(c, "check")
 	if !ok {
-		fmt.Fprintf(os.Stderr, "zexic %s: expected a .zx file argument\n", cmd)
 		return 2
 	}
-	src, err := os.ReadFile(path)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "zexic: cannot read %s: %v\n", path, err)
-		return 2
-	}
-
 	em := diag.NewEmitter()
-	fileID := em.AddFile(path, src)
+	art, ok := driver.FrontEnd(path, c.opts(), em)
+	if !ok {
+		em.Render(os.Stderr, emFileID(em))
+		return 1
+	}
+	fmt.Printf("%s: ok (%d function(s), %d constant(s))\n", filepath.Base(path), len(art.Info.FnOrder), len(art.Info.Consts))
+	return 0
+}
 
-	// Front end: lex -> parse. Later stages (resolve, check, borrowck, mir,
-	// codegen) slot in here in pipeline order.
-	_, parseDiags := parser.Parse(fileID, src)
-	em.Report(parseDiags...)
+func cmdBuild(c cli) int {
+	path, ok := requireFile(c, "build")
+	if !ok {
+		return 2
+	}
+	em := diag.NewEmitter()
+	out, ok := driver.Build(path, c.out, c.opts(), em)
+	if !ok {
+		em.Render(os.Stderr, emFileID(em))
+		return 1
+	}
+	fmt.Printf("built %s\n", out)
+	return 0
+}
 
-	if cmd != "check" && !em.HasErrors() {
-		fmt.Fprintf(os.Stderr, "zexic %s: code generation is not implemented yet; see docs/05 (M0 roadmap)\n", cmd)
+func cmdRun(c cli) int {
+	path, ok := requireFile(c, "run")
+	if !ok {
+		return 2
+	}
+	em := diag.NewEmitter()
+	dir, err := os.MkdirTemp("", "zexic-run-")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "zexic run: %v\n", err)
+		return 2
+	}
+	defer os.RemoveAll(dir)
+
+	out := filepath.Join(dir, driver.DefaultOutput(path))
+	if _, ok := driver.Build(path, out, c.opts(), em); !ok {
+		em.Render(os.Stderr, emFileID(em))
+		return 1
 	}
 
-	em.Render(os.Stderr, fileID)
-	if em.HasErrors() {
-		return 1
+	child := exec.Command(out)
+	child.Stdin = os.Stdin
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	if err := child.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return ee.ExitCode()
+		}
+		fmt.Fprintf(os.Stderr, "zexic run: %v\n", err)
+		return 2
 	}
 	return 0
 }
 
-// firstFileArg returns the first non-flag argument, i.e. the source path.
-func firstFileArg(args []string) (string, bool) {
-	for _, a := range args {
-		if strings.HasPrefix(a, "-") {
-			continue
-		}
-		return a, true
+func cmdEmit(c cli) int {
+	path, ok := requireFile(c, "emit")
+	if !ok {
+		return 2
 	}
-	return "", false
+	if c.emit == "" {
+		c.emit = "c"
+	}
+	if c.emit != "c" {
+		fmt.Fprintf(os.Stderr, "zexic emit: --emit=%s is not supported yet (try `c`)\n", c.emit)
+		return 2
+	}
+	em := diag.NewEmitter()
+	art, ok := driver.FrontEnd(path, c.opts(), em)
+	if !ok {
+		em.Render(os.Stderr, emFileID(em))
+		return 1
+	}
+	fmt.Print(art.CSrc)
+	return 0
 }
+
+// emFileID returns the id of the single source file registered with em, or 0.
+func emFileID(em *diag.Emitter) int { return em.FirstFileID() }
 
 func usage(w *os.File) {
 	fmt.Fprint(w, `zexi - the Zexi programming language compiler
@@ -137,18 +220,17 @@ usage:
   zexic <command> [options] <file.zx>
 
 commands:
-  check      parse, typecheck, and borrow-check only
+  check      parse, typecheck, and validate (no code generation)
   build      compile to a standalone native binary
   run        build to a temporary path and execute
-  tokenize   print the token stream (front end demo)
+  emit       print an intermediate form (--emit=c)
+  tokenize   print the token stream
   version    print the compiler version
-  help       show this message
 
-options (planned, see docs/04):
-  -o <path>                  output path
+options:
+  -o <path>                  output path for build
   --opt-level=<0|1|2|3|s>    optimization profile (default 2, 's' for size)
-  --target=<triple>          cross-compile
-  --static / --dynamic       link mode
-  --emit=<ast|hir|mir|c|asm|bin>
+  --cc=<path>                C compiler to use (default $CC or cc)
+  --emit=<c>                 intermediate form to print
 `)
 }

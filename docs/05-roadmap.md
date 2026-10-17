@@ -1,5 +1,15 @@
 # 5. Roadmap & Minimal Viable Feature Set
 
+> **Progress:** M0 is partially landed. Working today: lexer, parser, name
+> resolution, type inference, constant folding, and a C backend that produces a
+> runnable native binary. Implemented language surface: functions, `let`,
+> `const`, arithmetic/bitwise/comparison operators, `as` casts, `if`/`else`,
+> `while`, `loop`, `for i in a..b`, `return`/`break`/`continue`, and
+> `print`/`println`. Not yet implemented: structs, enums, `match`, `impl`,
+> slices/arrays as values, `Box`/heap, generics, modules, and the ownership /
+> borrow checker (M0's remaining and M1's first items). See
+> `docs/06-backend-strategy.md` for the backend status.
+
 The MVP is milestone **M0**: enough language to compile real, safe, small
 programs to standalone binaries, with every architectural seam in place so
 M1/M2 are additive.

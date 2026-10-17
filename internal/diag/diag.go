@@ -97,6 +97,15 @@ func (e *Emitter) AddFile(name string, src []byte) int {
 	return id
 }
 
+// FirstFileID returns the id of the first registered file, or -1 if none has
+// been added. It is a convenience for single-file compilation.
+func (e *Emitter) FirstFileID() int {
+	if len(e.files) == 0 {
+		return -1
+	}
+	return 0
+}
+
 // Report records a diagnostic. Passing zero Diagnostics is a no-op.
 func (e *Emitter) Report(ds ...Diagnostic) {
 	if len(ds) == 0 {
