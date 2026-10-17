@@ -1,0 +1,33 @@
+// examples/result.zx
+// Errors are values. `?` is the single piece of implicit control flow and it
+// is syntactically visible at the call site.
+
+enum ParseError { Empty, BadDigit(pos: usize) }
+
+fn parse_u32(s: &[u8]) -> Result<u32, ParseError> {
+    if s.len() == 0 { return Err(ParseError::Empty); }
+    let mut acc: u32 = 0;
+    let mut i: usize = 0;
+    while i < s.len() {
+        let c = s[i];
+        if c < b'0' || c > b'9' {
+            return Err(ParseError::BadDigit(i));
+        }
+        acc = acc * 10 + (c - b'0') as u32;
+        i += 1;
+    }
+    Ok(acc)
+}
+
+fn double(s: &[u8]) -> Result<u32, ParseError> {
+    let n = parse_u32(s)?;      // early-return on Err, erase the Ok
+    Ok(n * 2)
+}
+
+fn main() -> i32 {
+    match double(b"21") {
+        Ok(n) => { println(n); 0 }
+        Err(ParseError::Empty) => { println("empty"); 1 }
+        Err(ParseError::BadDigit(pos)) => { println(pos); 2 }
+    }
+}

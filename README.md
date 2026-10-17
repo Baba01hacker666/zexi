@@ -1,0 +1,52 @@
+# Zexi
+
+Zexi is an experimental systems programming language: **memory-safe like Rust, as small as C, as fast as Rust, with a minimalist surface like Rust — without the runtime baggage of Go.**
+
+This repository contains the **initial design and specification** of Zexi: the viable feature set (M0–M2) and the compiler architecture. The compiler is written in **Go**.
+
+> Status: design phase. The Go tree under `cmd/` and `internal/` is a front-end skeleton (working lexer) that pins down the architecture described in `docs/`.
+
+## TL;DR of the design
+
+| Concern | Decision |
+| --- | --- |
+| Source form | Expression-oriented, C/Rust-flavored, semicolon-terminated statements |
+| Memory safety | **Compile-time ownership + borrow checking**, no garbage collector |
+| Runtime | Freestanding, opt-in. Hello-world links a runtime of a few KB |
+| Compiler host lang | Go |
+| Backend (M0) | Emit **C11**, compile with the system `cc` / `clang` (portable, mature optimizer) |
+| Backend (M2+) | Native x86-64/ARM64 (or Cranelift) for full control of size & speed |
+| Output | A **standalone native binary**, direct syscalls or libc, static by default |
+| Generics | Monomorphized (zero-cost), no boxing, no reflection |
+| Binary size | Dead-code elimination at MIR, section GC, no std by default, `opt-level=size` |
+
+## Documents
+
+- [`docs/01-overview.md`](docs/01-overview.md) — vision, goals, non-goals, comparisons.
+- [`docs/02-language-spec.md`](docs/02-language-spec.md) — lexical & syntactic spec, type system, EBNF.
+- [`docs/03-memory-model.md`](docs/03-memory-model.md) — ownership, borrows, lifetimes, `unsafe`.
+- [`docs/04-compiler-architecture.md`](docs/04-compiler-architecture.md) — Go pipeline, IRs, passes, backends.
+- [`docs/05-roadmap.md`](docs/05-roadmap.md) — M0/M1/M2 milestones and the minimal viable feature set.
+- [`examples/`](examples/) — illustrative Zexi programs (not yet compilable by the skeleton).
+
+## Repository layout
+
+```
+cmd/zexic/            compiler driver (CLI entry point)
+internal/
+  token/              token kinds + positions
+  lexer/              hand-written lexer (working)
+  ast/                syntax tree
+  parser/             recursive-descent parser (stub, M0)
+  diag/               diagnostics + source spans
+docs/                 the specification
+examples/             sample Zexi source
+```
+
+## Try the skeleton
+
+```sh
+go build ./...
+go test ./...
+go run ./cmd/zexic tokenize examples/hello.zx
+```

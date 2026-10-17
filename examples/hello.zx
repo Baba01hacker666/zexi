@@ -1,0 +1,8 @@
+// examples/hello.zx
+// M0 target: compiles to a standalone binary; printing goes through a thin
+// syscall/libc wrapper because there is no default std.
+
+fn main() -> i32 {
+    println("hello, zexi");
+    0
+}

@@ -1,0 +1,32 @@
+// examples/ownership.zx
+// Demonstrates the memory model: moves, borrows, and stack/heap values.
+
+struct Point { x: f64, y: f64 }
+
+impl Point {
+    fn len_sq(self) -> f64 { self.x * self.x + self.y * self.y }
+}
+
+fn consume(p: Point) -> f64 {
+    p.len_sq()          // `p` is owned here; dropped at end of scope
+}
+
+fn rand_point() -> Point {
+    // Non-Copy :: allocated on the stack at the call site (return slot),
+    // no hidden heap allocation.
+    Point { x: 3.0, y: 4.0 }
+}
+
+fn main() -> i32 {
+    let p = rand_point();
+    let d = consume(p);          // move: `p` is unusable after this line
+    // println(p.x);             // ERROR[E0382]: use of moved value `p`
+
+    let mut q = rand_point();
+    let r = &q;                  // shared borrow
+    println(r.x);
+    // q.x = 0.0;                // ERROR[E0502]: cannot assign while borrowed
+    q.x = 1.0;                   // ok: `r` is no longer used (NLL, M1)
+    println(d);
+    0
+}

@@ -1,0 +1,30 @@
+# Build output
+/zexic
+/zexi
+*.exe
+*.out
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+
+# Compiled Zexi artifacts and emitted intermediates
+*.zx.c
+*.gch
+
+# Go
+/bin/
+/dist/
+vendor/
+coverage.out
+*.test
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local tooling
+/tmp/
