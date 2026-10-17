@@ -223,7 +223,10 @@ Rules:
 
 - Values have a single owner. Assignment/parameter-passing **moves** non-`Copy`
   values.
-- `Copy` types (primitives, tuples/arrays of `Copy`) are copied, not moved.
+- `Copy` types are copied, not moved. Primitives, references, and pointers are
+  `Copy`; arrays/tuples are `Copy` when their components are. **Structs and
+  enums are move-only by default** and opt into copying with `#[copy]` (all
+  fields must then be `Copy`), mirroring Rust's `derive(Copy)`.
 - A value is dropped (its `Drop::drop` runs, then its memory is freed if owned)
   at the end of its owner's scope, or at the last use (**non-lexical lifetimes**,
   M1; M0 uses lexical scopes).

@@ -63,6 +63,7 @@ type Struct struct {
 	Name   string
 	Fields []Field
 	Tuple  bool
+	Copy   bool // opt-in via `#[copy]`
 }
 
 // Field is one struct field.
@@ -86,6 +87,7 @@ func (s *Struct) Field(name string) (*Field, bool) {
 type Enum struct {
 	Name     string
 	Variants []Variant
+	Copy     bool // opt-in via `#[copy]`
 }
 
 // Variant is one case of an enum. Variants with no fields are unit variants.
@@ -220,15 +222,16 @@ func Equal(a, b *Type) bool {
 
 // IsCopy reports whether values of this type are copied on assignment rather
 // than moved. Primitives, references, pointers, and function pointers are
-// copyable; aggregates are copyable iff all of their components are.
+// copyable. Structs and enums are *not* copyable unless declared `#[copy]`
+// (with all fields copyable). Arrays and tuples copy iff their components do.
 func (t *Type) IsCopy() bool {
 	if t == nil {
 		return true
 	}
 	switch t.Kind {
 	case StructKind:
-		if t.St == nil {
-			return true
+		if t.St == nil || !t.St.Copy {
+			return false
 		}
 		for _, f := range t.St.Fields {
 			if !f.Ty.IsCopy() {
@@ -237,8 +240,8 @@ func (t *Type) IsCopy() bool {
 		}
 		return true
 	case EnumKind:
-		if t.En == nil {
-			return true
+		if t.En == nil || !t.En.Copy {
+			return false
 		}
 		for _, v := range t.En.Variants {
 			for _, f := range v.Fields {
@@ -262,6 +265,16 @@ func (t *Type) IsCopy() bool {
 	default:
 		return true
 	}
+}
+
+// CopyAttr reports whether an attribute list opts a type into `Copy`.
+func CopyAttr(attrs []string) bool {
+	for _, a := range attrs {
+		if a == "copy" {
+			return true
+		}
+	}
+	return false
 }
 
 // String renders a type for diagnostics.

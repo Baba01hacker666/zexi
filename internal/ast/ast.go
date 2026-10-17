@@ -72,6 +72,7 @@ type GenericParam struct {
 // StructDecl is a struct definition.
 type StructDecl struct {
 	Vis    Visibility
+	Attrs  []string
 	Name   string
 	Fields []Field
 	Tuple  bool // true for `struct S(T, U);`
@@ -92,6 +93,7 @@ type Field struct {
 // EnumDecl is a tagged-union definition.
 type EnumDecl struct {
 	Vis      Visibility
+	Attrs    []string
 	Name     string
 	Variants []Variant
 	Sp       token.Span

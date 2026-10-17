@@ -4,18 +4,31 @@ Zexi is an experimental systems programming language: **memory-safe like Rust, a
 
 This repository contains the **initial design and specification** of Zexi: the viable feature set (M0–M2) and the compiler architecture. The compiler is written in **Go**.
 
-> Status: **M0-alpha, working end to end.** `zexic` parses, type-checks, lowers
-> to C, and links a **native binary** you can run. The supported subset is
-> functions, `let`, `const`, arithmetic, comparisons, casts, `if`/`else`,
-> `while`, `loop`, `for i in a..b`, and `print`/`println`. Structs, enums,
-> `match`, `impl`, generics, and the ownership checker are designed but not yet
-> implemented — see `docs/05-roadmap.md`.
+> Status: **M0-alpha, working end to end.** `zexic` parses, type-checks, runs a
+> flow-sensitive move checker, lowers to C, and links a **native binary** you can
+> run.
+>
+> Implemented: functions and recursion; `let`/`const`; integer/float/bool/char/
+> `str` values; arithmetic, bitwise, comparison, and logical operators; `as`
+> casts; `if`/`else`; `while`/`loop`/`for i in a..b`; `print`/`println`; `len`;
+> **structs** (named and tuple) with **`impl` methods** (`self`, `&self`,
+> `&mut self`); **enums** with tuple/struct/unit variants and **`match`** with
+> exhaustiveness checking; **first-class arrays** with bounds-checked indexing;
+> and a **use-after-move checker** for non-`Copy` values (opt into copying with
+> `#[copy]`).
+>
+> Not yet implemented: generics, traits/`impl Trait`, modules/`use`, heap types
+> (`Box`/`Vec`/`String`), `Drop`/destructors, borrow-lifetime analysis, and
+> `Result`/`?`. See `docs/05-roadmap.md`.
 
 ## Try it
 
 ```sh
 go build ./...
 go run ./cmd/zexic run tests/tour.zx      # compile + run a real program
+go run ./cmd/zexic run tests/structs.zx   # structs, methods, #[copy]
+go run ./cmd/zexic run tests/enums.zx     # enums + match
+go run ./cmd/zexic run tests/arrays.zx    # arrays + bounds checks
 go run ./cmd/zexic run examples/hello.zx
 go run ./cmd/zexic emit --emit=c tests/tour.zx   # inspect the generated C
 ```
@@ -59,7 +72,8 @@ internal/
   ast/                syntax tree
   parser/             recursive-descent + Pratt parser (working, fuzz-tested)
   types/              semantic type representation
-  sema/               name resolution, type inference, constant folding
+  sema/               name resolution, type inference, constant folding,
+                      and the flow-sensitive move checker (own.go)
   codegen/c/          M0 backend: typed program -> C11
   driver/             pipeline orchestration + C compiler invocation
   diag/               diagnostics + source spans

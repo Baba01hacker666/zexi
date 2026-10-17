@@ -1,14 +1,18 @@
 # 5. Roadmap & Minimal Viable Feature Set
 
-> **Progress:** M0 is partially landed. Working today: lexer, parser, name
-> resolution, type inference, constant folding, and a C backend that produces a
-> runnable native binary. Implemented language surface: functions, `let`,
-> `const`, arithmetic/bitwise/comparison operators, `as` casts, `if`/`else`,
-> `while`, `loop`, `for i in a..b`, `return`/`break`/`continue`, and
-> `print`/`println`. Not yet implemented: structs, enums, `match`, `impl`,
-> slices/arrays as values, `Box`/heap, generics, modules, and the ownership /
-> borrow checker (M0's remaining and M1's first items). See
-> `docs/06-backend-strategy.md` for the backend status.
+> **Progress:** M0 is largely landed. Working today: lexer, parser, name
+> resolution, bidirectional type inference, constant folding, a flow-sensitive
+> move checker, and a C backend that produces a runnable native binary.
+> Implemented language surface: functions and recursion; `let`/`const`;
+> integer/float/bool/char/`str`; arithmetic, bitwise, comparison, and logical
+> operators; `as` casts; `if`/`else`; `while`/`loop`/`for i in a..b`;
+> `print`/`println`; `len`; structs (named and tuple) with `impl` methods
+> (`self`, `&self`, `&mut self`); enums (unit/tuple/struct variants) with
+> `match` and exhaustiveness checking; first-class arrays with bounds-checked
+> indexing; and use-after-move errors for non-`Copy` values (`#[copy]` opts in).
+> Not yet implemented: generics, traits, modules/`use`, heap types
+> (`Box`/`Vec`/`String`), `Drop`, borrow-lifetime analysis, and `Result`/`?`.
+> See `docs/06-backend-strategy.md` for the backend status.
 
 The MVP is milestone **M0**: enough language to compile real, safe, small
 programs to standalone binaries, with every architectural seam in place so

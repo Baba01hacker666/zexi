@@ -6,8 +6,13 @@ struct Point { x: f64, y: f64 }
 
 struct Rect { lo: Point, hi: Point }
 
+// `#[copy]` opts a struct into copy semantics (like Rust's `derive(Copy)`).
+// Without it, structs are move-only.
+#[copy]
+struct Vec2 { x: f64, y: f64 }
+
 impl Point {
-    fn len_sq(self) -> f64 {
+    fn len_sq(&self) -> f64 {
         return self.x * self.x + self.y * self.y;
     }
 
@@ -53,6 +58,11 @@ fn main() -> i32 {
     let mut r2 = r;
     r2.hi.y = 10.0;
     println(r2.area());
+
+    // `Vec2` is `#[copy]`, so assignment copies rather than moves.
+    let v0 = Vec2 { x: 1.0, y: 2.0 };
+    let v1 = v0;
+    println(v0.x + v1.x);
 
     0
 }

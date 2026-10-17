@@ -105,7 +105,7 @@ func (p *parser) parseFile() *ast.File {
 // parseItem parses a top-level declaration, including its attributes and
 // visibility.
 func (p *parser) parseItem() ast.Item {
-	p.skipAttributes()
+	attrs := p.parseAttributes()
 
 	vis := ast.Visibility(p.accept(token.KindPub))
 	start := p.cur().Pos.Offset
@@ -127,9 +127,9 @@ func (p *parser) parseItem() ast.Item {
 	case token.KindExtern:
 		return p.parseExternFn(vis, start)
 	case token.KindStruct:
-		return p.parseStruct(vis, start)
+		return p.parseStruct(vis, attrs, start)
 	case token.KindEnum:
-		return p.parseEnum(vis, start)
+		return p.parseEnum(vis, attrs, start)
 	case token.KindConst:
 		return p.parseConst(vis, start)
 	case token.KindType:
@@ -146,13 +146,18 @@ func (p *parser) parseItem() ast.Item {
 	}
 }
 
-// skipAttributes consumes `#[...]` attribute lists, ignoring their contents for
-// now (attributes are an M1 feature).
-func (p *parser) skipAttributes() {
+// parseAttributes consumes `#[...]` attribute lists and returns the top-level
+// attribute names (for example `copy` in `#[copy]`). Nested/complex attributes
+// are consumed but their contents ignored.
+func (p *parser) parseAttributes() []string {
+	var attrs []string
 	for p.at(token.KindHash) {
 		p.bump()
 		if _, ok := p.expect(token.KindLBracket, " after `#`"); !ok {
-			return
+			return attrs
+		}
+		if p.at(token.KindIdentifier) {
+			attrs = append(attrs, p.cur().Lit)
 		}
 		depth := 1
 		for depth > 0 && !p.at(token.KindEOF) {
@@ -165,7 +170,11 @@ func (p *parser) skipAttributes() {
 			p.bump()
 		}
 	}
+	return attrs
 }
+
+// skipAttributes consumes and discards attribute lists.
+func (p *parser) skipAttributes() { _ = p.parseAttributes() }
 
 func (p *parser) parseFn(vis ast.Visibility, start token.Pos) ast.Item {
 	p.bump() // fn
@@ -255,7 +264,7 @@ func (p *parser) parseParams() []ast.Param {
 	return params
 }
 
-func (p *parser) parseStruct(vis ast.Visibility, start token.Pos) ast.Item {
+func (p *parser) parseStruct(vis ast.Visibility, attrs []string, start token.Pos) ast.Item {
 	p.bump() // struct
 	name, ok := p.expectIdent("struct name")
 	if !ok {
@@ -265,7 +274,7 @@ func (p *parser) parseStruct(vis ast.Visibility, start token.Pos) ast.Item {
 		p.errf(p.cur(), "E0900", "generics are not supported yet (design milestone M1)")
 		p.skipGenericArgs()
 	}
-	d := &ast.StructDecl{Vis: vis, Name: name}
+	d := &ast.StructDecl{Vis: vis, Attrs: attrs, Name: name}
 	switch {
 	case p.accept(token.KindSemicolon):
 	case p.at(token.KindLBrace):
@@ -305,7 +314,7 @@ func (p *parser) parseStruct(vis ast.Visibility, start token.Pos) ast.Item {
 	return d
 }
 
-func (p *parser) parseEnum(vis ast.Visibility, start token.Pos) ast.Item {
+func (p *parser) parseEnum(vis ast.Visibility, attrs []string, start token.Pos) ast.Item {
 	p.bump() // enum
 	name, ok := p.expectIdent("enum name")
 	if !ok {
@@ -315,7 +324,7 @@ func (p *parser) parseEnum(vis ast.Visibility, start token.Pos) ast.Item {
 		p.errf(p.cur(), "E0900", "generics are not supported yet (design milestone M1)")
 		p.skipGenericArgs()
 	}
-	d := &ast.EnumDecl{Vis: vis, Name: name}
+	d := &ast.EnumDecl{Vis: vis, Attrs: attrs, Name: name}
 	if _, ok := p.expect(token.KindLBrace, " to begin enum body"); !ok {
 		return d
 	}

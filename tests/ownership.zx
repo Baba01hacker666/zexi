@@ -1,0 +1,31 @@
+// tests/ownership.zx
+// Move semantics for non-`Copy` values, the `#[copy]` opt-in, and borrows:
+// `id()` takes `&self` (borrow), `consume` takes `Buffer` by value (move).
+
+struct Buffer { id: i64 }
+
+#[copy]
+struct Handle { id: i64 }
+
+impl Buffer {
+    fn id(&self) -> i64 {
+        return self.id;
+    }
+}
+
+fn consume(b: Buffer) -> i64 {
+    return b.id;
+}
+
+fn main() -> i32 {
+    let b = Buffer { id: 7 };
+    println(b.id()); // shared borrow: does not move `b`
+    let n = consume(b); // moves `b`
+    println(n);
+
+    let h = Handle { id: 42 };
+    let h2 = h; // `Handle` is `#[copy]`: copies, so `h` stays usable
+    println(h.id + h2.id);
+
+    0
+}

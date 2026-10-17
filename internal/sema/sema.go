@@ -102,6 +102,7 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 	}
 	c.collect()
 	c.checkBodies()
+	c.checkOwnership()
 	c.info.Main = c.info.Fns["main"]
 	if c.info.Main == nil {
 		c.errf(token.Span{}, "E0601", "no `main` function found")
@@ -176,7 +177,7 @@ func (c *checker) registerEnum(d *ast.EnumDecl) {
 		c.errf(d.Sp, "E0428", "the enum `%s` is defined multiple times", d.Name)
 		return
 	}
-	en := &types.Enum{Name: d.Name}
+	en := &types.Enum{Name: d.Name, Copy: types.CopyAttr(d.Attrs)}
 	c.info.Enums[d.Name] = en
 	c.info.EnumOrd = append(c.info.EnumOrd, en)
 }
@@ -205,6 +206,15 @@ func (c *checker) collectEnumVariants(d *ast.EnumDecl) {
 		}
 		en.Variants = append(en.Variants, tv)
 	}
+	if en.Copy {
+		for _, v := range en.Variants {
+			for _, f := range v.Fields {
+				if !f.Ty.IsCopy() {
+					c.errf(d.Sp, "E0204", "`#[copy]` enum `%s` has non-Copy field of type `%s` in variant `%s`", en.Name, f.Ty, v.Name)
+				}
+			}
+		}
+	}
 }
 
 func (c *checker) registerStruct(d *ast.StructDecl) {
@@ -212,7 +222,7 @@ func (c *checker) registerStruct(d *ast.StructDecl) {
 		c.errf(d.Sp, "E0428", "the struct `%s` is defined multiple times", d.Name)
 		return
 	}
-	st := &types.Struct{Name: d.Name, Tuple: d.Tuple}
+	st := &types.Struct{Name: d.Name, Tuple: d.Tuple, Copy: types.CopyAttr(d.Attrs)}
 	c.info.Structs[d.Name] = st
 	c.info.StructOrd = append(c.info.StructOrd, st)
 }
@@ -232,6 +242,13 @@ func (c *checker) collectStructFields(d *ast.StructDecl) {
 			ft = &types.Type{Kind: types.Invalid}
 		}
 		st.Fields = append(st.Fields, types.Field{Name: name, Ty: ft, Pub: bool(f.Vis)})
+	}
+	if st.Copy {
+		for _, f := range st.Fields {
+			if !f.Ty.IsCopy() {
+				c.errf(d.Sp, "E0204", "`#[copy]` struct `%s` has non-Copy field `%s` of type `%s`", st.Name, f.Name, f.Ty)
+			}
+		}
 	}
 }
 
