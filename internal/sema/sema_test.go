@@ -1065,3 +1065,28 @@ fn main() -> i32 { let p = P { x: 1 }; println(f"{p}"); 0 }`)
 		t.Fatalf("expected E0277 for struct interpolation, got ok=%v codes=%v", ok, codes)
 	}
 }
+
+func TestCBridgeBuiltins(t *testing.T) {
+	// cstr borrows a String (it is not moved), from_cstr owns a copy.
+	src := `extern "C" fn puts2(s: *u8) -> i32;
+fn main() -> i32 {
+    let s = String::from("hi");
+    let n = puts2(cstr(s));
+    println(s);
+    let back = from_cstr(cstr(s));
+    println(back, n);
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	// cstr needs a string, from_cstr needs a pointer.
+	ok, codes := check(t, `fn main() -> i32 { let p = cstr(42); 0 }`)
+	if ok || !has(codes, "E0308") {
+		t.Fatalf("expected E0308 for cstr(int), got ok=%v codes=%v", ok, codes)
+	}
+	ok, codes = check(t, `fn main() -> i32 { let s = from_cstr("literal"); println(s); 0 }`)
+	if ok || !has(codes, "E0308") {
+		t.Fatalf("expected E0308 for from_cstr(str), got ok=%v codes=%v", ok, codes)
+	}
+}

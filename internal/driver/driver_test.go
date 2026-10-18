@@ -20,6 +20,7 @@ func TestTypeCheckExamples(t *testing.T) {
 	files := []string{
 		"../../examples/hello.zx",
 		"../../examples/easy.zx",
+		"../../examples/cbridge.zx",
 		"../../tests/tour.zx",
 		"../../tests/structs.zx",
 		"../../tests/enums.zx",
@@ -358,5 +359,60 @@ func TestUseMissingLibrary(t *testing.T) {
 	em.Render(&buf, em.FirstFileID())
 	if !strings.Contains(buf.String(), "E9022") {
 		t.Fatalf("expected E9022, got:\n%s", buf.String())
+	}
+}
+
+// TestCBridge builds a Zexi program that calls C code: a glue .c file
+// compiled in with Options.CFiles and libm linked with Options.LinkLibs.
+// It exercises the whole bridge — extern declarations, `str` pass-through,
+// `cstr`/`from_cstr` marshalling, and the extra link inputs.
+func TestCBridge(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	glue := `#include <string.h>
+int zx_add(int a, int b) { return a + b; }
+int zx_exclaim_len(const char *s) { return (int)strlen(s) + 1; }
+int zx_count_a(const char *s) { int n = 0; for (; *s; s++) { if (*s == 'a') n++; } return n; }
+const char *zx_motto(void) { return "fast and small"; }
+`
+	main := `extern "C" fn zx_add(a: i32, b: i32) -> i32;
+extern "C" fn zx_exclaim_len(s: str) -> i32;
+extern "C" fn zx_count_a(s: *u8) -> i32;
+extern "C" fn zx_motto() -> *u8;
+extern "C" fn sqrt(x: f64) -> f64;
+fn main() -> i32 {
+    println(zx_add(20, 22));
+    println(zx_exclaim_len("zexi"));
+    let motto = from_cstr(zx_motto());
+    println(motto);
+    println(zx_count_a(cstr(motto)));
+    println(sqrt(2.25));
+    0
+}
+`
+	gluePath := filepath.Join(dir, "glue.c")
+	mainPath := filepath.Join(dir, "main.zx")
+	if err := os.WriteFile(gluePath, []byte(glue), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mainPath, []byte(main), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	opts := driver.Options{CFiles: []string{gluePath}, LinkLibs: []string{"m"}}
+	if _, ok := driver.Build(mainPath, out, opts, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("C bridge build failed")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running bridged program: %v", err)
+	}
+	want := "42\n5\nfast and small\n3\n1.5\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
 	}
 }

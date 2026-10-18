@@ -8,6 +8,12 @@ This repository contains the **initial design and specification** of Zexi: the v
 > flow-sensitive move checker, lowers to C, and links a **native binary** you can
 > run.
 >
+> **C bridge:** since Zexi compiles to C, C libraries are first-class —
+> `extern "C"` declarations (generated from headers by `zexic bindgen`),
+> `cstr`/`from_cstr` string marshalling, and `--csrc`/`--link` to compile
+> and link C code in (see `docs/09-c-bridge.md` and `examples/cbridge.zx`;
+> `lib/http.zx` is a full worked example over BSD sockets).
+>
 > Easy to write, like Python: `#` or `//` comments; semicolons optional at
 > line ends; `f"hello, {name}!"` string interpolation; default arguments
 > (`fn area(w: i64, h: i64 = 10)`) and named arguments (`area(h = 4, w = 2)`);
