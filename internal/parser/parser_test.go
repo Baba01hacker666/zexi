@@ -107,3 +107,23 @@ func TestMatchGuardsAndJumpsInArmBodies(t *testing.T) {
 		t.Fatalf("unexpected diagnostics: %d", n)
 	}
 }
+
+// TestMatchArmCommaOptionalAfterBlock covers the Rust-like rule that a match arm
+// whose body ends in `}` may omit its trailing comma.
+func TestMatchArmCommaOptionalAfterBlock(t *testing.T) {
+	src := `fn main() -> i32 {
+    match 1 {
+        0 => { println(0) }
+        x if x == 1 => if true { println(1) } else { println(2) }
+        _ => { println(3) },
+    }
+    0
+}`
+	if _, n := parse(t, src); n != 0 {
+		t.Fatalf("unexpected diagnostics: %d", n)
+	}
+	// A non-block body still requires a comma before another arm.
+	if _, n := parse(t, "fn main() -> i32 { match 1 { 0 => 1 1 => 2 }; 0 }"); n == 0 {
+		t.Fatalf("expected a diagnostic for a missing comma")
+	}
+}

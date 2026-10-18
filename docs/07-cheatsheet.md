@@ -131,7 +131,8 @@ match n {
 ```
 
 `break`, `continue`, and `return` may be used directly as an arm body
-(`_ => continue`).
+(`_ => continue`). The comma after an arm is optional when the body ends in `}`
+(`0 => { a() } _ => { b() }`).
 
 ## 7.9 Arrays
 

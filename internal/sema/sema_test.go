@@ -473,3 +473,36 @@ func TestConstRange(t *testing.T) {
 		})
 	}
 }
+
+// TestReturnTypePropagation covers bidirectional inference for a function body's
+// trailing expression and the branches of a trailing `if`/`match`.
+func TestReturnTypePropagation(t *testing.T) {
+	accepted := []struct{ name, src string }{
+		{"int-literal-tail", "fn f() -> i64 { 5 }\nfn main() -> i32 { println(f()); 0 }"},
+		{"u8-literal-tail", "fn f() -> u8 { 200 }\nfn main() -> i32 { println(f() as i32); 0 }"},
+		{"if-branches", "fn f(c: bool) -> i64 { if c { 1 } else { 2 } }\nfn main() -> i32 { println(f(true)); 0 }"},
+		{"match-arms", "fn f(n: i32) -> i64 { match n { 0 => 10, _ => 20 } }\nfn main() -> i32 { println(f(0)); 0 }"},
+		{"annotated-let-if", "fn main() -> i32 { let x: i64 = if true { 1 } else { 2 }; println(x); 0 }"},
+		{"annotated-let-match", "fn main() -> i32 { let x: u8 = match 0 { 0 => 1, _ => 2 }; println(x as i32); 0 }"},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			if ok, codes := check(t, tc.src); !ok {
+				t.Fatalf("expected clean, got %v", codes)
+			}
+		})
+	}
+
+	rejected := []struct{ name, src, code string }{
+		{"literal-too-big-for-tail", "fn f() -> u8 { 300 }\nfn main() -> i32 { println(f() as i32); 0 }", "E0080"},
+		{"bad-branch", "fn f(c: bool) -> i64 { if c { 1 } else { \"s\" } }\nfn main() -> i32 { println(f(true)); 0 }", "E0308"},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			if ok || !has(codes, tc.code) {
+				t.Fatalf("expected %s, got %v", tc.code, codes)
+			}
+		})
+	}
+}

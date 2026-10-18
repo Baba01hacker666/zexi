@@ -200,7 +200,11 @@ Traits provide bounds; `dyn Trait` gives type-erased dynamic dispatch (M2).
 
 - **Static, strong, nominal** for structs/enums; `dyn Trait` is structural.
 - **Inference:** bidirectional (like Rust). Only *local* inference; function
-  signatures are always explicit. Un-annotated integer literals default `i32`.
+  signatures are always explicit. Un-annotated integer literals default `i32`,
+  but wherever the expected type is known — a `let` annotation, a function's
+  return type, an `if`/`match` branch in such a position, a call argument — an
+  integer literal adopts it (`fn f() -> i64 { 5 }` and
+  `let x: u8 = 1;` both work).
 - **No implicit conversions**, including `i32 -> i64` and `bool -> int`. Use
   `as` for primitive casts; `as` between numeric types is the only implicit-ish
   operation and is explicit. Pointer/`unsafe` casts live in `unsafe`.

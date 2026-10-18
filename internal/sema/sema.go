@@ -510,9 +510,14 @@ func (c *checker) checkBodies() {
 			// `&self` methods may not mutate the receiver.
 			c.markMut("self", false)
 		}
-		bt := c.checkBlock(fn.Decl.Body)
+		var want *types.Type
 		if fn.Ret.Kind != types.Unit {
-			if !c.exprAlwaysReturns(fn.Decl.Body) && bt.Kind != types.Never {
+			want = fn.Ret
+		}
+		bt := c.checkBlockWith(fn.Decl.Body, want)
+		if fn.Ret.Kind != types.Unit {
+			// An invalid body type has already been diagnosed; don't pile on.
+			if !c.exprAlwaysReturns(fn.Decl.Body) && bt.Kind != types.Never && bt.Kind != types.Invalid {
 				if !c.assignable(fn.Ret, bt) {
 					c.errf(fn.Decl.Body.Sp, "E0308", "function `%s` returns `%s` but its body has type `%s`", fn.Name, fn.Ret, bt)
 				}
@@ -551,14 +556,20 @@ func (c *checker) blockAlwaysReturns(b *ast.Block) bool {
 	return false
 }
 
-func (c *checker) checkBlock(b *ast.Block) *types.Type {
+func (c *checker) checkBlock(b *ast.Block) *types.Type { return c.checkBlockWith(b, nil) }
+
+// checkBlockWith type-checks a block, giving its trailing expression `want` as
+// the expected type. This is how a function body's tail adopts the declared
+// return type (`fn f() -> i64 { 5 }`), and how the branches of a tail `if`/
+// `match` learn it too.
+func (c *checker) checkBlockWith(b *ast.Block, want *types.Type) *types.Type {
 	c.pushScope()
 	defer c.popScope()
 	for _, s := range b.Stmts {
 		c.checkStmt(s)
 	}
 	if b.Tail != nil {
-		t := c.checkExpr(b.Tail, nil)
+		t := c.checkExpr(b.Tail, want)
 		c.info.Types[b] = t
 		return t
 	}
@@ -679,7 +690,7 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		return nil
 
 	case *ast.Block:
-		return c.checkBlock(x)
+		return c.checkBlockWith(x, expected)
 
 	case *ast.UnExpr:
 		return c.inferUnary(x, expected)
@@ -709,7 +720,7 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		return c.inferCall(x)
 
 	case *ast.IfExpr:
-		return c.inferIf(x)
+		return c.inferIf(x, expected)
 
 	case *ast.LoopExpr:
 		return c.inferLoop(x)
@@ -718,7 +729,7 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		return c.inferJump(x)
 
 	case *ast.MatchExpr:
-		return c.inferMatch(x)
+		return c.inferMatch(x, expected)
 	case *ast.FieldExpr:
 		return c.inferField(x)
 	case *ast.MethodCallExpr:
@@ -1246,13 +1257,18 @@ func isCatchAll(p ast.Pattern) bool {
 	return false
 }
 
-func (c *checker) inferMatch(x *ast.MatchExpr) *types.Type {
+func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type {
 	st := c.checkExpr(x.Scrutinee, nil)
 	base := recvBase(st)
 	if base == nil || (base.Kind != types.EnumKind && !base.Kind.IsInt()) {
 		c.errAt(x.Scrutinee, "E0308", "`match` requires an enum or integer scrutinee, found `%s`", st)
 	}
 	var result *types.Type
+	if expected != nil && expected.Kind != types.Unit && expected.Kind != types.Never && expected.Kind != types.Invalid {
+		// The context may fix the result type (e.g. `fn f() -> i64 { match .. }`),
+		// so that literal arms adopt it.
+		result = expected
+	}
 	covered := map[string]bool{}
 	catchAll := false
 	for _, arm := range x.Arms {
@@ -1561,12 +1577,12 @@ func (c *checker) inferPrint(x *ast.CallExpr, name string) *types.Type {
 	return types.UnitT
 }
 
-func (c *checker) inferIf(x *ast.IfExpr) *types.Type {
+func (c *checker) inferIf(x *ast.IfExpr, expected *types.Type) *types.Type {
 	ct := c.checkExpr(x.Cond, types.BoolT)
 	if ct.Kind != types.Bool {
 		c.errAt(x.Cond, "E0308", "`if` condition must be `bool`, found `%s`", ct)
 	}
-	thenT := c.checkBlock(x.Then)
+	thenT := c.checkBlockWith(x.Then, expected)
 	if x.Else == nil {
 		if thenT.Kind != types.Unit && thenT.Kind != types.Never {
 			c.errf(x.Sp, "E0317", "`if` without `else` must have type `()`; found `%s`", thenT)

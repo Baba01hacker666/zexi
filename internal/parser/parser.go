@@ -1013,6 +1013,16 @@ func (p *parser) parseIf() ast.Expr {
 	return e
 }
 
+// isBlockLikeExpr reports whether e ends in `}`, so that a match arm using it as
+// its body may omit the trailing comma.
+func isBlockLikeExpr(e ast.Expr) bool {
+	switch e.(type) {
+	case *ast.Block, *ast.IfExpr, *ast.MatchExpr, *ast.LoopExpr:
+		return true
+	}
+	return false
+}
+
 func (p *parser) parseMatch() ast.Expr {
 	start := p.cur().Pos.Offset
 	p.bump() // match
@@ -1035,7 +1045,9 @@ func (p *parser) parseMatch() ast.Expr {
 		arm.Sp = p.spanFrom(astart)
 		m.Arms = append(m.Arms, arm)
 		if !p.accept(token.KindComma) {
-			if !p.at(token.KindRBrace) {
+			// A block-like body ends with `}`, so the comma is optional (as in
+			// Rust): `0 => { a() } _ => { b() }`.
+			if !p.at(token.KindRBrace) && !isBlockLikeExpr(arm.Body) {
 				break
 			}
 		}
