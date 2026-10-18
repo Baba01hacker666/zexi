@@ -99,6 +99,12 @@ func (m *mover) declarePat(p ast.Pattern) {
 	switch pt := p.(type) {
 	case *ast.BindPat:
 		m.declare(pt.Name)
+	case *ast.OrPat:
+		for _, alt := range pt.Alts {
+			m.declarePat(alt)
+		}
+	case *ast.RangePat:
+		// binds nothing
 	case *ast.PathPat:
 		for _, sub := range pt.Sub {
 			m.declarePat(sub)
@@ -137,6 +143,10 @@ func (m *mover) stmt(s ast.Stmt) {
 		}
 		m.declarePat(st.Pat)
 	case *ast.ExprStmt:
+		m.use(st.X)
+	case *ast.DeferStmt:
+		// Checked here, at the point of the `defer`: a deferred expression
+		// may not use a value that gets moved before the scope exits.
 		m.use(st.X)
 	}
 }
@@ -204,6 +214,13 @@ func (m *mover) use(e ast.Expr) {
 		}
 	case *ast.TryExpr:
 		m.use(x.X)
+	case *ast.InterpStrExpr:
+		// Interpolation reads (borrows) its values; it never moves them.
+		for _, part := range x.Parts {
+			m.use(part)
+		}
+	case *ast.NamedArgExpr:
+		m.use(x.Val)
 	}
 }
 
@@ -264,6 +281,17 @@ func (m *mover) consume(e ast.Expr) {
 }
 
 func (m *mover) call(x *ast.CallExpr) {
+	// A tuple-struct construction moves each non-Copy argument into a field.
+	if st := m.c.info.TupleCtors[x]; st != nil {
+		for i, a := range x.Args {
+			if i < len(st.Fields) && !st.Fields[i].Ty.IsCopy() {
+				m.consume(a)
+			} else {
+				m.use(a)
+			}
+		}
+		return
+	}
 	fn := m.c.info.Resolved[x]
 	for i, a := range x.Args {
 		if fn != nil && i < len(fn.Params) && !fn.Params[i].IsCopy() {

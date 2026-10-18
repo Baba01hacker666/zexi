@@ -21,7 +21,12 @@ fn main() -> i32 {
 const MAX: i32 = 100;
 const GREETING = "hello";        // type inferred
 
+type Meters = i64;               // a `type` alias is the same type everywhere
+type Distance = Meters;          // aliases may chain
+type Scores = [i32; 2];          // ... and may name compound types
+
 struct Point { x: f64, y: f64 }  // move-only by default
+struct Pair(i32, i32);           // tuple struct: `Pair(3, 4)`, fields `.0`/`.1`
 
 #[copy]                          // opt into copy semantics
 struct Vec2 { x: f64, y: f64 }
@@ -57,8 +62,9 @@ conversion.)
 42  1_000  0xFF  0b1010  0o755     // integers
 3.14  1e9  2.5e-3                  // floats
 true  false                        // bool
-'Z'  '\n'  '\u{1F600}'             // char
-"hi\n"  "élan"  r"C:\path"         // str
+'Z'  '\n'  '\u{1F600}'             // char (exactly one character)
+"hi\n"  "élan"  r"C:\path"         // str; raw strings take backslashes literally
+r#"say "hi""#  r##"a #" b"##       // raw strings with `#`s may contain quotes
 ```
 
 ## 7.5 Bindings
@@ -98,8 +104,18 @@ if n < 0 {
 // ... or as an expression that yields a value
 let s = if n < 0 { -1 } else if n == 0 { 0 } else { 1 };
 
+// `elif` is `else if` without the extra keyword
+if n < 0 {
+    return "negative";
+} elif n == 0 {
+    return "zero";
+} else {
+    return "positive";
+}
+
 // loops
 while i < 5 { sum += i; i += 1; }
+until i >= 5 { sum += i; i += 1; }   // `until` loops while the condition is false
 
 let mut n = 0;
 loop { n += 1; if n == 3 { break; } }
@@ -114,9 +130,37 @@ for k in 1..=4 { acc += k; }   // inclusive range; 1..4 is exclusive
 ```
 
 `return`, `break`, and `continue` work in every loop. Only `loop` yields a value
-from `break`; `while`/`for` always evaluate to `()`. A `loop` with no `break` at
-all has the never type, so `fn f() -> i32 { loop { return 1; } }` is fine. A
-block's value is its trailing expression (no `;`).
+from `break`; `while`/`until`/`for` always evaluate to `()`. A `loop` with no
+`break` at all has the never type, so `fn f() -> i32 { loop { return 1; } }` is
+fine. A block's value is its trailing expression (no `;`).
+
+`if let` runs a block when a pattern matches, and `while let` loops while it
+keeps matching (the scrutinee is re-evaluated each iteration). Both are sugar
+over `match`, and take the same patterns:
+
+```zx
+if let Shape::Circle(r) = shape {
+    println(r);
+} else {
+    println("not a circle");
+}
+
+while let Step::More(v) = next(i) {
+    total += v;
+    i += 1;
+}
+```
+
+`defer expr;` schedules an expression to run when the enclosing *block* scope
+exits — by falling off the end or via `return`/`break`/`continue`. Defers in
+one scope run last-in-first-out, are evaluated at exit time (so they see the
+locals' final values), and run before that scope's destructors:
+
+```zx
+let mut s = String::from("x");
+defer println(s);   // prints "xy": it runs at scope exit
+s.push_str("y");
+```
 
 ## 7.8 `match`
 
@@ -143,10 +187,43 @@ match n {
 }
 ```
 
-The scrutinee may be an `enum`, an integer, a `bool`, or a `char`. Integers and
+The scrutinee may be an `enum`, an integer, a `bool`, a `char`, or a `str`. Integers and
 `char`s need a `_` arm; a `bool` may instead cover both `true` and `false`.
 Negative literal patterns are allowed (`-1 => ..`), out-of-range patterns are
 rejected (`E0080`), and duplicate literal arms are rejected (`E0001`).
+
+Alternatives may be combined with `|` (or-patterns) and ranges. Or-pattern
+alternatives may not bind variables; a range must not be empty (`5..=1` is
+`E0080`), and ranges do not by themselves make a match exhaustive:
+
+```zx
+match n {
+    0 => "zero",
+    1 | 2 | 3 => "small",
+    4..=6 => "mid",
+    7..10 => "high",
+    _ => "huge",
+}
+match c {
+    'a'..='z' => "lower",
+    'A'..='Z' => "upper",
+    _ => "other",
+}
+```
+
+A binding may be declared mutable inside a pattern: `Shape::Circle(mut r)`.
+Pattern bindings in a `let` use `let mut` as usual.
+
+Strings match too (compared by value, needs a `_` arm) — handy for
+command dispatch; match a `String` via `.as_str()`:
+
+```zx
+match arg_at(1).as_str() {
+    "quit" | "exit" => 0,
+    "help" => 1,
+    _ => 2,
+}
+```
 
 `break`, `continue`, and `return` may be used directly as an arm body
 (`_ => continue`). The comma after an arm is optional when the body ends in `}`
@@ -210,8 +287,60 @@ let m = big as i32;    // truncating integer cast
 let f = 3 as f64;
 ```
 
-## 7.13 Not implemented yet (roadmap M1+)
+## 7.13 Writing it the easy way
 
-Generics, traits, `mod`/`use`, `Vec`/`Box`, user-defined `Drop`, tuples,
-borrow-lifetime (NLL) analysis, `Result`/`?`, and enum variants that own
-resources. See [`05-roadmap.md`](05-roadmap.md) for the plan.
+Zexi borrows Python's ergonomics where they cost nothing at run time:
+
+```zx
+#!/usr/bin/env zexi          # `#` comments work (so do `//` and `/* */`);
+// Semicolons are optional: a newline ends a statement. Keep them if you like.
+let a = 1
+let b = 2;
+
+let name = "world"
+println(f"hello, {name}! 1 + 2 = {1 + 2}")   // interpolation, type String
+
+fn area(w: i64, h: i64 = 10) -> i64 { w * h }  // default argument
+area(5)              // 50
+area(5, h = 3)       // 15 — named (keyword) arguments, any order
+area(h = 4, w = 2)   // 8
+
+fn greet() { println("hi") }   // no return type needed when returning ()
+```
+
+- Defaults must be constant expressions (`= 10`, `= 20 + 22`, `= SOME_CONST`),
+  and only trailing parameters may have them.
+- In `f"..."`, `{{` and `}}` are literal braces. Interpolated values are
+  borrowed, never moved, and must be printable (numbers, `bool`, `char`,
+  `str`, `String`).
+
+Libraries: `use` imports whole files into your program — their `pub`
+functions, structs, enums, and constants become available unqualified.
+
+```zx
+use "helpers.zx";   // a file next to yours (path relative to your file)
+use math;           // standard library: searched next to your file, in a
+use std::text;      //   lib/ folder beside it, then in the embedded stdlib
+```
+
+Every file is loaded at most once and import cycles are harmless. The
+embedded standard library (sources in `internal/driver/std/`) currently has
+`math` (`mini`, `maxi`, `clampi`, `absi`, `signi`, `is_even`, `gcdi`,
+`powi`, `minf`, `maxf`, `clampf`, `absf`), `text` (`repeat_text`,
+`exclaim`, `pad_start`, `join_with`, `shout`), `io` (`read_line`,
+`prompt_line`), and `random` (`seed_random`, `seed_from_time`, `rand_int`,
+`rand_bool`, `rand_float`). Passing extra `.zx` files on the command line
+(`zexic run main.zx lib.zx`) still works too.
+
+Command-line arguments are builtins: `arg_count()` counts them (index 0
+is the program name) and `arg_at(i)` returns argument `i` as a `String`
+(`""` when out of range) — see `examples/args.zx`. For a complete small
+program that ties it all together, see `examples/guess.zx`.
+
+## 7.14 Not implemented yet (roadmap M1+)
+
+Generics, traits, `mod`, `Vec`/`Box`, user-defined `Drop`, tuple values
+(tuple *structs* exist; `(a, b)` values and destructuring do not yet),
+borrow-lifetime (NLL) analysis, `Result`/`?`, bindings inside or-patterns,
+nested patterns, and enum variants that own resources. See
+[`05-roadmap.md`](05-roadmap.md) for the plan.

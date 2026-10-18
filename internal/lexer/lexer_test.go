@@ -130,3 +130,66 @@ func FuzzLexer(f *testing.F) {
 		}
 	})
 }
+
+func TestNewKeywords(t *testing.T) {
+	eq(t, "until elif defer",
+		token.KindUntil, token.KindElif, token.KindDefer)
+}
+
+func TestRawStringWithHashes(t *testing.T) {
+	lx := lexer.New(0, []byte(`r#"say "hi""# r##"a #" b"## r"plain"`))
+	toks := lx.All()
+	if errs := lx.Errors(); len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	want := []string{`say "hi"`, `a #" b`, "plain"}
+	if len(toks) < 3 {
+		t.Fatalf("got %v", toks)
+	}
+	for i, w := range want {
+		if toks[i].Kind != token.KindRawString || toks[i].Lit != w {
+			t.Fatalf("token %d = %v, want raw string %q", i, toks[i], w)
+		}
+	}
+}
+
+func TestUnderscorePlacementErrors(t *testing.T) {
+	for _, src := range []string{"1__2", "1_", "0x_FF", "0b1__0"} {
+		lx := lexer.New(0, []byte(src))
+		lx.All()
+		errs := lx.Errors()
+		if len(errs) == 0 || errs[0].Code != "E0005" {
+			t.Fatalf("lex(%q): expected E0005, got %v", src, errs)
+		}
+	}
+	eq(t, "1_000 0xFF_FF", token.KindInteger, token.KindInteger)
+}
+
+func TestHashCommentAndFStringTokens(t *testing.T) {
+	lx := lexer.New(0, []byte("# a comment\nlet x = f\"a {x} b\" # trailing\n#[copy]"))
+	var kinds []token.Kind
+	var fstr string
+	for _, tk := range lx.All() {
+		kinds = append(kinds, tk.Kind)
+		if tk.Kind == token.KindFString {
+			fstr = tk.Lit
+		}
+	}
+	if errs := lx.Errors(); len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if fstr != "a {x} b" {
+		t.Fatalf("f-string literal = %q, want %q", fstr, "a {x} b")
+	}
+	// The attribute form `#[...]` must survive: `#` opens a comment
+	// unless it is immediately followed by `[`.
+	foundHash := false
+	for _, k := range kinds {
+		if k == token.KindHash {
+			foundHash = true
+		}
+	}
+	if !foundHash {
+		t.Fatal("expected a Hash token for #[copy]")
+	}
+}

@@ -1,0 +1,35 @@
+// random — small random helpers over the C library's rand(),
+// part of the Zexi standard library. Import with `use random;`.
+
+extern "C" fn rand() -> i32;
+extern "C" fn srand(seed: u32);
+extern "C" fn time(t: *mut i64) -> i64;
+
+// seed_random seeds the generator with an explicit value (same seed,
+// same sequence — handy for tests and reproducible games).
+pub fn seed_random(seed: i64) {
+    srand(seed as u32);
+}
+
+// seed_from_time seeds the generator from the wall clock.
+pub fn seed_from_time() {
+    let mut slot: i64 = 0;
+    srand(time(&mut slot) as u32);
+}
+
+// rand_int returns a random integer in [lo, hi], inclusive on both
+// ends (like Python's randint). With no room to vary it returns lo.
+pub fn rand_int(lo: i64, hi: i64) -> i64 {
+    if hi <= lo { return lo; }
+    lo + (rand() as i64) % (hi - lo + 1)
+}
+
+// rand_bool returns true or false with roughly even odds.
+pub fn rand_bool() -> bool {
+    rand() % 2 == 0
+}
+
+// rand_float returns a random float in [0.0, 1.0].
+pub fn rand_float() -> f64 {
+    (rand() as f64) / 2147483647.0
+}

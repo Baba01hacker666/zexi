@@ -10,8 +10,10 @@ package sema
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"zexi/internal/ast"
 	"zexi/internal/diag"
@@ -25,11 +27,17 @@ type Fn struct {
 	Name     string
 	QualName string // "Point::len_sq" for methods, else Name
 	Params   []*types.Type
-	Ret      *types.Type
-	Self     *SelfParam
-	Recv     *types.Type // receiver type for methods (struct or enum), else nil
-	Extern   bool
-	ABI      string
+	// ParamNames and Defaults are aligned with Params (the receiver, when
+	// present, occupies slot 0 with an empty name and no default).
+	// Defaults[i] is the materialized literal for parameter i's default
+	// value, or nil when the argument is required.
+	ParamNames []string
+	Defaults   []ast.Expr
+	Ret        *types.Type
+	Self       *SelfParam
+	Recv       *types.Type // receiver type for methods (struct or enum), else nil
+	Extern     bool
+	ABI        string
 }
 
 // SelfParam describes a method receiver.
@@ -65,9 +73,11 @@ type Info struct {
 	StructOrd  []*types.Struct
 	Enums      map[string]*types.Enum
 	EnumOrd    []*types.Enum
-	Methods    map[string]map[string]*Fn // struct name -> method name -> fn
-	Resolved   map[ast.Expr]*Fn          // resolved call / method target
-	Ctors      map[ast.Expr]*Ctor        // resolved enum-variant construction
+	Methods    map[string]map[string]*Fn  // struct name -> method name -> fn
+	Resolved   map[ast.Expr]*Fn           // resolved call / method target
+	Ctors      map[ast.Expr]*Ctor         // resolved enum-variant construction
+	TupleCtors map[ast.Expr]*types.Struct // resolved tuple-struct construction
+	Aliases    map[string]*types.Type     // resolved `type` aliases
 	PatVariant map[ast.Pattern]*types.Variant
 	Types      map[ast.Expr]*types.Type
 	DeclTypes  map[ast.Stmt]*types.Type
@@ -95,10 +105,15 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 			Methods:    map[string]map[string]*Fn{},
 			Resolved:   map[ast.Expr]*Fn{},
 			Ctors:      map[ast.Expr]*Ctor{},
+			TupleCtors: map[ast.Expr]*types.Struct{},
+			Aliases:    map[string]*types.Type{},
 			PatVariant: map[ast.Pattern]*types.Variant{},
 			Types:      map[ast.Expr]*types.Type{},
 			DeclTypes:  map[ast.Stmt]*types.Type{},
 		},
+		aliasDecls: map[string]*ast.TypeAlias{},
+		aliasTypes: map[string]*types.Type{},
+		aliasBusy:  map[string]bool{},
 	}
 	c.collect()
 	c.checkBodies()
@@ -117,6 +132,10 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 type checker struct {
 	info *Info
 	errs []diag.Diagnostic
+
+	aliasDecls map[string]*ast.TypeAlias
+	aliasTypes map[string]*types.Type
+	aliasBusy  map[string]bool
 
 	scope     []map[string]*types.Type // local bindings, innermost last
 	mutScope  []map[string]bool        // mutability of tracked bindings (else permissive)
@@ -147,22 +166,45 @@ func (c *checker) errAt(e ast.Expr, code, format string, args ...any) {
 // --- collection pass ------------------------------------------------------
 
 func (c *checker) collect() {
-	// Pass 1: register struct and enum names so fields can refer to one
-	// another.
+	// Pass 1: register struct, enum, and type-alias names so fields can refer
+	// to one another.
 	for _, it := range c.info.File.Items {
 		switch d := it.(type) {
 		case *ast.StructDecl:
 			c.registerStruct(d)
 		case *ast.EnumDecl:
 			c.registerEnum(d)
+		case *ast.TypeAlias:
+			c.registerAlias(d)
 		}
 	}
 	// Pass 2: constants, so their values are available to array lengths and
-	// other constant positions in the declarations below.
+	// other constant positions in the declarations below. A constant may
+	// refer to one declared later in the file, so collect to a fixpoint and
+	// only then report the ones that never became constant.
+	var pending []*ast.ConstDecl
 	for _, it := range c.info.File.Items {
 		if d, ok := it.(*ast.ConstDecl); ok {
-			c.collectConst(d)
+			pending = append(pending, d)
 		}
+	}
+	for len(pending) > 0 {
+		progress := false
+		var rest []*ast.ConstDecl
+		for _, d := range pending {
+			if c.tryCollectConst(d) {
+				progress = true
+			} else {
+				rest = append(rest, d)
+			}
+		}
+		if !progress {
+			for _, d := range rest {
+				c.errf(d.Val.Span(), "E0602", "constant `%s` is not a compile-time constant expression", d.Name)
+			}
+			break
+		}
+		pending = rest
 	}
 	// Pass 3: fill in struct fields and enum variants.
 	for _, it := range c.info.File.Items {
@@ -180,17 +222,70 @@ func (c *checker) collect() {
 			c.collectFn(d, false, "")
 		case *ast.ImplBlock:
 			c.collectImpl(d)
-		case *ast.TypeAlias:
-			c.errf(d.Sp, "E0900", "`type` aliases are not supported by the compiler yet (roadmap M1)")
 		case *ast.ModDecl:
 			c.errf(d.Sp, "E0900", "`mod` is not supported by the compiler yet (roadmap M1)")
 		case *ast.UseDecl:
 			c.errf(d.Sp, "E0900", "`use` is not supported by the compiler yet (roadmap M1)")
 		}
 	}
+	// Resolve every alias eagerly, so unknown or cyclic aliases are reported
+	// even when nothing uses them.
+	for _, it := range c.info.File.Items {
+		if d, ok := it.(*ast.TypeAlias); ok {
+			c.resolveAlias(d.Name, d.Sp)
+		}
+	}
 	// Finally, reject types that contain themselves by value: they have
 	// infinite size and cannot be emitted as a C struct.
 	c.checkTypeCycles()
+}
+
+// registerAlias records a `type Name = Ty;` declaration. Aliases share the
+// type namespace, so the name must not collide with a struct, enum, builtin,
+// or another alias.
+func (c *checker) registerAlias(d *ast.TypeAlias) {
+	if _, dup := c.aliasDecls[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the type alias `%s` is defined multiple times", d.Name)
+		return
+	}
+	if _, dup := c.info.Structs[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
+		return
+	}
+	if _, dup := c.info.Enums[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
+		return
+	}
+	if _, dup := types.Builtins[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
+		return
+	}
+	c.aliasDecls[d.Name] = d
+}
+
+// resolveAlias resolves an alias name to the type it stands for, recursively
+// (an alias may name another alias). Cyclic aliases are rejected.
+func (c *checker) resolveAlias(name string, sp token.Span) *types.Type {
+	if t, ok := c.aliasTypes[name]; ok {
+		return t
+	}
+	d, ok := c.aliasDecls[name]
+	if !ok {
+		return nil
+	}
+	if c.aliasBusy[name] {
+		c.errf(sp, "E0072", "type alias `%s` is cyclic", name)
+		return &types.Type{Kind: types.Invalid}
+	}
+	c.aliasBusy[name] = true
+	t := c.resolveType(d.Ty)
+	delete(c.aliasBusy, name)
+	if t == nil {
+		t = &types.Type{Kind: types.Invalid}
+	}
+	c.aliasTypes[name] = t
+	c.info.Aliases[name] = t
+	return t
 }
 
 // checkTypeCycles rejects structs and enums that reach themselves through
@@ -270,6 +365,10 @@ func (c *checker) registerEnum(d *ast.EnumDecl) {
 		c.errf(d.Sp, "E0428", "the enum `%s` is defined multiple times", d.Name)
 		return
 	}
+	if _, dup := c.aliasDecls[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
+		return
+	}
 	en := &types.Enum{Name: d.Name, Copy: types.CopyAttr(d.Attrs)}
 	c.info.Enums[d.Name] = en
 	c.info.EnumOrd = append(c.info.EnumOrd, en)
@@ -319,6 +418,10 @@ func (c *checker) collectEnumVariants(d *ast.EnumDecl) {
 func (c *checker) registerStruct(d *ast.StructDecl) {
 	if _, dup := c.info.Structs[d.Name]; dup {
 		c.errf(d.Sp, "E0428", "the struct `%s` is defined multiple times", d.Name)
+		return
+	}
+	if _, dup := c.aliasDecls[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
 		return
 	}
 	st := &types.Struct{Name: d.Name, Tuple: d.Tuple, Copy: types.CopyAttr(d.Attrs)}
@@ -437,6 +540,53 @@ func (c *checker) makeFn(d *ast.FnDecl, recv *types.Type) *Fn {
 		}
 		fn.Params = append(fn.Params, pt)
 	}
+	// Parameter names and default values, aligned with Params. A default
+	// must be a constant expression (a literal, a `const`, or arithmetic
+	// over those); it is materialized once, here, as a literal that call
+	// sites can substitute for an omitted argument.
+	seenDefault := false
+	for _, p := range d.Params {
+		if p.Self {
+			// Match the loop above: an invalid `self` (a top-level function)
+			// reported E0424 and appended no type, so it must not append a
+			// name/default slot either — Params and ParamNames would skew.
+			if recv == nil {
+				continue
+			}
+			fn.ParamNames = append(fn.ParamNames, "")
+			fn.Defaults = append(fn.Defaults, nil)
+			continue
+		}
+		fn.ParamNames = append(fn.ParamNames, p.Name)
+		fn.Defaults = append(fn.Defaults, nil)
+		if p.Default == nil {
+			if seenDefault {
+				c.errf(p.Sp, "E0061", "parameter `%s` without a default value follows a parameter with one", p.Name)
+			}
+			continue
+		}
+		seenDefault = true
+		pt := fn.Params[len(fn.ParamNames)-1]
+		if lit, ok := p.Default.(*ast.LiteralExpr); ok {
+			// A literal default stands as-is; check it against the
+			// parameter type once, here, so a bad default is reported
+			// even if the function is never called.
+			c.checkExpr(lit, pt)
+			fn.Defaults[len(fn.Defaults)-1] = lit
+			continue
+		}
+		cv, ok := c.evalConst(p.Default)
+		if !ok {
+			c.errf(p.Default.Span(), "E0602", "default value for parameter `%s` is not a constant expression", p.Name)
+			continue
+		}
+		lit := constLiteralFor(cv, pt, p.Default.Span())
+		if lit == nil {
+			c.errf(p.Default.Span(), "E0602", "default value for parameter `%s` cannot be used as `%s`", p.Name, pt)
+			continue
+		}
+		fn.Defaults[len(fn.Defaults)-1] = lit
+	}
 	if d.Ret != nil {
 		fn.Ret = c.resolveType(d.Ret)
 	}
@@ -471,10 +621,14 @@ func typePathName(t ast.Type) string {
 	return "<error>"
 }
 
-func (c *checker) collectConst(d *ast.ConstDecl) {
+// tryCollectConst folds and registers one constant. It returns false only
+// when the value is not (yet) a compile-time constant — for example because
+// it refers to a constant declared later, which the fixpoint loop in collect
+// retries. All other outcomes (success and hard errors) return true.
+func (c *checker) tryCollectConst(d *ast.ConstDecl) bool {
 	if _, dup := c.info.Consts[d.Name]; dup {
 		c.errf(d.Sp, "E0428", "the constant `%s` is defined multiple times", d.Name)
-		return
+		return true
 	}
 	var declared *types.Type
 	if d.Ty != nil {
@@ -482,24 +636,24 @@ func (c *checker) collectConst(d *ast.ConstDecl) {
 	}
 	val, ok := c.evalConst(d.Val)
 	if !ok {
-		c.errf(d.Val.Span(), "E0602", "constant `%s` is not a compile-time constant expression", d.Name)
-		return
+		return false
 	}
 	if declared != nil {
 		if val.Untyped && declared.Kind.IsInt() && declared.Kind != types.Invalid {
 			if !intValFits(val, declared) {
 				c.errf(d.Val.Span(), "E0080", "constant `%s` does not fit in `%s`", d.Name, declared)
-				return
+				return true
 			}
 			val.Ty = declared
 		} else if !c.assignable(declared, val.Ty) {
 			c.errf(d.Val.Span(), "E0308", "mismatched types: expected `%s`, found `%s`", declared, val.Ty)
-			return
+			return true
 		} else {
 			val.Ty = declared
 		}
 	}
 	c.info.Consts[d.Name] = &Const{Decl: d, Name: d.Name, Ty: val.Ty, Val: val}
+	return true
 }
 
 // --- body checking --------------------------------------------------------
@@ -626,11 +780,113 @@ func (c *checker) checkStmt(s ast.Stmt) {
 		if bp, ok := st.Pat.(*ast.BindPat); ok {
 			c.markMut(bp.Name, st.Mut)
 		}
+	case *ast.DeferStmt:
+		if exprHasJump(st.X) {
+			c.errf(st.Sp, "E0268", "`return`, `break`, and `continue` cannot be used inside a `defer` expression")
+		}
+		c.checkExpr(st.X, nil)
 	case *ast.ExprStmt:
 		c.checkExpr(st.X, nil)
 	default:
 		c.errf(s.Span(), "E0900", "unsupported statement")
 	}
+}
+
+// exprHasJump reports whether e contains a `return`, `break`, or `continue`
+// anywhere inside it. Such jumps cannot be deferred: the deferred expression
+// runs at scope exit, where the jump's target no longer exists.
+func exprHasJump(e ast.Expr) bool {
+	switch x := e.(type) {
+	case nil:
+		return false
+	case *ast.JumpExpr:
+		return true
+	case *ast.Block:
+		for _, s := range x.Stmts {
+			switch st := s.(type) {
+			case *ast.LetStmt:
+				if exprHasJump(st.Val) {
+					return true
+				}
+			case *ast.DeferStmt:
+				if exprHasJump(st.X) {
+					return true
+				}
+			case *ast.ExprStmt:
+				if exprHasJump(st.X) {
+					return true
+				}
+			}
+		}
+		return exprHasJump(x.Tail)
+	case *ast.BinExpr:
+		return exprHasJump(x.L) || exprHasJump(x.R)
+	case *ast.UnExpr:
+		return exprHasJump(x.X)
+	case *ast.CastExpr:
+		return exprHasJump(x.X)
+	case *ast.TryExpr:
+		return exprHasJump(x.X)
+	case *ast.AssignExpr:
+		return exprHasJump(x.Lhs) || exprHasJump(x.Rhs)
+	case *ast.FieldExpr:
+		return exprHasJump(x.Recv)
+	case *ast.IndexExpr:
+		return exprHasJump(x.Recv) || exprHasJump(x.Index)
+	case *ast.CallExpr:
+		if exprHasJump(x.Callee) {
+			return true
+		}
+		for _, a := range x.Args {
+			if exprHasJump(a) {
+				return true
+			}
+		}
+	case *ast.MethodCallExpr:
+		if exprHasJump(x.Recv) {
+			return true
+		}
+		for _, a := range x.Args {
+			if exprHasJump(a) {
+				return true
+			}
+		}
+	case *ast.StructLitExpr:
+		for _, f := range x.Fields {
+			if exprHasJump(f.Val) {
+				return true
+			}
+		}
+	case *ast.ArrayLitExpr:
+		if exprHasJump(x.Value) || exprHasJump(x.Count) {
+			return true
+		}
+		for _, el := range x.Elems {
+			if exprHasJump(el) {
+				return true
+			}
+		}
+	case *ast.TupleExpr:
+		for _, el := range x.Elems {
+			if exprHasJump(el) {
+				return true
+			}
+		}
+	case *ast.IfExpr:
+		return exprHasJump(x.Cond) || exprHasJump(x.Then) || exprHasJump(x.Else)
+	case *ast.LoopExpr:
+		return exprHasJump(x.Cond) || exprHasJump(x.Iter) || exprHasJump(x.Body)
+	case *ast.MatchExpr:
+		if exprHasJump(x.Scrutinee) {
+			return true
+		}
+		for _, a := range x.Arms {
+			if exprHasJump(a.Guard) || exprHasJump(a.Body) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (c *checker) bindPattern(p ast.Pattern, ty *types.Type, let bool) {
@@ -746,6 +1002,26 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		return c.inferField(x)
 	case *ast.MethodCallExpr:
 		return c.inferMethodCall(x)
+	case *ast.InterpStrExpr:
+		// `f"...{expr}..."`: literal chunks are plain strings; every
+		// interpolated expression must have a printable type. The result
+		// is an owning `String`.
+		for _, part := range x.Parts {
+			at := c.checkExpr(part, nil)
+			if _, isLit := part.(*ast.LiteralExpr); isLit {
+				continue
+			}
+			if at != nil && at.Kind != types.Invalid && !isPrintable(at) {
+				c.errAt(part, "E0277", "value of type `%s` cannot be interpolated into a string", at)
+			}
+		}
+		return types.StringT
+	case *ast.NamedArgExpr:
+		// Named arguments are rewritten by resolveArgs before their
+		// values are checked; reaching here means the call target does
+		// not accept them (a builtin, constructor, or variant).
+		c.errAt(x, "E0061", "named arguments are only supported for function and method calls")
+		return c.checkExpr(x.Val, nil)
 	case *ast.StructLitExpr:
 		return c.inferStructLit(x)
 	case *ast.IndexExpr:
@@ -818,13 +1094,77 @@ func (c *checker) inferLiteral(x *ast.LiteralExpr, expected *types.Type) *types.
 		// Raw strings are not decoded, so escapes are literal text.
 		return types.StrT
 	case token.KindChar:
-		c.checkEscapes(x)
+		if _, ok := decodeCharLiteral(x.Text); !ok {
+			c.errf(x.Sp, "E0001", "char literal must contain exactly one character")
+		}
 		return types.CharT
 	case token.KindByteChar:
-		c.checkEscapes(x)
+		if r, ok := decodeCharLiteral(x.Text); !ok || r > 0xFF {
+			c.errf(x.Sp, "E0001", "byte literal must contain exactly one byte")
+		}
 		return &types.Type{Kind: types.U8}
 	}
 	return nil
+}
+
+// editDistance is the Levenshtein distance between two names, for
+// "did you mean" suggestions.
+func editDistance(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	prev := make([]int, len(rb)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ra); i++ {
+		cur := make([]int, len(rb)+1)
+		cur[0] = i
+		for j := 1; j <= len(rb); j++ {
+			cost := 0
+			if ra[i-1] != rb[j-1] {
+				cost = 1
+			}
+			cur[j] = min3(cur[j-1]+1, prev[j]+1, prev[j-1]+cost)
+		}
+		prev = cur
+	}
+	return prev[len(rb)]
+}
+
+func min3(a, b, c int) int {
+	if a < b {
+		if a < c {
+			return a
+		}
+		return c
+	}
+	if b < c {
+		return b
+	}
+	return c
+}
+
+// suggestName returns " (did you mean `x`?)" when one of the candidates
+// is within edit distance 2 of name, and "" otherwise. Candidates are
+// sorted first so a tie between two equally-distant suggestions resolves
+// to the same one every run (callers build the list by ranging over Go
+// maps, whose iteration order is randomized).
+func suggestName(name string, candidates []string) string {
+	sorted := make([]string, len(candidates))
+	copy(sorted, candidates)
+	sort.Strings(sorted)
+	best, bestD := "", 3
+	for _, cand := range sorted {
+		if cand == name {
+			continue
+		}
+		if d := editDistance(name, cand); d < bestD {
+			best, bestD = cand, d
+		}
+	}
+	if best == "" {
+		return ""
+	}
+	return fmt.Sprintf(" (did you mean `%s`?)", best)
 }
 
 func (c *checker) inferIdent(name string, sp token.Span) *types.Type {
@@ -843,7 +1183,19 @@ func (c *checker) inferIdent(name string, sp token.Span) *types.Type {
 	if fn, ok := c.info.Fns[name]; ok {
 		return &types.Type{Kind: types.Fn, Params: fn.Params, Ret: fn.Ret}
 	}
-	c.errf(sp, "E0425", "cannot find `%s` in this scope", name)
+	var cands []string
+	for i := len(c.scope) - 1; i >= 0; i-- {
+		for n := range c.scope[i] {
+			cands = append(cands, n)
+		}
+	}
+	for n := range c.info.Consts {
+		cands = append(cands, n)
+	}
+	for n := range c.info.Fns {
+		cands = append(cands, n)
+	}
+	c.errf(sp, "E0425", "cannot find `%s` in this scope%s", name, suggestName(name, cands))
 	return nil
 }
 
@@ -1079,9 +1431,51 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 	if name == "len" {
 		return c.inferLen(x)
 	}
+	if name == "cstr" {
+		return c.inferCStr(x)
+	}
+	if name == "from_cstr" {
+		return c.inferFromCStr(x)
+	}
+	if name == "arg_count" {
+		return c.inferArgCount(x)
+	}
+	if name == "arg_at" {
+		return c.inferArgAt(x)
+	}
+	// `Pair(1, 2)` constructs a tuple struct; a named struct used this way
+	// gets a pointed error rather than "cannot find function".
+	if st, ok := c.info.Structs[name]; ok {
+		if !st.Tuple {
+			c.errAt(x.Callee, "E0061", "struct `%s` is not a tuple struct; construct it as `%s { field: value }`", name, name)
+			for _, a := range x.Args {
+				c.checkExpr(a, nil)
+			}
+			return &types.Type{Kind: types.StructKind, St: st}
+		}
+		c.info.TupleCtors[x] = st
+		if len(x.Args) != len(st.Fields) {
+			c.errAt(x, "E0061", "tuple struct `%s` takes %d field(s) but %d were supplied", name, len(st.Fields), len(x.Args))
+		}
+		for i, a := range x.Args {
+			var want *types.Type
+			if i < len(st.Fields) {
+				want = st.Fields[i].Ty
+			}
+			at := c.checkExpr(a, want)
+			if want != nil && !c.argAssignable(want, at, false) {
+				c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
+			}
+		}
+		return &types.Type{Kind: types.StructKind, St: st}
+	}
 	fn, ok := c.info.Fns[name]
 	if !ok {
-		c.errAt(x.Callee, "E0425", "cannot find function `%s` in this scope", name)
+		cands := []string{"print", "println", "len", "cstr", "from_cstr", "arg_count", "arg_at"}
+		for n := range c.info.Fns {
+			cands = append(cands, n)
+		}
+		c.errAt(x.Callee, "E0425", "cannot find function `%s` in this scope%s", name, suggestName(name, cands))
 		for _, a := range x.Args {
 			c.checkExpr(a, nil)
 		}
@@ -1090,10 +1484,106 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 	return c.checkCallArgs(x, fn, fmt.Sprintf("function `%s`", name))
 }
 
+// resolveArgs rewrites a call's argument list into plain positional
+// order: named arguments (`name = value`) are matched to parameters by
+// name, and omitted trailing parameters that have defaults are filled
+// with their default literals. names/defaults are aligned with the
+// callee's value parameters. When the call is already plain positional
+// with the right arity it is returned unchanged, so the caller's arity
+// diagnostic still fires for malformed calls.
+func (c *checker) resolveArgs(sp token.Span, args []ast.Expr, names []string, defaults []ast.Expr, label string) []ast.Expr {
+	hasNamed := false
+	for _, a := range args {
+		if _, ok := a.(*ast.NamedArgExpr); ok {
+			hasNamed = true
+			break
+		}
+	}
+	if !hasNamed {
+		if len(args) == len(names) {
+			return args
+		}
+		if len(args) < len(names) {
+			filled := make([]ast.Expr, len(names))
+			copy(filled, args)
+			ok := true
+			for i := len(args); i < len(names); i++ {
+				if defaults[i] == nil {
+					ok = false
+					break
+				}
+				filled[i] = defaults[i]
+			}
+			if ok {
+				return filled
+			}
+		}
+		return args
+	}
+	out := make([]ast.Expr, len(names))
+	seen := make([]bool, len(names))
+	pos := 0
+	for _, a := range args {
+		if na, ok := a.(*ast.NamedArgExpr); ok {
+			idx := -1
+			for i, n := range names {
+				if n == na.Name {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				c.errf(na.Sp, "E0061", "%s has no parameter named `%s`", label, na.Name)
+				continue
+			}
+			if seen[idx] {
+				c.errf(na.Sp, "E0062", "argument `%s` was specified more than once", na.Name)
+				continue
+			}
+			seen[idx] = true
+			out[idx] = na.Val
+			continue
+		}
+		if pos >= len(names) {
+			// `out` always has len(names) entries, so the caller's arity
+			// check never sees a surplus — report it here.
+			c.errf(a.Span(), "E0061", "%s takes %d argument(s) but more were supplied", label, len(names))
+			break
+		}
+		// Find the next unfilled slot for this positional argument; a
+		// positional argument may not follow a named one for a slot
+		// that a named argument already claimed out of order.
+		for pos < len(names) && seen[pos] {
+			pos++
+		}
+		if pos >= len(names) {
+			c.errf(a.Span(), "E0061", "%s takes %d argument(s) but more were supplied", label, len(names))
+			break
+		}
+		seen[pos] = true
+		out[pos] = a
+		pos++
+	}
+	for i := range out {
+		if out[i] == nil && defaults != nil && defaults[i] != nil {
+			out[i] = defaults[i]
+			seen[i] = true
+		}
+	}
+	for i := range out {
+		if out[i] == nil {
+			c.errf(sp, "E0061", "%s is missing an argument for parameter `%s`", label, names[i])
+			out[i] = &ast.LiteralExpr{Kind: token.KindInteger, Text: "0", Sp: sp}
+		}
+	}
+	return out
+}
+
 // checkCallArgs records the resolved callee, checks a call's arguments against
 // its parameter list, and returns the callee's return type.
 func (c *checker) checkCallArgs(x *ast.CallExpr, fn *Fn, label string) *types.Type {
 	c.info.Resolved[x] = fn
+	x.Args = c.resolveArgs(x.Sp, x.Args, fn.ParamNames, fn.Defaults, label)
 	if len(x.Args) != len(fn.Params) {
 		c.errAt(x, "E0061", "%s takes %d argument(s) but %d were supplied", label, len(fn.Params), len(x.Args))
 	}
@@ -1103,7 +1593,7 @@ func (c *checker) checkCallArgs(x *ast.CallExpr, fn *Fn, label string) *types.Ty
 			want = fn.Params[i]
 		}
 		at := c.checkExpr(a, want)
-		if want != nil && !c.argAssignable(want, at) {
+		if want != nil && !c.argAssignable(want, at, fn.Extern) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
 		}
 	}
@@ -1137,7 +1627,7 @@ func (c *checker) inferStringCtor(x *ast.CallExpr, name string) *types.Type {
 			wt = want[i]
 		}
 		at := c.checkExpr(a, wt)
-		if wt != nil && !c.argAssignable(wt, at) {
+		if wt != nil && !c.argAssignable(wt, at, false) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", wt, at)
 		}
 	}
@@ -1203,11 +1693,78 @@ func (c *checker) inferStringMethod(x *ast.MethodCallExpr) *types.Type {
 			wt = m.params[i]
 		}
 		at := c.checkExpr(a, wt)
-		if wt != nil && !c.argAssignable(wt, at) {
+		if wt != nil && !c.argAssignable(wt, at, false) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", wt, at)
 		}
 	}
 	return m.ret
+}
+
+// inferCStr checks the C-bridge builtin `cstr(x)`: it borrows a
+// NUL-terminated C string (`*u8`) from a `str` or a `String`, for
+// passing to `extern "C"` functions that take `const char *`. The value
+// is only borrowed; the argument is never consumed.
+func (c *checker) inferCStr(x *ast.CallExpr) *types.Type {
+	if len(x.Args) != 1 {
+		c.errAt(x, "E0061", "`cstr` takes 1 argument but %d were supplied", len(x.Args))
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return types.PtrTo(types.U8T)
+	}
+	at := c.checkExpr(x.Args[0], nil)
+	if at != nil && at.Kind != types.Invalid && at.Kind != types.Str && at.Kind != types.StringKind {
+		c.errAt(x.Args[0], "E0308", "`cstr` expects a `str` or `String`, found `%s`", at)
+	}
+	return types.PtrTo(types.U8T)
+}
+
+// inferFromCStr checks the C-bridge builtin `from_cstr(p)`: it copies a
+// NUL-terminated C string into an owning Zexi `String`. The caller must
+// guarantee that p points to a valid C string.
+func (c *checker) inferFromCStr(x *ast.CallExpr) *types.Type {
+	if len(x.Args) != 1 {
+		c.errAt(x, "E0061", "`from_cstr` takes 1 argument but %d were supplied", len(x.Args))
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return types.StringT
+	}
+	at := c.checkExpr(x.Args[0], nil)
+	if at != nil && at.Kind != types.Invalid && at.Kind != types.Ptr {
+		c.errAt(x.Args[0], "E0308", "`from_cstr` expects a `*u8` C string pointer, found `%s`", at)
+	}
+	return types.StringT
+}
+
+// inferArgCount checks the builtin `arg_count()`: the number of
+// command-line arguments the program was started with, including the
+// program name at index 0.
+func (c *checker) inferArgCount(x *ast.CallExpr) *types.Type {
+	if len(x.Args) != 0 {
+		c.errAt(x, "E0061", "`arg_count` takes no arguments but %d were supplied", len(x.Args))
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+	}
+	return types.I32T
+}
+
+// inferArgAt checks the builtin `arg_at(i)`: the i-th command-line
+// argument as an owning `String` ("" when out of range).
+func (c *checker) inferArgAt(x *ast.CallExpr) *types.Type {
+	if len(x.Args) != 1 {
+		c.errAt(x, "E0061", "`arg_at` takes 1 argument but %d were supplied", len(x.Args))
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return types.StringT
+	}
+	at := c.checkExpr(x.Args[0], nil)
+	if at != nil && at.Kind != types.Invalid && !at.Kind.IsInt() {
+		c.errAt(x.Args[0], "E0308", "`arg_at` expects an integer index, found `%s`", at)
+	}
+	return types.StringT
 }
 
 // inferLen checks the builtin `len(x)` for arrays and strings.
@@ -1320,7 +1877,7 @@ func (c *checker) inferVariantCtor(x *ast.CallExpr, p *ast.PathExpr) *types.Type
 			want = v.Fields[i].Ty
 		}
 		at := c.checkExpr(a, want)
-		if want != nil && !c.argAssignable(want, at) {
+		if want != nil && !c.argAssignable(want, at, false) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
 		}
 	}
@@ -1387,8 +1944,8 @@ func litPatKindName(k token.Kind) string {
 func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type {
 	st := c.checkExpr(x.Scrutinee, nil)
 	base := recvBase(st)
-	if base == nil || (base.Kind != types.EnumKind && !base.Kind.IsInt() && base.Kind != types.Bool && base.Kind != types.Char) {
-		c.errAt(x.Scrutinee, "E0308", "`match` requires an enum, integer, `bool`, or `char` scrutinee, found `%s`", st)
+	if base == nil || (base.Kind != types.EnumKind && !base.Kind.IsInt() && base.Kind != types.Bool && base.Kind != types.Char && base.Kind != types.Str) {
+		c.errAt(x.Scrutinee, "E0308", "`match` requires an enum, integer, `bool`, `char`, or `str` scrutinee, found `%s`", st)
 	}
 	var result *types.Type
 	if expected != nil && expected.Kind != types.Unit && expected.Kind != types.Never && expected.Kind != types.Invalid {
@@ -1408,12 +1965,12 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 			}
 			catchAll = true
 		}
-		if lp, ok := arm.Pat.(*ast.LitPat); ok && !guarded {
+		noteLit := func(lp *ast.LitPat) {
 			// Each literal becomes one C `case`, and duplicate cases are invalid
 			// C, so catch them here with a real diagnostic.
 			key := litPatKey(lp)
 			if litCovered[key] {
-				c.errf(arm.Pat.Span(), "E0001", "unreachable pattern: this value is already covered")
+				c.errf(lp.Sp, "E0001", "unreachable pattern: this value is already covered")
 			}
 			litCovered[key] = true
 			if lp.Kind == token.KindTrue {
@@ -1421,6 +1978,24 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 			}
 			if lp.Kind == token.KindFalse {
 				boolsCovered["false"] = true
+			}
+		}
+		if lp, ok := arm.Pat.(*ast.LitPat); ok && !guarded {
+			noteLit(lp)
+		}
+		if op, ok := arm.Pat.(*ast.OrPat); ok && !guarded {
+			// An or-pattern covers the union of its alternatives; a catch-all
+			// alternative makes the whole arm a catch-all.
+			for _, alt := range op.Alts {
+				if isCatchAll(alt) {
+					if catchAll {
+						c.errf(alt.Span(), "E0001", "unreachable pattern: an earlier arm already matches everything")
+					}
+					catchAll = true
+				}
+				if lp, ok := alt.(*ast.LitPat); ok {
+					noteLit(lp)
+				}
 			}
 		}
 		c.pushScope()
@@ -1431,6 +2006,22 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 					c.errf(arm.Pat.Span(), "E0001", "unreachable pattern: `%s` is already covered", v.Name)
 				}
 				covered[v.Name] = true
+			}
+		}
+		if op, ok := arm.Pat.(*ast.OrPat); ok && !guarded {
+			seenHere := map[string]bool{}
+			for _, alt := range op.Alts {
+				pp, ok := alt.(*ast.PathPat)
+				if !ok {
+					continue
+				}
+				if v := c.info.PatVariant[pp]; v != nil && !seenHere[v.Name] {
+					seenHere[v.Name] = true
+					if covered[v.Name] {
+						c.errf(alt.Span(), "E0001", "unreachable pattern: `%s` is already covered", v.Name)
+					}
+					covered[v.Name] = true
+				}
 			}
 		}
 		if arm.Guard != nil {
@@ -1464,7 +2055,7 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 		}
 	} else if base != nil && base.Kind == types.Bool && !catchAll && !(boolsCovered["true"] && boolsCovered["false"]) {
 		c.errAt(x, "E0004", "non-exhaustive match: cover both `true` and `false`, or add a `_` arm")
-	} else if base != nil && (base.Kind.IsInt() || base.Kind == types.Char) && !catchAll {
+	} else if base != nil && (base.Kind.IsInt() || base.Kind == types.Char || base.Kind == types.Str) && !catchAll {
 		c.errAt(x, "E0004", "non-exhaustive match: add a `_` arm")
 	}
 	if result == nil {
@@ -1484,7 +2075,25 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type) {
 			c.declare(pt.Sp, pt.Name, st)
 		}
 		return
+	case *ast.OrPat:
+		for _, alt := range pt.Alts {
+			if patternBinds(alt) {
+				// Which alternative matched would be ambiguous, and codegen
+				// binds nothing for an or-pattern arm.
+				c.errf(alt.Span(), "E0900", "or-pattern alternatives cannot bind variables; match on the whole value and destructure in the arm body instead")
+			}
+			c.checkPattern(alt, st)
+		}
+		return
+	case *ast.RangePat:
+		c.checkRangePat(pt, st)
+		return
 	case *ast.LitPat:
+		if pt.Kind == token.KindChar || pt.Kind == token.KindByteChar {
+			if r, ok := decodeCharLiteral(pt.Text); !ok || (pt.Kind == token.KindByteChar && r > 0xFF) {
+				c.errf(pt.Sp, "E0001", "invalid char literal in pattern")
+			}
+		}
 		switch {
 		case st != nil && st.Kind.IsInt():
 			if pt.Kind != token.KindInteger && pt.Kind != token.KindByteChar {
@@ -1500,8 +2109,16 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type) {
 			if pt.Kind != token.KindChar {
 				c.errf(pt.Sp, "E0308", "expected a `char` pattern, found %s", litPatKindName(pt.Kind))
 			}
+		case st != nil && st.Kind == types.Str:
+			if pt.Kind != token.KindString && pt.Kind != token.KindRawString {
+				c.errf(pt.Sp, "E0308", "expected a string pattern, found %s", litPatKindName(pt.Kind))
+			} else if pt.Kind == token.KindString {
+				if _, ok := DecodeString(pt.Text); !ok {
+					c.errf(pt.Sp, "E0001", "invalid string literal in pattern")
+				}
+			}
 		default:
-			c.errf(pt.Sp, "E0308", "literal patterns require an integer, `bool`, or `char` scrutinee, found `%s`", st)
+			c.errf(pt.Sp, "E0308", "literal patterns require an integer, `bool`, `char`, or `str` scrutinee, found `%s`", st)
 		}
 		return
 	case *ast.PathPat:
@@ -1546,12 +2163,103 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type) {
 	}
 }
 
+// patternBinds reports whether p introduces a variable binding anywhere
+// inside it (including struct-pattern field shorthand).
+func patternBinds(p ast.Pattern) bool {
+	switch pt := p.(type) {
+	case *ast.BindPat:
+		return true
+	case *ast.TuplePat:
+		for _, el := range pt.Elems {
+			if patternBinds(el) {
+				return true
+			}
+		}
+	case *ast.OrPat:
+		for _, alt := range pt.Alts {
+			if patternBinds(alt) {
+				return true
+			}
+		}
+	case *ast.PathPat:
+		for _, sub := range pt.Sub {
+			if patternBinds(sub) {
+				return true
+			}
+		}
+		for _, fp := range pt.Fields {
+			if fp.Pat == nil || patternBinds(fp.Pat) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// checkRangePat validates a `lo..hi` / `lo..=hi` pattern against the
+// scrutinee type: endpoints must be literals of the matching kind, must fit,
+// and must not describe an empty range.
+func (c *checker) checkRangePat(pt *ast.RangePat, st *types.Type) {
+	switch {
+	case st != nil && st.Kind.IsInt():
+		if pt.Lo.Kind != token.KindInteger || pt.Hi.Kind != token.KindInteger {
+			c.errf(pt.Sp, "E0308", "range pattern endpoints must be integer literals for an integer scrutinee")
+			return
+		}
+		for _, ep := range []*ast.LitPat{pt.Lo, pt.Hi} {
+			if !intLitFits(ep.Text, st) {
+				c.errf(ep.Sp, "E0080", "pattern `%s` does not fit in `%s`", ep.Text, st)
+			}
+		}
+		if lo, ok1 := intLitValue(pt.Lo.Text); ok1 {
+			if hi, ok2 := intLitValue(pt.Hi.Text); ok2 && rangeIsEmpty(lo, hi, pt.Inclusive) {
+				c.errf(pt.Sp, "E0080", "range pattern `%s` is empty and can never match", rangePatText(pt))
+			}
+		}
+	case st != nil && st.Kind == types.Char:
+		if pt.Lo.Kind != token.KindChar || pt.Hi.Kind != token.KindChar {
+			c.errf(pt.Sp, "E0308", "range pattern endpoints must be char literals for a `char` scrutinee")
+			return
+		}
+		lo, hi := firstRune(pt.Lo.Text), firstRune(pt.Hi.Text)
+		if rangeIsEmpty(int64(lo), int64(hi), pt.Inclusive) {
+			c.errf(pt.Sp, "E0080", "range pattern `%s` is empty and can never match", rangePatText(pt))
+		}
+	default:
+		c.errf(pt.Sp, "E0308", "range patterns require an integer or `char` scrutinee, found `%s`", st)
+	}
+}
+
+// intLitValue parses an integer literal pattern's text, if it fits in an i64.
+func intLitValue(text string) (int64, bool) {
+	s := strings.ReplaceAll(text, "_", "")
+	v, err := strconv.ParseInt(s, 0, 64)
+	return v, err == nil
+}
+
+// rangeIsEmpty reports whether lo..hi (or lo..=hi) matches no value.
+func rangeIsEmpty(lo, hi int64, inclusive bool) bool {
+	if inclusive {
+		return lo > hi
+	}
+	return lo >= hi
+}
+
+// rangePatText renders a range pattern for diagnostics.
+func rangePatText(pt *ast.RangePat) string {
+	op := ".."
+	if pt.Inclusive {
+		op = "..="
+	}
+	return pt.Lo.Text + op + pt.Hi.Text
+}
+
 // rejectNestedPat diagnoses refutable sub-patterns. Codegen discriminates only
 // the outer variant, so a nested variant or literal pattern would silently pick
 // the wrong arm (or emit a duplicate `case`), so we reject it for now.
 func (c *checker) rejectNestedPat(p ast.Pattern) {
 	switch p.(type) {
-	case *ast.PathPat, *ast.LitPat:
+	case *ast.PathPat, *ast.LitPat, *ast.OrPat, *ast.RangePat:
 		c.errf(p.Span(), "E0900", "nested patterns are not supported by the compiler yet (roadmap M0)")
 	}
 }
@@ -1615,7 +2323,7 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 		return nil
 	}
 	if m.Self == nil {
-		c.errAt(x, "E0599", "`%s::%s` takes no `self`, so it cannot be called with `.`", base.St.Name, x.Name)
+		c.errAt(x, "E0599", "`%s::%s` takes no `self`, so it cannot be called with `.`", nominalName(base), x.Name)
 		for _, a := range x.Args {
 			c.checkExpr(a, nil)
 		}
@@ -1630,11 +2338,16 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 	}
 	c.info.Resolved[x] = m
 	want := m.Params
+	names, defaults := m.ParamNames, m.Defaults
 	if m.Self != nil && len(want) > 0 {
 		want = want[1:] // skip the receiver
+		if len(names) > 0 {
+			names, defaults = names[1:], defaults[1:]
+		}
 	}
+	x.Args = c.resolveArgs(x.Sp, x.Args, names, defaults, fmt.Sprintf("method `%s::%s`", nominalName(base), x.Name))
 	if len(x.Args) != len(want) {
-		c.errAt(x, "E0061", "method `%s::%s` takes %d argument(s) but %d were supplied", base.St.Name, x.Name, len(want), len(x.Args))
+		c.errAt(x, "E0061", "method `%s::%s` takes %d argument(s) but %d were supplied", nominalName(base), x.Name, len(want), len(x.Args))
 	}
 	for i, a := range x.Args {
 		var wt *types.Type
@@ -1642,7 +2355,7 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 			wt = want[i]
 		}
 		at := c.checkExpr(a, wt)
-		if wt != nil && !c.argAssignable(wt, at) {
+		if wt != nil && !c.argAssignable(wt, at, false) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", wt, at)
 		}
 	}
@@ -1782,11 +2495,11 @@ func (c *checker) inferLoop(x *ast.LoopExpr, expected *types.Type) *types.Type {
 		// No `break` at all: the loop can only be left by `return` (or by
 		// running forever), so its type is the never type.
 		return types.NeverT
-	case token.KindWhile:
-		c.pushBreak(token.KindWhile, nil)
+	case token.KindWhile, token.KindUntil:
+		c.pushBreak(x.Kind, nil)
 		ct := c.checkExpr(x.Cond, types.BoolT)
 		if ct.Kind != types.Bool {
-			c.errAt(x.Cond, "E0308", "`while` condition must be `bool`, found `%s`", ct)
+			c.errAt(x.Cond, "E0308", "`%s` condition must be `bool`, found `%s`", loopKindName(x.Kind), ct)
 		}
 		c.loopDepth++
 		c.checkBlock(x.Body)
@@ -1935,6 +2648,8 @@ func loopKindName(k token.Kind) string {
 	switch k {
 	case token.KindWhile:
 		return "while"
+	case token.KindUntil:
+		return "until"
 	case token.KindFor:
 		return "for"
 	}
@@ -1965,6 +2680,9 @@ func (c *checker) resolveType(t ast.Type) *types.Type {
 		}
 		if en, ok := c.info.Enums[x.Segments[0]]; ok {
 			return &types.Type{Kind: types.EnumKind, En: en}
+		}
+		if _, ok := c.aliasDecls[x.Segments[0]]; ok {
+			return c.resolveAlias(x.Segments[0], x.Sp)
 		}
 		c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope", x.Segments[0])
 		return nil
@@ -2034,11 +2752,30 @@ func (c *checker) assignable(dst, src *types.Type) bool {
 // borrows it for the duration of the call. It is deliberately *not* used for
 // `let`/field/return positions, where a longer-lived borrow from a temporary
 // could dangle.
-func (c *checker) argAssignable(want, got *types.Type) bool {
+//
+// ptrRefOK enables the pointer/reference interchange: at the C boundary a
+// reference and a raw pointer are the same machine pointer, so either may
+// be passed where the other is expected (with matching mutability). This
+// keeps `extern "C"` declarations pleasant — `time(&mut slot)` just works —
+// but it must stay confined to extern call sites: a raw `*T` (which an
+// extern function may return null) would otherwise become a `&T` with no
+// `unsafe`, removing the guarantee that a reference is valid.
+func (c *checker) argAssignable(want, got *types.Type, ptrRefOK bool) bool {
 	if c.assignable(want, got) {
 		return true
 	}
-	return want != nil && want.Kind == types.Str && got != nil && got.Kind == types.StringKind
+	if want != nil && want.Kind == types.Str && got != nil && got.Kind == types.StringKind {
+		return true
+	}
+	if ptrRefOK && want != nil && got != nil &&
+		(want.Kind == types.Ptr || want.Kind == types.Ref) &&
+		(got.Kind == types.Ptr || got.Kind == types.Ref) {
+		if want.Mut && !got.Mut {
+			return false
+		}
+		return types.Equal(want.Elem, got.Elem)
+	}
+	return false
 }
 
 // --- scope helpers --------------------------------------------------------
@@ -2246,10 +2983,106 @@ type ConstVal struct {
 	Bool    bool
 	IsFloat bool
 	IsStr   bool
+	Raw     bool // a raw string literal: Str holds undecoded source text
 	IsBool  bool
 	// Untyped marks an integer value that came from a bare literal (defaulting
 	// to `i32`) and may still adopt an explicit integer type.
 	Untyped bool
+}
+
+// constLiteralFor materializes a folded constant as a literal expression
+// of the given parameter type, for use as a call-site default argument.
+// It returns nil when the value cannot be a literal of that type.
+func constLiteralFor(cv ConstVal, pt *types.Type, sp token.Span) ast.Expr {
+	invalid := pt == nil || pt.Kind == types.Invalid
+	switch {
+	case cv.IsStr:
+		if !invalid && pt.Kind != types.Str && pt.Kind != types.StringKind {
+			return nil
+		}
+		text := cv.Str
+		if cv.Raw {
+			text = escapeStringLit(cv.Str)
+		}
+		return &ast.LiteralExpr{Kind: token.KindString, Text: text, Sp: sp}
+	case cv.IsBool:
+		if !invalid && pt.Kind != types.Bool {
+			return nil
+		}
+		kind := token.KindFalse
+		if cv.Bool {
+			kind = token.KindTrue
+		}
+		return &ast.LiteralExpr{Kind: kind, Sp: sp}
+	case cv.IsFloat:
+		if !invalid && !pt.Kind.IsFloat() {
+			return nil
+		}
+		return &ast.LiteralExpr{Kind: token.KindFloat, Text: strconv.FormatFloat(cv.Float, 'g', -1, 64), Sp: sp}
+	default:
+		if !invalid && pt.Kind == types.Char {
+			r := rune(cv.Int)
+			if !utf8.ValidRune(r) {
+				return nil
+			}
+			return &ast.LiteralExpr{Kind: token.KindChar, Text: escapeCharLit(r), Sp: sp}
+		}
+		if !invalid && !pt.Kind.IsInt() {
+			return nil
+		}
+		text := strconv.FormatInt(cv.Int, 10)
+		if !invalid && pt.Kind.IsUnsigned() {
+			text = strconv.FormatUint(cv.Uint, 10)
+		}
+		return &ast.LiteralExpr{Kind: token.KindInteger, Text: text, Sp: sp}
+	}
+}
+
+// escapeStringLit renders a decoded string as the inner text of a string
+// literal (without the surrounding quotes).
+func escapeStringLit(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString("\\\"")
+		case '\\':
+			b.WriteString("\\\\")
+		case '\n':
+			b.WriteString("\\n")
+		case '\t':
+			b.WriteString("\\t")
+		case '\r':
+			b.WriteString("\\r")
+		default:
+			if r < 0x20 {
+				fmt.Fprintf(&b, "\\u{%X}", r)
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String()
+}
+
+// escapeCharLit renders a rune as the inner text of a char literal.
+func escapeCharLit(r rune) string {
+	switch r {
+	case '\'':
+		return "\\'"
+	case '\\':
+		return "\\\\"
+	case '\n':
+		return "\\n"
+	case '\t':
+		return "\\t"
+	case '\r':
+		return "\\r"
+	}
+	if r < 0x20 {
+		return fmt.Sprintf("\\u{%X}", r)
+	}
+	return string(r)
 }
 
 // evalConst folds a constant expression, supporting literals, unary minus, and
@@ -2336,8 +3169,10 @@ func (c *checker) evalConstLiteral(x *ast.LiteralExpr) (ConstVal, bool) {
 		return ConstVal{Ty: types.BoolT, Bool: true, IsBool: true}, true
 	case token.KindFalse:
 		return ConstVal{Ty: types.BoolT, Bool: false, IsBool: true}, true
-	case token.KindString, token.KindRawString:
+	case token.KindString:
 		return ConstVal{Ty: types.StrT, Str: x.Text, IsStr: true}, true
+	case token.KindRawString:
+		return ConstVal{Ty: types.StrT, Str: x.Text, IsStr: true, Raw: true}, true
 	case token.KindChar:
 		r := firstRune(x.Text)
 		return ConstVal{Ty: types.CharT, Int: int64(r), Uint: uint64(r)}, true
@@ -2421,6 +3256,46 @@ func firstRune(s string) rune {
 	return r
 }
 
+// decodeCharLiteral decodes the inner text of a char or byte literal,
+// requiring exactly one character: a single rune, or one escape sequence.
+// (A multi-character or empty literal used to be silently truncated to
+// its first byte.)
+func decodeCharLiteral(s string) (rune, bool) {
+	if s == "" {
+		return 0, false
+	}
+	if s[0] != '\\' {
+		r, size := utf8.DecodeRuneInString(s)
+		return r, size == len(s)
+	}
+	r, ok := decodeEscape(s[1:])
+	if !ok {
+		return 0, false
+	}
+	return r, 1+escapeLen(s[1:]) == len(s)
+}
+
+// escapeLen returns the length of the escape sequence at the start of s,
+// where s is the text following the backslash.
+func escapeLen(s string) int {
+	if s == "" {
+		return 0
+	}
+	switch s[0] {
+	case 'x':
+		if len(s) >= 3 {
+			return 3
+		}
+		return len(s)
+	case 'u':
+		if i := strings.IndexByte(s, '}'); i >= 0 {
+			return i + 1
+		}
+		return len(s)
+	}
+	return 1
+}
+
 // decodeCharInner decodes one character (with escapes) from a char literal's
 // inner text.
 func decodeCharInner(s string) (rune, bool) {
@@ -2465,7 +3340,10 @@ func decodeEscape(s string) (rune, bool) {
 		if len(s) >= 2 && s[1] == '{' {
 			if i := strings.IndexByte(s, '}'); i > 2 {
 				if v, err := strconv.ParseUint(s[2:i], 16, 32); err == nil {
-					return rune(v), true
+					// Only Unicode scalar values are valid `char`s.
+					if v <= 0x10FFFF && !(v >= 0xD800 && v <= 0xDFFF) {
+						return rune(v), true
+					}
 				}
 			}
 		}

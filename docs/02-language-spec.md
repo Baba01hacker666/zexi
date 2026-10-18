@@ -6,9 +6,16 @@ This is the *normative-shaped* spec for the M0 language. Features tagged
 ## 2.1 Lexical structure
 
 - **Encoding:** UTF-8 source; identifiers are ASCII for M0.
-- **Line comments:** `// ...`
+- **Line comments:** `// ...` and `# ...` (a `#` that opens an attribute,
+  `#[...]`, is not a comment; this also makes `#!/usr/bin/env zexi`
+  shebang lines work).
 - **Block comments:** `/* ... */`, nesting.
 - **Doc comments:** `///` (attached to the following item).
+- **Statement termination:** a statement ends at `;` *or* at a newline.
+  Two statements on one line still need `;` between them; an expression
+  continues across a newline wherever an operator or opener follows, as
+  before. Semicolons are therefore always safe and never required at a
+  line end.
 - **Identifiers:** `[A-Za-z_][A-Za-z0-9_]*`.
 - **Types** are identifiers; there is no separate type namespace.
 
@@ -22,7 +29,8 @@ This is the *normative-shaped* spec for the M0 language. Features tagged
 | Byte | `b'A'`, `b'\n'` |
 | Char (a Unicode scalar) | `'A'`, `'\u{1F600}'` |
 | String (UTF-8, immutable) | `"hi\n"`, `"élan"` |
-| Raw string | `r"C:\path"` |
+| Interpolated string (`String`) | `f"hi {name}, {n + 1} pts"` (`{{`/`}}` are literal braces) |
+| Raw string (no escapes) | `r"C:\path"`, `r#"say "hi""#`, `r##"a #" b"##` |
 | Boolean | `true`, `false` |
 | Unit/void | `()` |
 
@@ -32,10 +40,10 @@ also adopt a float context. There are no implicit numeric conversions (see 2.4).
 ### Keywords
 
 ```
-as      break   const   continue  defer   else    enum    extern
+as      break   const   continue  defer   else    elif    enum    extern
 false   fn      for     if        impl    in      let     loop
 match   mod     mut     pub       return  struct  true    type
-unsafe  use     while   i8 i16 i32 i64 isize u8 u16 u32 u64 usize f32 f64
+unsafe  until   use     while   i8 i16 i32 i64 isize u8 u16 u32 u64 usize f32 f64
 bool    char    str     never
 ```
 
@@ -80,8 +88,9 @@ use_item    = "use" path [ "as" ident ] ";" ;
 impl_item   = "impl" [ generics ] type [ "for" type ] "{" { fn_item } "}" ;
 
 block       = "{" { stmt } [ expr ] "}" ;
-stmt        = let_stmt | item | expr [ ";" ] ;
+stmt        = let_stmt | defer_stmt | item | expr [ ";" ] ;
 let_stmt    = "let" "mut"? pattern [ ":" type ] [ "=" expr ] ";" ;
+defer_stmt  = "defer" expr ";" ;
 
 expr        = assign ;
 assign      = logic_or [ ( "=" | op="=" ) expr ] ;
@@ -107,10 +116,16 @@ primary     = literal | ident | path
             | "(" [ expr { "," expr } ] ")"
             | "[" [ expr { "," expr } ] "]"
             | "{" block } | "if" if_expr | "match" match_expr
-            | "loop" block | "while" expr block | "for" pattern "in" expr block
+            | "loop" block | "while" expr block | "while" "let" pattern "=" expr block
+            | "until" expr block | "for" pattern "in" expr block
             | "return" [ expr ] | "break" [ expr ] | "continue"
-            | "defer" expr | "unsafe" block
+            | "unsafe" block
             | path struct_lit ;
+if_expr     = "if" expr block { "elif" expr block } [ "else" ( if_expr | block ) ]
+            | "if" "let" pattern "=" expr block [ "else" ( if_expr | block ) ] ;
+pattern     = single_pat { "|" single_pat } ;
+single_pat  = "_" | "mut"? ident | path [ "(" patterns ")" | "{" field_pats "}" ]
+            | literal | "-" number | literal ( ".." | "..=" ) literal ;
 struct_lit  = "{" [ field_init { "," field_init } ] "}" ;
 path        = ident { "::" ident } ;
 ```
@@ -251,10 +266,44 @@ fn abs(n: i64) -> i64 {
 }
 ```
 
-Loops: `loop { }` (infinite), `while cond { }`, and `for pat in iter { }` over an
-integer range (`1..4`) or an array. `break`/`continue` behave as expected. A
-`loop` may yield a value with `break <expr>`, and the loop expression then has
-the type of that value (`while`/`for` always evaluate to `()`).
+Loops: `loop { }` (infinite), `while cond { }`, `until cond { }` (loops while
+the condition is false), and `for pat in iter { }` over an integer range
+(`1..4`) or an array. `break`/`continue` behave as expected. A `loop` may yield
+a value with `break <expr>`, and the loop expression then has the type of that
+value (`while`/`until`/`for` always evaluate to `()`).
+
+`elif` is sugar for `else if`. `if let pat = expr { .. } else { .. }` and
+`while let pat = expr { .. }` are sugar over `match`: the block runs when the
+pattern matches; `while let` re-evaluates `expr` each iteration and stops at
+the first non-match. Patterns in `match` arms and `let`-patterns may be
+combined with `|` (or-patterns, whose alternatives may not bind variables),
+may be inclusive/exclusive ranges over integer or `char` literals
+(`1..=9`, `'a'..'z'`; an empty range is an error), and a binding may be marked
+`mut` (`Step::More(mut v)`).
+
+`defer expr;` evaluates `expr` when the enclosing block scope exits — by
+falling off the end or via `return`/`break`/`continue` — in LIFO order per
+scope, before that scope's locals are dropped. The expression is evaluated at
+exit time, so it observes the locals' final values; `return`/`break`/
+`continue` inside a deferred expression are rejected.
+
+`type Name = Ty;` declares a type alias. An alias is transparent — it is the
+same type as `Ty` everywhere (including in `impl` targets and array lengths),
+may name another alias, and may not be cyclic. A tuple struct
+`struct Pair(i32, i32);` is constructed with call syntax, `Pair(1, 2)`, and
+its fields are read as `.0`, `.1`, and so on. Constants may refer to constants
+declared later in the same file. A `char` literal holds exactly one Unicode
+scalar value; `''` and `'ab'` are errors.
+
+Parameters may declare **default values** (`fn area(w: i64, h: i64 = 10)`):
+only trailing parameters may have them, and the default must be a constant
+expression. Calls may omit defaulted arguments and may pass any argument
+**by name** (`area(h = 4, w = 2)`), in any order, for functions and methods;
+an unknown name (E0061), a duplicated argument (E0062), or a missing
+required argument (E0061) is an error. A function whose return type is
+omitted returns `()`. An interpolated string `f"...{expr}..."` evaluates to
+an owning `String`; interpolated values are borrowed (never moved) and must
+be printable (numbers, `bool`, `char`, `str`, `String`).
 
 ```zexi
 let first = loop {
@@ -329,10 +378,18 @@ No exceptions. Two mechanisms:
 ## 2.8 Modules & packages
 
 - A **file** is a module; a **directory** with `mod.zx` is a package root.
-- `mod foo;` declares a child module (file `foo.zx` or `foo/mod.zx`).
-- `use` brings paths into scope; `pub` controls visibility.
-- **M0 compiles a single file** for the first milestone; the module system
-  lands in M1.
+- `mod foo;` declares a child module (file `foo.zx` or `foo/mod.zx`) —
+  still reserved for the roadmap.
+- **Implemented today:** `use` imports whole library files at compile
+  time. `use "path.zx";` loads a file relative to the importing file;
+  `use a::b;` loads `a/b.zx`, searched next to the importing file, then
+  in a `lib/` folder beside it, then in the standard library embedded in
+  the compiler (`use std::math;` also works). Imports are transitive,
+  each file is loaded at most once, and cycles are harmless. The imported
+  file's items join the program's single namespace (name collisions are
+  errors, as for any duplicate definition), and an unresolvable import is
+  E9022. Files may also be passed directly on the command line, as
+  before.
 
 ## 2.9 Attributes (M1/M2)
 

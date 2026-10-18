@@ -9,6 +9,8 @@
 package parser
 
 import (
+	"strings"
+
 	"zexi/internal/ast"
 	"zexi/internal/diag"
 	"zexi/internal/lexer"
@@ -255,7 +257,15 @@ func (p *parser) parseParams() []ast.Param {
 		}
 		p.expect(token.KindColon, " after parameter name")
 		ty := p.parseType()
-		params = append(params, ast.Param{Mut: mut, Name: name, Ty: ty, Sp: p.spanFrom(start)})
+		pr := ast.Param{Mut: mut, Name: name, Ty: ty, Sp: p.spanFrom(start)}
+		if p.accept(token.KindEq) {
+			// `name: i32 = 42` — a default value for callers that omit
+			// this (trailing) argument. Must be a constant expression;
+			// the checker enforces that.
+			pr.Default = p.parseExpr()
+			pr.Sp = p.spanFrom(start)
+		}
+		params = append(params, pr)
 		if !p.accept(token.KindComma) {
 			break
 		}
@@ -480,6 +490,13 @@ func (p *parser) parseMod(vis ast.Visibility, start token.Pos) ast.Item {
 func (p *parser) parseUse(start token.Pos) ast.Item {
 	p.bump() // use
 	d := &ast.UseDecl{}
+	if p.at(token.KindString) {
+		// `use "helpers.zx";` imports a file relative to this one.
+		d.File = p.bump().Lit
+		p.expectSemicolon()
+		d.Sp = p.spanFrom(start)
+		return d
+	}
 	d.Path = append(d.Path, p.expectIdentPath("use path"))
 	for p.accept(token.KindColonColon) {
 		d.Path = append(d.Path, p.expectIdentPath("use path segment"))
@@ -505,6 +522,8 @@ func (p *parser) parseBlock() *ast.Block {
 		before := p.pos
 		if p.at(token.KindLet) {
 			b.Stmts = append(b.Stmts, p.parseLet())
+		} else if p.at(token.KindDefer) {
+			b.Stmts = append(b.Stmts, p.parseDefer())
 		} else if p.at(token.KindSemicolon) {
 			p.bump() // stray semicolon
 		} else {
@@ -523,6 +542,9 @@ func (p *parser) parseBlock() *ast.Block {
 				b.Stmts = append(b.Stmts, &ast.ExprStmt{X: e, Sp: e.Span()})
 			case p.at(token.KindRBrace):
 				b.Tail = e
+			case p.newlineBeforeCur():
+				// No semicolon, but the statement ends at the newline.
+				b.Stmts = append(b.Stmts, &ast.ExprStmt{X: e, Sp: e.Span()})
 			default:
 				p.errf(p.cur(), "E0203", "expected `;` after expression statement")
 				p.skipTo(token.KindSemicolon, token.KindRBrace)
@@ -605,6 +627,15 @@ func (p *parser) parseStructLit(path []string, start token.Pos) ast.Expr {
 	return lit
 }
 
+// parseDefer parses `defer expr;`.
+func (p *parser) parseDefer() ast.Stmt {
+	start := p.cur().Pos.Offset
+	p.bump() // defer
+	x := p.parseExpr()
+	p.expectSemicolon()
+	return &ast.DeferStmt{X: x, Sp: p.spanFrom(start)}
+}
+
 func (p *parser) parseLet() ast.Stmt {
 	start := p.cur().Pos.Offset
 	p.bump() // let
@@ -622,6 +653,19 @@ func (p *parser) parseLet() ast.Stmt {
 	return s
 }
 
+// newlineBeforeCur reports whether the current token starts on a later
+// line than the previous token ended. Zexi accepts a newline as a
+// statement terminator (semicolons are always allowed, never required at
+// a line end), which keeps code light to write without needing a separate
+// lexer pass: expressions still continue across lines wherever an
+// operator or opener makes that unambiguous.
+func (p *parser) newlineBeforeCur() bool {
+	if p.pos == 0 {
+		return false
+	}
+	return p.cur().Pos.Line > p.toks[p.pos-1].Pos.Line
+}
+
 func (p *parser) expectSemicolon() {
 	if p.accept(token.KindSemicolon) {
 		return
@@ -631,6 +675,10 @@ func (p *parser) expectSemicolon() {
 	if p.at(token.KindRBrace) || p.at(token.KindEOF) {
 		return
 	}
+	// A newline also ends the statement.
+	if p.newlineBeforeCur() {
+		return
+	}
 	p.errf(p.cur(), "E0203", "expected `;`, found %s", p.cur().Kind)
 	p.skipTo(token.KindSemicolon, token.KindRBrace)
 	p.accept(token.KindSemicolon)
@@ -638,9 +686,38 @@ func (p *parser) expectSemicolon() {
 
 // --- patterns -------------------------------------------------------------
 
+// parsePattern parses a pattern, including top-level or-patterns
+// (`A | B | 1..=9`). Or-patterns are only meaningful where the checker can
+// test alternatives (match arms, `if let`, `while let`); elsewhere it rejects
+// them.
 func (p *parser) parsePattern() ast.Pattern {
 	start := p.cur().Pos.Offset
+	first := p.parseSinglePattern()
+	if !p.at(token.KindPipe) {
+		return first
+	}
+	alts := []ast.Pattern{first}
+	for p.accept(token.KindPipe) {
+		alts = append(alts, p.parseSinglePattern())
+	}
+	return &ast.OrPat{Alts: alts, Sp: p.spanFrom(start)}
+}
+
+func (p *parser) parseSinglePattern() ast.Pattern {
+	start := p.cur().Pos.Offset
 	switch p.cur().Kind {
+	case token.KindMut:
+		p.bump()
+		if p.at(token.KindIdentifier) {
+			name := p.bump().Lit
+			if p.at(token.KindColonColon) || p.at(token.KindLParen) || p.at(token.KindLBrace) {
+				p.errf(p.cur(), "E0202", "`mut` cannot precede a variant pattern")
+				return p.finishPathPattern(false, name, start)
+			}
+			return &ast.BindPat{Mut: true, Name: name, Sp: p.spanFrom(start)}
+		}
+		p.errf(p.cur(), "E0202", "expected a binding name after `mut` in a pattern")
+		return &ast.WildcardPat{Sp: p.spanFrom(start)}
 	case token.KindUnderscore:
 		p.bump()
 		return &ast.WildcardPat{Sp: p.spanFrom(start)}
@@ -658,13 +735,13 @@ func (p *parser) parsePattern() ast.Pattern {
 	case token.KindInteger, token.KindFloat, token.KindString, token.KindRawString,
 		token.KindChar, token.KindByteChar, token.KindTrue, token.KindFalse:
 		t := p.bump()
-		return &ast.LitPat{Kind: t.Kind, Text: t.Lit, Sp: p.spanFrom(start)}
+		return p.maybeRangePat(&ast.LitPat{Kind: t.Kind, Text: t.Lit, Sp: p.spanFrom(start)}, start)
 	case token.KindMinus:
 		// A negative number pattern, e.g. `-1`.
 		p.bump()
 		if p.at(token.KindInteger) || p.at(token.KindFloat) {
 			t := p.bump()
-			return &ast.LitPat{Kind: t.Kind, Text: "-" + t.Lit, Sp: p.spanFrom(start)}
+			return p.maybeRangePat(&ast.LitPat{Kind: t.Kind, Text: "-" + t.Lit, Sp: p.spanFrom(start)}, start)
 		}
 		p.errf(p.cur(), "E0202", "expected a number after `-` in a pattern")
 		return &ast.WildcardPat{Sp: p.spanFrom(start)}
@@ -683,6 +760,35 @@ func (p *parser) parsePattern() ast.Pattern {
 		p.bump()
 		return &ast.WildcardPat{Sp: p.spanFrom(start)}
 	}
+}
+
+// maybeRangePat extends a literal pattern into a range pattern when `..` or
+// `..=` follows (`1..=9`, `'a'..'z'`, `-10..-1`). Only integer and char
+// literals can be range endpoints.
+func (p *parser) maybeRangePat(lo *ast.LitPat, start token.Pos) ast.Pattern {
+	if lo.Kind != token.KindInteger && lo.Kind != token.KindChar && lo.Kind != token.KindByteChar {
+		return lo
+	}
+	var inclusive bool
+	if p.accept(token.KindDotDotEq) {
+		inclusive = true
+	} else if !p.accept(token.KindDotDot) {
+		return lo
+	}
+	hiStart := p.cur().Pos.Offset
+	neg := p.accept(token.KindMinus)
+	t := p.cur()
+	if t.Kind != token.KindInteger && t.Kind != token.KindChar && t.Kind != token.KindByteChar {
+		p.errf(t, "E0202", "expected an integer or char literal to end a range pattern")
+		return &ast.RangePat{Lo: lo, Hi: lo, Inclusive: inclusive, Sp: p.spanFrom(start)}
+	}
+	p.bump()
+	text := t.Lit
+	if neg {
+		text = "-" + text
+	}
+	hi := &ast.LitPat{Kind: t.Kind, Text: text, Sp: p.spanFrom(hiStart)}
+	return &ast.RangePat{Lo: lo, Hi: hi, Inclusive: inclusive, Sp: p.spanFrom(start)}
 }
 
 func (p *parser) finishPathPattern(_ bool, first string, start token.Pos) ast.Pattern {
@@ -852,6 +958,108 @@ func (p *parser) parsePostfix() ast.Expr {
 	}
 }
 
+// parseFString splits an `f"..."` literal into literal chunks and
+// interpolated expressions: `f"hi {name}, {n + 1} pts"`. `{{` and `}}`
+// are literal braces. Each hole is parsed by a fresh sub-parser over its
+// source text (with token offsets shifted back into the enclosing file,
+// so diagnostics keep pointing at the right place).
+func (p *parser) parseFString() ast.Expr {
+	tok := p.bump() // f"..."
+	src := tok.Lit
+	x := &ast.InterpStrExpr{Sp: token.Span{Start: tok.Pos.Offset, End: tok.End}}
+	var chunk strings.Builder
+	flush := func() {
+		if chunk.Len() > 0 {
+			x.Parts = append(x.Parts, &ast.LiteralExpr{Kind: token.KindString, Text: chunk.String(), Sp: x.Sp})
+			chunk.Reset()
+		}
+	}
+	i := 0
+	for i < len(src) {
+		c := src[i]
+		switch {
+		case c == '\\' && i+1 < len(src):
+			chunk.WriteString(src[i : i+2])
+			i += 2
+		case c == '{' && i+1 < len(src) && src[i+1] == '{':
+			chunk.WriteByte('{')
+			i += 2
+		case c == '}' && i+1 < len(src) && src[i+1] == '}':
+			chunk.WriteByte('}')
+			i += 2
+		case c == '{':
+			end := matchingBrace(src, i)
+			if end < 0 {
+				p.errf(tok, "E0202", "unterminated `{` in string interpolation (use `{{` for a literal brace)")
+				i = len(src)
+				break
+			}
+			flush()
+			x.Parts = append(x.Parts, p.parseInterpHole(src[i+1:end], tok, i+1))
+			i = end + 1
+		case c == '}':
+			p.errf(tok, "E0202", "unmatched `}` in string literal (use `}}` for a literal brace)")
+			i++
+		default:
+			chunk.WriteByte(c)
+			i++
+		}
+	}
+	flush()
+	return x
+}
+
+// matchingBrace returns the index of the `}` closing the `{` at src[i],
+// skipping nested braces and string/char literals, or -1 if there is none.
+func matchingBrace(src string, i int) int {
+	depth := 0
+	for j := i; j < len(src); j++ {
+		switch src[j] {
+		case '"', '\'':
+			q := src[j]
+			for j++; j < len(src) && src[j] != q; j++ {
+				if src[j] == '\\' {
+					j++
+				}
+			}
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return j
+			}
+		}
+	}
+	return -1
+}
+
+// parseInterpHole parses the inside of one `{...}` hole as an expression.
+// innerOff is the hole's byte offset within the f-string's inner text.
+func (p *parser) parseInterpHole(inner string, tok token.Token, innerOff int) ast.Expr {
+	lx := lexer.New(tok.Pos.FileID, []byte(inner))
+	toks := lx.All()
+	// Shift the sub-lexer tokens back into the enclosing file: the hole
+	// starts after `f"` plus innerOff bytes.
+	base := tok.Pos.Offset + token.Pos(2+innerOff)
+	for i := range toks {
+		toks[i].Pos.Offset += base
+		toks[i].End += base
+		if toks[i].Pos.Line > 1 {
+			toks[i].Pos.Line += tok.Pos.Line - 1
+		} else if tok.Pos.Line > 1 {
+			toks[i].Pos.Line = tok.Pos.Line
+		}
+	}
+	sub := &parser{fileID: tok.Pos.FileID, src: []byte(inner), toks: toks}
+	e := sub.parseExpr()
+	if len(lx.Errors()) > 0 || len(sub.errs) > 0 || !sub.at(token.KindEOF) || e == nil {
+		p.errf(tok, "E0202", "invalid expression in string interpolation")
+		return &ast.LiteralExpr{Kind: token.KindInteger, Text: "0", Sp: token.Span{Start: tok.Pos.Offset, End: tok.End}}
+	}
+	return e
+}
+
 // parseArrayLit parses `[a, b, c]` and the repeat form `[value; count]`.
 func (p *parser) parseArrayLit() ast.Expr {
 	start := p.cur().Pos.Offset
@@ -885,7 +1093,17 @@ func (p *parser) parseArgs() []ast.Expr {
 	var args []ast.Expr
 	p.bump() // (
 	for !p.at(token.KindRParen) && !p.at(token.KindEOF) {
-		args = append(args, p.parseExpr())
+		// `name = expr` is a named (keyword) argument, as in Python. The
+		// checker matches it to the parameter of that name.
+		if p.at(token.KindIdentifier) && p.tokAt(1).Kind == token.KindEq {
+			start := p.cur().Pos.Offset
+			name := p.bump().Lit
+			p.bump() // =
+			val := p.parseExpr()
+			args = append(args, &ast.NamedArgExpr{Name: name, Val: val, Sp: p.spanFrom(start)})
+		} else {
+			args = append(args, p.parseExpr())
+		}
 		if !p.accept(token.KindComma) {
 			break
 		}
@@ -902,6 +1120,9 @@ func (p *parser) parsePrimary() ast.Expr {
 		token.KindChar, token.KindByteChar, token.KindTrue, token.KindFalse:
 		p.bump()
 		return &ast.LiteralExpr{Kind: t.Kind, Text: t.Lit, Sp: p.spanFrom(start)}
+
+	case token.KindFString:
+		return p.parseFString()
 
 	case token.KindIdentifier:
 		p.bump()
@@ -956,11 +1177,23 @@ func (p *parser) parsePrimary() ast.Expr {
 
 	case token.KindWhile:
 		p.bump()
+		if p.at(token.KindLet) {
+			return p.parseWhileLet(start)
+		}
 		p.noStructLit++
 		cond := p.parseExpr()
 		p.noStructLit--
 		body := p.parseBlock()
 		return &ast.LoopExpr{Kind: token.KindWhile, Cond: cond, Body: body, Sp: p.spanFrom(start)}
+
+	case token.KindUntil:
+		// `until cond { .. }` loops while the condition is false.
+		p.bump()
+		p.noStructLit++
+		cond := p.parseExpr()
+		p.noStructLit--
+		body := p.parseBlock()
+		return &ast.LoopExpr{Kind: token.KindUntil, Cond: cond, Body: body, Sp: p.spanFrom(start)}
 
 	case token.KindFor:
 		p.bump()
@@ -993,7 +1226,7 @@ func (p *parser) parsePrimary() ast.Expr {
 	case token.KindDefer:
 		p.bump()
 		x := p.parseExpr()
-		p.errf(t, "E0900", "`defer` is not supported yet (design milestone M1)")
+		p.errf(t, "E0202", "`defer` is only allowed as a statement, e.g. `defer cleanup();`")
 		return x
 
 	default:
@@ -1006,20 +1239,93 @@ func (p *parser) parsePrimary() ast.Expr {
 func (p *parser) parseIf() ast.Expr {
 	start := p.cur().Pos.Offset
 	p.bump() // if
+	return p.parseIfTail(start)
+}
+
+// parseIfTail parses `cond { .. } [else/elif ..]` or, when the next token is
+// `let`, an `if let` (see parseIfLet). The `if`/`elif` keyword is already
+// consumed; start is its offset.
+func (p *parser) parseIfTail(start token.Pos) ast.Expr {
+	if p.at(token.KindLet) {
+		return p.parseIfLet(start)
+	}
 	p.noStructLit++
 	cond := p.parseExpr()
 	p.noStructLit--
 	then := p.parseBlock()
 	e := &ast.IfExpr{Cond: cond, Then: then}
-	if p.accept(token.KindElse) {
-		if p.at(token.KindIf) {
-			e.Else = p.parseIf()
-		} else {
-			e.Else = p.parseBlock()
-		}
-	}
+	e.Else = p.parseElseBranch()
 	e.Sp = p.spanFrom(start)
 	return e
+}
+
+// parseElseBranch parses an `else { .. }`, `else if ..`, or bare `elif ..`
+// chain after a then-block, returning nil when there is none. `elif` is sugar
+// for `else if` without the extra keyword.
+func (p *parser) parseElseBranch() ast.Expr {
+	if p.accept(token.KindElse) {
+		switch {
+		case p.at(token.KindIf):
+			return p.parseIf()
+		case p.at(token.KindElif):
+			start := p.cur().Pos.Offset
+			p.bump()
+			return p.parseIfTail(start)
+		default:
+			return p.parseBlock()
+		}
+	}
+	if p.at(token.KindElif) {
+		start := p.cur().Pos.Offset
+		p.bump()
+		return p.parseIfTail(start)
+	}
+	return nil
+}
+
+// parseIfLet parses `let pat = expr { .. } [else/elif ..]` after `if`/`elif`
+// and desugars it to a two-arm `match`: the pattern arm runs the then-block,
+// the wildcard arm runs the else-branch (or nothing). All pattern, binding,
+// exhaustiveness, and code generation behaviour is inherited from `match`.
+func (p *parser) parseIfLet(start token.Pos) ast.Expr {
+	p.bump() // let
+	pat := p.parsePattern()
+	p.expect(token.KindEq, " after the `if let` pattern")
+	p.noStructLit++
+	scrut := p.parseExpr()
+	p.noStructLit--
+	then := p.parseBlock()
+	elseE := p.parseElseBranch()
+	if elseE == nil {
+		elseE = &ast.Block{Sp: p.spanFrom(start)}
+	}
+	m := &ast.MatchExpr{Scrutinee: scrut, Arms: []ast.MatchArm{
+		{Pat: pat, Body: then, Sp: then.Sp},
+		{Pat: &ast.WildcardPat{Sp: p.spanFrom(start)}, Body: elseE, Sp: elseE.Span()},
+	}}
+	m.Sp = p.spanFrom(start)
+	return m
+}
+
+// parseWhileLet parses `let pat = expr { .. }` after `while` and desugars it
+// to `loop { match expr { pat => { .. }, _ => break } }`, so the scrutinee is
+// re-evaluated each iteration and `break`/`continue` in the body behave as
+// they do in any loop.
+func (p *parser) parseWhileLet(start token.Pos) ast.Expr {
+	p.bump() // let
+	pat := p.parsePattern()
+	p.expect(token.KindEq, " after the `while let` pattern")
+	p.noStructLit++
+	scrut := p.parseExpr()
+	p.noStructLit--
+	body := p.parseBlock()
+	m := &ast.MatchExpr{Scrutinee: scrut, Arms: []ast.MatchArm{
+		{Pat: pat, Body: body, Sp: body.Sp},
+		{Pat: &ast.WildcardPat{Sp: p.spanFrom(start)}, Body: &ast.JumpExpr{Kind: token.KindBreak, Sp: p.spanFrom(start)}},
+	}}
+	m.Sp = p.spanFrom(start)
+	loopBody := &ast.Block{Tail: m, Sp: body.Sp}
+	return &ast.LoopExpr{Kind: token.KindLoop, Body: loopBody, Sp: p.spanFrom(start)}
 }
 
 // isBlockLikeExpr reports whether e ends in `}`, so that a match arm using it as

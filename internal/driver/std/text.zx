@@ -1,0 +1,48 @@
+// text — small string helpers, part of the Zexi standard library.
+// Import with `use text;` or `use std::text;`.
+
+// repeat_text returns `s` concatenated `n` times.
+pub fn repeat_text(s: str, n: i32) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < n {
+        out.push_str(s);
+        i += 1;
+    }
+    out
+}
+
+// exclaim returns `s` with a trailing "!".
+pub fn exclaim(s: str) -> String {
+    let mut out = String::from(s);
+    out.push_str("!");
+    out
+}
+
+// pad_start pads `s` on the left with `ch` until it is `width` bytes long.
+pub fn pad_start(s: str, width: i32, ch: char) -> String {
+    let mut out = String::new();
+    let mut missing = width - (len(s) as i32);
+    while missing > 0 {
+        out.push(ch);
+        missing -= 1;
+    }
+    out.push_str(s);
+    out
+}
+
+// join_with returns a + sep + b.
+pub fn join_with(a: str, sep: str, b: str) -> String {
+    let mut out = String::from(a);
+    out.push_str(sep);
+    out.push_str(b);
+    out
+}
+
+// shout_naive wraps `s` in asterisks, for emphasis in plain-text output.
+pub fn shout(s: str) -> String {
+    let mut out = String::from("*");
+    out.push_str(s);
+    out.push_str("*");
+    out
+}

@@ -1,0 +1,220 @@
+// tests/keywords.zx
+// Coverage for the expanded surface: the `until` and `elif` keywords, a
+// working `defer`, `type` aliases, or-patterns and range patterns in `match`,
+// `if let` / `while let`, hash raw strings, tuple-struct construction, and
+// constants that refer to constants declared later.
+
+// ---- type aliases -------------------------------------------------------
+type Meters = i64;
+type Distance = Meters; // an alias may name another alias
+type Scores = [i32; 2];
+
+fn add_m(a: Meters, b: Meters) -> Meters {
+    a + b
+}
+
+// ---- tuple structs ------------------------------------------------------
+struct Pair(i32, i32);
+struct Named(String, i32);
+
+// ---- enums for `let` patterns and or-patterns ---------------------------
+enum Dir { North, South, East, West }
+enum Step { More(i32), Done }
+
+fn step(i: i32) -> Step {
+    if i < 3 { Step::More(i * 10) } else { Step::Done }
+}
+
+fn axis(d: Dir) -> str {
+    match d {
+        Dir::North | Dir::South => "vertical",
+        Dir::East | Dir::West => "horizontal",
+    }
+}
+
+fn bump_step(s: Step) -> i32 {
+    match s {
+        Step::More(mut v) => { v += 1; v },
+        Step::Done => -1,
+    }
+}
+
+// ---- or-patterns, range patterns, guards --------------------------------
+fn describe(n: i32) -> str {
+    match n {
+        0 => "zero",
+        1 | 2 | 3 => "small",
+        4..=6 => "mid",
+        7..10 => "high",
+        _ => "huge",
+    }
+}
+
+fn pick(n: i32) -> i32 {
+    match n {
+        1 | 2 if n == 2 => 20,
+        1 | 2 => 10,
+        _ => 0,
+    }
+}
+
+fn temp(n: i32) -> str {
+    match n {
+        -50..-10 => "deep freeze",
+        -10..=0 => "freezing",
+        _ => "ok",
+    }
+}
+
+fn kind(c: char) -> str {
+    match c {
+        'a'..='z' => "lower",
+        'A'..='Z' => "upper",
+        '0'..='9' => "digit",
+        _ => "other",
+    }
+}
+
+// ---- elif ---------------------------------------------------------------
+fn grade(score: i32) -> str {
+    if score >= 90 {
+        "A"
+    } elif score >= 80 {
+        "B"
+    } elif score >= 70 {
+        "C"
+    } else {
+        "F"
+    }
+}
+
+// ---- defer on early return ----------------------------------------------
+fn early(flag: bool) -> i32 {
+    defer println("early cleanup");
+    if flag {
+        return 1;
+    }
+    println("no return");
+    return 2;
+}
+
+// ---- constants may refer to later constants ------------------------------
+const LIMIT = BASE + 2;
+const BASE = 40;
+const RAW = r"a\tb";
+
+fn main() -> i32 {
+    // elif
+    println(grade(95)); // A
+    println(grade(85)); // B
+    println(grade(75)); // C
+    println(grade(10)); // F
+
+    // until: loops while the condition is false; zero times if already true
+    let mut n = 0;
+    until n >= 4 {
+        n += 1;
+    }
+    println(n); // 4
+    until true {
+        n += 100;
+    }
+    println(n); // 4
+
+    // defer: LIFO at scope exit
+    {
+        defer println("deferred-2");
+        defer println("deferred-1");
+        println("block body");
+    }
+    // block body, deferred-1, deferred-2
+
+    // a deferred expression is evaluated at exit, not at the `defer`
+    {
+        let mut s = String::from("x");
+        defer println(s);
+        s.push_str("y");
+    }
+    // xy
+
+    // defer runs on early return, before the caller continues
+    println(early(true));  // early cleanup, 1
+    println(early(false)); // no return, early cleanup, 2
+
+    // defer runs at the end of every loop iteration, even via `continue`
+    let mut i = 0;
+    while i < 3 {
+        i += 1;
+        defer println("iter", i);
+        if i == 2 {
+            continue;
+        }
+        println("body", i);
+    }
+    // body 1, iter 1, iter 2, body 3, iter 3
+
+    // type aliases
+    let d: Distance = 40;
+    println(add_m(d, 2)); // 42
+    let scores: Scores = [5, 6];
+    println(scores[1]); // 6
+
+    // tuple-struct construction and positional fields
+    let p = Pair(3, 4);
+    println(p.0, p.1);   // 3 4
+    println(p.0 + p.1);  // 7
+    let named = Named(String::from("bob"), 7);
+    println(named.0, named.1); // bob 7
+
+    // or-patterns and range patterns
+    println(describe(0));  // zero
+    println(describe(2));  // small
+    println(describe(5));  // mid
+    println(describe(9));  // high
+    println(describe(70)); // huge
+    println(pick(1));      // 10
+    println(pick(2));      // 20
+    println(temp(-30));    // deep freeze
+    println(temp(-10));    // freezing
+    println(temp(3));      // ok
+    println(kind('q'));    // lower
+    println(kind('Q'));    // upper
+    println(kind('5'));    // digit
+    println(kind('!'));    // other
+    println(axis(Dir::East));  // horizontal
+    println(axis(Dir::North)); // vertical
+    println(bump_step(Step::More(4))); // 5
+    println(bump_step(Step::Done));    // -1
+
+    // if let / while let
+    if let Step::More(v) = step(1) {
+        println("got", v); // got 10
+    } else {
+        println("none");
+    }
+    if let Step::More(v) = step(9) {
+        println("got", v);
+    } else {
+        println("none"); // none
+    }
+    if let Step::Done = step(9) {
+        println("done"); // done
+    }
+    let mut total = 0;
+    let mut k = 0;
+    while let Step::More(v) = step(k) {
+        total += v;
+        k += 1;
+    }
+    println(total); // 30
+
+    // raw strings are literal text; the `#` form may contain quotes
+    println(r"C:\new\test");   // C:\new\test
+    println(r#"say "hi" \n"#); // say "hi" \n
+    println(RAW);              // a\tb
+
+    // forward-referenced constants
+    println(LIMIT); // 42
+
+    0
+}

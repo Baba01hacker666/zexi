@@ -19,6 +19,10 @@ import (
 func TestTypeCheckExamples(t *testing.T) {
 	files := []string{
 		"../../examples/hello.zx",
+		"../../examples/easy.zx",
+		"../../examples/cbridge.zx",
+		"../../examples/guess.zx",
+		"../../examples/args.zx",
 		"../../tests/tour.zx",
 		"../../tests/structs.zx",
 		"../../tests/enums.zx",
@@ -33,6 +37,8 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/match_guards.zx",
 		"../../tests/robustness.zx",
 		"../../tests/sugar.zx",
+		"../../tests/keywords.zx",
+		"../../tests/easy.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -163,6 +169,33 @@ func TestRunPrograms(t *testing.T) {
 				"ratio: 1 3.5", "",
 			}, "\n"),
 		},
+		{
+			file: "../../tests/keywords.zx",
+			want: strings.Join([]string{
+				"A", "B", "C", "F", "4", "4",
+				"block body", "deferred-1", "deferred-2", "xy",
+				"early cleanup", "1", "no return", "early cleanup", "2",
+				"body 1", "iter 1", "iter 2", "body 3", "iter 3",
+				"42", "6", "3 4", "7", "bob 7",
+				"zero", "small", "mid", "high", "huge", "10", "20",
+				"deep freeze", "freezing", "ok",
+				"lower", "upper", "digit", "other",
+				"horizontal", "vertical", "5", "-1",
+				"got 10", "none", "done", "30",
+				`C:\new\test`, `say "hi" \n`, `a\tb`, "42", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/easy.zx",
+			want: strings.Join([]string{
+				"hello, bob!", "hello, ada? x2", "hello, cy! x3",
+				"50", "15", "8",
+				"21", "welcome, zexi!",
+				"10", "6", "1024", "ababab", "00042",
+				"world #3 {ok}", "pi~3.5 ok=true grade=A",
+				"42", "6", "3", "",
+			}, "\n"),
+		},
 	}
 
 	for _, tc := range cases {
@@ -273,4 +306,172 @@ func waitPort(addr string, d time.Duration) bool {
 		time.Sleep(25 * time.Millisecond)
 	}
 	return false
+}
+
+// TestUseLoadsRelativeFile checks that `use "helper.zx";` pulls a sibling
+// file into the program.
+func TestUseLoadsRelativeFile(t *testing.T) {
+	dir := t.TempDir()
+	helper := "pub fn triple(n: i32) -> i32 { n * 3 }\n"
+	main := "use \"helper.zx\";\nfn main() -> i32 { println(triple(7)); 0 }\n"
+	if err := os.WriteFile(filepath.Join(dir, "helper.zx"), []byte(helper), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mainPath := filepath.Join(dir, "main.zx")
+	if err := os.WriteFile(mainPath, []byte(main), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	em := diag.NewEmitter()
+	if _, ok := driver.FrontEnd(mainPath, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("expected `use \"helper.zx\"` to load the library")
+	}
+}
+
+// TestUseEmbeddedStdlib checks that `use math;` finds the standard library
+// embedded in the compiler, from any directory.
+func TestUseEmbeddedStdlib(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	src := "use math;\nfn main() -> i32 { println(clampi(15, 0, 10), gcdi(12, 18)); 0 }\n"
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	em := diag.NewEmitter()
+	if _, ok := driver.FrontEnd(mainPath, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("expected `use math;` to load the embedded stdlib")
+	}
+}
+
+// TestUseMissingLibrary checks that an unresolvable `use` is a clean
+// diagnostic (E9022), not a crash.
+func TestUseMissingLibrary(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	src := "use nosuchlib;\nfn main() -> i32 { 0 }\n"
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	em := diag.NewEmitter()
+	if _, ok := driver.FrontEnd(mainPath, driver.Options{}, em); ok {
+		t.Fatal("expected a diagnostic for a missing library")
+	}
+	var buf bytes.Buffer
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E9022") {
+		t.Fatalf("expected E9022, got:\n%s", buf.String())
+	}
+}
+
+// TestCBridge builds a Zexi program that calls C code: a glue .c file
+// compiled in with Options.CFiles and libm linked with Options.LinkLibs.
+// It exercises the whole bridge — extern declarations, `str` pass-through,
+// `cstr`/`from_cstr` marshalling, and the extra link inputs.
+func TestCBridge(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	glue := `#include <string.h>
+int zx_add(int a, int b) { return a + b; }
+int zx_exclaim_len(const char *s) { return (int)strlen(s) + 1; }
+int zx_count_a(const char *s) { int n = 0; for (; *s; s++) { if (*s == 'a') n++; } return n; }
+const char *zx_motto(void) { return "fast and small"; }
+`
+	main := `extern "C" fn zx_add(a: i32, b: i32) -> i32;
+extern "C" fn zx_exclaim_len(s: str) -> i32;
+extern "C" fn zx_count_a(s: *u8) -> i32;
+extern "C" fn zx_motto() -> *u8;
+extern "C" fn sqrt(x: f64) -> f64;
+fn main() -> i32 {
+    println(zx_add(20, 22));
+    println(zx_exclaim_len("zexi"));
+    let motto = from_cstr(zx_motto());
+    println(motto);
+    println(zx_count_a(cstr(motto)));
+    println(sqrt(2.25));
+    0
+}
+`
+	gluePath := filepath.Join(dir, "glue.c")
+	mainPath := filepath.Join(dir, "main.zx")
+	if err := os.WriteFile(gluePath, []byte(glue), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mainPath, []byte(main), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	opts := driver.Options{CFiles: []string{gluePath}, LinkLibs: []string{"m"}}
+	if _, ok := driver.Build(mainPath, out, opts, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("C bridge build failed")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running bridged program: %v", err)
+	}
+	want := "42\n5\nfast and small\n3\n1.5\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestProgramArgs builds a program that echoes its command line through
+// arg_count()/arg_at(i) and checks the output.
+func TestProgramArgs(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	out := filepath.Join(t.TempDir(), "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build("../../examples/args.zx", out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("args build failed")
+	}
+	raw, err := exec.Command(out, "hello", "world").Output()
+	if err != nil {
+		t.Fatalf("running args program: %v", err)
+	}
+	want := "program: " + out + "\narg 1: hello\narg 2: world\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestReadLine builds a program against the stdlib `io` module and feeds
+// it a line on stdin.
+func TestReadLine(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	src := `use io;
+fn main() -> i32 {
+    let line = read_line();
+    println(f"got: {line} ({len(line)})");
+    0
+}
+`
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("read_line build failed")
+	}
+	cmd := exec.Command(out)
+	cmd.Stdin = strings.NewReader("hello zexi\nignored\n")
+	raw, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("running read_line program: %v", err)
+	}
+	if want := "got: hello zexi (10)\n"; string(raw) != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
+	}
 }

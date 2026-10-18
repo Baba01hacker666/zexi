@@ -1,0 +1,31 @@
+#!/usr/bin/env zexi
+# easy.zx — Zexi written the easy way.
+#
+#   * `#` comments (and `//` ones too), no semicolons needed at line ends
+#   * f"..." string interpolation
+#   * default arguments and named (keyword) arguments
+#   * libraries with `use` — including the standard library that ships
+#     inside the compiler (`use math;` just works, anywhere)
+#
+# Run it with:  go run ./cmd/zexic run examples/easy.zx
+
+use math;
+
+fn greet(name: str, punct: str = "!", times: i64 = 1) -> String {
+    let base = f"hello, {name}{punct}"
+    if times > 1 { f"{base} x{times}" } else { base }
+}
+
+fn main() {
+    println(greet("world"))
+    println(greet(name = "zexi", times = 3, punct = "?"))
+
+    let n = clampi(15, 0, 10)
+    println(f"clamped: {n}, gcd(12, 18) = {gcdi(12, 18)}, 2^10 = {powi(2, 10)}")
+
+    let mut total = 0
+    for i in 1..5 {
+        total += i
+    }
+    println(f"sum 1..5 = {total}")
+}

@@ -795,3 +795,357 @@ func TestIntLiteralInFloatContext(t *testing.T) {
 		t.Fatalf("expected E0080 for an oversized literal, got %v", codes)
 	}
 }
+
+func TestCharLiteralMustBeOneChar(t *testing.T) {
+	for _, src := range []string{
+		`fn main() -> i32 { let c = 'ab'; 0 }`,
+		`fn main() -> i32 { let c = ''; 0 }`,
+		"fn main() -> i32 { let b = b'\\u{1F600}'; 0 }",
+		"fn main() -> i32 { let c = '\\u{D800}'; 0 }",
+		`fn main() -> i32 { match 'x' { 'ab' => 1, _ => 0 } }`,
+	} {
+		ok, codes := check(t, src)
+		if ok || !has(codes, "E0001") {
+			t.Fatalf("%q: expected E0001, got ok=%v codes=%v", src, ok, codes)
+		}
+	}
+	// Valid forms still check cleanly.
+	for _, src := range []string{
+		`fn main() -> i32 { let c = 'a'; let b = b'x'; let u = '\u{1F600}'; 0 }`,
+	} {
+		if ok, codes := check(t, src); !ok {
+			t.Fatalf("%q: expected clean, got %v", src, codes)
+		}
+	}
+}
+
+func TestTypeAliases(t *testing.T) {
+	src := `type Meters = i64;
+type Distance = Meters;
+type Scores = [i32; 2];
+fn add(a: Meters, b: Meters) -> Meters { a + b }
+fn main() -> i32 {
+    let d: Distance = 40;
+    let s: Scores = [5, 6];
+    println(add(d, 2) + s[1] as i64);
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestCyclicTypeAlias(t *testing.T) {
+	src := `type A = B;
+type B = A;
+fn main() -> i32 { 0 }`
+	ok, codes := check(t, src)
+	if ok || !has(codes, "E0072") {
+		t.Fatalf("expected E0072, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestConstForwardReference(t *testing.T) {
+	src := `const LIMIT = BASE + 2;
+const BASE = 40;
+fn main() -> i32 { println(LIMIT); 0 }`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	// A genuinely non-constant initializer is still rejected.
+	ok, codes := check(t, `const X = f(1);
+fn f(n: i32) -> i32 { n }
+fn main() -> i32 { 0 }`)
+	if ok || !has(codes, "E0602") {
+		t.Fatalf("expected E0602, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestTupleStructConstruction(t *testing.T) {
+	src := `struct Pair(i32, i32);
+fn main() -> i32 { let p = Pair(3, 4); println(p.0 + p.1); 0 }`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	ok, codes := check(t, `struct Pair(i32, i32);
+fn main() -> i32 { let p = Pair(3); 0 }`)
+	if ok || !has(codes, "E0061") {
+		t.Fatalf("expected E0061 for arity, got ok=%v codes=%v", ok, codes)
+	}
+	ok, codes = check(t, `struct Named { x: i32 }
+fn main() -> i32 { let p = Named(3); 0 }`)
+	if ok || !has(codes, "E0061") {
+		t.Fatalf("expected E0061 for named struct called as tuple, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestEnumAssociatedFnViaDotDoesNotPanic(t *testing.T) {
+	// Regression: this used to dereference a nil struct pointer and crash
+	// the compiler when the receiver was an enum.
+	src := `enum E { A, B }
+impl E { fn make() -> E { E::A } }
+fn main() -> i32 { let e = E::A; println(e.make()); 0 }`
+	ok, codes := check(t, src)
+	if ok || !has(codes, "E0599") {
+		t.Fatalf("expected E0599, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestOrAndRangePatterns(t *testing.T) {
+	src := `enum E { A, B, C }
+fn f(n: i32) -> i32 {
+    match n {
+        1 | 2 => 10,
+        3..=5 => 30,
+        6..9 => 60,
+        _ => 0,
+    }
+}
+fn g(e: E) -> i32 {
+    match e {
+        E::A | E::B => 1,
+        E::C => 2,
+    }
+}
+fn main() -> i32 { f(2) + g(E::B) }`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestOrPatternCannotBind(t *testing.T) {
+	src := `fn main() -> i32 {
+    match 1 {
+        x | _ => x,
+    }
+}`
+	ok, codes := check(t, src)
+	if ok || !has(codes, "E0900") {
+		t.Fatalf("expected E0900, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestEmptyRangePattern(t *testing.T) {
+	src := `fn main() -> i32 {
+    match 1 {
+        5..=1 => 1,
+        _ => 0,
+    }
+}`
+	ok, codes := check(t, src)
+	if ok || !has(codes, "E0080") {
+		t.Fatalf("expected E0080, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestIfLetAndWhileLet(t *testing.T) {
+	src := `enum E { V(i32), None }
+fn make(i: i32) -> E { if i < 2 { E::V(i) } else { E::None } }
+fn main() -> i32 {
+    let mut total = 0;
+    if let E::V(x) = make(1) {
+        total += x;
+    } else {
+        total += 100;
+    }
+    let mut i = 0;
+    while let E::V(x) = make(i) {
+        total += x;
+        i += 1;
+    }
+    total
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestUntilAndElif(t *testing.T) {
+	src := `fn grade(n: i32) -> str {
+    if n > 90 { "A" } elif n > 50 { "B" } else { "F" }
+}
+fn main() -> i32 {
+    let mut i = 0;
+    until i >= 3 { i += 1; }
+    println(grade(95), i);
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestDefer(t *testing.T) {
+	src := `fn main() -> i32 {
+    let mut s = String::from("x");
+    defer println(s);
+    defer println("later");
+    s.push_str("y");
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestDefaultAndNamedArgs(t *testing.T) {
+	src := `fn area(w: i64, h: i64 = 10) -> i64 { w * h }
+fn main() -> i32 { println(area(5), area(5, h = 3), area(h = 4, w = 2)); 0 }`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	// Computed constant defaults are fine.
+	ok, codes := check(t, `fn f(a: i32, b: i32 = 20 + 22) -> i32 { a + b }
+fn main() -> i32 { println(f(0)); 0 }`)
+	if !ok {
+		t.Fatalf("expected clean const default, got %v", codes)
+	}
+	// Unknown parameter name.
+	ok, codes = check(t, `fn area(w: i64, h: i64 = 10) -> i64 { w * h }
+fn main() -> i32 { println(area(5, z = 1)); 0 }`)
+	if ok || !has(codes, "E0061") {
+		t.Fatalf("expected E0061 for unknown name, got ok=%v codes=%v", ok, codes)
+	}
+	// Same parameter twice (positionally and by name).
+	ok, codes = check(t, `fn area(w: i64, h: i64 = 10) -> i64 { w * h }
+fn main() -> i32 { println(area(5, w = 2)); 0 }`)
+	if ok || !has(codes, "E0062") {
+		t.Fatalf("expected E0062 for duplicate, got ok=%v codes=%v", ok, codes)
+	}
+	// A required argument is still required.
+	ok, codes = check(t, `fn area(w: i64, h: i64 = 10) -> i64 { w * h }
+fn main() -> i32 { println(area()); 0 }`)
+	if ok || !has(codes, "E0061") {
+		t.Fatalf("expected E0061 for missing arg, got ok=%v codes=%v", ok, codes)
+	}
+	// Defaults must be constant expressions.
+	ok, codes = check(t, `fn g() -> i32 { 1 }
+fn f(a: i32, b: i32 = g()) -> i32 { a + b }
+fn main() -> i32 { println(f(1)); 0 }`)
+	if ok || !has(codes, "E0602") {
+		t.Fatalf("expected E0602 for non-const default, got ok=%v codes=%v", ok, codes)
+	}
+	// A parameter without a default may not follow one with a default.
+	ok, codes = check(t, `fn f(a: i32 = 1, b: i32) -> i32 { a + b }
+fn main() -> i32 { println(f(1, 2)); 0 }`)
+	if ok || !has(codes, "E0061") {
+		t.Fatalf("expected E0061 for non-trailing default, got ok=%v codes=%v", ok, codes)
+	}
+	// Named arguments are not accepted by builtins.
+	ok, codes = check(t, `fn main() -> i32 { println(x = 1); 0 }`)
+	if ok || !has(codes, "E0061") {
+		t.Fatalf("expected E0061 for named arg to println, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestFStrings(t *testing.T) {
+	src := `fn main() -> i32 {
+    let name = "zexi";
+    let s = f"hi {name}, {1 + 2} + {2.5} = fun? {true} {'!'}";
+    println(s);
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	// Interpolating a String borrows it: it stays usable afterwards.
+	ok, codes := check(t, `fn main() -> i32 {
+    let s = String::from("x");
+    println(f"{s}");
+    println(s);
+    0
+}`)
+	if !ok {
+		t.Fatalf("expected clean String interpolation, got %v", codes)
+	}
+	// Non-printable values cannot be interpolated.
+	ok, codes = check(t, `struct P { x: i32 }
+fn main() -> i32 { let p = P { x: 1 }; println(f"{p}"); 0 }`)
+	if ok || !has(codes, "E0277") {
+		t.Fatalf("expected E0277 for struct interpolation, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestCBridgeBuiltins(t *testing.T) {
+	// cstr borrows a String (it is not moved), from_cstr owns a copy.
+	src := `extern "C" fn puts2(s: *u8) -> i32;
+fn main() -> i32 {
+    let s = String::from("hi");
+    let n = puts2(cstr(s));
+    println(s);
+    let back = from_cstr(cstr(s));
+    println(back, n);
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	// cstr needs a string, from_cstr needs a pointer.
+	ok, codes := check(t, `fn main() -> i32 { let p = cstr(42); 0 }`)
+	if ok || !has(codes, "E0308") {
+		t.Fatalf("expected E0308 for cstr(int), got ok=%v codes=%v", ok, codes)
+	}
+	ok, codes = check(t, `fn main() -> i32 { let s = from_cstr("literal"); println(s); 0 }`)
+	if ok || !has(codes, "E0308") {
+		t.Fatalf("expected E0308 for from_cstr(str), got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestStrMatch(t *testing.T) {
+	src := `fn kind(cmd: str) -> i32 {
+    match cmd {
+        "quit" | "exit" => 0,
+        "help" => 1,
+        _ => 2,
+    }
+}
+fn main() -> i32 { println(kind("help")); 0 }`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	// String matches need a catch-all.
+	ok, codes := check(t, `fn main() -> i32 {
+    let n = match "x" { "x" => 1 };
+    println(n);
+    0
+}`)
+	if ok || !has(codes, "E0004") {
+		t.Fatalf("expected E0004, got ok=%v codes=%v", ok, codes)
+	}
+	// Non-string patterns do not fit a string scrutinee.
+	ok, codes = check(t, `fn main() -> i32 {
+    let n = match "x" { 1 => 1, _ => 0 };
+    println(n);
+    0
+}`)
+	if ok || !has(codes, "E0308") {
+		t.Fatalf("expected E0308, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestArgBuiltins(t *testing.T) {
+	src := `fn main() -> i32 {
+    if arg_count() > 1 { println(arg_at(1)); }
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	ok, codes := check(t, `fn main() -> i32 { println(arg_at("x")); 0 }`)
+	if ok || !has(codes, "E0308") {
+		t.Fatalf("expected E0308, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestDidYouMeanStillErrors(t *testing.T) {
+	// A mistyped function name is E0425 (with a "did you mean" hint in
+	// the message), not a panic or a silent pass.
+	ok, codes := check(t, `fn main() -> i32 { pritnln("hi"); 0 }`)
+	if ok || !has(codes, "E0425") {
+		t.Fatalf("expected E0425, got ok=%v codes=%v", ok, codes)
+	}
+	ok, codes = check(t, `fn main() -> i32 { let total = 1; println(totla); 0 }`)
+	if ok || !has(codes, "E0425") {
+		t.Fatalf("expected E0425, got ok=%v codes=%v", ok, codes)
+	}
+}

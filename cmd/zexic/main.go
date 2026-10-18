@@ -6,7 +6,7 @@
 //
 //	zexic <command> [options] <file.zx>
 //
-// Commands: check, build, run, emit, tokenize, version.
+// Commands: check, build, run, emit, tokenize, bindgen, version.
 // See docs/04 §4.9 for the planned CLI surface.
 package main
 
@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"zexi/internal/bindgen"
 	"zexi/internal/diag"
 	"zexi/internal/driver"
 	"zexi/internal/token"
@@ -29,17 +30,30 @@ func main() { os.Exit(run(os.Args[1:])) }
 // cli holds parsed command-line options.
 type cli struct {
 	positional []string
+	progArgs   []string // program arguments after `--` (run only)
 	out        string
 	emit       string
 	optLevel   string
 	cc         string
+	// C bridge options.
+	cFiles      []string
+	linkLibs    []string
+	libDirs     []string
+	includeDirs []string
 }
 
 func parseArgs(args []string) cli {
 	var c cli
+	afterSep := false // everything after `--` is a program argument
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if afterSep {
+			c.progArgs = append(c.progArgs, a)
+			continue
+		}
 		switch {
+		case a == "--":
+			afterSep = true
 		case a == "-o" && i+1 < len(args):
 			i++
 			c.out = args[i]
@@ -51,6 +65,14 @@ func parseArgs(args []string) cli {
 			c.optLevel = strings.TrimPrefix(a, "--opt-level=")
 		case strings.HasPrefix(a, "--cc="):
 			c.cc = strings.TrimPrefix(a, "--cc=")
+		case strings.HasPrefix(a, "--csrc="):
+			c.cFiles = append(c.cFiles, strings.TrimPrefix(a, "--csrc="))
+		case strings.HasPrefix(a, "--link="):
+			c.linkLibs = append(c.linkLibs, strings.TrimPrefix(a, "--link="))
+		case strings.HasPrefix(a, "--lib-dir="):
+			c.libDirs = append(c.libDirs, strings.TrimPrefix(a, "--lib-dir="))
+		case strings.HasPrefix(a, "--include="):
+			c.includeDirs = append(c.includeDirs, strings.TrimPrefix(a, "--include="))
 		case strings.HasPrefix(a, "-"):
 			// Unknown flag: ignore for forward compatibility.
 		default:
@@ -61,7 +83,14 @@ func parseArgs(args []string) cli {
 }
 
 func (c cli) opts() driver.Options {
-	return driver.Options{OptLevel: c.optLevel, CC: c.cc}
+	return driver.Options{
+		OptLevel:    c.optLevel,
+		CC:          c.cc,
+		CFiles:      c.cFiles,
+		LinkLibs:    c.linkLibs,
+		LibDirs:     c.libDirs,
+		IncludeDirs: c.includeDirs,
+	}
 }
 
 func run(args []string) int {
@@ -81,6 +110,8 @@ func run(args []string) int {
 		return 0
 	case "tokenize":
 		return cmdTokenize(c)
+	case "bindgen":
+		return cmdBindgen(c)
 	case "check":
 		return cmdCheck(c)
 	case "build":
@@ -170,6 +201,9 @@ func cmdRun(c cli) int {
 	if !ok {
 		return 2
 	}
+	// Arguments after a `--` separator belong to the program, not to the
+	// compiler: `zexic run app.zx -- arg1 arg2` runs app with arg1 arg2.
+	progArgs := c.progArgs
 	em := diag.NewEmitter()
 	dir, err := os.MkdirTemp("", "zexic-run-")
 	if err != nil {
@@ -184,7 +218,7 @@ func cmdRun(c cli) int {
 		return 1
 	}
 
-	child := exec.Command(out)
+	child := exec.Command(out, progArgs...)
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
@@ -220,6 +254,32 @@ func cmdEmit(c cli) int {
 	return 0
 }
 
+// cmdBindgen translates a C header into Zexi `extern "C"` declarations,
+// printed to stdout or written to the -o file. Declarations bindgen cannot
+// map are listed in the output as comments.
+func cmdBindgen(c cli) int {
+	path, ok := requireFile(c, "bindgen")
+	if !ok {
+		return 2
+	}
+	src, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "zexic bindgen: %v\n", err)
+		return 1
+	}
+	res := bindgen.Generate(src, filepath.Base(path))
+	if c.out != "" {
+		if err := os.WriteFile(c.out, []byte(res.Source), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "zexic bindgen: %v\n", err)
+			return 1
+		}
+		fmt.Printf("wrote %s (%d declaration(s), %d skipped)\n", c.out, len(res.Bound), len(res.Skipped))
+		return 0
+	}
+	fmt.Print(res.Source)
+	return 0
+}
+
 // emFileID returns the id of the single source file registered with em, or 0.
 func emFileID(em *diag.Emitter) int { return em.FirstFileID() }
 
@@ -235,15 +295,22 @@ commands:
   run        build to a temporary path and execute
   emit       print an intermediate form (--emit=c)
   tokenize   print the token stream
+  bindgen    generate Zexi extern declarations from a C header
   version    print the compiler version
 
 Multiple .zx files are compiled together into one program (the first is the
 entry file; the rest are usually library files).
 
 options:
-  -o <path>                  output path for build
+  -o <path>                  output path for build (or for bindgen)
   --opt-level=<0|1|2|3|s>    optimization profile (default 2, 's' for size)
   --cc=<path>                C compiler to use (default $CC or cc)
   --emit=<c>                 intermediate form to print
+
+C bridge options (build/run):
+  --csrc=<file.c>            extra C source compiled and linked in (repeatable)
+  --link=<lib>               library to link, like -l<lib> (repeatable)
+  --lib-dir=<dir>            library search directory (repeatable)
+  --include=<dir>            header search directory for --csrc files (repeatable)
 `)
 }

@@ -1,0 +1,18 @@
+# args.zx — command-line arguments via arg_count() / arg_at(i).
+#
+#     zexic run examples/args.zx hello world
+#     program: .../args
+#     arg 1: hello
+#     arg 2: world
+
+fn main() {
+    println(f"program: {arg_at(0)}")
+    let mut i = 1
+    while i < arg_count() {
+        println(f"arg {i}: {arg_at(i)}")
+        i += 1
+    }
+    if arg_count() < 2 {
+        println("(no arguments — try: zexic run examples/args.zx hello world)")
+    }
+}

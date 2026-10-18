@@ -54,6 +54,9 @@ type Param struct {
 	Mut  bool
 	Name string
 	Ty   Type
+	// Default is the optional default value (`name: i32 = 42`). It must be
+	// a constant expression; calls may omit trailing defaulted arguments.
+	Default Expr
 	// Self marks the receiver parameter of a method. When set, Ty is nil for
 	// `self`, or a reference type for `&self` / `&mut self`.
 	Self    bool
@@ -144,9 +147,13 @@ type ModDecl struct {
 func (*ModDecl) itemNode()          {}
 func (d *ModDecl) Span() token.Span { return d.Sp }
 
-// UseDecl is `use path;`.
+// UseDecl is `use path;` or `use "file.zx";`. The driver resolves it to
+// source files (a library import) before type checking.
 type UseDecl struct {
 	Path []string
+	// File is the literal path of `use "file.zx";`, resolved relative to
+	// the importing file. Empty for the `use a::b;` form.
+	File string
 	As   string
 	Sp   token.Span
 }
@@ -271,6 +278,18 @@ type ExprStmt struct {
 func (*ExprStmt) stmtNode()          {}
 func (s *ExprStmt) Span() token.Span { return s.Sp }
 
+// DeferStmt is `defer expr;`: the expression is evaluated when the enclosing
+// block scope exits — by falling off the end, or via `return`, `break`, or
+// `continue` — after the deferred expressions registered later in the same
+// scope (LIFO) and before the scope's locals are dropped.
+type DeferStmt struct {
+	X  Expr
+	Sp token.Span
+}
+
+func (*DeferStmt) stmtNode()          {}
+func (s *DeferStmt) Span() token.Span { return s.Sp }
+
 // --- expressions ----------------------------------------------------------
 
 // Expr is an expression.
@@ -381,6 +400,31 @@ type ArrayLitExpr struct {
 func (*ArrayLitExpr) exprNode()          {}
 func (e *ArrayLitExpr) Span() token.Span { return e.Sp }
 
+// NamedArgExpr is one `name = value` argument in a call. The checker
+// rewrites calls that use named arguments (or omit defaulted ones) into
+// plain positional argument lists, so later stages never see this node in
+// a resolved call.
+type NamedArgExpr struct {
+	Name string
+	Val  Expr
+	Sp   token.Span
+}
+
+func (*NamedArgExpr) exprNode()          {}
+func (e *NamedArgExpr) Span() token.Span { return e.Sp }
+
+// InterpStrExpr is an interpolated string `f"...{expr}..."`. Parts
+// alternates literal chunks (*LiteralExpr of kind string) and arbitrary
+// expressions whose values are converted to text. The whole expression
+// has type `String`.
+type InterpStrExpr struct {
+	Parts []Expr
+	Sp    token.Span
+}
+
+func (*InterpStrExpr) exprNode()          {}
+func (e *InterpStrExpr) Span() token.Span { return e.Sp }
+
 // CallExpr is `f(args)`.
 type CallExpr struct {
 	Callee Expr
@@ -460,10 +504,10 @@ type MatchArm struct {
 	Sp    token.Span
 }
 
-// LoopExpr covers `loop`, `while`, and `for`.
+// LoopExpr covers `loop`, `while`, `until`, and `for`.
 type LoopExpr struct {
-	Kind token.Kind // KindLoop, KindWhile, or KindFor
-	Cond Expr       // while
+	Kind token.Kind // KindLoop, KindWhile, KindUntil, or KindFor
+	Cond Expr       // while / until
 	Pat  Pattern    // for
 	Iter Expr       // for
 	Body *Block
@@ -563,3 +607,24 @@ type FieldPat struct {
 	Pat  Pattern
 	Sp   token.Span
 }
+
+// OrPat is `pat | pat | ...` in a `match` arm or `if let`/`while let`: the arm
+// is taken when any alternative matches. Alternatives may not bind variables
+// (which alternative bound the value would be ambiguous).
+type OrPat struct {
+	Alts []Pattern
+	Sp   token.Span
+}
+
+func (*OrPat) patternNode()       {}
+func (p *OrPat) Span() token.Span { return p.Sp }
+
+// RangePat is `lo..hi` or `lo..=hi` over integer or `char` literal endpoints.
+type RangePat struct {
+	Lo, Hi    *LitPat
+	Inclusive bool // true for `..=`
+	Sp        token.Span
+}
+
+func (*RangePat) patternNode()       {}
+func (p *RangePat) Span() token.Span { return p.Sp }

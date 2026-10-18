@@ -48,6 +48,11 @@ type gen struct {
 	trapDepth  int  // compiler-generated constructs (matches) since the innermost loop
 	hasString  bool // whether the program uses the builtin `String`
 	hasChar    bool // whether a `char` value is printed (needs the UTF-8 helper)
+	// externNames is the set of C-visible function names (`extern "C"`
+	// declarations and `main`): locals mangle to `zx_<name>`, which must
+	// never shadow one of these (a local `motto` would hide the C
+	// function `zx_motto` it may need to call).
+	externNames map[string]bool
 }
 
 // loopLabel are the jump targets of one source-level loop.
@@ -58,9 +63,11 @@ type loopLabel struct {
 }
 
 // dropFrame is the set of locals declared in one lexical scope, in declaration
-// order; destructors run in reverse.
+// order; destructors run in reverse. It also holds the scope's deferred
+// expressions, which run (last-in-first-out) before the destructors.
 type dropFrame struct {
-	vars []dropVar
+	vars   []dropVar
+	defers []ast.Expr
 }
 
 type dropVar struct {
@@ -94,7 +101,12 @@ func (w *writer) raw(s string) { w.b.WriteString(s) }
 
 // Generate emits a complete C translation unit for the program.
 func Generate(info *sema.Info, opts Options) (string, error) {
-	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}, arrays: map[string]*types.Type{}, arrSeen: map[string]bool{}, dropSeen: map[string]bool{}}
+	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}, arrays: map[string]*types.Type{}, arrSeen: map[string]bool{}, dropSeen: map[string]bool{}, externNames: map[string]bool{}}
+	for _, fn := range info.FnOrder {
+		if fn.Extern || fn.Name == "main" {
+			g.externNames[funcName(fn)] = true
+		}
+	}
 	g.preamble()
 	g.collectArrayTypes()
 	g.collectDropTypes()
@@ -150,6 +162,11 @@ func (g *gen) preamble() {
 	g.w.line("")
 	g.w.line("// Defined only when a `char` is printed.")
 	g.w.line("static int zx_print_char(uint32_t c);")
+	g.w.line("")
+	g.w.line("// Command-line arguments, captured by `main` for arg_count()/arg_at().")
+	g.w.line("static int zx_argc;")
+	g.w.line("static char **zx_argv;")
+	g.w.line("static int zx_arg_count(void) { return zx_argc; }")
 	g.w.line("")
 }
 
@@ -663,10 +680,18 @@ func (g *gen) funcDef(fn *sema.Fn) {
 	if len(params) == 0 {
 		params = []string{"void"}
 	}
+	if fn.Name == "main" {
+		// C's main receives the command line; capture it for the
+		// arg_count()/arg_at() builtins.
+		params = []string{"int zx_argc_in", "char **zx_argv_in"}
+	}
 
 	g.w.line("%s%s %s(%s) {", staticPrefix(fn), retC, funcName(fn), strings.Join(params, ", "))
 	g.w.indent++
 	g.openDropFrame() // body frame
+	if fn.Name == "main" {
+		g.w.line("zx_argc = zx_argc_in; zx_argv = zx_argv_in;")
+	}
 	g.blockStmts(fn.Decl.Body, ret)
 	g.closeDropFrame()
 	g.closeDropFrame()
@@ -709,6 +734,15 @@ func (g *gen) stmt(s ast.Stmt) {
 	switch st := s.(type) {
 	case *ast.LetStmt:
 		g.letStmt(st)
+	case *ast.DeferStmt:
+		// Register the expression on the innermost scope frame; it is
+		// emitted when that frame exits (see emitFrameExit).
+		if len(g.dropFrames) > 0 {
+			f := g.dropFrames[len(g.dropFrames)-1]
+			f.defers = append(f.defers, st.X)
+		} else {
+			g.discard(st.X)
+		}
 	case *ast.ExprStmt:
 		g.stmtExpr(st.X)
 	default:
@@ -837,8 +871,11 @@ func (g *gen) loopStmt(x *ast.LoopExpr) string {
 		g.w.line("}")
 		g.w.line("%s: ;", brk)
 		return res
-	case token.KindWhile:
+	case token.KindWhile, token.KindUntil:
 		cond := g.value(x.Cond)
+		if x.Kind == token.KindUntil {
+			cond = "!(" + cond + ")"
+		}
 		res := g.loopResult(x)
 		brk, cont := g.openLoop(res)
 		g.w.line("while (%s) {", cond)
@@ -1037,6 +1074,9 @@ func (g *gen) value(e ast.Expr) string {
 
 	case *ast.CallExpr:
 		return g.callValue(x)
+
+	case *ast.InterpStrExpr:
+		return g.interpStrValue(x)
 
 	case *ast.IfExpr:
 		return g.ifValue(x)
@@ -1297,7 +1337,10 @@ func (g *gen) ifValue(x *ast.IfExpr) string {
 // value, wrapped as a statement expression.
 func (g *gen) branchValue(b *ast.Block, t *types.Type) string {
 	if len(b.Stmts) == 0 && b.Tail != nil {
-		return g.value(b.Tail)
+		// Consume, like blockValue does: a resource-owning place used as
+		// a branch value must move, or both the place and the branch
+		// result would own (and drop) the same buffer.
+		return g.consume(b.Tail)
 	}
 	return g.blockValue(b)
 }
@@ -1351,6 +1394,21 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 	if ctor := g.info.Ctors[x]; ctor != nil {
 		return g.enumConstruct(ctor, x.Args)
 	}
+	if st := g.info.TupleCtors[x]; st != nil {
+		// `Pair(1, 2)`: a compound literal in field order.
+		if len(st.Fields) == 0 {
+			return "((" + typeName(st.Name) + "){ 0 })"
+		}
+		var parts []string
+		for i, f := range st.Fields {
+			s := zeroValue(f.Ty)
+			if i < len(x.Args) {
+				s = g.consume(x.Args[i])
+			}
+			parts = append(parts, "."+fieldName(f.Name)+" = "+s)
+		}
+		return "((" + typeName(st.Name) + "){ " + strings.Join(parts, ", ") + " })"
+	}
 	if fn := g.info.Resolved[x]; fn != nil {
 		return g.withArgs(x.Args, fn.Params, g.exprStmtType(x), func(ps []string) string {
 			return funcName(fn) + "(" + strings.Join(ps, ", ") + ")"
@@ -1370,6 +1428,25 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 	}
 	if name == "len" {
 		return g.lenValue(x)
+	}
+	if name == "cstr" {
+		return g.cstrValue(x)
+	}
+	if name == "from_cstr" {
+		if len(x.Args) != 1 {
+			return "0"
+		}
+		// Copy the C string into an owning zx_String.
+		return "zx_string_from((const char *)(" + g.value(x.Args[0]) + "))"
+	}
+	if name == "arg_count" {
+		return "zx_arg_count()"
+	}
+	if name == "arg_at" {
+		if len(x.Args) != 1 {
+			return "zx_string_from(\"\")"
+		}
+		return "zx_arg_at((int)(" + g.value(x.Args[0]) + "))"
 	}
 	fn, ok := g.info.Fns[name]
 	if !ok {
@@ -1730,6 +1807,29 @@ func (g *gen) indexValue(x *ast.IndexExpr) string {
 	return "(" + recv + ")[" + idx + "]"
 }
 
+// cstrValue emits the C-bridge builtin `cstr(x)`: a borrowed `*u8`
+// pointing at NUL-terminated text. A `str` already is a C string; a
+// `String` place lends its buffer. A computed `String` temporary is
+// materialized and intentionally not dropped — its buffer must outlive
+// the pointer, mirroring how C code treats such hand-offs (bind the
+// String to a variable first if that is not acceptable).
+func (g *gen) cstrValue(x *ast.CallExpr) string {
+	if len(x.Args) != 1 {
+		return "0"
+	}
+	arg := x.Args[0]
+	t := g.info.TypeOf(arg)
+	if t != nil && t.Kind == types.StringKind {
+		if isPlaceExpr(arg) {
+			return "((uint8_t *)zx_string_as_str(&(" + g.value(arg) + ")))"
+		}
+		tm := g.tmpName()
+		return "({ zx_String " + tm + " = " + g.value(arg) +
+			"; (uint8_t *)zx_string_as_str(&" + tm + "); })"
+	}
+	return "((uint8_t *)(" + g.value(arg) + "))"
+}
+
 // lenValue emits the builtin `len(x)`.
 func (g *gen) lenValue(x *ast.CallExpr) string {
 	if len(x.Args) != 1 {
@@ -1797,15 +1897,67 @@ func (g *gen) matchScrutinee(st *types.Type, scrut string) (*types.Type, string)
 	return st, scrut
 }
 
-// emitMatchArms lowers the arms. A `switch` is used when no arm has a guard;
-// guarded arms need fall-through on guard failure, which a C `switch` cannot
-// express, so they are lowered to an if-chain inside a `do { } while (0)`.
+// emitMatchArms lowers the arms. A `switch` is used when no arm has a guard
+// or a complex (or/range) pattern; those need fall-through on guard failure
+// or tests a C `switch` cannot express, so they are lowered to an if-chain
+// inside a `do { } while (0)`.
 func (g *gen) emitMatchArms(x *ast.MatchExpr, st *types.Type, m, result string, w *writer) {
-	if matchHasGuard(x) {
+	// String matches also take the guarded path: they test with strcmp,
+	// which a C `switch` cannot express.
+	if matchHasGuard(x) || matchHasComplexPat(x) || (st != nil && st.Kind == types.Str) {
 		g.emitGuardedArms(x, st, m, result, w)
 		return
 	}
 	g.emitSwitch(x, st, m, result, w)
+}
+
+// matchHasComplexPat reports whether any arm uses an or-pattern or a range
+// pattern, which a C `switch` cannot express directly.
+func matchHasComplexPat(x *ast.MatchExpr) bool {
+	for _, a := range x.Arms {
+		switch a.Pat.(type) {
+		case *ast.OrPat, *ast.RangePat:
+			return true
+		}
+	}
+	return false
+}
+
+// patCond renders the C test for a pattern against disc (the scrutinee value,
+// or its `.tag` for enums), or "" when the pattern always matches.
+func (g *gen) patCond(p ast.Pattern, disc string, st *types.Type) string {
+	isEnum := st != nil && st.Kind == types.EnumKind
+	switch pt := p.(type) {
+	case *ast.WildcardPat, *ast.BindPat:
+		return ""
+	case *ast.PathPat:
+		if v := g.info.PatVariant[pt]; v != nil && isEnum {
+			return disc + " == " + strconv.Itoa(v.Index)
+		}
+		return ""
+	case *ast.LitPat:
+		if st != nil && st.Kind == types.Str {
+			return "strcmp(" + disc + ", " + strPatLabel(pt) + ") == 0"
+		}
+		return disc + " == " + litPatLabel(pt)
+	case *ast.OrPat:
+		var parts []string
+		for _, alt := range pt.Alts {
+			c := g.patCond(alt, disc, st)
+			if c == "" {
+				return "" // a catch-all alternative matches everything
+			}
+			parts = append(parts, "("+c+")")
+		}
+		return strings.Join(parts, " || ")
+	case *ast.RangePat:
+		op := "<"
+		if pt.Inclusive {
+			op = "<="
+		}
+		return disc + " >= " + litPatLabel(pt.Lo) + " && " + disc + " " + op + " " + litPatLabel(pt.Hi)
+	}
+	return ""
 }
 
 // emitGuardedArms emits one block per arm. When an arm's pattern matches but its
@@ -1820,11 +1972,11 @@ func (g *gen) emitGuardedArms(x *ast.MatchExpr, st *types.Type, m, result string
 	w.line("do {")
 	w.indent++
 	for _, arm := range x.Arms {
-		label, catchAll := g.armLabel(arm.Pat, isEnum)
+		cond := g.patCond(arm.Pat, disc, st)
 		w.line("{")
 		w.indent++
-		if !catchAll {
-			w.line("if (%s == %s) {", disc, label)
+		if cond != "" {
+			w.line("if (%s) {", cond)
 			w.indent++
 		}
 		g.pushScope()
@@ -1849,7 +2001,7 @@ func (g *gen) emitGuardedArms(x *ast.MatchExpr, st *types.Type, m, result string
 		}
 		g.trapDepth--
 		g.popScope()
-		if !catchAll {
+		if cond != "" {
 			w.indent--
 			w.line("}")
 		}
@@ -2021,6 +2173,18 @@ func litPatLabel(p *ast.LitPat) string {
 	return "0"
 }
 
+// strPatLabel renders a string literal pattern as a C string literal.
+func strPatLabel(p *ast.LitPat) string {
+	if p.Kind == token.KindRawString {
+		return cString(p.Text)
+	}
+	decoded, ok := sema.DecodeString(p.Text)
+	if !ok {
+		decoded = p.Text
+	}
+	return cString(decoded)
+}
+
 // intMinMacro maps a bare magnitude that is exactly the minimum of a signed
 // type to the matching <stdint.h> macro. Writing the positive magnitude in C
 // would either overflow a signed type or be silently treated as unsigned.
@@ -2061,12 +2225,15 @@ func (g *gen) literal(x *ast.LiteralExpr) string {
 			s += ".0"
 		}
 		return s
-	case token.KindString, token.KindRawString:
+	case token.KindString:
 		decoded, ok := sema.DecodeString(x.Text)
 		if !ok {
 			decoded = x.Text
 		}
 		return cString(decoded)
+	case token.KindRawString:
+		// Raw strings are literal text: backslashes are not escapes.
+		return cString(x.Text)
 	case token.KindChar:
 		r := firstRune(x.Text)
 		return "(uint32_t)" + strconv.FormatInt(int64(r), 10)
@@ -2079,6 +2246,51 @@ func (g *gen) literal(x *ast.LiteralExpr) string {
 		return "false"
 	}
 	return "0"
+}
+
+// interpStrValue lowers `f"...{expr}..."` to a GNU statement expression
+// that builds a fresh `String` part by part. Interpolated values are only
+// read, never moved: a `String` place is borrowed through its `str` view,
+// and a computed `String` is dropped after its text is copied out.
+func (g *gen) interpStrValue(x *ast.InterpStrExpr) string {
+	s := g.tmpName()
+	var b strings.Builder
+	b.WriteString("({ zx_String " + s + " = zx_string_new();")
+	for _, part := range x.Parts {
+		// Literal chunks are always string literals; an interpolated
+		// literal (`{3.5}`, `{true}`) goes through the typed switch.
+		if lit, ok := part.(*ast.LiteralExpr); ok && lit.Kind == token.KindString {
+			b.WriteString(" zx_string_push_str(&" + s + ", " + g.literal(lit) + ");")
+			continue
+		}
+		t := g.info.TypeOf(part)
+		v := g.value(part)
+		switch {
+		case t == nil || t.Kind == types.Invalid:
+			// Already diagnosed by the checker.
+		case t.Kind == types.Str:
+			b.WriteString(" zx_string_push_str(&" + s + ", " + v + ");")
+		case t.Kind == types.StringKind:
+			if isPlaceExpr(part) {
+				b.WriteString(" zx_string_push_str(&" + s + ", zx_string_as_str(&(" + v + ")));")
+			} else {
+				tm := g.tmpName()
+				b.WriteString(" { zx_String " + tm + " = " + v + "; zx_string_push_str(&" + s + ", zx_string_as_str(&" + tm + ")); zx_drop_String(&" + tm + "); }")
+			}
+		case t.Kind.IsInt() && t.Kind.IsSigned():
+			b.WriteString(" zx_string_push_i64(&" + s + ", (int64_t)(" + v + "));")
+		case t.Kind.IsInt():
+			b.WriteString(" zx_string_push_u64(&" + s + ", (uint64_t)(" + v + "));")
+		case t.Kind.IsFloat():
+			b.WriteString(" zx_string_push_f64(&" + s + ", (double)(" + v + "));")
+		case t.Kind == types.Bool:
+			b.WriteString(" zx_string_push_str(&" + s + ", (" + v + ") ? \"true\" : \"false\");")
+		case t.Kind == types.Char:
+			b.WriteString(" zx_string_push(&" + s + ", (uint32_t)(" + v + "));")
+		}
+	}
+	b.WriteString(" " + s + "; })")
+	return b.String()
 }
 
 // --- naming ---------------------------------------------------------------
@@ -2161,6 +2373,11 @@ func (g *gen) bind(name string) string {
 	c := "zx_" + safeIdent(name)
 	if g.counts[name] > 0 {
 		c = fmt.Sprintf("%s_%d", c, g.counts[name])
+	}
+	// Never shadow a C-visible function: a local whose mangled name
+	// would hide an `extern "C"` function it may call gets a suffix.
+	for g.externNames[c] {
+		c += "_"
 	}
 	g.counts[name]++
 	if len(g.scopes) > 0 {
@@ -2246,8 +2463,19 @@ func (g *gen) closeDropFrame() {
 		return
 	}
 	f := g.dropFrames[len(g.dropFrames)-1]
-	g.emitDrops(f)
+	g.emitFrameExit(f)
 	g.dropFrames = g.dropFrames[:len(g.dropFrames)-1]
+}
+
+// emitFrameExit emits everything that must happen when a scope is left: its
+// deferred expressions first, in reverse order of their `defer` statements
+// (so they can still read the locals), then the destructors of the locals
+// declared in the scope.
+func (g *gen) emitFrameExit(f *dropFrame) {
+	for i := len(f.defers) - 1; i >= 0; i-- {
+		g.discard(f.defers[i])
+	}
+	g.emitDrops(f)
 }
 
 func (g *gen) emitDrops(f *dropFrame) {
@@ -2257,11 +2485,12 @@ func (g *gen) emitDrops(f *dropFrame) {
 	}
 }
 
-// emitDropsFrom runs destructors for every frame from the innermost down to and
-// including frame `start`. Used on `return`, `break`, and `continue`.
+// emitDropsFrom runs deferred expressions and destructors for every frame
+// from the innermost down to and including frame `start`. Used on `return`,
+// `break`, and `continue`.
 func (g *gen) emitDropsFrom(start int) {
 	for i := len(g.dropFrames) - 1; i >= start; i-- {
-		g.emitDrops(g.dropFrames[i])
+		g.emitFrameExit(g.dropFrames[i])
 	}
 }
 
@@ -2466,9 +2695,11 @@ func zeroValue(t *types.Type) string {
 func constLiteral(v sema.ConstVal, t *types.Type) string {
 	switch {
 	case v.IsStr:
-		s, ok := sema.DecodeString(v.Str)
-		if !ok {
-			s = v.Str
+		s := v.Str
+		if !v.Raw {
+			if decoded, ok := sema.DecodeString(v.Str); ok {
+				s = decoded
+			}
 		}
 		return cString(s)
 	case v.IsBool:
@@ -2562,6 +2793,11 @@ static zx_String zx_string_from(const char *p) {
     return s;
 }
 
+static zx_String zx_arg_at(int i) {
+    if (i < 0 || i >= zx_argc || !zx_argv) return zx_string_from("");
+    return zx_string_from(zx_argv[i]);
+}
+
 static zx_String zx_string_with_capacity(size_t n) {
     zx_String s;
     s.len = 0;
@@ -2610,6 +2846,22 @@ static void zx_string_push_str(zx_String *s, const char *p) {
     /* memmove: the source may overlap the destination (self-append). */
     memmove(s->ptr + s->len, src, n + 1);
     s->len += n;
+}
+
+static void zx_string_push_i64(zx_String *s, int64_t v) {
+    char buf[32];
+    snprintf(buf, sizeof buf, "%lld", (long long)v);
+    zx_string_push_str(s, buf);
+}
+static void zx_string_push_u64(zx_String *s, uint64_t v) {
+    char buf[32];
+    snprintf(buf, sizeof buf, "%llu", (unsigned long long)v);
+    zx_string_push_str(s, buf);
+}
+static void zx_string_push_f64(zx_String *s, double v) {
+    char buf[64];
+    snprintf(buf, sizeof buf, "%g", v);
+    zx_string_push_str(s, buf);
 }
 
 static int zx_utf8_encode(unsigned int c, char *out) {
