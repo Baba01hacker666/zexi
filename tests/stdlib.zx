@@ -1,0 +1,50 @@
+// exercises the text, math, random and sys standard-library modules.
+
+use text;
+use math;
+use random;
+use sys;
+
+fn main() -> i32 {
+    // text
+    println(to_upper("zexi lang"));
+    println(to_lower("ZEXI"));
+    println(index_of("hello world", "o"));
+    println(last_index_of("hello", "l"));
+    println(count_occurrences("aXbXc", "X"));
+    println(replace_all("a-b-c", "-", "+"));
+    println(slice_text("zexi", 1, 3));
+    println(trim_start("  hi  "));
+    println(trim_end("  hi  "));
+    println(compare("a", "b") < 0);
+    println(pad_end("ab", 5, '.'));
+    println(is_digits_only("123"));
+    println(format_bool(false));
+
+    // math
+    println(div_floor(-7, 2));
+    println(mod_floor(-7, 2));
+    println(div_ceil(7, 2));
+    println(lcmi(4, 6));
+    println(isqrt(1000));
+    println(pow_mod(2, 10, 1000));
+    println(popcount(255));
+    println(trailing_zeros(8));
+    println(leading_zeros(1));
+    println(log2_floor(1024));
+    println(round_f(2.5));
+    println(floor_f(-2.5));
+
+    // random (deterministic: the same seed always prints the same values)
+    let mut r = Rng::new(42);
+    println(r.int(1, 100));
+    println(r.int(1, 100));
+    println(r.coin());
+
+    // sys
+    sleep_ms(2);
+    println(mono_ms() >= 0);
+    println(time_s() > 1600000000);
+    println(len(env_get("ZEXI_NO_SUCH_VARIABLE")));
+    0
+}

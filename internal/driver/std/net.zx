@@ -1,0 +1,187 @@
+// net — TCP sockets over POSIX, part of the Zexi standard library.
+// Import with `use net;` or `use std::net;`.
+//
+// The low-level calls live in the embedded C runtime, linked in only
+// when this module is used. The linker prunes anything the program does not
+// call, so pulling in `use net;` costs nothing unless you open a socket.
+
+extern "C" fn zxn_socket(domain: i32, typ: i32, protocol: i32) -> i32;
+extern "C" fn zxn_connect(fd: i32, host: str, port: i32) -> i32;
+extern "C" fn zxn_bind(fd: i32, host: str, port: i32) -> i32;
+extern "C" fn zxn_listen(fd: i32, backlog: i32) -> i32;
+extern "C" fn zxn_accept(fd: i32) -> i32;
+extern "C" fn zxn_setsockopt_reuseaddr(fd: i32) -> i32;
+extern "C" fn zxn_set_timeout(fd: i32, ms: i32) -> i32;
+extern "C" fn zxn_send_all(fd: i32, buf: str, n: i32) -> i32;
+extern "C" fn zxn_recv(fd: i32, buf: &mut [u8; 8192], cap: usize) -> i32;
+extern "C" fn zxn_read_head(fd: i32, buf: &mut [u8; 8192], cap: i32) -> i32;
+extern "C" fn zxn_close(fd: i32) -> i32;
+
+const AF_INET: i32 = 2;
+const SOCK_STREAM: i32 = 1;
+const RECV_BUF: usize = 8192;
+// MAX_READ caps read_all so a hostile or broken peer cannot exhaust memory.
+const MAX_READ: usize = 67108864;
+
+// Conn is an open TCP connection. Owns the file descriptor; call close.
+#[copy]
+pub struct Conn { fd: i32 }
+
+// Server is a listening TCP socket. Owns the file descriptor.
+#[copy]
+pub struct Server { fd: i32 }
+
+// connect opens a TCP connection to host:port. Conn.fd is negative on error.
+pub fn connect(host: str, port: i32) -> Conn {
+    let fd = zxn_socket(AF_INET, SOCK_STREAM, 0);
+    if fd < 0 {
+        return Conn { fd: -1 };
+    }
+    if zxn_connect(fd, host, port) != 0 {
+        zxn_close(fd);
+        return Conn { fd: -1 };
+    }
+    return Conn { fd: fd };
+}
+
+// listen binds a TCP listener on host:port. Server.fd is negative on error.
+pub fn listen(host: str, port: i32) -> Server {
+    let fd = zxn_socket(AF_INET, SOCK_STREAM, 0);
+    if fd < 0 {
+        return Server { fd: -1 };
+    }
+    zxn_setsockopt_reuseaddr(fd);
+    if zxn_bind(fd, host, port) != 0 {
+        zxn_close(fd);
+        return Server { fd: -1 };
+    }
+    if zxn_listen(fd, 128) != 0 {
+        zxn_close(fd);
+        return Server { fd: -1 };
+    }
+    return Server { fd: fd };
+}
+
+impl Conn {
+    // ok reports whether the connection was opened successfully.
+    pub fn ok(&self) -> bool {
+        return self.fd >= 0;
+    }
+
+    // set_timeout bounds blocking send/recv calls (in milliseconds;
+    // 0 disables the timeout). Returns 0 on success.
+    pub fn set_timeout(&self, ms: i32) -> i32 {
+        return zxn_set_timeout(self.fd, ms);
+    }
+
+    // write sends the whole string. Returns bytes sent, or -1 on error.
+    pub fn write(&self, data: str) -> i64 {
+        return zxn_send_all(self.fd, data, len(data) as i32) as i64;
+    }
+
+    // write_bytes sends exactly n bytes from data, even if they contain NUL.
+    // Use it for binary payloads, where `write` would stop at the first 0.
+    pub fn write_bytes(&self, data: str, n: usize) -> i64 {
+        return zxn_send_all(self.fd, data, n as i32) as i64;
+    }
+
+    // read_line reads one newline-terminated line (without the "\n").
+    pub fn read_line(&self) -> String {
+        let mut out = String::new();
+        let mut buf: [u8; 8192] = [0; 8192];
+        loop {
+            let n = zxn_recv(self.fd, &mut buf, 1);
+            if n <= 0 {
+                break;
+            }
+            if buf[0] == 10 {
+                break;
+            }
+            if buf[0] != 13 {
+                out.push_byte(buf[0]);
+            }
+        }
+        return out;
+    }
+
+    // read_head reads until the blank line that ends an HTTP head
+    // ("\r\n\r\n"), returning everything read so far.
+    pub fn read_head(&self) -> String {
+        let mut out = String::new();
+        let mut buf: [u8; 8192] = [0; 8192];
+        let n = zxn_read_head(self.fd, &mut buf, RECV_BUF as i32);
+        let mut i: usize = 0;
+        while n > 0 && i < (n as usize) {
+            out.push_byte(buf[i]);
+            i += 1;
+        }
+        return out;
+    }
+
+    // read_exact reads up to n bytes (fewer only at EOF or on error).
+    pub fn read_exact(&self, n: usize) -> String {
+        let mut out = String::with_capacity(if n < RECV_BUF { n } else { RECV_BUF });
+        let mut buf: [u8; 8192] = [0; 8192];
+        let mut left = n;
+        while left > 0 {
+            let want = if left < RECV_BUF { left } else { RECV_BUF };
+            let got = zxn_recv(self.fd, &mut buf, want);
+            if got <= 0 {
+                break;
+            }
+            let mut i: usize = 0;
+            while i < (got as usize) {
+                out.push_byte(buf[i]);
+                i += 1;
+            }
+            left = left - (got as usize);
+        }
+        return out;
+    }
+
+    // read_all_max reads until the peer closes, stopping after max bytes.
+    pub fn read_all_max(&self, max: usize) -> String {
+        let mut out = String::with_capacity(RECV_BUF);
+        let mut buf: [u8; 8192] = [0; 8192];
+        while out.len() < max {
+            let left = max - out.len();
+            let want = if left < RECV_BUF { left } else { RECV_BUF };
+            let n = zxn_recv(self.fd, &mut buf, want);
+            if n <= 0 {
+                break;
+            }
+            let mut i: usize = 0;
+            while i < (n as usize) {
+                out.push_byte(buf[i]);
+                i += 1;
+            }
+        }
+        return out;
+    }
+
+    // read_all reads until the peer closes (capped at MAX_READ bytes).
+    pub fn read_all(&self) -> String {
+        return self.read_all_max(MAX_READ);
+    }
+
+    pub fn close(&self) {
+        zxn_close(self.fd);
+    }
+}
+
+impl Server {
+    // ok reports whether the listener was opened successfully.
+    pub fn ok(&self) -> bool {
+        return self.fd >= 0;
+    }
+
+    // accept waits for and returns one incoming connection.
+    pub fn accept(&self) -> Conn {
+        let cfd = zxn_accept(self.fd);
+        return Conn { fd: cfd };
+    }
+
+    pub fn close(&self) {
+        zxn_close(self.fd);
+    }
+}

@@ -1,7 +1,8 @@
-// io — console input, part of the Zexi standard library.
+// io — console input/output, part of the Zexi standard library.
 // Import with `use io;` or `use std::io;`.
 
 extern "C" fn read(fd: i32, buf: &mut [u8; 4096], n: usize) -> i64;
+extern "C" fn write(fd: i32, buf: str, n: usize) -> i64;
 
 // read_line reads one line from standard input (without the trailing
 // newline) and returns it as a String. At end of input it returns "".
@@ -28,4 +29,47 @@ pub fn read_line() -> String {
 pub fn prompt_line(prompt: str) -> String {
     print(prompt);
     read_line()
+}
+
+// read_all reads standard input to end of file (a pipe, a redirected file,
+// or Ctrl-D), flushing every 64 KiB so large inputs stay cheap.
+pub fn read_all() -> String {
+    let mut buf: [u8; 4096] = [0; 4096];
+    let mut out = String::with_capacity(4096);
+    let mut done = false;
+    while !done {
+        let n = read(0, &mut buf, 4096);
+        if n <= 0 {
+            done = true;
+        } else {
+            let mut i: usize = 0;
+            while i < (n as usize) {
+                out.push_byte(buf[i]);
+                i += 1;
+            }
+            if out.len() >= 65536 {
+                let flushed = write(1, out.as_str(), out.len());
+                out.clear();
+                if flushed < 0 {
+                    done = true;
+                }
+            }
+        }
+    }
+    if out.len() > 0 {
+        write(1, out.as_str(), out.len());
+    }
+    return out;
+}
+
+// print_err writes a message to standard error (no newline added).
+pub fn print_err(s: str) {
+    let n = len(s);
+    write(2, s, n);
+}
+
+// eprintln_err writes a message to standard error, followed by a newline.
+pub fn eprintln_err(s: str) {
+    print_err(s);
+    write(2, "\n", 1);
 }

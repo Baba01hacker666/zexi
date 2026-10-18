@@ -1,0 +1,47 @@
+/* zxsys.c — tiny OS helpers for Zexi's `sys` module (env, clocks, sleep, pid).
+ *
+ * Linked only when a program does `use sys;` (or `use random;`, which needs
+ * the clock). All calls are libc; nothing else is required.
+ */
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+/* zxs_env_get copies an environment variable into buf, returning its length,
+ * or -1 when the variable is unset. */
+int zxs_env_get(const char *name, char *buf, int cap) {
+    const char *v = getenv(name);
+    if (!v || !buf || cap <= 0) return -1;
+    int n = (int)strlen(v);
+    if (n >= cap) n = cap - 1;
+    memcpy(buf, v, (size_t)n);
+    buf[n] = 0;
+    return n;
+}
+
+/* zxs_time_ms is wall-clock milliseconds since the Unix epoch. */
+long zxs_time_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return -1;
+    return (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000);
+}
+
+/* zxs_mono_ms is a monotonic millisecond clock, for measuring intervals. */
+long zxs_mono_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return -1;
+    return (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000);
+}
+
+/* zxs_sleep_ms pauses for at least ms milliseconds, retrying on EINTR. */
+void zxs_sleep_ms(long ms) {
+    if (ms <= 0) return;
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+    while (nanosleep(&ts, &ts) != 0) { /* retry remaining time */ }
+}
+
+/* zxs_pid is the current process id. */
+int zxs_pid(void) { return (int)getpid(); }
