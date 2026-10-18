@@ -1,0 +1,32 @@
+#!/usr/bin/env zexi
+# guess.zx — a tiny number-guessing game (interactive).
+#
+#     zexic run examples/guess.zx
+#
+# Uses the standard library's `io` (read_line) and `random` modules.
+
+use io;
+use random;
+
+fn main() {
+    seed_from_time()
+    let secret = rand_int(1, 100)
+    println("I'm thinking of a number between 1 and 100.")
+
+    let mut tries = 0
+    let mut done = false
+    while !done {
+        let line = prompt_line("your guess: ")
+        let guess = line.trim().parse_i64()
+        tries += 1
+        if guess < secret {
+            println("too low")
+        } elif guess > secret {
+            println("too high")
+        } else {
+            println(f"you got it in {tries} tries!")
+            done = true
+        }
+        if tries >= 1000 { done = true }   // end-of-input safety stop
+    }
+}

@@ -163,6 +163,11 @@ func (g *gen) preamble() {
 	g.w.line("// Defined only when a `char` is printed.")
 	g.w.line("static int zx_print_char(uint32_t c);")
 	g.w.line("")
+	g.w.line("// Command-line arguments, captured by `main` for arg_count()/arg_at().")
+	g.w.line("static int zx_argc;")
+	g.w.line("static char **zx_argv;")
+	g.w.line("static int zx_arg_count(void) { return zx_argc; }")
+	g.w.line("")
 }
 
 // runtime emits helpers that the generated code may call. Each is emitted only
@@ -675,10 +680,18 @@ func (g *gen) funcDef(fn *sema.Fn) {
 	if len(params) == 0 {
 		params = []string{"void"}
 	}
+	if fn.Name == "main" {
+		// C's main receives the command line; capture it for the
+		// arg_count()/arg_at() builtins.
+		params = []string{"int zx_argc_in", "char **zx_argv_in"}
+	}
 
 	g.w.line("%s%s %s(%s) {", staticPrefix(fn), retC, funcName(fn), strings.Join(params, ", "))
 	g.w.indent++
 	g.openDropFrame() // body frame
+	if fn.Name == "main" {
+		g.w.line("zx_argc = zx_argc_in; zx_argv = zx_argv_in;")
+	}
 	g.blockStmts(fn.Decl.Body, ret)
 	g.closeDropFrame()
 	g.closeDropFrame()
@@ -1426,6 +1439,15 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 		// Copy the C string into an owning zx_String.
 		return "zx_string_from((const char *)(" + g.value(x.Args[0]) + "))"
 	}
+	if name == "arg_count" {
+		return "zx_arg_count()"
+	}
+	if name == "arg_at" {
+		if len(x.Args) != 1 {
+			return "zx_string_from(\"\")"
+		}
+		return "zx_arg_at((int)(" + g.value(x.Args[0]) + "))"
+	}
 	fn, ok := g.info.Fns[name]
 	if !ok {
 		return "0 /* call to unknown function */"
@@ -1880,7 +1902,9 @@ func (g *gen) matchScrutinee(st *types.Type, scrut string) (*types.Type, string)
 // or tests a C `switch` cannot express, so they are lowered to an if-chain
 // inside a `do { } while (0)`.
 func (g *gen) emitMatchArms(x *ast.MatchExpr, st *types.Type, m, result string, w *writer) {
-	if matchHasGuard(x) || matchHasComplexPat(x) {
+	// String matches also take the guarded path: they test with strcmp,
+	// which a C `switch` cannot express.
+	if matchHasGuard(x) || matchHasComplexPat(x) || (st != nil && st.Kind == types.Str) {
 		g.emitGuardedArms(x, st, m, result, w)
 		return
 	}
@@ -1901,7 +1925,8 @@ func matchHasComplexPat(x *ast.MatchExpr) bool {
 
 // patCond renders the C test for a pattern against disc (the scrutinee value,
 // or its `.tag` for enums), or "" when the pattern always matches.
-func (g *gen) patCond(p ast.Pattern, disc string, isEnum bool) string {
+func (g *gen) patCond(p ast.Pattern, disc string, st *types.Type) string {
+	isEnum := st != nil && st.Kind == types.EnumKind
 	switch pt := p.(type) {
 	case *ast.WildcardPat, *ast.BindPat:
 		return ""
@@ -1911,11 +1936,14 @@ func (g *gen) patCond(p ast.Pattern, disc string, isEnum bool) string {
 		}
 		return ""
 	case *ast.LitPat:
+		if st != nil && st.Kind == types.Str {
+			return "strcmp(" + disc + ", " + strPatLabel(pt) + ") == 0"
+		}
 		return disc + " == " + litPatLabel(pt)
 	case *ast.OrPat:
 		var parts []string
 		for _, alt := range pt.Alts {
-			c := g.patCond(alt, disc, isEnum)
+			c := g.patCond(alt, disc, st)
 			if c == "" {
 				return "" // a catch-all alternative matches everything
 			}
@@ -1944,7 +1972,7 @@ func (g *gen) emitGuardedArms(x *ast.MatchExpr, st *types.Type, m, result string
 	w.line("do {")
 	w.indent++
 	for _, arm := range x.Arms {
-		cond := g.patCond(arm.Pat, disc, isEnum)
+		cond := g.patCond(arm.Pat, disc, st)
 		w.line("{")
 		w.indent++
 		if cond != "" {
@@ -2143,6 +2171,18 @@ func litPatLabel(p *ast.LitPat) string {
 		return strconv.FormatInt(int64(firstRune(p.Text)), 10)
 	}
 	return "0"
+}
+
+// strPatLabel renders a string literal pattern as a C string literal.
+func strPatLabel(p *ast.LitPat) string {
+	if p.Kind == token.KindRawString {
+		return cString(p.Text)
+	}
+	decoded, ok := sema.DecodeString(p.Text)
+	if !ok {
+		decoded = p.Text
+	}
+	return cString(decoded)
 }
 
 // intMinMacro maps a bare magnitude that is exactly the minimum of a signed
@@ -2751,6 +2791,11 @@ static zx_String zx_string_from(const char *p) {
     if (!s.ptr) { fputs("zexi: out of memory\n", stderr); abort(); }
     memcpy(s.ptr, p, s.len + 1);
     return s;
+}
+
+static zx_String zx_arg_at(int i) {
+    if (i < 0 || i >= zx_argc || !zx_argv) return zx_string_from("");
+    return zx_string_from(zx_argv[i]);
 }
 
 static zx_String zx_string_with_capacity(size_t n) {

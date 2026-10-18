@@ -1090,3 +1090,62 @@ fn main() -> i32 {
 		t.Fatalf("expected E0308 for from_cstr(str), got ok=%v codes=%v", ok, codes)
 	}
 }
+
+func TestStrMatch(t *testing.T) {
+	src := `fn kind(cmd: str) -> i32 {
+    match cmd {
+        "quit" | "exit" => 0,
+        "help" => 1,
+        _ => 2,
+    }
+}
+fn main() -> i32 { println(kind("help")); 0 }`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	// String matches need a catch-all.
+	ok, codes := check(t, `fn main() -> i32 {
+    let n = match "x" { "x" => 1 };
+    println(n);
+    0
+}`)
+	if ok || !has(codes, "E0004") {
+		t.Fatalf("expected E0004, got ok=%v codes=%v", ok, codes)
+	}
+	// Non-string patterns do not fit a string scrutinee.
+	ok, codes = check(t, `fn main() -> i32 {
+    let n = match "x" { 1 => 1, _ => 0 };
+    println(n);
+    0
+}`)
+	if ok || !has(codes, "E0308") {
+		t.Fatalf("expected E0308, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestArgBuiltins(t *testing.T) {
+	src := `fn main() -> i32 {
+    if arg_count() > 1 { println(arg_at(1)); }
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	ok, codes := check(t, `fn main() -> i32 { println(arg_at("x")); 0 }`)
+	if ok || !has(codes, "E0308") {
+		t.Fatalf("expected E0308, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestDidYouMeanStillErrors(t *testing.T) {
+	// A mistyped function name is E0425 (with a "did you mean" hint in
+	// the message), not a panic or a silent pass.
+	ok, codes := check(t, `fn main() -> i32 { pritnln("hi"); 0 }`)
+	if ok || !has(codes, "E0425") {
+		t.Fatalf("expected E0425, got ok=%v codes=%v", ok, codes)
+	}
+	ok, codes = check(t, `fn main() -> i32 { let total = 1; println(totla); 0 }`)
+	if ok || !has(codes, "E0425") {
+		t.Fatalf("expected E0425, got ok=%v codes=%v", ok, codes)
+	}
+}

@@ -21,6 +21,8 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../examples/hello.zx",
 		"../../examples/easy.zx",
 		"../../examples/cbridge.zx",
+		"../../examples/guess.zx",
+		"../../examples/args.zx",
 		"../../tests/tour.zx",
 		"../../tests/structs.zx",
 		"../../tests/enums.zx",
@@ -414,5 +416,62 @@ fn main() -> i32 {
 	want := "42\n5\nfast and small\n3\n1.5\n"
 	if got := string(raw); got != want {
 		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestProgramArgs builds a program that echoes its command line through
+// arg_count()/arg_at(i) and checks the output.
+func TestProgramArgs(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	out := filepath.Join(t.TempDir(), "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build("../../examples/args.zx", out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("args build failed")
+	}
+	raw, err := exec.Command(out, "hello", "world").Output()
+	if err != nil {
+		t.Fatalf("running args program: %v", err)
+	}
+	want := "program: " + out + "\narg 1: hello\narg 2: world\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestReadLine builds a program against the stdlib `io` module and feeds
+// it a line on stdin.
+func TestReadLine(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	src := `use io;
+fn main() -> i32 {
+    let line = read_line();
+    println(f"got: {line} ({len(line)})");
+    0
+}
+`
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("read_line build failed")
+	}
+	cmd := exec.Command(out)
+	cmd.Stdin = strings.NewReader("hello zexi\nignored\n")
+	raw, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("running read_line program: %v", err)
+	}
+	if want := "got: hello zexi (10)\n"; string(raw) != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
 	}
 }

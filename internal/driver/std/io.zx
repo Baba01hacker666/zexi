@@ -1,0 +1,31 @@
+// io — console input, part of the Zexi standard library.
+// Import with `use io;` or `use std::io;`.
+
+extern "C" fn read(fd: i32, buf: &mut [u8; 4096], n: usize) -> i64;
+
+// read_line reads one line from standard input (without the trailing
+// newline) and returns it as a String. At end of input it returns "".
+// Bytes are read one at a time, which is plenty for interactive input;
+// carriage returns are ignored so CRLF input behaves.
+pub fn read_line() -> String {
+    let mut buf: [u8; 4096] = [0; 4096];
+    let mut out = String::new();
+    let mut done = false;
+    while !done {
+        let n = read(0, &mut buf, 1);
+        if n <= 0 {
+            done = true;
+        } else if buf[0] == 10 {
+            done = true;
+        } else if buf[0] != 13 {
+            out.push_byte(buf[0]);
+        }
+    }
+    out
+}
+
+// prompt_line prints a prompt (no newline), then reads a line of input.
+pub fn prompt_line(prompt: str) -> String {
+    print(prompt);
+    read_line()
+}

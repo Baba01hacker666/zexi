@@ -1100,6 +1100,60 @@ func (c *checker) inferLiteral(x *ast.LiteralExpr, expected *types.Type) *types.
 	return nil
 }
 
+// editDistance is the Levenshtein distance between two names, for
+// "did you mean" suggestions.
+func editDistance(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	prev := make([]int, len(rb)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ra); i++ {
+		cur := make([]int, len(rb)+1)
+		cur[0] = i
+		for j := 1; j <= len(rb); j++ {
+			cost := 0
+			if ra[i-1] != rb[j-1] {
+				cost = 1
+			}
+			cur[j] = min3(cur[j-1]+1, prev[j]+1, prev[j-1]+cost)
+		}
+		prev = cur
+	}
+	return prev[len(rb)]
+}
+
+func min3(a, b, c int) int {
+	if a < b {
+		if a < c {
+			return a
+		}
+		return c
+	}
+	if b < c {
+		return b
+	}
+	return c
+}
+
+// suggestName returns " (did you mean `x`?)" when one of the candidates
+// is within edit distance 2 of name, and "" otherwise.
+func suggestName(name string, candidates []string) string {
+	best, bestD := "", 3
+	for _, cand := range candidates {
+		if cand == name {
+			continue
+		}
+		if d := editDistance(name, cand); d < bestD {
+			best, bestD = cand, d
+		}
+	}
+	if best == "" {
+		return ""
+	}
+	return fmt.Sprintf(" (did you mean `%s`?)", best)
+}
+
 func (c *checker) inferIdent(name string, sp token.Span) *types.Type {
 	if name == "_" {
 		c.errf(sp, "E0425", "cannot use `_` as a value")
@@ -1116,7 +1170,19 @@ func (c *checker) inferIdent(name string, sp token.Span) *types.Type {
 	if fn, ok := c.info.Fns[name]; ok {
 		return &types.Type{Kind: types.Fn, Params: fn.Params, Ret: fn.Ret}
 	}
-	c.errf(sp, "E0425", "cannot find `%s` in this scope", name)
+	var cands []string
+	for i := len(c.scope) - 1; i >= 0; i-- {
+		for n := range c.scope[i] {
+			cands = append(cands, n)
+		}
+	}
+	for n := range c.info.Consts {
+		cands = append(cands, n)
+	}
+	for n := range c.info.Fns {
+		cands = append(cands, n)
+	}
+	c.errf(sp, "E0425", "cannot find `%s` in this scope%s", name, suggestName(name, cands))
 	return nil
 }
 
@@ -1358,6 +1424,12 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 	if name == "from_cstr" {
 		return c.inferFromCStr(x)
 	}
+	if name == "arg_count" {
+		return c.inferArgCount(x)
+	}
+	if name == "arg_at" {
+		return c.inferArgAt(x)
+	}
 	// `Pair(1, 2)` constructs a tuple struct; a named struct used this way
 	// gets a pointed error rather than "cannot find function".
 	if st, ok := c.info.Structs[name]; ok {
@@ -1386,7 +1458,11 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 	}
 	fn, ok := c.info.Fns[name]
 	if !ok {
-		c.errAt(x.Callee, "E0425", "cannot find function `%s` in this scope", name)
+		cands := []string{"print", "println", "len", "cstr", "from_cstr", "arg_count", "arg_at"}
+		for n := range c.info.Fns {
+			cands = append(cands, n)
+		}
+		c.errAt(x.Callee, "E0425", "cannot find function `%s` in this scope%s", name, suggestName(name, cands))
 		for _, a := range x.Args {
 			c.checkExpr(a, nil)
 		}
@@ -1644,6 +1720,36 @@ func (c *checker) inferFromCStr(x *ast.CallExpr) *types.Type {
 	return types.StringT
 }
 
+// inferArgCount checks the builtin `arg_count()`: the number of
+// command-line arguments the program was started with, including the
+// program name at index 0.
+func (c *checker) inferArgCount(x *ast.CallExpr) *types.Type {
+	if len(x.Args) != 0 {
+		c.errAt(x, "E0061", "`arg_count` takes no arguments but %d were supplied", len(x.Args))
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+	}
+	return types.I32T
+}
+
+// inferArgAt checks the builtin `arg_at(i)`: the i-th command-line
+// argument as an owning `String` ("" when out of range).
+func (c *checker) inferArgAt(x *ast.CallExpr) *types.Type {
+	if len(x.Args) != 1 {
+		c.errAt(x, "E0061", "`arg_at` takes 1 argument but %d were supplied", len(x.Args))
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return types.StringT
+	}
+	at := c.checkExpr(x.Args[0], nil)
+	if at != nil && at.Kind != types.Invalid && !at.Kind.IsInt() {
+		c.errAt(x.Args[0], "E0308", "`arg_at` expects an integer index, found `%s`", at)
+	}
+	return types.StringT
+}
+
 // inferLen checks the builtin `len(x)` for arrays and strings.
 func (c *checker) inferLen(x *ast.CallExpr) *types.Type {
 	if len(x.Args) != 1 {
@@ -1821,8 +1927,8 @@ func litPatKindName(k token.Kind) string {
 func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type {
 	st := c.checkExpr(x.Scrutinee, nil)
 	base := recvBase(st)
-	if base == nil || (base.Kind != types.EnumKind && !base.Kind.IsInt() && base.Kind != types.Bool && base.Kind != types.Char) {
-		c.errAt(x.Scrutinee, "E0308", "`match` requires an enum, integer, `bool`, or `char` scrutinee, found `%s`", st)
+	if base == nil || (base.Kind != types.EnumKind && !base.Kind.IsInt() && base.Kind != types.Bool && base.Kind != types.Char && base.Kind != types.Str) {
+		c.errAt(x.Scrutinee, "E0308", "`match` requires an enum, integer, `bool`, `char`, or `str` scrutinee, found `%s`", st)
 	}
 	var result *types.Type
 	if expected != nil && expected.Kind != types.Unit && expected.Kind != types.Never && expected.Kind != types.Invalid {
@@ -1932,7 +2038,7 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 		}
 	} else if base != nil && base.Kind == types.Bool && !catchAll && !(boolsCovered["true"] && boolsCovered["false"]) {
 		c.errAt(x, "E0004", "non-exhaustive match: cover both `true` and `false`, or add a `_` arm")
-	} else if base != nil && (base.Kind.IsInt() || base.Kind == types.Char) && !catchAll {
+	} else if base != nil && (base.Kind.IsInt() || base.Kind == types.Char || base.Kind == types.Str) && !catchAll {
 		c.errAt(x, "E0004", "non-exhaustive match: add a `_` arm")
 	}
 	if result == nil {
@@ -1986,8 +2092,16 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type) {
 			if pt.Kind != token.KindChar {
 				c.errf(pt.Sp, "E0308", "expected a `char` pattern, found %s", litPatKindName(pt.Kind))
 			}
+		case st != nil && st.Kind == types.Str:
+			if pt.Kind != token.KindString && pt.Kind != token.KindRawString {
+				c.errf(pt.Sp, "E0308", "expected a string pattern, found %s", litPatKindName(pt.Kind))
+			} else if pt.Kind == token.KindString {
+				if _, ok := DecodeString(pt.Text); !ok {
+					c.errf(pt.Sp, "E0001", "invalid string literal in pattern")
+				}
+			}
 		default:
-			c.errf(pt.Sp, "E0308", "literal patterns require an integer, `bool`, or `char` scrutinee, found `%s`", st)
+			c.errf(pt.Sp, "E0308", "literal patterns require an integer, `bool`, `char`, or `str` scrutinee, found `%s`", st)
 		}
 		return
 	case *ast.PathPat:
@@ -2625,7 +2739,22 @@ func (c *checker) argAssignable(want, got *types.Type) bool {
 	if c.assignable(want, got) {
 		return true
 	}
-	return want != nil && want.Kind == types.Str && got != nil && got.Kind == types.StringKind
+	if want != nil && want.Kind == types.Str && got != nil && got.Kind == types.StringKind {
+		return true
+	}
+	// At the C boundary a reference and a raw pointer are the same
+	// machine pointer, so either may be passed where the other is
+	// expected (with matching mutability). This keeps `extern "C"`
+	// declarations pleasant: `time(&mut slot)` just works.
+	if want != nil && got != nil &&
+		(want.Kind == types.Ptr || want.Kind == types.Ref) &&
+		(got.Kind == types.Ptr || got.Kind == types.Ref) {
+		if want.Mut && !got.Mut {
+			return false
+		}
+		return types.Equal(want.Elem, got.Elem)
+	}
+	return false
 }
 
 // --- scope helpers --------------------------------------------------------
