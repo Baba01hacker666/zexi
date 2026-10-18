@@ -615,7 +615,7 @@ pub fn send_response(c: &Conn, r: &Response) -> i64 {
     if r.body.len() == 0 {
         return sent;
     }
-    let body_sent = c.write_bytes(r.body.as_str(), r.body.len());
+    let body_sent = c.write_raw(r.body.as_str(), r.body.len());
     if body_sent < 0 {
         return -1;
     }
@@ -654,13 +654,10 @@ pub fn read_request(c: &Conn) -> Request {
     let head = c.read_head();
     let mut req = parse_request(&head);
     let want = req.content_length();
-    if want > 0 {
+    if want > 0 && want <= MAX_BODY as i64 {
         let have = req.body.len() as i64;
         if have < want {
-            let mut take = want - have;
-            if take > MAX_BODY as i64 {
-                take = MAX_BODY as i64;
-            }
+            let take = want - have;
             let more = c.read_exact(take as usize);
             req.body.push_str(more);
         }
@@ -747,15 +744,15 @@ impl Client {
         let u = String::from(url);
         let b = String::from(body);
         let ct = String::from(content_type);
-        return self.send_inner(&m, &u, &b, &ct, 0);
+        return self.send_inner(&m, &u, &b, &ct, 0, true);
     }
 
-    fn send_inner(&self, method: &String, url: &String, body: &String, content_type: &String, depth: i32) -> Response {
+    fn send_inner(&self, method: &String, url: &String, body: &String, content_type: &String, depth: i32, send_headers: bool) -> Response {
         let u = parse_url(url.as_str());
         if !u.valid() {
             return bad_response(u.error.as_str());
         }
-        let resp = self.one(&u, method, body, content_type);
+        let resp = self.one(&u, method, body, content_type, send_headers);
         if self.follow_redirects && is_redirect(resp.status) {
             let loc = resp.header("Location");
             if loc.len() > 0 {
@@ -763,20 +760,23 @@ impl Client {
                     return bad_response("too many redirects");
                 }
                 let next = resolve_location(&u, &loc);
+                let nu = parse_url(next.as_str());
+                let same_origin = nu.host.as_str() == u.host.as_str() && nu.port == u.port;
+                let next_headers = send_headers && same_origin;
                 if resp.status == 301 || resp.status == 302 || resp.status == 303 {
                     let get = String::from("GET");
                     let none = String::new();
-                    return self.send_inner(&get, &next, &none, &none, depth + 1);
+                    return self.send_inner(&get, &next, &none, &none, depth + 1, next_headers);
                 }
-                return self.send_inner(method, &next, body, content_type, depth + 1);
+                return self.send_inner(method, &next, body, content_type, depth + 1, next_headers);
             }
         }
         return resp;
     }
 
     // one performs exactly one request/response exchange.
-    fn one(&self, u: &Url, method: &String, body: &String, content_type: &String) -> Response {
-        let c = connect(u.host.as_str(), u.port);
+    fn one(&self, u: &Url, method: &String, body: &String, content_type: &String, send_headers: bool) -> Response {
+        let mut c = connect(u.host.as_str(), u.port);
         if c.fd < 0 {
             return bad_response("connection failed");
         }
@@ -793,7 +793,7 @@ impl Client {
         req.push_str("\r\nUser-Agent: ");
         req.push_str(self.user_agent.as_str());
         req.push_str("\r\nAccept: */*\r\n");
-        if self.headers.len() > 0 {
+        if send_headers && self.headers.len() > 0 {
             req.push_str(self.headers.as_str());
         }
         if body.len() > 0 {
@@ -837,7 +837,7 @@ pub fn post(host: str, port: i32, path: str, body: str) -> String {
 }
 
 fn send_request(method: str, host: str, port: i32, path: str, body: str, content_type: str) -> String {
-    let c = connect(host, port);
+    let mut c = connect(host, port);
     if c.fd < 0 {
         return String::new();
     }
@@ -1069,6 +1069,7 @@ impl Router {
     // serve reads one request from c, dispatches it, and writes the response.
     // It returns false when the peer sent nothing usable (a probe or EOF).
     pub fn serve(&self, c: &Conn) -> bool {
+        c.set_timeout(DEFAULT_TIMEOUT_MS);
         let req = read_request(c);
         if !req.valid() {
             return false;
@@ -1076,6 +1077,11 @@ impl Router {
         if req.body_too_large() {
             let too_large = Response::empty(413);
             send_response(c, &too_large);
+            return true;
+        }
+        if !req.body_complete() {
+            let bad = Response::empty(400);
+            send_response(c, &bad);
             return true;
         }
         let res = self.dispatch(&req);
@@ -1108,7 +1114,7 @@ pub fn read_file(path: str) -> String {
     if handle >= 0 {
         let mut buf: [u8; 8192] = [0; 8192];
         loop {
-            let n = zxn_file_read(handle, &mut buf, RECV_BUF as i32);
+            let n = zxn_file_read(handle, &mut buf, 8192);
             if n <= 0 {
                 break;
             }

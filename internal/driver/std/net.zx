@@ -6,7 +6,7 @@
 // call, so pulling in `use net;` costs nothing unless you open a socket.
 
 extern "C" fn zxn_socket(domain: i32, typ: i32, protocol: i32) -> i32;
-extern "C" fn zxn_connect(fd: i32, host: str, port: i32) -> i32;
+extern "C" fn zxn_connect(fd: i32, host: str, port: i32, timeout_ms: i32) -> i32;
 extern "C" fn zxn_bind(fd: i32, host: str, port: i32) -> i32;
 extern "C" fn zxn_listen(fd: i32, backlog: i32) -> i32;
 extern "C" fn zxn_accept(fd: i32) -> i32;
@@ -22,22 +22,23 @@ const SOCK_STREAM: i32 = 1;
 const RECV_BUF: usize = 8192;
 // MAX_READ caps read_all so a hostile or broken peer cannot exhaust memory.
 const MAX_READ: usize = 67108864;
+// MAX_LINE caps a single read_line so a peer cannot exhaust memory.
+const MAX_LINE: usize = 65536;
 
 // Conn is an open TCP connection. Owns the file descriptor; call close.
-#[copy]
 pub struct Conn { fd: i32 }
 
 // Server is a listening TCP socket. Owns the file descriptor.
-#[copy]
 pub struct Server { fd: i32 }
 
 // connect opens a TCP connection to host:port. Conn.fd is negative on error.
-pub fn connect(host: str, port: i32) -> Conn {
+// timeout_ms bounds connection establishment (0 uses the default).
+pub fn connect(host: str, port: i32, timeout_ms: i32 = 30000) -> Conn {
     let fd = zxn_socket(AF_INET, SOCK_STREAM, 0);
     if fd < 0 {
         return Conn { fd: -1 };
     }
-    if zxn_connect(fd, host, port) != 0 {
+    if zxn_connect(fd, host, port, timeout_ms) != 0 {
         zxn_close(fd);
         return Conn { fd: -1 };
     }
@@ -82,14 +83,34 @@ impl Conn {
     // write_bytes sends exactly n bytes from data, even if they contain NUL.
     // Use it for binary payloads, where `write` would stop at the first 0.
     pub fn write_bytes(&self, data: str, n: usize) -> i64 {
+        if n > len(data) {
+            return -1;
+        }
+        if n > 2147483647 {
+            return -1;
+        }
+        return zxn_send_all(self.fd, data, n as i32) as i64;
+    }
+
+    // write_raw sends exactly n bytes from data without validating n against
+    // strlen(data). Used internally for binary payloads that may contain NUL.
+    pub fn write_raw(&self, data: str, n: usize) -> i64 {
+        if n > 2147483647 {
+            return -1;
+        }
         return zxn_send_all(self.fd, data, n as i32) as i64;
     }
 
     // read_line reads one newline-terminated line (without the "\n").
+    // The accumulated line is capped at MAX_LINE bytes; once the cap is
+    // reached the read stops and the (truncated) line is returned.
     pub fn read_line(&self) -> String {
         let mut out = String::new();
         let mut buf: [u8; 8192] = [0; 8192];
         loop {
+            if out.len() >= MAX_LINE {
+                break;
+            }
             let n = zxn_recv(self.fd, &mut buf, 1);
             if n <= 0 {
                 break;
@@ -164,8 +185,11 @@ impl Conn {
         return self.read_all_max(MAX_READ);
     }
 
-    pub fn close(&self) {
-        zxn_close(self.fd);
+    pub fn close(&mut self) {
+        if self.fd >= 0 {
+            zxn_close(self.fd);
+            self.fd = -1;
+        }
     }
 }
 
@@ -181,7 +205,10 @@ impl Server {
         return Conn { fd: cfd };
     }
 
-    pub fn close(&self) {
-        zxn_close(self.fd);
+    pub fn close(&mut self) {
+        if self.fd >= 0 {
+            zxn_close(self.fd);
+            self.fd = -1;
+        }
     }
 }

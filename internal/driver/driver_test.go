@@ -319,14 +319,14 @@ func TestStdNetHTTPRoundTrip(t *testing.T) {
 	serverSrc := `use http;
 
 fn main() -> i32 {
-    let srv = listen("127.0.0.1", 18082);
+    let mut srv = listen("127.0.0.1", 18082);
     if srv.fd < 0 {
         println("bind failed");
         return 1;
     }
     let mut served: i32 = 0;
     while served < 3 {
-        let c = srv.accept();
+        let mut c = srv.accept();
         if c.fd < 0 {
             continue;
         }
@@ -578,7 +578,7 @@ fn form_handler(req: &Request) -> Response {
 }
 
 fn main() -> i32 {
-    let srv = listen("127.0.0.1", 18088);
+    let mut srv = listen("127.0.0.1", 18088);
     if !srv.ok() {
         println("bind failed");
         return 1;
@@ -592,7 +592,7 @@ fn main() -> i32 {
 
     let mut served: i32 = 0;
     while served < 6 {
-        let c = srv.accept();
+        let mut c = srv.accept();
         if !c.ok() {
             continue;
         }
@@ -743,14 +743,14 @@ func TestStdHTTPStaticFiles(t *testing.T) {
 
 fn main() -> i32 {
     let root = String::from(arg_at(1));
-    let srv = listen("127.0.0.1", 18089);
+    let mut srv = listen("127.0.0.1", 18089);
     if !srv.ok() {
         println("bind failed");
         return 1;
     }
     let mut served: i32 = 0;
     while served < 4 {
-        let c = srv.accept();
+        let mut c = srv.accept();
         if !c.ok() {
             continue;
         }

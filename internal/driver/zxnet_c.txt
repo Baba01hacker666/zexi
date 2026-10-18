@@ -13,9 +13,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -38,7 +40,7 @@ int zxn_socket(int domain, int type, int protocol) {
     return fd;
 }
 
-int zxn_connect(int fd, const char *host, int port) {
+int zxn_connect(int fd, const char *host, int port, int timeout_ms) {
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     sa.sin_family = AF_INET;
@@ -53,11 +55,38 @@ int zxn_connect(int fd, const char *host, int port) {
         memcpy(&sa.sin_addr, &((struct sockaddr_in *)res->ai_addr)->sin_addr, sizeof sa.sin_addr);
         freeaddrinfo(res);
     }
-    for (;;) {
-        int rc = connect(fd, (struct sockaddr *)&sa, sizeof sa);
-        if (rc < 0 && errno == EINTR) continue;
-        return rc;
+    if (timeout_ms <= 0) timeout_ms = 30000;
+    /* Make the socket non-blocking so connect() can be bounded by select(). */
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int rc = connect(fd, (struct sockaddr *)&sa, sizeof sa);
+    if (rc < 0 && errno != EINPROGRESS) {
+        if (flags >= 0) fcntl(fd, F_SETFL, flags);
+        return -1;
     }
+    if (rc == 0) {
+        if (flags >= 0) fcntl(fd, F_SETFL, flags);
+        return 0;
+    }
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    int sel = select(fd + 1, NULL, &wfds, NULL, &tv);
+    if (sel <= 0) {
+        if (flags >= 0) fcntl(fd, F_SETFL, flags);
+        return -1;
+    }
+    int err = 0;
+    socklen_t len = sizeof err;
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0) {
+        if (flags >= 0) fcntl(fd, F_SETFL, flags);
+        return -1;
+    }
+    if (flags >= 0) fcntl(fd, F_SETFL, flags);
+    return 0;
 }
 
 int zxn_bind(int fd, const char *host, int port) {
@@ -203,7 +232,7 @@ int zxn_http_send(int fd, const char *status_line, const char *body) {
 char *zxn_http_get(const char *host, int port, const char *path) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return NULL;
-    if (zxn_connect(fd, host, port) != 0) {
+    if (zxn_connect(fd, host, port, 30000) != 0) {
         close(fd);
         return NULL;
     }

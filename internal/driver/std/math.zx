@@ -109,13 +109,18 @@ pub fn isqrt(n: i64) -> i64 {
 }
 
 // pow_mod computes (base^exp) mod m with binary exponentiation in unsigned
-// 64-bit arithmetic, keeping intermediates exact while exp is small.
+// 64-bit arithmetic. Results are exact only when m <= 4294967296, since
+// b*b and result*b can overflow u64 for larger moduli.
 pub fn pow_mod(base: i64, exp: i64, m: i64) -> i64 {
     if m <= 1 {
         return 0;
     }
     let mut result: u64 = 1;
-    let mut b: u64 = (base % m) as u64;
+    let mut bm = base % m;
+    if bm < 0 {
+        bm += m;
+    }
+    let mut b: u64 = bm as u64;
     let mut e = exp;
     while e > 0 {
         if e % 2 == 1 {

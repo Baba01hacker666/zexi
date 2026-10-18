@@ -254,7 +254,9 @@ func cmdEmit(c cli) int {
 		return 2
 	}
 	em := diag.NewEmitter()
-	art, ok := driver.FrontEndFiles(paths, c.opts(), em)
+	opts := c.opts()
+	opts.Jobs = 1 // emit prints one translation unit
+	art, ok := driver.FrontEndFiles(paths, opts, em)
 	if !ok {
 		em.Render(os.Stderr, emFileID(em))
 		return 1

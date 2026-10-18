@@ -193,7 +193,7 @@ type loader struct {
 	merged  *ast.File
 	loaded  map[string]bool // canonical file keys already loaded
 	usesNet bool            // program imports net/http (needs the C runtime)
-	usesSys bool            // program imports sys/random (needs the C shim)
+	usesSys bool            // program imports sys (needs the C shim)
 }
 
 // loadDiskFile loads one file from disk and everything it imports.
@@ -473,7 +473,11 @@ func CompileUnits(header string, units []string, outPath string, opts Options) e
 		}
 	}
 
-	args := []string{"-o", outPath}
+	args := []string{"-std=gnu11", optFlag(opts.OptLevel), "-ffunction-sections", "-fdata-sections"}
+	for _, inc := range opts.IncludeDirs {
+		args = append(args, "-I"+inc)
+	}
+	args = append(args, "-o", outPath)
 	args = append(args, objs...)
 	args = append(args, opts.CFiles...)
 	for _, libDir := range opts.LibDirs {

@@ -51,6 +51,11 @@ This repository contains the **initial design and specification** of Zexi: the v
 > tracked), and `Result`/`?`. Enum variants cannot carry owning payloads yet. See
 > `docs/05-roadmap.md`.
 
+## How it works
+
+See [`workings.md`](workings.md) for a walkthrough of the compiler pipeline and
+runtime.
+
 ## Try it
 
 ```sh
