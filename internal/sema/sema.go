@@ -835,6 +835,8 @@ func exprHasJump(e ast.Expr) bool {
 		return exprHasJump(x.Recv)
 	case *ast.IndexExpr:
 		return exprHasJump(x.Recv) || exprHasJump(x.Index)
+	case *ast.SliceExpr:
+		return exprHasJump(x.Recv) || exprHasJump(x.Low) || exprHasJump(x.High)
 	case *ast.CallExpr:
 		if exprHasJump(x.Callee) {
 			return true
@@ -1028,6 +1030,8 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		return c.inferStructLit(x)
 	case *ast.IndexExpr:
 		return c.inferIndex(x)
+	case *ast.SliceExpr:
+		return c.inferSlice(x)
 	case *ast.ArrayLitExpr:
 		return c.inferArrayLit(x, expected)
 	case *ast.TryExpr:
@@ -1393,6 +1397,8 @@ func (c *checker) isPlace(e ast.Expr) bool {
 	case *ast.FieldExpr:
 		return c.isPlace(x.Recv)
 	case *ast.IndexExpr:
+		return c.isPlace(x.Recv)
+	case *ast.SliceExpr:
 		return c.isPlace(x.Recv)
 	}
 	return false
@@ -1818,11 +1824,42 @@ func (c *checker) inferIndex(x *ast.IndexExpr) *types.Type {
 	}
 	// Constant indices are bounds-checked at compile time.
 	if n, ok := c.evalConst(x.Index); ok && n.Ty != nil && n.Ty.Kind.IsInt() {
-		if rt.Kind == types.Array && (n.Int < 0 || n.Int >= rt.Len) {
-			c.errAt(x.Index, "E0502", "index %d is out of bounds for array of length %d", n.Int, rt.Len)
+		if rt.Kind == types.Array {
+			if n.Int >= rt.Len || n.Int < -rt.Len {
+				c.errAt(x.Index, "E0502", "index %d is out of bounds for array of length %d", n.Int, rt.Len)
+			}
 		}
 	}
 	return rt.Elem
+}
+
+// inferSlice checks `s[lo:hi]` string slicing.
+func (c *checker) inferSlice(x *ast.SliceExpr) *types.Type {
+	rt := c.checkExpr(x.Recv, nil)
+	isStr := rt != nil && (rt.Kind == types.Str || rt.Kind == types.StringKind)
+	if !isStr {
+		c.errAt(x, "E0608", "cannot slice a value of type `%s`", rt)
+		if x.Low != nil {
+			c.checkExpr(x.Low, nil)
+		}
+		if x.High != nil {
+			c.checkExpr(x.High, nil)
+		}
+		return nil
+	}
+	if x.Low != nil {
+		it := c.checkExpr(x.Low, nil)
+		if it != nil && !it.Kind.IsInt() {
+			c.errAt(x.Low, "E0308", "slice bound must be an integer, found `%s`", it)
+		}
+	}
+	if x.High != nil {
+		it := c.checkExpr(x.High, nil)
+		if it != nil && !it.Kind.IsInt() {
+			c.errAt(x.High, "E0308", "slice bound must be an integer, found `%s`", it)
+		}
+	}
+	return types.StringT
 }
 
 // inferArrayLit checks `[a, b, c]` and `[value; count]`, using the expected
@@ -2858,6 +2895,8 @@ func mutRoot(e ast.Expr) string {
 	case *ast.FieldExpr:
 		return mutRoot(x.Recv)
 	case *ast.IndexExpr:
+		return mutRoot(x.Recv)
+	case *ast.SliceExpr:
 		return mutRoot(x.Recv)
 	}
 	return ""

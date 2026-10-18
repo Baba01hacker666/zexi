@@ -466,6 +466,18 @@ type IndexExpr struct {
 func (*IndexExpr) exprNode()          {}
 func (e *IndexExpr) Span() token.Span { return e.Sp }
 
+// SliceExpr is `xs[lo:hi]` (Python-style slicing). Either bound may be
+// omitted; a negative bound counts from the end.
+type SliceExpr struct {
+	Recv Expr
+	Low  Expr // may be nil  -> 0
+	High Expr // may be nil  -> len
+	Sp   token.Span
+}
+
+func (*SliceExpr) exprNode()          {}
+func (e *SliceExpr) Span() token.Span { return e.Sp }
+
 // TryExpr is postfix `?`.
 type TryExpr struct {
 	X  Expr
