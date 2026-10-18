@@ -39,6 +39,7 @@ const (
 	KindFor
 	KindIf
 	KindImpl
+	KindImport
 	KindIn
 	KindLet
 	KindLoop
@@ -126,6 +127,7 @@ var keywords = map[string]Kind{
 	"for":      KindFor,
 	"if":       KindIf,
 	"impl":     KindImpl,
+	"import":   KindImport,
 	"in":       KindIn,
 	"let":      KindLet,
 	"loop":     KindLoop,
@@ -197,6 +199,7 @@ var kindNames = map[Kind]string{
 	KindFor:        "for",
 	KindIf:         "if",
 	KindImpl:       "impl",
+	KindImport:     "import",
 	KindIn:         "in",
 	KindLet:        "let",
 	KindLoop:       "loop",

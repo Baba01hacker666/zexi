@@ -1,5 +1,5 @@
 // io — console input/output, part of the Zexi standard library.
-// Import with `use io;` or `use std::io;`.
+// Import with `use io;`, `use std::io;`, or `import io;`.
 
 extern "C" fn read(fd: i32, buf: &mut [u8; 4096], n: usize) -> i64;
 extern "C" fn write(fd: i32, buf: str, n: usize) -> i64;
@@ -62,4 +62,13 @@ pub fn print_err(s: str) {
 pub fn eprintln_err(s: str) {
     print_err(s);
     write(2, "\n", 1);
+}
+
+// input is a Python-shaped convenience wrapper around read_line. It accepts an
+// optional prompt and returns the line without its trailing newline.
+pub fn input(prompt: str = "") -> String {
+    if len(prompt) > 0 {
+        print(prompt);
+    }
+    return read_line();
 }

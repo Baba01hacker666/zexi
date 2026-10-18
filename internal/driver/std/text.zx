@@ -1,5 +1,5 @@
 // text — a practical string toolkit, part of the Zexi standard library.
-// Import with `use text;` or `use std::text;`.
+// Import with `use text;`, `use std::text;`, or `import text;`.
 //
 // Functions take `str` inputs (string literals pass directly) and return
 // owning `String`s. Scanning/ASCII only — no Unicode case folding yet.
@@ -277,4 +277,40 @@ pub fn format_bool(b: bool) -> String {
 
 fn is_space_byte(b: i64) -> bool {
     return b == 32 || b == 9 || b == 10 || b == 13 || b == 11 || b == 12;
+}
+
+// --- familiar convenience spellings ---------------------------------------
+// These aliases keep tiny scripts readable for people coming from Python and
+// other batteries-included languages. They operate on byte-oriented `str`
+// input just like the rest of this ASCII-focused module.
+
+pub fn upper(s: str) -> String { to_upper(s) }
+pub fn lower(s: str) -> String { to_lower(s) }
+
+// strip removes ASCII whitespace from both ends.
+pub fn strip(s: str) -> String {
+    let left = trim_start(s);
+    return trim_end(left.as_str());
+}
+
+pub fn contains(s: str, sub: str) -> bool { index_of(s, sub) >= 0 }
+
+pub fn starts_with(s: str, prefix: str) -> bool {
+    let value = String::from(s);
+    return value.starts_with(prefix);
+}
+
+pub fn ends_with(s: str, suffix: str) -> bool {
+    let value = String::from(s);
+    return value.ends_with(suffix);
+}
+
+pub fn replace(s: str, from: str, to: str) -> String {
+    return replace_all(s, from, to);
+}
+
+// is_blank reports whether s is empty or all ASCII whitespace.
+pub fn is_blank(s: str) -> bool {
+    let value = strip(s);
+    return value.len() == 0;
 }

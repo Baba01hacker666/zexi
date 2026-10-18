@@ -229,3 +229,38 @@ fn main() {
 		t.Fatal("expected a diagnostic for unterminated `{` in f-string")
 	}
 }
+
+func TestImportAndInlineModuleSyntax(t *testing.T) {
+	src := `import http.server as server;
+import std::http::client;
+import "helper.zx" as helper;
+mod inline { fn answer() -> i32 { 42 } }
+mod external;`
+	file, n := parse(t, src)
+	if n != 0 {
+		t.Fatalf("unexpected diagnostics: %d", n)
+	}
+	if len(file.Items) != 5 {
+		t.Fatalf("expected 5 items, got %d", len(file.Items))
+	}
+	first, ok := file.Items[0].(*ast.UseDecl)
+	if !ok || len(first.Path) != 2 || first.Path[0] != "http" || first.Path[1] != "server" || first.As != "server" {
+		t.Fatalf("unexpected dotted import: %#v", file.Items[0])
+	}
+	second, ok := file.Items[1].(*ast.UseDecl)
+	if !ok || len(second.Path) != 3 || second.Path[0] != "std" || second.Path[2] != "client" {
+		t.Fatalf("unexpected qualified import: %#v", file.Items[1])
+	}
+	third, ok := file.Items[2].(*ast.UseDecl)
+	if !ok || third.File != "helper.zx" || third.As != "helper" {
+		t.Fatalf("unexpected file import: %#v", file.Items[2])
+	}
+	inline, ok := file.Items[3].(*ast.ModDecl)
+	if !ok || !inline.Inline || inline.Name != "inline" || len(inline.Items) != 1 {
+		t.Fatalf("unexpected inline module: %#v", file.Items[3])
+	}
+	external, ok := file.Items[4].(*ast.ModDecl)
+	if !ok || external.Inline || external.Name != "external" {
+		t.Fatalf("unexpected external module: %#v", file.Items[4])
+	}
+}

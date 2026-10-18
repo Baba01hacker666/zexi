@@ -1,5 +1,5 @@
 // net — TCP sockets over POSIX, part of the Zexi standard library.
-// Import with `use net;` or `use std::net;`.
+// Import with `use net;`, `use std::net;`, or `import net.tcp;`.
 //
 // The low-level calls live in the embedded C runtime, linked in only
 // when this module is used. The linker prunes anything the program does not
@@ -16,6 +16,14 @@ extern "C" fn zxn_send_all(fd: i32, buf: str, n: i32) -> i32;
 extern "C" fn zxn_recv(fd: i32, buf: &mut [u8; 8192], cap: usize) -> i32;
 extern "C" fn zxn_read_head(fd: i32, buf: &mut [u8; 8192], cap: i32) -> i32;
 extern "C" fn zxn_close(fd: i32) -> i32;
+
+// File helpers share the opt-in POSIX C shim with sockets. Keeping the ABI
+// declarations here lets `http` and `fs` compose without duplicate externs.
+extern "C" fn zxn_file_open(path: str) -> i64;
+extern "C" fn zxn_file_read(handle: i64, buf: &mut [u8; 8192], cap: i32) -> i32;
+extern "C" fn zxn_file_close(handle: i64) -> i32;
+extern "C" fn zxn_file_size(path: str) -> i64;
+extern "C" fn zxn_write_file(path: str, buf: str, n: i32) -> i32;
 
 const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;

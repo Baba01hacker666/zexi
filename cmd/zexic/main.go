@@ -24,7 +24,7 @@ import (
 	"zexi/internal/token"
 )
 
-const version = "zexi 0.1.0 (M0-alpha: functions, control flow, printing)"
+const version = "zexi 0.1.0 (M0-alpha + M1 foundations: imports, stdlib, native C)"
 
 func main() { os.Exit(run(os.Args[1:])) }
 

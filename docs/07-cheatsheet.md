@@ -314,23 +314,45 @@ fn greet() { println("hi") }   // no return type needed when returning ()
   borrowed, never moved, and must be printable (numbers, `bool`, `char`,
   `str`, `String`).
 
-Libraries: `use` imports whole files into your program — their `pub`
-functions, structs, enums, and constants become available unqualified.
+Libraries: `use` and `import` load whole files into your program — loaded
+declarations are currently available unqualified because visibility is not yet
+enforced. `import` accepts Python-shaped dots as a friendly alternative to
+`use` paths with `::`.
 
 ```zx
-use "helpers.zx";   // a file next to yours (path relative to your file)
-use math;           // standard library: searched next to your file, in a
-use std::text;      //   lib/ folder beside it, then in the embedded stdlib
+use "helpers.zx";      // a file next to yours (path relative to your file)
+import "helpers.zx";   // same operation, alternate spelling
+use math;               // standard library: local files win, then embedded std
+use std::text;
+import http.server;     // package-shaped facade; call serve(&router, port), Router, ...
+import io.fs;           // filesystem facade
 ```
 
-Every file is loaded at most once and import cycles are harmless. The
-embedded standard library (sources in `internal/driver/std/`) currently has
-`math` (`mini`, `maxi`, `clampi`, `absi`, `signi`, `is_even`, `gcdi`,
-`powi`, `minf`, `maxf`, `clampf`, `absf`), `text` (`repeat_text`,
-`exclaim`, `pad_start`, `join_with`, `shout`), `io` (`read_line`,
-`prompt_line`), and `random` (`seed_random`, `seed_from_time`, `rand_int`,
-`rand_bool`, `rand_float`). Passing extra `.zx` files on the command line
-(`zexic run main.zx lib.zx`) still works too.
+`mod name;` is an M1-preview layout helper: it loads `name.zx` or
+`name/mod.zx`; `mod name { ... }` works too. Every file is loaded at most once
+and cycles are harmless. Imports/modules are intentionally **flat for now**:
+there is no `http.server.serve()` lookup or visibility enforcement yet, so the
+names loaded by `import http.server;` are called directly. `as` is parsed for
+the future scoped model, but is rejected today with E9024 instead of silently
+being ignored. Passing extra `.zx` files on the command line (`zexic run
+main.zx lib.zx`) still works too.
+
+The embedded standard library (sources in `internal/driver/std/`) includes:
+
+- `math`: integer helpers plus `PI`, `sqrt`, `hypot`, `sin`, `cos`, `pow`,
+  `lerp`, `factorial`, `choose`, `is_prime`, and conventional `min`/`max`/
+  `abs` aliases.
+- `text`: ASCII casing, trim/pad/replace/search, comparisons, and simple
+  formatting helpers; familiar `upper`, `lower`, `strip`, `contains`,
+  `starts_with`, `ends_with`, `replace`, and `is_blank` aliases are included
+  for small scripts.
+- `io`, `fs`, `sys`, and `random`: console I/O (`input(prompt = "")` and
+  `read_line`); capped binary-safe file reads plus
+  `write_bytes(path, &String)` (reads, writes, and copies cap at 32 MiB);
+  environment/clocks/sleep; and deterministic or libc-backed random numbers.
+- `net` and `http`: TCP and a high-level HTTP client/server. `Client`, `fetch`,
+  `request`, `Router`, `serve`, `serve_n`, `serve_dir`, and static-file helpers
+  are documented in [`08-networking.md`](08-networking.md).
 
 Command-line arguments are builtins: `arg_count()` counts them (index 0
 is the program name) and `arg_at(i)` returns argument `i` as a `String`
@@ -339,8 +361,10 @@ program that ties it all together, see `examples/guess.zx`.
 
 ## 7.14 Not implemented yet (roadmap M1+)
 
-Generics, traits, `mod`, `Vec`/`Box`, user-defined `Drop`, tuple values
-(tuple *structs* exist; `(a, b)` values and destructuring do not yet),
-borrow-lifetime (NLL) analysis, `Result`/`?`, bindings inside or-patterns,
-nested patterns, and enum variants that own resources. See
+Generics, traits, scoped modules/path-qualified item lookup and visibility
+checking (the current `mod`/`use`/`import` loader is intentionally flat),
+`Vec`/`Box`, user-defined `Drop`, tuple values (tuple *structs* exist; `(a, b)`
+values and destructuring do not yet), borrow-lifetime (NLL) analysis,
+`Result`/`?`, bindings inside or-patterns, nested patterns, and enum variants
+that own resources. See
 [`05-roadmap.md`](05-roadmap.md) for the plan.

@@ -18,10 +18,12 @@ This repository contains the **initial design and specification** of Zexi: the v
 > line ends; `f"hello, {name}!"` string interpolation; default arguments
 > (`fn area(w: i64, h: i64 = 10)`) and named arguments (`area(h = 4, w = 2)`);
 > functions may omit a return type when they return nothing. Libraries via
-> `use`: `use "helpers.zx";` imports a neighbouring file, and `use math;` /
-> `use text;` (or `use std::math;`) import the standard library embedded in
-> the compiler — see `internal/driver/std/`. Still compiled to a small,
-> fast native binary through C.
+> `use` or Python-shaped `import`: `use "helpers.zx";` / `import "helpers.zx";`
+> import a neighbouring file, while `use math;`, `import http.server;`, and
+> `use io::fs;` select embedded standard-library helpers — see
+> `internal/driver/std/`. `mod name;` also loads `name.zx` or `name/mod.zx`
+> today (a deliberately flat, M1-preview module surface). Everything still
+> compiles to a small, fast native binary through C.
 >
 > Implemented: functions and recursion; `let`/`const`; `type` aliases; integer/
 > float/bool/char/`str` values; arithmetic, bitwise, comparison, and logical
@@ -40,16 +42,22 @@ This repository contains the **initial design and specification** of Zexi: the v
 > (`"n = " + n`, `s += n`); **`extern "C"` FFI** for
 > calling libc; and compiling **several source files into one binary** — enough
 > to ship an HTTP client/server in [`lib/http.zx`](lib/http.zx), plus embedded
-> `net`/`http` modules (`use http;`) with URL parsing, redirects, headers,
-> query/form decoding, chunked bodies, timeouts, response builders, cookies,
-> static-file serving with MIME detection, downloads, and a fixed-capacity
-> router built on function values (see
-> [`docs/08-networking.md`](docs/08-networking.md)).
+> `net`/`http` modules (`import http.server;`) with URL parsing, redirects,
+> headers, query/form decoding, chunked bodies, timeouts, response builders,
+> cookies, static-file serving with MIME detection, downloads, and a
+> fixed-capacity router built on function values. High-level `serve(&app, 8000)`
+> and `serve_dir(root, 8000)` remove the socket/accept boilerplate; `Client`,
+> `fetch`, and `request` cover the client side (see
+> [`docs/08-networking.md`](docs/08-networking.md)). Embedded `math`, `text`,
+> `io`, and `fs` also provide dependency-free arithmetic/trig/primes, familiar
+> string helpers, `input(prompt)`, and capped binary-safe file helpers.
 >
-> Not yet implemented: generics, traits/`impl Trait`, modules/`mod`, `Box`/`Vec`,
+> Not yet implemented: generics, traits/`impl Trait`, **scoped** modules and
+> visibility enforcement (the current `use`/`import`/`mod` loader is flat;
+> `import ... as name` is explicitly rejected until namespaces exist), `Box`/`Vec`,
 > user-defined `Drop`, borrow-lifetime analysis (bound `&`/`*` aliases are not yet
-> tracked), and `Result`/`?`. Enum variants cannot carry owning payloads yet. See
-> `docs/05-roadmap.md`.
+> tracked), and `Result`/`?`. Enum variants cannot carry
+> owning payloads yet. See `docs/05-roadmap.md`.
 
 ## How it works
 
@@ -72,7 +80,10 @@ go run ./cmd/zexic run tests/easy.zx      # the easy way: no semicolons, f-strin
 go run ./cmd/zexic run examples/easy.zx   # same ideas, as a small standalone demo
 go run ./cmd/zexic run tests/sugar.zx     # break-with-value, Type::new(..), print/format sugar
 go run ./cmd/zexic run tests/pi.zx        # 30 digits of π: big-int + Machin's formula
-go run ./cmd/zexic run examples/http_server.zx lib/http.zx   # an HTTP server, in Zexi
+go run ./cmd/zexic run examples/http_app.zx                  # high-level Router + serve
+go run ./cmd/zexic run examples/static_server.zx -- .         # one-call static server
+# The low-level, explicit FFI example remains available too:
+go run ./cmd/zexic run examples/http_server.zx lib/http.zx
 go run ./cmd/zexic run examples/http_client.zx lib/http.zx   # an HTTP client (needs the server)
 go run ./cmd/zexic run examples/hello.zx
 go run ./cmd/zexic emit --emit=c tests/tour.zx   # inspect the generated C
@@ -123,7 +134,7 @@ internal/
   sema/               name resolution, type inference, constant folding,
                       and the flow-sensitive move checker (own.go)
   codegen/c/          M0 backend: typed program -> C11
-  driver/             pipeline orchestration + C compiler invocation
+  driver/             pipeline orchestration, imports/modules + C compiler invocation
   diag/               diagnostics + source spans
 docs/                 the specification
 examples/             sample Zexi source

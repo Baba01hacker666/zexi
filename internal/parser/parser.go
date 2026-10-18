@@ -138,12 +138,14 @@ func (p *parser) parseItem() ast.Item {
 		return p.parseTypeAlias(vis, start)
 	case token.KindImpl:
 		return p.parseImpl(start)
+	case token.KindImport:
+		return p.parseImport(start)
 	case token.KindMod:
 		return p.parseMod(vis, start)
 	case token.KindUse:
 		return p.parseUse(start)
 	default:
-		p.errf(p.cur(), "E0202", "expected an item (fn, struct, enum, const, type, impl, mod, use), found %s", p.cur().Kind)
+		p.errf(p.cur(), "E0202", "expected an item (fn, struct, enum, const, type, impl, mod, use, import), found %s", p.cur().Kind)
 		return nil
 	}
 }
@@ -473,6 +475,7 @@ func (p *parser) parseMod(vis ast.Visibility, start token.Pos) ast.Item {
 	if _, ok := p.expect(token.KindLBrace, " to begin module body"); !ok {
 		return d
 	}
+	d.Inline = true
 	for !p.at(token.KindRBrace) && !p.at(token.KindEOF) {
 		before := p.pos
 		if it := p.parseItem(); it != nil {
@@ -488,21 +491,37 @@ func (p *parser) parseMod(vis ast.Visibility, start token.Pos) ast.Item {
 }
 
 func (p *parser) parseUse(start token.Pos) ast.Item {
-	p.bump() // use
+	return p.parseImportLike(start, false)
+}
+
+// parseImport accepts the Python-style spelling as a friendly alias for
+// `use`. Import paths may use dots (`import http.server;`) or `::`
+// (`import http::server;`); both lower to the same UseDecl and are resolved by
+// the driver before semantic analysis.
+func (p *parser) parseImport(start token.Pos) ast.Item {
+	return p.parseImportLike(start, true)
+}
+
+func (p *parser) parseImportLike(start token.Pos, allowDots bool) ast.Item {
+	p.bump() // use or import
 	d := &ast.UseDecl{}
 	if p.at(token.KindString) {
-		// `use "helpers.zx";` imports a file relative to this one.
+		// `use "helpers.zx";` / `import "helpers.zx";` imports a file
+		// relative to this one. Keep parsing a following `as` clause too so
+		// the loader can give its deliberate M1-preview diagnostic uniformly.
 		d.File = p.bump().Lit
-		p.expectSemicolon()
-		d.Sp = p.spanFrom(start)
-		return d
-	}
-	d.Path = append(d.Path, p.expectIdentPath("use path"))
-	for p.accept(token.KindColonColon) {
-		d.Path = append(d.Path, p.expectIdentPath("use path segment"))
+	} else {
+		d.Path = append(d.Path, p.expectIdentPath("import path"))
+		for {
+			if p.accept(token.KindColonColon) || (allowDots && p.accept(token.KindDot)) {
+				d.Path = append(d.Path, p.expectIdentPath("import path segment"))
+				continue
+			}
+			break
+		}
 	}
 	if p.accept(token.KindAs) {
-		d.As = p.expectIdentPath("use alias")
+		d.As = p.expectIdentPath("import alias")
 	}
 	p.expectSemicolon()
 	d.Sp = p.spanFrom(start)

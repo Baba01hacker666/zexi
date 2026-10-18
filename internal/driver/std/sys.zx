@@ -1,5 +1,5 @@
 // sys — operating-system helpers: environment, clocks, sleeping, pid.
-// Import with `use sys;` or `use std::sys;`.
+// Import with `use sys;`, `use std::sys;`, `import os;`, or `import time;`.
 //
 // A small C shim (`zxs_*`) is linked in only when this module is used.
 

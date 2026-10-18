@@ -29,22 +29,27 @@ handles strings, printing, arrays, and the standard library's C shims.
 
 ### 2.2 Parser (`internal/parser`)
 - Builds an AST (`internal/ast`).
-- Handles expressions, statements, items (functions, structs, enums, impls,
-  use declarations).
+- Handles expressions, statements, and items (functions, structs, enums, impls,
+  `use`/`import` declarations, and `mod`).
 
 ### 2.3 Loader / driver (`internal/driver`)
 - `FrontEndFiles` (in `driver.go`) loads one or more source files.
-- Resolves `use` declarations:
-  - `use "helpers.zx";` → relative file
-  - `use math;` / `use std::math;` → embedded standard library
+- Resolves source-layout declarations:
+  - `use "helpers.zx";` / `import "helpers.zx";` → relative file
+  - `use math;`, `use std::math;`, `import http.server;`, and
+    `import io.fs;` → embedded standard-library modules
     (`internal/driver/std/*.zx`)
-- Merges all items into one module.
+  - `mod name;` → `name.zx` or `name/mod.zx` beside the declaring file
+- Merges all imported/module items into one namespace for this M1-preview
+  stage; scoped names and visibility enforcement come later. `as` aliases are
+  parsed for forward compatibility but explicitly report E9024 until real
+  namespaces can make them meaningful.
 
 ### 2.4 Semantic analysis (`internal/sema`)
 - Type checking, name resolution.
 - Move checker (`own.go`): non-`#[copy]` values are move-only; use-after-move
   is an error.
-- Produces `sema.Info` with `FnOrder` (reachable functions in order).
+- Produces `sema.Info` with `FnOrder` (checked functions in declaration order).
 
 ### 2.5 Code generation (`internal/codegen/c`)
 - Lowers the typed AST to C.
@@ -54,8 +59,8 @@ handles strings, printing, arrays, and the standard library's C shims.
 
 ### 2.6 Compilation / linking (`driver.CompileC` / `CompileUnits`)
 - Writes generated C to temp files.
-- Invokes `cc` with `-std=gnu11`, optimization, `-ffunction-sections`,
-  `-fdata-sections`, and include dirs.
+- Invokes `cc` with `-std=gnu11`, optimization, `-fwrapv` (defined signed
+  integer wrapping), `-ffunction-sections`, `-fdata-sections`, and include dirs.
 - Links extra C sources (`--csrc`), embedded runtimes (net/sys), and libs.
 - `--gc-sections` / `-dead_strip` prunes unused functions (tree-shaking).
 
@@ -82,16 +87,18 @@ Embedded in the compiler under `internal/driver/std/`:
 
 | Module | File | Purpose |
 |--------|------|---------|
-| io     | `io.zx` | stdin/stdout, files, read_all |
-| math   | `math.zx` | arithmetic helpers, isqrt, pow_mod |
+| io     | `io.zx` | stdin/stdout, input/read_line/read_all |
+| fs     | `fs.zx` | capped binary-safe file read/write/copy helpers |
+| math   | `math.zx` | arithmetic, roots/trig/interpolation, primes/combinatorics |
 | text   | `text.zx` | string helpers |
 | random | `random.zx` | RNG |
 | sys    | `sys.zx` | env, clocks, sleep, pid (C shim `zxsys_c.txt`) |
-| net    | `net.zx` | TCP sockets (C shim `zxnet_c.txt`) |
-| http   | `http.zx` | HTTP client/server on top of net |
+| net    | `net.zx` | TCP sockets and shared file ABI (C shim `zxnet_c.txt`) |
+| http   | `http.zx` | HTTP client/server, Router + serve/serve_dir helpers |
 
-Import with `use io;`, `use std::net;`, `use http;`, etc. The linker prunes
-anything not called, so importing costs nothing unless used.
+Import with `use io;`, `use std::net;`, `use http;`, or Python-shaped
+`import http.server;` / `import io.fs;`. The linker prunes anything not called,
+so importing costs nothing unless used.
 
 Each module may pull in a C shim (`zxnet_c.txt`, `zxsys_c.txt`) which is
 appended to the build only when the module is used.

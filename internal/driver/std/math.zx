@@ -1,5 +1,5 @@
 // math — numeric helpers, part of the Zexi standard library.
-// Import with `use math;` or `use std::math;`.
+// Import with `use math;`, `use std::math;`, or `import math;`.
 //
 // Pure Zexi (no libm link required). Integer math uses wrapping C semantics;
 // the floor/ceil variants correct the truncated division explicitly.
@@ -187,6 +187,11 @@ pub fn log2_floor(x: u64) -> i32 {
 
 // --- floats (pure Zexi; no libm) -------------------------------------------
 
+// Casting an out-of-range float (or NaN) to i64 is undefined in C. At and
+// beyond this power of two, every representable f64 is already integral, so
+// floor/ceil/trunc can safely return it unchanged.
+const MATH_F64_I64_LIMIT: f64 = 9223372036854775808.0;
+
 pub fn minf(a: f64, b: f64) -> f64 {
     if a < b { a } else { b }
 }
@@ -205,7 +210,10 @@ pub fn absf(x: f64) -> f64 {
 
 // floor_f rounds toward negative infinity.
 pub fn floor_f(x: f64) -> f64 {
-    let t = x as i64; // truncates toward zero
+    if x != x || x >= MATH_F64_I64_LIMIT || x <= 0.0 - MATH_F64_I64_LIMIT {
+        return x;
+    }
+    let t = x as i64; // truncates toward zero within the checked range
     let f = t as f64;
     if f > x {
         return f - 1.0;
@@ -215,6 +223,9 @@ pub fn floor_f(x: f64) -> f64 {
 
 // ceil_f rounds toward positive infinity.
 pub fn ceil_f(x: f64) -> f64 {
+    if x != x || x >= MATH_F64_I64_LIMIT || x <= 0.0 - MATH_F64_I64_LIMIT {
+        return x;
+    }
     let t = x as i64;
     let f = t as f64;
     if f < x {
@@ -233,5 +244,266 @@ pub fn round_f(x: f64) -> f64 {
 
 // trunc_f rounds toward zero.
 pub fn trunc_f(x: f64) -> f64 {
+    if x != x || x >= MATH_F64_I64_LIMIT || x <= 0.0 - MATH_F64_I64_LIMIT {
+        return x;
+    }
     return (x as i64) as f64;
+}
+
+// --- friendly high-level helpers ------------------------------------------
+//
+// The short names in this section are intentionally Python-shaped. The older
+// *_i / *_f helpers above remain available and are useful when a call site
+// wants to advertise its numeric domain explicitly.
+
+pub const PI: f64 = 3.14159265358979323846264338327950288;
+pub const TAU: f64 = 6.28318530717958647692528676655900576;
+pub const E: f64 = 2.71828182845904523536028747135266250;
+
+pub fn min(a: f64, b: f64) -> f64 { minf(a, b) }
+pub fn max(a: f64, b: f64) -> f64 { maxf(a, b) }
+pub fn clamp(x: f64, lo: f64, hi: f64) -> f64 { clampf(x, lo, hi) }
+pub fn abs(x: f64) -> f64 { absf(x) }
+pub fn floor(x: f64) -> f64 { floor_f(x) }
+pub fn ceil(x: f64) -> f64 { ceil_f(x) }
+pub fn round(x: f64) -> f64 { round_f(x) }
+pub fn trunc(x: f64) -> f64 { trunc_f(x) }
+
+pub fn min_i(a: i64, b: i64) -> i64 { mini(a, b) }
+pub fn max_i(a: i64, b: i64) -> i64 { maxi(a, b) }
+pub fn clamp_i(x: i64, lo: i64, hi: i64) -> i64 { clampi(x, lo, hi) }
+pub fn abs_i(x: i64) -> i64 { absi(x) }
+pub fn sign_i(x: i64) -> i64 { signi(x) }
+pub fn gcd(a: i64, b: i64) -> i64 { gcdi(a, b) }
+pub fn lcm(a: i64, b: i64) -> i64 { lcmi(a, b) }
+
+// sqrt returns the non-negative square root of x. Negative inputs return 0.
+// Scaling keeps Newton's method accurate for both very large and very small
+// finite values without requiring libm.
+pub fn sqrt(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    let mut y = x;
+    let mut scale = 1.0;
+    let mut scaled_up = false;
+    let mut shifts: i32 = 0;
+    // Finite f64 values need at most about 540 base-4 shifts. The cap keeps
+    // +infinity from turning this pure helper into an accidental infinite loop.
+    while y < 1.0 && shifts < 1024 {
+        y *= 4.0;
+        scale *= 2.0;
+        scaled_up = true;
+        shifts += 1;
+    }
+    while y > 4.0 && shifts < 1024 {
+        y *= 0.25;
+        scale *= 2.0;
+        shifts += 1;
+    }
+    if y > 4.0 {
+        return y;
+    }
+    let mut guess = (1.0 + y) / 2.0;
+    let mut i = 0;
+    while i < 16 {
+        guess = (guess + y / guess) / 2.0;
+        i += 1;
+    }
+    if scaled_up {
+        return guess / scale;
+    }
+    return guess * scale;
+}
+
+// hypot returns sqrt(x*x + y*y) while avoiding intermediate overflow for
+// ordinary finite inputs.
+pub fn hypot(x: f64, y: f64) -> f64 {
+    let ax = absf(x);
+    let ay = absf(y);
+    let hi = maxf(ax, ay);
+    let lo = minf(ax, ay);
+    if hi == 0.0 {
+        return 0.0;
+    }
+    let r = lo / hi;
+    return hi * sqrt(1.0 + r * r);
+}
+
+// pow raises a floating-point base to an integer exponent. Negative exponents
+// produce the reciprocal. Like C arithmetic, overflow becomes an infinity.
+pub fn pow(base: f64, exponent: i32) -> f64 {
+    let mut e = exponent as i64;
+    let invert = e < 0;
+    if invert {
+        e = -e;
+    }
+    let mut b = base;
+    let mut out = 1.0;
+    while e > 0 {
+        if e % 2 == 1 {
+            out *= b;
+        }
+        b *= b;
+        e /= 2;
+    }
+    if invert {
+        return 1.0 / out;
+    }
+    return out;
+}
+
+// wrap_angle reduces an angle to [-PI, PI]. A quotient reduction handles
+// ordinary large inputs without a long subtraction loop; the bounded fallback
+// keeps infinities and extreme values from hanging the process.
+fn wrap_angle(x0: f64) -> f64 {
+    let mut x = x0;
+    if x > TAU || x < 0.0 - TAU {
+        // Keep the float-to-int conversion in its defined finite range.
+        if x < 9000000000000000000.0 && x > 0.0 - 9000000000000000000.0 {
+            x -= trunc_f(x / TAU) * TAU;
+        }
+    }
+    let mut steps: i32 = 0;
+    while x > PI && steps < 1024 {
+        x -= TAU;
+        steps += 1;
+    }
+    while x < 0.0 - PI && steps < 1024 {
+        x += TAU;
+        steps += 1;
+    }
+    return x;
+}
+
+// sin and cos use a reduced-angle Taylor series. They are dependency-free,
+// accurate enough for UI, games, and small numerical programs (not a libm
+// replacement for scientific edge cases).
+pub fn sin(x: f64) -> f64 {
+    let y = wrap_angle(x);
+    let mut term = y;
+    let mut out = y;
+    let mut k: i32 = 1;
+    while k < 12 {
+        let divisor = ((2 * k) * (2 * k + 1)) as f64;
+        term = 0.0 - term * y * y / divisor;
+        out += term;
+        k += 1;
+    }
+    return out;
+}
+
+pub fn cos(x: f64) -> f64 {
+    let y = wrap_angle(x);
+    let mut term = 1.0;
+    let mut out = 1.0;
+    let mut k: i32 = 1;
+    while k < 12 {
+        let divisor = ((2 * k - 1) * (2 * k)) as f64;
+        term = 0.0 - term * y * y / divisor;
+        out += term;
+        k += 1;
+    }
+    return out;
+}
+
+pub fn tan(x: f64) -> f64 { sin(x) / cos(x) }
+
+pub fn lerp(a: f64, b: f64, t: f64) -> f64 { a + (b - a) * t }
+
+// inverse_lerp reports where x lies between a and b. Equal endpoints have no
+// useful ratio, so they return 0 instead of dividing by zero.
+pub fn inverse_lerp(a: f64, b: f64, x: f64) -> f64 {
+    if a == b {
+        return 0.0;
+    }
+    return (x - a) / (b - a);
+}
+
+pub fn remap(in_lo: f64, in_hi: f64, out_lo: f64, out_hi: f64, x: f64) -> f64 {
+    return lerp(out_lo, out_hi, inverse_lerp(in_lo, in_hi, x));
+}
+
+pub fn approx_eq(a: f64, b: f64, tolerance: f64) -> bool {
+    return absf(a - b) <= absf(tolerance);
+}
+
+pub fn mean2(a: f64, b: f64) -> f64 { a / 2.0 + b / 2.0 }
+
+// factorial returns n! for n >= 0, or 0 for a negative input. The i64 result
+// wraps after 20!, matching the rest of Zexi's fixed-width integer helpers.
+pub fn factorial(n: i32) -> i64 {
+    if n < 0 {
+        return 0;
+    }
+    let mut out: i64 = 1;
+    let mut i: i64 = 2;
+    while i <= n as i64 {
+        out *= i;
+        i += 1;
+    }
+    return out;
+}
+
+// choose returns "n choose k", or 0 when k is outside 0..n. It is exact while
+// intermediate i64 arithmetic fits.
+pub fn choose(n: i64, k0: i64) -> i64 {
+    if n < 0 || k0 < 0 || k0 > n {
+        return 0;
+    }
+    let k = if k0 < n - k0 { k0 } else { n - k0 };
+    let mut out: i64 = 1;
+    let mut i: i64 = 1;
+    while i <= k {
+        out = out * (n - k + i) / i;
+        i += 1;
+    }
+    return out;
+}
+
+pub fn is_prime(n: i64) -> bool {
+    if n < 2 {
+        return false;
+    }
+    if n == 2 {
+        return true;
+    }
+    if n % 2 == 0 {
+        return false;
+    }
+    let mut divisor: i64 = 3;
+    // n / divisor avoids an overflowing divisor*divisor test.
+    while divisor <= n / divisor {
+        if n % divisor == 0 {
+            return false;
+        }
+        divisor += 2;
+    }
+    return true;
+}
+
+// next_prime returns the first prime strictly greater than n, or 0 when no
+// greater i64 is representable. The final representable odd candidate is still
+// tested rather than being skipped at the boundary.
+pub fn next_prime(n: i64) -> i64 {
+    if n < 2 {
+        return 2;
+    }
+    if n >= 9223372036854775807 {
+        return 0;
+    }
+    let mut candidate = n + 1;
+    if candidate % 2 == 0 {
+        candidate += 1;
+    }
+    loop {
+        if is_prime(candidate) {
+            return candidate;
+        }
+        // candidate is odd. Once it is MAX_I64, adding two would overflow.
+        if candidate > 9223372036854775805 {
+            return 0;
+        }
+        candidate += 2;
+    }
 }
