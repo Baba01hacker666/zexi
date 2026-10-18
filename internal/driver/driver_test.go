@@ -149,7 +149,7 @@ func TestRunPrograms(t *testing.T) {
 			file: "../../tests/robustness.zx",
 			want: strings.Join([]string{
 				"4", "5", "6", "xy", "xyxy", "box", "3", "boxed",
-				"38", "-128", "-300", "",
+				"38", "-128", "-300", "é", "😀", "A", "",
 			}, "\n"),
 		},
 	}

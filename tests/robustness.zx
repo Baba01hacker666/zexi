@@ -64,5 +64,9 @@ fn main() -> i32 {
     let neg = -300;
     println(low);
     println(neg);
+    // a `char` is a Unicode scalar value: printing it writes UTF-8
+    println(233 as char);
+    println(128512 as char);
+    println(65 as char);
     0
 }

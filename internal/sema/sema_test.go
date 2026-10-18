@@ -506,3 +506,29 @@ func TestReturnTypePropagation(t *testing.T) {
 		})
 	}
 }
+
+// TestEscapeDiagnostics covers malformed escapes in string/char/byte literals.
+func TestEscapeDiagnostics(t *testing.T) {
+	bad := []string{
+		`fn main() -> i32 { println("a\q"); 0 }`,
+		`fn main() -> i32 { println("a\xZZ"); 0 }`,
+		`fn main() -> i32 { println("a\u{zz}"); 0 }`,
+	}
+	for _, src := range bad {
+		ok, codes := check(t, src)
+		if ok || !has(codes, "E0001") {
+			t.Fatalf("expected E0001 for %q, got %v", src, codes)
+		}
+	}
+	good := []string{
+		`fn main() -> i32 { println("a\tb\nc\\d\"e\x41\u{1F600}"); 0 }`,
+		`fn main() -> i32 { println(r"a\qb"); 0 }`,
+		`fn main() -> i32 { let b = b'\n'; println(b as i32); 0 }`,
+		`fn main() -> i32 { let c = 'é'; println(c); 0 }`,
+	}
+	for _, src := range good {
+		if ok, codes := check(t, src); !ok {
+			t.Fatalf("expected clean for %q, got %v", src, codes)
+		}
+	}
+}

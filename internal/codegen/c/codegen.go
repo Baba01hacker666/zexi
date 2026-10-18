@@ -47,6 +47,7 @@ type gen struct {
 	loopLabels []loopLabel
 	trapDepth  int  // compiler-generated constructs (matches) since the innermost loop
 	hasString  bool // whether the program uses the builtin `String`
+	hasChar    bool // whether a `char` value is printed (needs the UTF-8 helper)
 }
 
 // loopLabel are the jump targets of one source-level loop.
@@ -106,7 +107,28 @@ func Generate(info *sema.Info, opts Options) (string, error) {
 			g.funcDef(fn)
 		}
 	}
+	g.charRuntime()
 	return g.w.b.String(), nil
+}
+
+// charRuntime emits the UTF-8 `char` printer, but only for programs that print
+// one, so that trivial programs keep producing minimal C.
+func (g *gen) charRuntime() {
+	if !g.hasChar {
+		return
+	}
+	g.w.line("")
+	g.w.line("// A `char` is a Unicode scalar value, so printing it writes its UTF-8")
+	g.w.line("// encoding (not just the low byte).")
+	g.w.line("static int zx_print_char(uint32_t c) {")
+	g.w.line("    char buf[4];")
+	g.w.line("    int n;")
+	g.w.line("    if (c < 0x80) { buf[0] = (char)c; n = 1; }")
+	g.w.line("    else if (c < 0x800) { buf[0] = (char)(0xC0 | (c >> 6)); buf[1] = (char)(0x80 | (c & 0x3F)); n = 2; }")
+	g.w.line("    else if (c < 0x10000) { buf[0] = (char)(0xE0 | (c >> 12)); buf[1] = (char)(0x80 | ((c >> 6) & 0x3F)); buf[2] = (char)(0x80 | (c & 0x3F)); n = 3; }")
+	g.w.line("    else { buf[0] = (char)(0xF0 | (c >> 18)); buf[1] = (char)(0x80 | ((c >> 12) & 0x3F)); buf[2] = (char)(0x80 | ((c >> 6) & 0x3F)); buf[3] = (char)(0x80 | (c & 0x3F)); n = 4; }")
+	g.w.line("    return (int)fwrite(buf, 1, (size_t)n, stdout);")
+	g.w.line("}")
 }
 
 func (g *gen) preamble() {
@@ -117,6 +139,9 @@ func (g *gen) preamble() {
 	g.w.line("#include <stdio.h>")
 	g.w.line("#include <stdlib.h>")
 	g.w.line("#include <string.h>")
+	g.w.line("")
+	g.w.line("// Defined only when a `char` is printed.")
+	g.w.line("static int zx_print_char(uint32_t c);")
 	g.w.line("")
 }
 
@@ -1310,6 +1335,15 @@ func (g *gen) printfCall(x *ast.CallExpr, name string) string {
 			tm, g.value(arg), nl, tm, tm)
 	}
 	v := g.value(arg)
+	if t != nil && t.Kind == types.Char {
+		// A `char` is a Unicode scalar value, not a byte: encode it as UTF-8
+		// rather than printing the low byte with `%c`.
+		g.hasChar = true
+		if nl == "" {
+			return fmt.Sprintf(`zx_print_char(%s)`, v)
+		}
+		return fmt.Sprintf(`({ zx_print_char(%s); printf("%s"); })`, v, nl)
+	}
 	format, cast := printFormat(t)
 	return fmt.Sprintf(`printf("%s%s", %s)`, format, nl, cast(v))
 }

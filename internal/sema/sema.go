@@ -748,6 +748,15 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 	return nil
 }
 
+// checkEscapes reports an unknown or malformed escape in a string or char
+// literal. The text is decoded later (in codegen), where an undecodable escape
+// would otherwise be silently passed through verbatim.
+func (c *checker) checkEscapes(x *ast.LiteralExpr) {
+	if _, ok := DecodeString(x.Text); !ok {
+		c.errf(x.Sp, "E0001", "unknown escape sequence in literal: %s", x.Text)
+	}
+}
+
 func (c *checker) inferLiteral(x *ast.LiteralExpr, expected *types.Type) *types.Type {
 	switch x.Kind {
 	case token.KindInteger:
@@ -777,11 +786,17 @@ func (c *checker) inferLiteral(x *ast.LiteralExpr, expected *types.Type) *types.
 		return types.F64T
 	case token.KindTrue, token.KindFalse:
 		return types.BoolT
-	case token.KindString, token.KindRawString:
+	case token.KindString:
+		c.checkEscapes(x)
+		return types.StrT
+	case token.KindRawString:
+		// Raw strings are not decoded, so escapes are literal text.
 		return types.StrT
 	case token.KindChar:
+		c.checkEscapes(x)
 		return types.CharT
 	case token.KindByteChar:
+		c.checkEscapes(x)
 		return &types.Type{Kind: types.U8}
 	}
 	return nil
