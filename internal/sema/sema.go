@@ -1087,7 +1087,6 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 		}
 		return nil
 	}
-	c.info.Resolved[x] = fn
 	return c.checkCallArgs(x, fn, fmt.Sprintf("function `%s`", name))
 }
 
