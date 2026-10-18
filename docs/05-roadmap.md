@@ -11,7 +11,8 @@
 > `impl` methods (`self`, `&self`, `&mut self`) and associated functions
 > (`Point::new(..)`); value-yielding `loop` (`break <expr>`); enums
 > (unit/tuple/struct variants) with
-> `match`, guards (`pat if cond`), and exhaustiveness checking; first-class
+> `match` over enums, integers, `bool`, and `char`, guards (`pat if cond`), and
+> exhaustiveness checking; first-class
 > arrays with bounds-checked indexing; `mut` enforcement (a non-`mut` binding
 > cannot be assigned through, `&mut`-borrowed, or mutated via a `&mut self`
 > method); use-after-move errors for non-`Copy` values (`#[copy]` opts in);

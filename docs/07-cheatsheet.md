@@ -141,6 +141,10 @@ match n {
 }
 ```
 
+The scrutinee may be an `enum`, an integer, a `bool`, or a `char`. Integers and
+`char`s need a `_` arm; a `bool` may instead cover both `true` and `false`.
+Duplicate literal arms are rejected (`E0001`).
+
 `break`, `continue`, and `return` may be used directly as an arm body
 (`_ => continue`). The comma after an arm is optional when the body ends in `}`
 (`0 => { a() } _ => { b() }`).

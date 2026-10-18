@@ -91,5 +91,16 @@ fn main() -> i32 {
         Shape::Circle(r) => println("circle", r),
         Shape::Empty => println("empty"),
     }
+
+    // `match` works on `bool` and `char` too
+    match 7 > 3 {
+        true => println("yes"),
+        false => println("no"),
+    }
+    match 'z' {
+        'a' => println("a"),
+        'z' => println("z"),
+        _ => println("other"),
+    }
     0
 }

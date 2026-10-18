@@ -684,3 +684,54 @@ func TestPrintAndStringSugar(t *testing.T) {
 		})
 	}
 }
+
+// TestMatchBoolCharAndDuplicates covers `match` on `bool`/`char` and the
+// rejection of duplicate literal arms (which would be duplicate C `case`s).
+func TestMatchBoolCharAndDuplicates(t *testing.T) {
+	accepted := []struct{ name, src string }{
+		{"bool-both-arms",
+			"fn main() -> i32 { let b = true; match b { true => println(1), false => println(0) } 0 }"},
+		{"bool-catch-all",
+			"fn main() -> i32 { match 1 > 2 { true => println(1), _ => println(0) } 0 }"},
+		{"bool-as-value",
+			"fn main() -> i32 { let n = match 3 > 2 { true => 10, false => 20 }; println(n); 0 }"},
+		{"char-match",
+			`fn main() -> i32 { match (98 as char) { 'a' => println(1), 'b' => println(2), _ => println(0) } 0 }`},
+		{"bool-guard-catch-all",
+			"fn main() -> i32 { let b = false; match b { x if x => println(1), _ => println(0) } 0 }"},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			if ok, codes := check(t, tc.src); !ok {
+				t.Fatalf("expected clean, got %v", codes)
+			}
+		})
+	}
+
+	rejected := []struct{ name, src, code string }{
+		{"duplicate-int-arm",
+			"fn main() -> i32 { match 1 { 1 => println(1), 1 => println(2), _ => println(3) } 0 }", "E0001"},
+		{"duplicate-int-arm-different-spelling",
+			"fn main() -> i32 { match 1 { 1 => println(1), 0x1 => println(2), _ => println(3) } 0 }", "E0001"},
+		{"duplicate-bool-arm",
+			"fn main() -> i32 { match true { true => println(1), true => println(2), _ => println(3) } 0 }", "E0001"},
+		{"bool-not-exhaustive",
+			"fn main() -> i32 { match true { true => println(1) } 0 }", "E0004"},
+		{"char-not-exhaustive",
+			`fn main() -> i32 { match 'a' { 'a' => println(1) } 0 }`, "E0004"},
+		{"bool-pattern-on-int",
+			"fn main() -> i32 { match 1 { true => println(1), _ => println(0) } 0 }", "E0308"},
+		{"int-pattern-on-bool",
+			"fn main() -> i32 { match true { 1 => println(1), _ => println(0) } 0 }", "E0308"},
+		{"char-pattern-on-bool",
+			`fn main() -> i32 { match true { 'a' => println(1), _ => println(0) } 0 }`, "E0308"},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			if ok || !has(codes, tc.code) {
+				t.Fatalf("expected %s, got %v", tc.code, codes)
+			}
+		})
+	}
+}

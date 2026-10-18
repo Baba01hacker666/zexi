@@ -1317,11 +1317,59 @@ func isCatchAll(p ast.Pattern) bool {
 	return false
 }
 
+// litPatKey canonicalises a literal pattern so duplicates can be rejected before
+// they become duplicate C `case` labels.
+func litPatKey(p *ast.LitPat) string {
+	switch p.Kind {
+	case token.KindTrue:
+		return "bool:true"
+	case token.KindFalse:
+		return "bool:false"
+	case token.KindInteger:
+		return "int:" + normalizeIntText(p.Text)
+	case token.KindChar, token.KindByteChar:
+		return litPatKindName(p.Kind) + ":" + p.Text
+	}
+	return litPatKindName(p.Kind) + ":" + p.Text
+}
+
+// normalizeIntText folds the various integer literal spellings of one value onto
+// a single key (so `1`, `0x1`, and `1_0` style duplicates are seen as one).
+func normalizeIntText(s string) string {
+	t := strings.ReplaceAll(s, "_", "")
+	if v, err := strconv.ParseInt(t, 0, 64); err == nil {
+		return strconv.FormatInt(v, 10)
+	}
+	if v, err := strconv.ParseUint(t, 0, 64); err == nil {
+		return strconv.FormatUint(v, 10)
+	}
+	return t
+}
+
+// litPatKindName names the kind of a literal for diagnostics.
+func litPatKindName(k token.Kind) string {
+	switch k {
+	case token.KindInteger:
+		return "an integer literal"
+	case token.KindFloat:
+		return "a float literal"
+	case token.KindString, token.KindRawString:
+		return "a string literal"
+	case token.KindChar:
+		return "a char literal"
+	case token.KindByteChar:
+		return "a byte literal"
+	case token.KindTrue, token.KindFalse:
+		return "a bool literal"
+	}
+	return "a " + k.String() + " literal"
+}
+
 func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type {
 	st := c.checkExpr(x.Scrutinee, nil)
 	base := recvBase(st)
-	if base == nil || (base.Kind != types.EnumKind && !base.Kind.IsInt()) {
-		c.errAt(x.Scrutinee, "E0308", "`match` requires an enum or integer scrutinee, found `%s`", st)
+	if base == nil || (base.Kind != types.EnumKind && !base.Kind.IsInt() && base.Kind != types.Bool && base.Kind != types.Char) {
+		c.errAt(x.Scrutinee, "E0308", "`match` requires an enum, integer, `bool`, or `char` scrutinee, found `%s`", st)
 	}
 	var result *types.Type
 	if expected != nil && expected.Kind != types.Unit && expected.Kind != types.Never && expected.Kind != types.Invalid {
@@ -1330,6 +1378,8 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 		result = expected
 	}
 	covered := map[string]bool{}
+	litCovered := map[string]bool{}
+	boolsCovered := map[string]bool{}
 	catchAll := false
 	for _, arm := range x.Arms {
 		guarded := arm.Guard != nil
@@ -1338,6 +1388,21 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 				c.errf(arm.Pat.Span(), "E0001", "unreachable pattern: an earlier arm already matches everything")
 			}
 			catchAll = true
+		}
+		if lp, ok := arm.Pat.(*ast.LitPat); ok && !guarded {
+			// Each literal becomes one C `case`, and duplicate cases are invalid
+			// C, so catch them here with a real diagnostic.
+			key := litPatKey(lp)
+			if litCovered[key] {
+				c.errf(arm.Pat.Span(), "E0001", "unreachable pattern: this value is already covered")
+			}
+			litCovered[key] = true
+			if lp.Kind == token.KindTrue {
+				boolsCovered["true"] = true
+			}
+			if lp.Kind == token.KindFalse {
+				boolsCovered["false"] = true
+			}
 		}
 		c.pushScope()
 		c.checkPattern(arm.Pat, st)
@@ -1378,7 +1443,9 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 		if len(missing) > 0 {
 			c.errAt(x, "E0004", "non-exhaustive match: missing `%s`", strings.Join(missing, "`, `"))
 		}
-	} else if base != nil && base.Kind.IsInt() && !catchAll {
+	} else if base != nil && base.Kind == types.Bool && !catchAll && !(boolsCovered["true"] && boolsCovered["false"]) {
+		c.errAt(x, "E0004", "non-exhaustive match: cover both `true` and `false`, or add a `_` arm")
+	} else if base != nil && (base.Kind.IsInt() || base.Kind == types.Char) && !catchAll {
 		c.errAt(x, "E0004", "non-exhaustive match: add a `_` arm")
 	}
 	if result == nil {
@@ -1399,8 +1466,21 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type) {
 		}
 		return
 	case *ast.LitPat:
-		if st == nil || !st.Kind.IsInt() {
-			c.errf(pt.Sp, "E0308", "literal patterns require an integer scrutinee, found `%s`", st)
+		switch {
+		case st != nil && st.Kind.IsInt():
+			if pt.Kind != token.KindInteger && pt.Kind != token.KindByteChar {
+				c.errf(pt.Sp, "E0308", "mismatched types: expected `%s` in pattern, found %s", st, litPatKindName(pt.Kind))
+			}
+		case st != nil && st.Kind == types.Bool:
+			if pt.Kind != token.KindTrue && pt.Kind != token.KindFalse {
+				c.errf(pt.Sp, "E0308", "expected a `bool` pattern (`true`/`false`), found %s", litPatKindName(pt.Kind))
+			}
+		case st != nil && st.Kind == types.Char:
+			if pt.Kind != token.KindChar {
+				c.errf(pt.Sp, "E0308", "expected a `char` pattern, found %s", litPatKindName(pt.Kind))
+			}
+		default:
+			c.errf(pt.Sp, "E0308", "literal patterns require an integer, `bool`, or `char` scrutinee, found `%s`", st)
 		}
 		return
 	case *ast.PathPat:
