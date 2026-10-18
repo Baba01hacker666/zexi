@@ -113,8 +113,9 @@ for k in 1..=4 { acc += k; }   // inclusive range; 1..4 is exclusive
 ```
 
 `return`, `break`, and `continue` work in every loop. Only `loop` yields a value
-from `break`; `while`/`for` always evaluate to `()`. A block's value is its
-trailing expression (no `;`).
+from `break`; `while`/`for` always evaluate to `()`. A `loop` with no `break` at
+all has the never type, so `fn f() -> i32 { loop { return 1; } }` is fine. A
+block's value is its trailing expression (no `;`).
 
 ## 7.8 `match`
 
@@ -143,7 +144,8 @@ match n {
 
 The scrutinee may be an `enum`, an integer, a `bool`, or a `char`. Integers and
 `char`s need a `_` arm; a `bool` may instead cover both `true` and `false`.
-Duplicate literal arms are rejected (`E0001`).
+Negative literal patterns are allowed (`-1 => ..`), out-of-range patterns are
+rejected (`E0080`), and duplicate literal arms are rejected (`E0001`).
 
 `break`, `continue`, and `return` may be used directly as an arm body
 (`_ => continue`). The comma after an arm is optional when the body ends in `}`

@@ -127,12 +127,13 @@ type checker struct {
 
 // breakInfo tracks the `break` value of one enclosing loop. Only `loop` may
 // carry one; `hasVal`/`val` record the first `break <expr>` seen so later
-// breaks can be checked against it.
+// breaks can be checked against it, and `hasBare` records a plain `break`.
 type breakInfo struct {
-	kind   token.Kind
-	want   *types.Type // the type expected of the loop's value (may be nil)
-	val    *types.Type
-	hasVal bool
+	kind    token.Kind
+	want    *types.Type // the type expected of the loop's value (may be nil)
+	val     *types.Type
+	hasVal  bool
+	hasBare bool
 }
 
 func (c *checker) errf(sp token.Span, code, format string, args ...any) {
@@ -1470,6 +1471,8 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type) {
 		case st != nil && st.Kind.IsInt():
 			if pt.Kind != token.KindInteger && pt.Kind != token.KindByteChar {
 				c.errf(pt.Sp, "E0308", "mismatched types: expected `%s` in pattern, found %s", st, litPatKindName(pt.Kind))
+			} else if pt.Kind == token.KindInteger && !intLitFits(pt.Text, st) {
+				c.errf(pt.Sp, "E0080", "pattern `%s` does not fit in `%s`", pt.Text, st)
 			}
 		case st != nil && st.Kind == types.Bool:
 			if pt.Kind != token.KindTrue && pt.Kind != token.KindFalse {
@@ -1755,7 +1758,12 @@ func (c *checker) inferLoop(x *ast.LoopExpr, expected *types.Type) *types.Type {
 		if bi.hasVal {
 			return bi.val
 		}
-		return types.UnitT
+		if bi.hasBare {
+			return types.UnitT
+		}
+		// No `break` at all: the loop can only be left by `return` (or by
+		// running forever), so its type is the never type.
+		return types.NeverT
 	case token.KindWhile:
 		c.pushBreak(token.KindWhile, nil)
 		ct := c.checkExpr(x.Cond, types.BoolT)
@@ -1880,6 +1888,8 @@ func (c *checker) inferJump(x *ast.JumpExpr) *types.Type {
 		if x.Val == nil {
 			if bi.hasVal {
 				c.errf(x.Sp, "E0308", "`break` must carry a value of type `%s`", bi.val)
+			} else {
+				bi.hasBare = true
 			}
 			return types.NeverT
 		}

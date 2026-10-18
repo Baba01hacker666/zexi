@@ -127,3 +127,22 @@ func TestMatchArmCommaOptionalAfterBlock(t *testing.T) {
 		t.Fatalf("expected a diagnostic for a missing comma")
 	}
 }
+
+// TestNegativeLiteralPattern covers `-N` as a match pattern.
+func TestNegativeLiteralPattern(t *testing.T) {
+	src := `fn f(n: i32) -> i32 {
+    match n {
+        -128 => 1,
+        -1 => 2,
+        0 => 3,
+        _ => 4,
+    }
+}`
+	if _, n := parse(t, src); n != 0 {
+		t.Fatalf("unexpected diagnostics: %d", n)
+	}
+	// `-` must be followed by a number.
+	if _, n := parse(t, "fn main() -> i32 { match 1 { -x => 0, _ => 1 }; 0 }"); n == 0 {
+		t.Fatalf("expected a diagnostic for `-x` in a pattern")
+	}
+}

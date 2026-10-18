@@ -159,7 +159,7 @@ func TestRunPrograms(t *testing.T) {
 				"7", "0", "-1", "-1", "40", "kept 4",
 				"point: 3 4", "flags true false 2.5",
 				"n = 42", "42 items", "answer: true!",
-				"count: 42 / 1.5", "empty", "yes", "z", "",
+				"count: 42 / 1.5", "empty", "yes", "z", "cold", "",
 			}, "\n"),
 		},
 	}

@@ -735,3 +735,37 @@ func TestMatchBoolCharAndDuplicates(t *testing.T) {
 		})
 	}
 }
+
+// TestNegativePatterns covers negative integer patterns and range checking.
+func TestNegativePatterns(t *testing.T) {
+	accepted := []struct{ name, src string }{
+		{"negative-literal",
+			"fn main() -> i32 { match -1 { -1 => println(1), _ => println(0) } 0 }"},
+		{"negative-smallest-i8",
+			"fn f(n: i8) -> i32 { match n { -128 => 1, _ => 0 } }\nfn main() -> i32 { println(f(-128)); 0 }"},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			if ok, codes := check(t, tc.src); !ok {
+				t.Fatalf("expected clean, got %v", codes)
+			}
+		})
+	}
+
+	rejected := []struct{ name, src, code string }{
+		{"negative-on-unsigned",
+			"fn f(n: u8) -> i32 { match n { -1 => 1, _ => 0 } }\nfn main() -> i32 { println(f(3)); 0 }", "E0080"},
+		{"literal-too-large",
+			"fn f(n: i8) -> i32 { match n { 300 => 1, _ => 0 } }\nfn main() -> i32 { println(f(3)); 0 }", "E0080"},
+		{"duplicate-negative",
+			"fn main() -> i32 { match -1 { -1 => println(1), -1 => println(2), _ => println(3) } 0 }", "E0001"},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			if ok || !has(codes, tc.code) {
+				t.Fatalf("expected %s, got %v", tc.code, codes)
+			}
+		})
+	}
+}

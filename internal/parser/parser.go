@@ -659,6 +659,15 @@ func (p *parser) parsePattern() ast.Pattern {
 		token.KindChar, token.KindByteChar, token.KindTrue, token.KindFalse:
 		t := p.bump()
 		return &ast.LitPat{Kind: t.Kind, Text: t.Lit, Sp: p.spanFrom(start)}
+	case token.KindMinus:
+		// A negative number pattern, e.g. `-1`.
+		p.bump()
+		if p.at(token.KindInteger) || p.at(token.KindFloat) {
+			t := p.bump()
+			return &ast.LitPat{Kind: t.Kind, Text: "-" + t.Lit, Sp: p.spanFrom(start)}
+		}
+		p.errf(p.cur(), "E0202", "expected a number after `-` in a pattern")
+		return &ast.WildcardPat{Sp: p.spanFrom(start)}
 	case token.KindIdentifier:
 		mut := p.accept(token.KindMut)
 		if p.at(token.KindIdentifier) {
