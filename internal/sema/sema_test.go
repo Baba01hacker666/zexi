@@ -532,3 +532,155 @@ func TestEscapeDiagnostics(t *testing.T) {
 		}
 	}
 }
+
+// TestAssociatedFunctions covers `Type::name(args)` calls that resolve to an
+// `impl` function declared without `self`.
+func TestAssociatedFunctions(t *testing.T) {
+	accepted := []struct{ name, src string }{
+		{"struct-ctor",
+			"struct P { x: i32, y: i32 }\nimpl P { fn new(x: i32, y: i32) -> P { P { x, y } } }\nfn main() -> i32 { let p = P::new(1, 2); println(p.x + p.y); 0 }"},
+		{"static-calls-static",
+			"struct P { x: i32 }\nimpl P { fn zero() -> P { P { x: 0 } } fn one() -> P { let p = P::zero(); P { x: p.x + 1 } } }\nfn main() -> i32 { println(P::one().x); 0 }"},
+		{"enum-associated-fn",
+			"enum E { A, B }\nimpl E { fn make() -> E { E::A } }\nfn main() -> i32 { match E::make() { E::A => println(1), E::B => println(2) } 0 }"},
+		{"string-arg-coercion",
+			"struct S { s: String }\nimpl S { fn of(name: str) -> S { S { s: String::from(name) } } }\nfn main() -> i32 { let s = S::of(\"hi\"); println(s.s); 0 }"},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			if ok, codes := check(t, tc.src); !ok {
+				t.Fatalf("expected clean, got %v", codes)
+			}
+		})
+	}
+
+	rejected := []struct{ name, src, code string }{
+		{"self-method-via-colons",
+			"struct P { x: i32 }\nimpl P { fn get(&self) -> i32 { self.x } }\nfn main() -> i32 { P::get(); 0 }", "E0599"},
+		{"wrong-arg-count",
+			"struct P { x: i32 }\nimpl P { fn new(x: i32) -> P { P { x } } }\nfn main() -> i32 { println(P::new(1, 2).x); 0 }", "E0061"},
+		{"wrong-arg-type",
+			"struct P { x: i32 }\nimpl P { fn new(x: i32) -> P { P { x } } }\nfn main() -> i32 { println(P::new(\"s\").x); 0 }", "E0308"},
+		{"unknown-type-still-reported",
+			"fn main() -> i32 { Nope::f(); 0 }", "E0412"},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			if ok || !has(codes, tc.code) {
+				t.Fatalf("expected %s, got %v", tc.code, codes)
+			}
+		})
+	}
+}
+
+// TestBreakValues covers `break <expr>` as the value of a `loop`.
+func TestBreakValues(t *testing.T) {
+	accepted := []struct{ name, src string }{
+		{"simple",
+			"fn main() -> i32 { let x = loop { break 5; }; println(x); 0 }"},
+		{"typed-by-let",
+			"fn main() -> i32 { let x: i64 = loop { break 5; }; println(x); 0 }"},
+		{"typed-by-return",
+			"fn f() -> i64 { loop { break 5; } }\nfn main() -> i32 { println(f()); 0 }"},
+		{"conditional",
+			"fn main() -> i32 { let x = loop { if true { break 5; } }; println(x); 0 }"},
+		{"owned-value",
+			"fn main() -> i32 { let s: String = loop { break String::from(\"a\"); }; println(s); 0 }"},
+		{"str-value",
+			"fn main() -> i32 { let s = loop { break \"a\"; }; println(s); 0 }"},
+		{"nested-loop",
+			"fn main() -> i32 { let r = loop { loop { break; } break 3; }; println(r); 0 }"},
+		{"break-in-match-arm",
+			"fn main() -> i32 { let mut n = 0; let x = loop { n += 1; match n { 2 => break n * 10, _ => {} } }; println(x); 0 }"},
+		{"plain-loop-still-unit",
+			"fn main() -> i32 { loop { break; } println(1); 0 }"},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			if ok, codes := check(t, tc.src); !ok {
+				t.Fatalf("expected clean, got %v", codes)
+			}
+		})
+	}
+
+	rejected := []struct{ name, src, code string }{
+		{"while-does-not-yield",
+			"fn main() -> i32 { while true { break 5; } 0 }", "E0308"},
+		{"for-does-not-yield",
+			"fn main() -> i32 { for i in 0..3 { break i; } 0 }", "E0308"},
+		{"mismatched-break-types",
+			"fn main() -> i32 { let x = loop { if true { break 1; } break 2.0; }; println(x); 0 }", "E0308"},
+		{"bare-break-in-valued-loop",
+			"fn main() -> i32 { let x = loop { if true { break 1; } break; }; println(x); 0 }", "E0308"},
+		{"value-outside-loop",
+			"fn main() -> i32 { break 5; 0 }", "E0268"},
+		{"break-type-mismatch",
+			"fn main() -> i32 { let x: i32 = loop { break \"no\"; }; 0 }", "E0308"},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			if ok || !has(codes, tc.code) {
+				t.Fatalf("expected %s, got %v", tc.code, codes)
+			}
+		})
+	}
+}
+
+// TestPrintAndStringSugar covers multi-value `println` and concatenating a
+// number, `bool`, or `char` onto a string.
+func TestPrintAndStringSugar(t *testing.T) {
+	accepted := []struct{ name, src string }{
+		{"println-many",
+			`fn main() -> i32 { println("a", 1, 2.5, true, 'c'); 0 }`},
+		{"print-many",
+			`fn main() -> i32 { print("a", 1); println(); 0 }`},
+		{"println-many-strings",
+			`fn main() -> i32 { println(String::from("a"), "b"); 0 }`},
+		{"println-none",
+			`fn main() -> i32 { println(); 0 }`},
+		{"str-plus-int",
+			`fn main() -> i32 { println("n = " + 1); 0 }`},
+		{"int-plus-str",
+			`fn main() -> i32 { println(1 + " items"); 0 }`},
+		{"str-plus-float-bool-char",
+			`fn main() -> i32 { println("x" + 1.5 + true + 'c'); 0 }`},
+		{"string-plus-int",
+			`fn main() -> i32 { println(String::from("n = ") + 1); 0 }`},
+		{"push-eq-scalar",
+			`fn main() -> i32 { let mut s = String::from("v: "); s += 7; println(s); 0 }`},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			if ok, codes := check(t, tc.src); !ok {
+				t.Fatalf("expected clean, got %v", codes)
+			}
+		})
+	}
+
+	rejected := []struct{ name, src, code string }{
+		{"unprintable-struct",
+			`struct P { x: i32 } fn main() -> i32 { println("p", P { x: 1 }); 0 }`, "E0277"},
+		{"str-plus-struct",
+			`struct P { x: i32 } fn main() -> i32 { println("p" + P { x: 1 }); 0 }`, "E0308"},
+		{"push-eq-struct",
+			`struct P { x: i32 } fn main() -> i32 { let mut s = String::from("a"); s += P { x: 1 }; 0 }`, "E0308"},
+		{"int-plus-int",
+			`fn main() -> i32 { println(1 + 2); 0 }`, ""},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			if tc.code == "" {
+				if !ok {
+					t.Fatalf("expected clean, got %v", codes)
+				}
+				return
+			}
+			if ok || !has(codes, tc.code) {
+				t.Fatalf("expected %s, got %v", tc.code, codes)
+			}
+		})
+	}
+}

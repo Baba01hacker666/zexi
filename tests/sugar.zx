@@ -1,0 +1,95 @@
+// tests/sugar.zx
+// Coverage for the ergonomic surface: `loop` with a `break` value, associated
+// functions declared without `self` (`Type::new(..)`), `println` of several
+// values, and string concatenation with numbers/bools/chars.
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+enum Shape {
+    Circle(i32),
+    Empty,
+}
+
+impl Point {
+    // An associated function: no `self`, so it is called as `Point::new(..)`.
+    fn new(x: i32, y: i32) -> Point {
+        Point { x, y }
+    }
+    fn origin() -> Point {
+        Point::new(0, 0)
+    }
+    fn sum(&self) -> i32 {
+        self.x + self.y
+    }
+}
+
+impl Shape {
+    fn unit() -> Shape {
+        Shape::Empty
+    }
+}
+
+// A value-yielding `loop`: `break <expr>` is the value of the loop.
+fn first_big(v: [i64; 6]) -> i64 {
+    let mut i = 0;
+    loop {
+        if v[i] > 100 { break v[i]; }
+        i += 1;
+        if i >= 6 { break -1; }
+    }
+}
+
+fn main() -> i32 {
+    // associated functions
+    let p = Point::new(3, 4);
+    println(p.sum());
+    println(Point::origin().sum());
+
+    // a value-yielding `loop`
+    let values: [i64; 6] = [5, 10, 15, 20, 25, 30];
+    println(first_big(values));
+    println(first_big([1, 2, 3, 4, 5, 6]));
+
+    // `break` out of a `match` inside a value-yielding loop
+    let mut n = 0;
+    let found = loop {
+        n += 1;
+        match n {
+            4 => break n * 10,
+            _ => {}
+        }
+    };
+    println(found);
+
+    // an owned value survives the loop body's destructors
+    let owned: String = loop {
+        let tmp = String::from("kept");
+        break tmp;
+    };
+    println(owned, owned.len());
+
+    // printing several values separates them with a space
+    println("point:", p.x, p.y);
+    println("flags", true, false, 2.5);
+
+    // a number, `bool`, or `char` concatenates onto a string
+    let n2 = 42;
+    println("n = " + n2);
+    println(n2 + " items");
+    println("answer: " + true + "!");
+    let mut s = String::from("count: ");
+    s += n2;
+    s += " / ";
+    s += 1.5;
+    println(s);
+
+    // matching on an enum built by an associated function
+    match Shape::unit() {
+        Shape::Circle(r) => println("circle", r),
+        Shape::Empty => println("empty"),
+    }
+    0
+}

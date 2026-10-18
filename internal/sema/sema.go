@@ -122,6 +122,17 @@ type checker struct {
 	mutScope  []map[string]bool        // mutability of tracked bindings (else permissive)
 	cur       *Fn
 	loopDepth int
+	breaks    []*breakInfo // one entry per enclosing loop, innermost last
+}
+
+// breakInfo tracks the `break` value of one enclosing loop. Only `loop` may
+// carry one; `hasVal`/`val` record the first `break <expr>` seen so later
+// breaks can be checked against it.
+type breakInfo struct {
+	kind   token.Kind
+	want   *types.Type // the type expected of the loop's value (may be nil)
+	val    *types.Type
+	hasVal bool
 }
 
 func (c *checker) errf(sp token.Span, code, format string, args ...any) {
@@ -723,7 +734,7 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		return c.inferIf(x, expected)
 
 	case *ast.LoopExpr:
-		return c.inferLoop(x)
+		return c.inferLoop(x, expected)
 
 	case *ast.JumpExpr:
 		return c.inferJump(x)
@@ -886,6 +897,15 @@ func isStrLike(t *types.Type) bool {
 	return t != nil && (t.Kind == types.Str || t.Kind == types.StringKind)
 }
 
+// isScalarText reports whether t is a value that can be rendered as text and
+// concatenated onto a string (`"count: " + n`).
+func isScalarText(t *types.Type) bool {
+	if t == nil {
+		return false
+	}
+	return t.Kind.IsNumeric() || t.Kind == types.Bool || t.Kind == types.Char
+}
+
 func (c *checker) inferBinary(x *ast.BinExpr) *types.Type {
 	if x.Op == token.KindDotDot || x.Op == token.KindDotDotEq {
 		lt := c.checkExpr(x.L, nil)
@@ -898,11 +918,16 @@ func (c *checker) inferBinary(x *ast.BinExpr) *types.Type {
 
 	lt := c.checkExpr(x.L, nil)
 	rt := c.checkExpr(x.R, nil)
-	// String concatenation: `+` over any mix of `str` and `String` produces a
+	// String concatenation: `+` over any mix of `str`/`String` produces a
 	// fresh `String`. Both operands are borrowed (their bytes are copied), so
-	// they remain usable afterwards.
-	if x.Op == token.KindPlus && isStrLike(lt) && isStrLike(rt) {
-		return types.StringT
+	// they remain usable afterwards. A number, `bool`, or `char` on one side is
+	// rendered as text, so `"count: " + n` reads naturally.
+	if x.Op == token.KindPlus {
+		switch {
+		case isStrLike(lt) && (isStrLike(rt) || isScalarText(rt)),
+			isStrLike(rt) && isScalarText(lt):
+			return types.StringT
+		}
 	}
 	// `==` / `!=` compare the bytes of any two string-like operands.
 	if (x.Op == token.KindEqEq || x.Op == token.KindBangEq) && isStrLike(lt) && isStrLike(rt) {
@@ -970,8 +995,9 @@ func (c *checker) inferAssign(x *ast.AssignExpr) *types.Type {
 		}
 	} else {
 		if lt.Kind == types.StringKind && x.Op == token.KindPlusEq {
-			// `s += t` appends to an owning `String`.
-			if !isStrLike(rt) {
+			// `s += t` appends to an owning `String`; a scalar `t` is formatted
+			// as text first.
+			if !isStrLike(rt) && !isScalarText(rt) {
 				c.errAt(x.Rhs, "E0308", "cannot append `%s` to a `String`", rt)
 			}
 		} else if x.Op == token.KindPercentEq && !lt.Kind.IsInt() {
@@ -1005,6 +1031,18 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 		if p.Segments[0] == "String" {
 			return c.inferStringCtor(x, p.Segments[1])
 		}
+		// `Type::name(args)` may also name an associated function: one declared
+		// in an `impl` block without a `self` parameter.
+		if m, ok := c.info.Methods[p.Segments[0]][p.Segments[1]]; ok {
+			if m.Self != nil {
+				c.errf(p.Sp, "E0599", "`%s::%s` takes `self`; call it with `.` on a value", p.Segments[0], p.Segments[1])
+				for _, a := range x.Args {
+					c.checkExpr(a, nil)
+				}
+				return m.Ret
+			}
+			return c.checkCallArgs(x, m, fmt.Sprintf("function `%s::%s`", p.Segments[0], p.Segments[1]))
+		}
 		return c.inferVariantCtor(x, p)
 	}
 	name, ok := calleeName(x.Callee)
@@ -1030,8 +1068,15 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 		return nil
 	}
 	c.info.Resolved[x] = fn
+	return c.checkCallArgs(x, fn, fmt.Sprintf("function `%s`", name))
+}
+
+// checkCallArgs records the resolved callee, checks a call's arguments against
+// its parameter list, and returns the callee's return type.
+func (c *checker) checkCallArgs(x *ast.CallExpr, fn *Fn, label string) *types.Type {
+	c.info.Resolved[x] = fn
 	if len(x.Args) != len(fn.Params) {
-		c.errAt(x, "E0061", "function `%s` takes %d argument(s) but %d were supplied", name, len(fn.Params), len(x.Args))
+		c.errAt(x, "E0061", "%s takes %d argument(s) but %d were supplied", label, len(fn.Params), len(x.Args))
 	}
 	for i, a := range x.Args {
 		var want *types.Type
@@ -1580,9 +1625,6 @@ func (c *checker) inferEnumStructLit(x *ast.StructLitExpr) *types.Type {
 }
 
 func (c *checker) inferPrint(x *ast.CallExpr, name string) *types.Type {
-	if len(x.Args) > 1 {
-		c.errAt(x, "E0061", "`%s` takes at most 1 argument but %d were supplied", name, len(x.Args))
-	}
 	for _, a := range x.Args {
 		at := c.checkExpr(a, nil)
 		if !isPrintable(at) {
@@ -1622,14 +1664,20 @@ func (c *checker) inferIf(x *ast.IfExpr, expected *types.Type) *types.Type {
 	return thenT
 }
 
-func (c *checker) inferLoop(x *ast.LoopExpr) *types.Type {
+func (c *checker) inferLoop(x *ast.LoopExpr, expected *types.Type) *types.Type {
 	switch x.Kind {
 	case token.KindLoop:
+		bi := c.pushBreak(token.KindLoop, expected)
 		c.loopDepth++
 		c.checkBlock(x.Body)
 		c.loopDepth--
+		c.popBreak()
+		if bi.hasVal {
+			return bi.val
+		}
 		return types.UnitT
 	case token.KindWhile:
+		c.pushBreak(token.KindWhile, nil)
 		ct := c.checkExpr(x.Cond, types.BoolT)
 		if ct.Kind != types.Bool {
 			c.errAt(x.Cond, "E0308", "`while` condition must be `bool`, found `%s`", ct)
@@ -1637,6 +1685,7 @@ func (c *checker) inferLoop(x *ast.LoopExpr) *types.Type {
 		c.loopDepth++
 		c.checkBlock(x.Body)
 		c.loopDepth--
+		c.popBreak()
 		return types.UnitT
 	case token.KindFor:
 		return c.inferFor(x)
@@ -1644,7 +1693,22 @@ func (c *checker) inferLoop(x *ast.LoopExpr) *types.Type {
 	return types.UnitT
 }
 
+// pushBreak enters a loop body for the purpose of `break` value checking.
+func (c *checker) pushBreak(kind token.Kind, want *types.Type) *breakInfo {
+	bi := &breakInfo{kind: kind, want: want}
+	c.breaks = append(c.breaks, bi)
+	return bi
+}
+
+func (c *checker) popBreak() {
+	if len(c.breaks) > 0 {
+		c.breaks = c.breaks[:len(c.breaks)-1]
+	}
+}
+
 func (c *checker) inferFor(x *ast.LoopExpr) *types.Type {
+	c.pushBreak(token.KindFor, nil)
+	defer c.popBreak()
 	rng, ok := x.Iter.(*ast.BinExpr)
 	if !ok || (rng.Op != token.KindDotDot && rng.Op != token.KindDotDotEq) {
 		// `for x in arr` iterates an array by value. Elements must be `Copy`,
@@ -1708,9 +1772,45 @@ func (c *checker) inferJump(x *ast.JumpExpr) *types.Type {
 	case token.KindBreak:
 		if c.loopDepth == 0 {
 			c.errf(x.Sp, "E0268", "`break` outside of a loop")
+			if x.Val != nil {
+				c.checkExpr(x.Val, nil)
+			}
+			return types.NeverT
 		}
-		if x.Val != nil {
-			c.errAt(x.Val, "E0900", "`break` with a value is not supported by the compiler yet")
+		if len(c.breaks) == 0 {
+			if x.Val != nil {
+				c.checkExpr(x.Val, nil)
+			}
+			return types.NeverT
+		}
+		bi := c.breaks[len(c.breaks)-1]
+		if bi.kind != token.KindLoop {
+			if x.Val != nil {
+				c.errAt(x.Val, "E0308", "`%s` loops do not produce a value; use `break` without a value", loopKindName(bi.kind))
+				c.checkExpr(x.Val, nil)
+			}
+			return types.NeverT
+		}
+		var want *types.Type
+		if bi.hasVal {
+			want = bi.val
+		} else {
+			want = bi.want
+		}
+		if x.Val == nil {
+			if bi.hasVal {
+				c.errf(x.Sp, "E0308", "`break` must carry a value of type `%s`", bi.val)
+			}
+			return types.NeverT
+		}
+		vt := c.checkExpr(x.Val, want)
+		if bi.hasVal {
+			if vt != nil && !c.assignable(bi.val, vt) {
+				c.errAt(x.Val, "E0308", "mismatched types in `break`: expected `%s`, found `%s`", bi.val, vt)
+			}
+		} else {
+			bi.val = vt
+			bi.hasVal = true
 		}
 		return types.NeverT
 	case token.KindContinue:
@@ -1720,6 +1820,17 @@ func (c *checker) inferJump(x *ast.JumpExpr) *types.Type {
 		return types.NeverT
 	}
 	return types.NeverT
+}
+
+// loopKindName names a loop keyword for diagnostics.
+func loopKindName(k token.Kind) string {
+	switch k {
+	case token.KindWhile:
+		return "while"
+	case token.KindFor:
+		return "for"
+	}
+	return "loop"
 }
 
 // --- type resolution ------------------------------------------------------

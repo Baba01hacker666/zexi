@@ -31,6 +31,8 @@ enum Shape { Circle(f64), Rect(f64, f64), Point }
 impl Point {
     fn len_sq(&self) -> f64 { return self.x * self.x + self.y * self.y; }
     fn shift(&mut self, dx: f64, dy: f64) { self.x += dx; self.y += dy; }
+    // No `self`: an associated function, called as `Point::new(x, y)`.
+    fn new(x: f64, y: f64) -> Point { Point { x, y } }
 }
 ```
 
@@ -44,7 +46,9 @@ impl Point {
 | compound | `[T; N]` fixed array · `&T` `&mut T` · `()` unit |
 
 Integer literals are untyped until inference and default to `i32`. There are no
-implicit numeric conversions — use `as`.
+implicit numeric conversions — use `as`. (`+` on a string renders a number,
+`bool`, or `char` as text; that is a formatting convenience, not a numeric
+conversion.)
 
 ## 7.4 Literals
 
@@ -99,10 +103,17 @@ while i < 5 { sum += i; i += 1; }
 let mut n = 0;
 loop { n += 1; if n == 3 { break; } }
 
+// a `loop` may produce a value with `break <expr>`
+let found = loop {
+    n += 1;
+    if n * n > 50 { break n; }
+};
+
 for k in 1..=4 { acc += k; }   // inclusive range; 1..4 is exclusive
 ```
 
-`return`, `break`, and `continue` work in every loop. A block's value is its
+`return`, `break`, and `continue` work in every loop. Only `loop` yields a value
+from `break`; `while`/`for` always evaluate to `()`. A block's value is its
 trailing expression (no `;`).
 
 ## 7.8 `match`
@@ -158,12 +169,16 @@ s += " done";          // `+=` appends
 println(s);            // zexi!? done
 println(s.len());      // 11
 let greeting = "hi, " + s + "!";   // `+` concatenates any mix of `str`/`String`
+let report = "lines: " + 12 + " (" + true + ")";  // numbers/bool/char are rendered
+s += 3;                // `+=` appends; a number is rendered as text
 let t = s.clone();     // deep copy
 let u = s;             // move: `s` is unusable afterwards (E0382)
 ```
 
 A `String` may be passed wherever a borrowed `str` is expected (for example a
 function parameter, `push_str`, or `==`), so `.as_str()` is usually unnecessary.
+When a number, `bool`, or `char` is concatenated with `+` (or `+=`) it is
+formatted into text first, which removes the need for a manual `int_to_str`.
 
 Values move by default; a moved-out value is a compile error if used again.
 Buffers are freed exactly once at scope exit (including on early `return` /
@@ -176,6 +191,8 @@ copy instead of moving.
 print("no newline");
 println("with newline");
 println(42);          // any printable value: ints, floats, bool, char, str, String
+println("point:", p.x, p.y);   // several values, separated by a space
+println();            // just a newline
 ```
 
 ## 7.12 Casts

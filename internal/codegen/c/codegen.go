@@ -53,7 +53,8 @@ type gen struct {
 // loopLabel are the jump targets of one source-level loop.
 type loopLabel struct {
 	brk, cont string
-	outerTrap int // trapDepth to restore when the loop body ends
+	outerTrap int    // trapDepth to restore when the loop body ends
+	result    string // C temp receiving a `break <expr>` value, or "" (see loopResult)
 }
 
 // dropFrame is the set of locals declared in one lexical scope, in declaration
@@ -118,15 +119,22 @@ func (g *gen) charRuntime() {
 		return
 	}
 	g.w.line("")
-	g.w.line("// A `char` is a Unicode scalar value, so printing it writes its UTF-8")
-	g.w.line("// encoding (not just the low byte).")
+	if !g.hasString {
+		// The `String` runtime defines the UTF-8 encoder; when a program only
+		// prints a `char` (and never uses `String`), emit it here instead.
+		g.w.line("// A `char` is a Unicode scalar value, so printing it writes its UTF-8")
+		g.w.line("// encoding (not just the low byte).")
+		g.w.line("static int zx_utf8_encode(unsigned int c, char *out) {")
+		g.w.line("    if (c < 0x80) { out[0] = (char)c; return 1; }")
+		g.w.line("    if (c < 0x800) { out[0] = (char)(0xC0 | (c >> 6)); out[1] = (char)(0x80 | (c & 0x3F)); return 2; }")
+		g.w.line("    if (c < 0x10000) { out[0] = (char)(0xE0 | (c >> 12)); out[1] = (char)(0x80 | ((c >> 6) & 0x3F)); out[2] = (char)(0x80 | (c & 0x3F)); return 3; }")
+		g.w.line("    out[0] = (char)(0xF0 | (c >> 18)); out[1] = (char)(0x80 | ((c >> 12) & 0x3F)); out[2] = (char)(0x80 | ((c >> 6) & 0x3F)); out[3] = (char)(0x80 | (c & 0x3F)); return 4;")
+		g.w.line("}")
+		g.w.line("")
+	}
 	g.w.line("static int zx_print_char(uint32_t c) {")
 	g.w.line("    char buf[4];")
-	g.w.line("    int n;")
-	g.w.line("    if (c < 0x80) { buf[0] = (char)c; n = 1; }")
-	g.w.line("    else if (c < 0x800) { buf[0] = (char)(0xC0 | (c >> 6)); buf[1] = (char)(0x80 | (c & 0x3F)); n = 2; }")
-	g.w.line("    else if (c < 0x10000) { buf[0] = (char)(0xE0 | (c >> 12)); buf[1] = (char)(0x80 | ((c >> 6) & 0x3F)); buf[2] = (char)(0x80 | (c & 0x3F)); n = 3; }")
-	g.w.line("    else { buf[0] = (char)(0xF0 | (c >> 18)); buf[1] = (char)(0x80 | ((c >> 12) & 0x3F)); buf[2] = (char)(0x80 | ((c >> 6) & 0x3F)); buf[3] = (char)(0x80 | (c & 0x3F)); n = 4; }")
+	g.w.line("    int n = zx_utf8_encode(c, buf);")
 	g.w.line("    return (int)fwrite(buf, 1, (size_t)n, stdout);")
 	g.w.line("}")
 }
@@ -815,10 +823,11 @@ func (g *gen) ifStmt(x *ast.IfExpr) {
 	g.w.write("}\n")
 }
 
-func (g *gen) loopStmt(x *ast.LoopExpr) {
+func (g *gen) loopStmt(x *ast.LoopExpr) string {
 	switch x.Kind {
 	case token.KindLoop:
-		brk, cont := g.openLoop()
+		res := g.loopResult(x)
+		brk, cont := g.openLoop(res)
 		g.w.line("for (;;) {")
 		g.w.indent++
 		g.blockStmts(x.Body, nil)
@@ -827,9 +836,11 @@ func (g *gen) loopStmt(x *ast.LoopExpr) {
 		g.w.indent--
 		g.w.line("}")
 		g.w.line("%s: ;", brk)
+		return res
 	case token.KindWhile:
 		cond := g.value(x.Cond)
-		brk, cont := g.openLoop()
+		res := g.loopResult(x)
+		brk, cont := g.openLoop(res)
 		g.w.line("while (%s) {", cond)
 		g.w.indent++
 		g.blockStmts(x.Body, nil)
@@ -838,16 +849,32 @@ func (g *gen) loopStmt(x *ast.LoopExpr) {
 		g.w.indent--
 		g.w.line("}")
 		g.w.line("%s: ;", brk)
+		return res
 	case token.KindFor:
-		g.forStmt(x)
+		return g.forStmt(x)
 	}
+	return ""
 }
 
-func (g *gen) forStmt(x *ast.LoopExpr) {
+// loopValue emits a loop in value position: `loop { ... break v; }` evaluates to
+// the `break` value, in the same way a block evaluates to its tail.
+func (g *gen) loopValue(x *ast.LoopExpr) string {
+	sub := &writer{indent: g.w.indent + 1}
+	save := g.w
+	g.w = sub
+	res := g.loopStmt(x)
+	g.w = save
+	if res == "" {
+		return "({ " + sub.b.String() + " 0; })"
+	}
+	sub.line("%s;", res)
+	return "({ " + sub.b.String() + " })"
+}
+
+func (g *gen) forStmt(x *ast.LoopExpr) string {
 	rng, ok := x.Iter.(*ast.BinExpr)
 	if !ok || (rng.Op != token.KindDotDot && rng.Op != token.KindDotDotEq) {
-		g.forArray(x)
-		return
+		return g.forArray(x)
 	}
 	lt := g.info.TypeOf(rng.L)
 	op := "<"
@@ -870,7 +897,8 @@ func (g *gen) forStmt(x *ast.LoopExpr) {
 	}
 	g.w.line("for (%s %s = %s; %s %s %s; %s++) {", ctype(lt), name, lo, name, op, hi, name)
 	g.w.indent++
-	brk, cont := g.openLoop()
+	res := g.loopResult(x)
+	brk, cont := g.openLoop(res)
 	g.blockStmts(x.Body, nil)
 	g.closeLoop()
 	g.endLoopBody(cont)
@@ -878,14 +906,15 @@ func (g *gen) forStmt(x *ast.LoopExpr) {
 	g.w.line("}")
 	g.w.line("%s: ;", brk)
 	g.popScope()
+	return res
 }
 
 // forArray lowers `for x in arr`: the array is evaluated once into a temporary,
 // then each element (a `Copy` value, enforced by sema) is bound in turn.
-func (g *gen) forArray(x *ast.LoopExpr) {
+func (g *gen) forArray(x *ast.LoopExpr) string {
 	it := g.info.TypeOf(x.Iter)
 	if it == nil || it.Kind != types.Array {
-		return // sema already diagnosed a non-array iterable
+		return "" // sema already diagnosed a non-array iterable
 	}
 	arr := g.tmpName()
 	g.w.line("%s %s = %s;", ctype(it), arr, g.value(x.Iter))
@@ -900,7 +929,8 @@ func (g *gen) forArray(x *ast.LoopExpr) {
 	g.w.line("for (size_t zx_i = 0; zx_i < %d; zx_i++) {", it.Len)
 	g.w.indent++
 	g.w.line("%s %s = %s.e[zx_i];", ctype(it.Elem), name, arr)
-	brk, cont := g.openLoop()
+	res := g.loopResult(x)
+	brk, cont := g.openLoop(res)
 	g.blockStmts(x.Body, nil)
 	g.closeLoop()
 	g.endLoopBody(cont)
@@ -908,6 +938,7 @@ func (g *gen) forArray(x *ast.LoopExpr) {
 	g.w.line("}")
 	g.w.line("%s: ;", brk)
 	g.popScope()
+	return res
 }
 
 func (g *gen) jumpStmt(x *ast.JumpExpr) {
@@ -915,6 +946,17 @@ func (g *gen) jumpStmt(x *ast.JumpExpr) {
 	case token.KindReturn:
 		g.emitReturn(x.Val)
 	case token.KindBreak:
+		res := ""
+		if len(g.loopLabels) > 0 {
+			res = g.loopLabels[len(g.loopLabels)-1].result
+		}
+		if x.Val != nil && res != "" {
+			// Move the value out before the body's destructors run, so a break
+			// value that is itself a body local is not freed first.
+			g.w.line("%s = %s;", res, g.consume(x.Val))
+		} else if x.Val != nil {
+			g.w.line("%s;", g.value(x.Val))
+		}
 		if len(g.loopFrames) > 0 {
 			g.emitDropsFrom(g.loopFrames[len(g.loopFrames)-1])
 		}
@@ -1026,6 +1068,9 @@ func (g *gen) value(e ast.Expr) string {
 	case *ast.MatchExpr:
 		return g.matchValue(x)
 
+	case *ast.LoopExpr:
+		return g.loopValue(x)
+
 	case *ast.JumpExpr:
 		// A jump used in value position only occurs in a diverging tail; emit
 		// it as a statement expression so it type-checks.
@@ -1052,7 +1097,7 @@ func isStrType(t *types.Type) bool {
 // through directly (`String` places by address). When retType is "", the call is
 // emitted as a statement (its value is discarded); otherwise its result is
 // returned from a GNU statement expression.
-func (g *gen) withStrArgs(args []ast.Expr, retType string, call func(ps []string) string) string {
+func (g *gen) withStrArgs(args []ast.Expr, retType string, stringify bool, call func(ps []string) string) string {
 	ps := make([]string, len(args))
 	var decls, drops []string
 	for i, e := range args {
@@ -1066,6 +1111,15 @@ func (g *gen) withStrArgs(args []ast.Expr, retType string, call func(ps []string
 				continue
 			}
 			ps[i] = "zx_string_as_str(&" + g.value(e) + ")"
+			continue
+		}
+		if stringify && isTextable(t) {
+			// A number, `bool`, or `char` is rendered into a local buffer so it
+			// can be concatenated. The buffer outlives the call because the
+			// whole expression is one statement expression.
+			buf := g.tmpName()
+			decls = append(decls, g.textDecl(buf, e))
+			ps[i] = buf
 			continue
 		}
 		ps[i] = g.value(e)
@@ -1093,6 +1147,27 @@ func (g *gen) withStrArgs(args []ast.Expr, retType string, call func(ps []string
 	}
 	b.WriteString("(void)0; })")
 	return b.String()
+}
+
+// isTextable reports whether t can be rendered as text for `"s" + value`.
+func isTextable(t *types.Type) bool {
+	if t == nil {
+		return false
+	}
+	return t.Kind.IsNumeric() || t.Kind == types.Bool || t.Kind == types.Char
+}
+
+// textDecl declares a local text buffer holding the rendering of e, for use as
+// a `str` argument.
+func (g *gen) textDecl(buf string, e ast.Expr) string {
+	t := g.info.TypeOf(e)
+	v := g.value(e)
+	if t != nil && t.Kind == types.Char {
+		g.hasChar = true // emits the UTF-8 encoder
+		return fmt.Sprintf("char %s[8]; %s[zx_utf8_encode((uint32_t)(%s), %s)] = 0;", buf, buf, v, buf)
+	}
+	format, cast := printFormat(t)
+	return fmt.Sprintf(`char %s[32]; snprintf(%s, sizeof %s, "%s", %s);`, buf, buf, buf, format, cast(v))
 }
 
 // withArgs emits a call, coercing each argument whose parameter type is `str`
@@ -1157,11 +1232,12 @@ func (g *gen) binValue(x *ast.BinExpr) string {
 	if x.Op == token.KindDotDot || x.Op == token.KindDotDotEq {
 		return "0 /* range outside of for */"
 	}
-	// String concatenation: `+` over `str`/`String` operands allocates a fresh
+	// String concatenation: `+` with a `str`/`String` operand allocates a fresh
 	// `String`. Operands are borrowed (their bytes copied), so temporaries are
-	// freed only after the result is built.
-	if x.Op == token.KindPlus && isStrType(g.info.TypeOf(x.L)) && isStrType(g.info.TypeOf(x.R)) {
-		return g.withStrArgs([]ast.Expr{x.L, x.R}, "zx_String", func(ps []string) string {
+	// freed only after the result is built. A number, `bool`, or `char` on the
+	// other side is rendered as text first.
+	if x.Op == token.KindPlus && (isStrType(g.info.TypeOf(x.L)) || isStrType(g.info.TypeOf(x.R))) {
+		return g.withStrArgs([]ast.Expr{x.L, x.R}, "zx_String", true, func(ps []string) string {
 			return "zx_string_concat(" + ps[0] + ", " + ps[1] + ")"
 		})
 	}
@@ -1169,7 +1245,7 @@ func (g *gen) binValue(x *ast.BinExpr) string {
 	// `String`.
 	if x.Op == token.KindEqEq || x.Op == token.KindBangEq {
 		if isStrType(g.info.TypeOf(x.L)) && isStrType(g.info.TypeOf(x.R)) {
-			return g.withStrArgs([]ast.Expr{x.L, x.R}, "bool", func(ps []string) string {
+			return g.withStrArgs([]ast.Expr{x.L, x.R}, "bool", false, func(ps []string) string {
 				cmp := "strcmp(" + ps[0] + ", " + ps[1] + ")"
 				if x.Op == token.KindEqEq {
 					return "(" + cmp + " == 0)"
@@ -1323,7 +1399,25 @@ func (g *gen) printfCall(x *ast.CallExpr, name string) string {
 	if len(x.Args) == 0 {
 		return fmt.Sprintf(`printf("%s")`, nl)
 	}
-	arg := x.Args[0]
+	if len(x.Args) == 1 {
+		return g.printOne(x.Args[0], nl)
+	}
+	// Several values are printed separated by a single space.
+	parts := make([]string, 0, len(x.Args)+1)
+	for i, arg := range x.Args {
+		if i > 0 {
+			parts = append(parts, `printf(" ")`)
+		}
+		parts = append(parts, g.printOne(arg, ""))
+	}
+	if nl != "" {
+		parts = append(parts, fmt.Sprintf(`printf("%s")`, nl))
+	}
+	return "({ " + strings.Join(parts, "; ") + "; (void)0; })"
+}
+
+// printOne emits the printing of a single value, optionally followed by `nl`.
+func (g *gen) printOne(arg ast.Expr, nl string) string {
 	t := g.info.TypeOf(arg)
 	if t != nil && t.Kind == types.StringKind {
 		if isPlaceExpr(arg) {
@@ -2107,13 +2201,28 @@ func (g *gen) openDropFrame() { g.dropFrames = append(g.dropFrames, &dropFrame{}
 // labels for `break`/`continue`. `break`/`continue` inside a `match` lowered to
 // a C `switch` or `do { } while (0)` would otherwise target that construct, so
 // they are instead emitted as `goto` to these labels (see trapDepth).
-func (g *gen) openLoop() (brk, cont string) {
+func (g *gen) openLoop(result string) (brk, cont string) {
 	g.openDropFrame()
 	g.loopFrames = append(g.loopFrames, len(g.dropFrames)-1)
 	brk, cont = g.tmpName(), g.tmpName()
-	g.loopLabels = append(g.loopLabels, loopLabel{brk: brk, cont: cont, outerTrap: g.trapDepth})
+	g.loopLabels = append(g.loopLabels, loopLabel{brk: brk, cont: cont, outerTrap: g.trapDepth, result: result})
 	g.trapDepth = 0
 	return brk, cont
+}
+
+// loopResult declares the storage that carries a `loop`'s `break` value and
+// returns its C name, or "" when the loop produces no value. The slot lives
+// outside the loop body so the value survives the body's destructors; it is
+// not registered for dropping (ownership is handed to the loop expression,
+// exactly like the value of a block).
+func (g *gen) loopResult(x *ast.LoopExpr) string {
+	t := g.info.TypeOf(x)
+	if t == nil || t.Kind == types.Unit || t.Kind == types.Never {
+		return ""
+	}
+	res := g.tmpName()
+	g.w.line("%s %s = %s;", ctype(t), res, zeroValue(t))
+	return res
 }
 
 // endLoopBody emits the `continue` target at the tail of a loop body. It must
@@ -2247,7 +2356,7 @@ func (g *gen) assignValue(x *ast.AssignExpr) string {
 	if x.Op == token.KindPlusEq {
 		if lt := g.info.TypeOf(x.Lhs); lt != nil && lt.Kind == types.StringKind {
 			lhs := g.value(x.Lhs)
-			return g.withStrArgs([]ast.Expr{x.Rhs}, "", func(ps []string) string {
+			return g.withStrArgs([]ast.Expr{x.Rhs}, "", true, func(ps []string) string {
 				return "zx_string_push_str(&" + lhs + ", " + ps[0] + ")"
 			})
 		}

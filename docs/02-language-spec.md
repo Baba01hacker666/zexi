@@ -151,7 +151,10 @@ fn(A, B) -> R function pointer
 - `enum` — **tagged union**; a discriminant plus the largest variant payload.
   `Option<T>` and `Result<T,E>` are ordinary library enums, no compiler magic
   except niche optimizations in M2.
-- `impl` — inherent and trait methods.
+- `impl` — inherent and trait methods. A function declared without a `self`
+  parameter is an *associated function*, called as `Type::name(args)` (for
+  example `Point::new(1, 2)`); one with `self` is called on a value
+  (`p.len()`, `p.shift(1.0, 2.0)`).
 
 ### Heap types
 
@@ -184,6 +187,11 @@ Owning values compose: a `struct` (or array) containing a `String` is itself an
 owning type and gets a generated destructor, so dropping it drops each
 field/element. `Vec<T>` and `Box<T>` arrive with generics (M1).
 
+`+` concatenates any mix of `str` and `String`, allocating a fresh `String`. A
+number, `bool`, or `char` operand is rendered as text first, so labels are easy
+to build without a helper (`"count: " + n`, `s += n`). `println`/`print` accept
+any number of printable values and separate them with a single space.
+
 ### Generics (M1)
 
 Generics are **monomorphized**: each concrete instantiation is a separate
@@ -207,7 +215,10 @@ Traits provide bounds; `dyn Trait` gives type-erased dynamic dispatch (M2).
   `let x: u8 = 1;` both work).
 - **No implicit conversions**, including `i32 -> i64` and `bool -> int`. Use
   `as` for primitive casts; `as` between numeric types is the only implicit-ish
-  operation and is explicit. Pointer/`unsafe` casts live in `unsafe`.
+  operation and is explicit. The one convenience is `+`/`+=` on a string, where
+  a number, `bool`, or `char` operand is rendered as text (`"n = " + n`); this
+  formats the value, it does not convert its type. Pointer/`unsafe` casts live
+  in `unsafe`.
 - **Coercions are limited to:** `&mut T -> &T`, `[T; N] -> [T]`,
   `T -> dyn Trait`, `never -> T`, and unsizing arrays to slices.
 - **Exhaustiveness:** `match` over an `enum` must be exhaustive.
@@ -238,9 +249,18 @@ fn abs(n: i64) -> i64 {
 }
 ```
 
-Loops: `loop { }` (infinite), `while cond { }`, `for pat in iter { }`, where
-`for` desugars to the `Iterator` trait protocol. `break`/`continue` as expected;
-`break value` yields from a `loop`.
+Loops: `loop { }` (infinite), `while cond { }`, and `for pat in iter { }` over an
+integer range (`1..4`) or an array. `break`/`continue` behave as expected. A
+`loop` may yield a value with `break <expr>`, and the loop expression then has
+the type of that value (`while`/`for` always evaluate to `()`).
+
+```zexi
+let first = loop {
+    if xs[i] > 100 { break xs[i]; }
+    i += 1;
+    if i == len(xs) { break 0; }
+};
+```
 
 ## 2.6 Ownership (summary — see docs/03)
 

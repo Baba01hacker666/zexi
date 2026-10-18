@@ -10,13 +10,16 @@ This repository contains the **initial design and specification** of Zexi: the v
 >
 > Implemented: functions and recursion; `let`/`const`; integer/float/bool/char/
 > `str` values; arithmetic, bitwise, comparison, and logical operators; `as`
-> casts; `if`/`else`; `while`/`loop`/`for i in a..b`; `print`/`println`; `len`;
+> casts; `if`/`else`; `while`/`loop`/`for i in a..b` (a `loop` can yield a value
+> via `break <expr>`); `print`/`println` of any number of values; `len`;
 > **structs** (named and tuple) with **`impl` methods** (`self`, `&self`,
-> `&mut self`); **enums** with tuple/struct/unit variants and **`match`** with
-> exhaustiveness checking; **first-class arrays** with bounds-checked indexing;
+> `&mut self`) and **associated functions** (`Point::new(1, 2)`); **enums** with
+> tuple/struct/unit variants and **`match`** with exhaustiveness checking;
+> **first-class arrays** with bounds-checked indexing;
 > a **use-after-move checker** for non-`Copy` values (opt into copying with
 > `#[copy]`); the built-in owning heap type **`String`** with **deterministic
-> destruction (`Drop`)** and string-parsing methods; **`extern "C"` FFI** for
+> destruction (`Drop`)**, string-parsing methods, and text-building sugar
+> (`"n = " + n`, `s += n`); **`extern "C"` FFI** for
 > calling libc; and compiling **several source files into one binary** — enough
 > to ship an HTTP client/server in [`lib/http.zx`](lib/http.zx) (see
 > [`docs/08-networking.md`](docs/08-networking.md)).
@@ -37,6 +40,7 @@ go run ./cmd/zexic run tests/arrays.zx    # arrays + bounds checks
 go run ./cmd/zexic run tests/strings.zx   # owning heap String + methods
 go run ./cmd/zexic run tests/drop.zx      # deterministic destruction across control flow
 go run ./cmd/zexic run tests/syntax.zx    # a runnable tour of the whole syntax
+go run ./cmd/zexic run tests/sugar.zx     # break-with-value, Type::new(..), print/format sugar
 go run ./cmd/zexic run tests/pi.zx        # 30 digits of π: big-int + Machin's formula
 go run ./cmd/zexic run examples/http_server.zx lib/http.zx   # an HTTP server, in Zexi
 go run ./cmd/zexic run examples/http_client.zx lib/http.zx   # an HTTP client (needs the server)
