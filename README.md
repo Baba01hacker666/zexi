@@ -42,7 +42,7 @@ This repository contains the **initial design and specification** of Zexi: the v
 > to ship an HTTP client/server in [`lib/http.zx`](lib/http.zx) (see
 > [`docs/08-networking.md`](docs/08-networking.md)).
 >
-> Not yet implemented: generics, traits/`impl Trait`, modules/`use`, `Box`/`Vec`,
+> Not yet implemented: generics, traits/`impl Trait`, modules/`mod`, `Box`/`Vec`,
 > user-defined `Drop`, borrow-lifetime analysis (bound `&`/`*` aliases are not yet
 > tracked), and `Result`/`?`. Enum variants cannot carry owning payloads yet. See
 > `docs/05-roadmap.md`.

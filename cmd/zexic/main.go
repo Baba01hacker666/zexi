@@ -30,6 +30,7 @@ func main() { os.Exit(run(os.Args[1:])) }
 // cli holds parsed command-line options.
 type cli struct {
 	positional []string
+	progArgs   []string // program arguments after `--` (run only)
 	out        string
 	emit       string
 	optLevel   string
@@ -43,9 +44,16 @@ type cli struct {
 
 func parseArgs(args []string) cli {
 	var c cli
+	afterSep := false // everything after `--` is a program argument
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if afterSep {
+			c.progArgs = append(c.progArgs, a)
+			continue
+		}
 		switch {
+		case a == "--":
+			afterSep = true
 		case a == "-o" && i+1 < len(args):
 			i++
 			c.out = args[i]
@@ -193,6 +201,9 @@ func cmdRun(c cli) int {
 	if !ok {
 		return 2
 	}
+	// Arguments after a `--` separator belong to the program, not to the
+	// compiler: `zexic run app.zx -- arg1 arg2` runs app with arg1 arg2.
+	progArgs := c.progArgs
 	em := diag.NewEmitter()
 	dir, err := os.MkdirTemp("", "zexic-run-")
 	if err != nil {
@@ -207,7 +218,7 @@ func cmdRun(c cli) int {
 		return 1
 	}
 
-	child := exec.Command(out)
+	child := exec.Command(out, progArgs...)
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr

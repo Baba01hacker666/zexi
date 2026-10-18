@@ -29,8 +29,8 @@ typedef int myint;
 		`extern "C" fn sqrt(x: f64) -> f64;`,
 		`extern "C" fn greet(name: str) -> str;`,
 		`extern "C" fn dupstr(s: *mut u8) -> *mut u8;`,
-		`extern "C" fn hash(data: *u8, len: usize) -> u64;`,
-		`extern "C" fn random() -> i64;`,
+		`extern "C" fn hash(data: *u8, len: usize) -> usize;`,
+		`extern "C" fn random() -> isize;`,
 		`extern "C" fn strlen(s: str) -> usize;`,
 		`extern "C" fn puts(a0: str) -> i32;`,
 	}

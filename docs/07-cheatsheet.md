@@ -339,7 +339,7 @@ program that ties it all together, see `examples/guess.zx`.
 
 ## 7.14 Not implemented yet (roadmap M1+)
 
-Generics, traits, `mod`/`use`, `Vec`/`Box`, user-defined `Drop`, tuple values
+Generics, traits, `mod`, `Vec`/`Box`, user-defined `Drop`, tuple values
 (tuple *structs* exist; `(a, b)` values and destructuring do not yet),
 borrow-lifetime (NLL) analysis, `Result`/`?`, bindings inside or-patterns,
 nested patterns, and enum variants that own resources. See

@@ -120,6 +120,11 @@ func (l *loader) loadDiskFile(path string) int {
 	if err != nil {
 		abs = filepath.Clean(path)
 	}
+	// Resolve symbolic links so two imports that reach the same file through
+	// a real path and a symlink share one key (and one load).
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	}
 	key := "file:" + abs
 	if l.loaded[key] {
 		return 0

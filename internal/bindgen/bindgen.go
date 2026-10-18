@@ -36,9 +36,9 @@ var scalarTypes = map[string]string{
 	"int":                "i32",
 	"unsigned":           "u32",
 	"unsigned int":       "u32",
-	"long":               "i64",
-	"long int":           "i64",
-	"unsigned long":      "u64",
+	"long":               "isize",
+	"long int":           "isize",
+	"unsigned long":      "usize",
 	"long long":          "i64",
 	"unsigned long long": "u64",
 	"size_t":             "usize",
@@ -141,7 +141,7 @@ func translate(stmt string) (decl, name, skipReason string) {
 	if open < 0 {
 		return "", "", ""
 	}
-	closeIdx := strings.LastIndex(stmt, ")")
+	closeIdx := matchParen(stmt, open)
 	if closeIdx < open {
 		return "", "", ""
 	}
@@ -237,11 +237,37 @@ func translateParam(raw string, idx int) (string, string, bool) {
 		// A char array is a byte buffer, matching `char *` -> `*mut u8`.
 		if ty == "i8" {
 			ty = "*mut u8"
-		} else if !strings.HasPrefix(ty, "*") && ty != "str" {
+		} else if strings.HasPrefix(ty, "*") {
+			// `T *name[N]` is a pointer-to-pointer (`char *items[4]` is
+			// `char **`). Zexi has no `**T`, so skip rather than bind
+			// the wrong ABI.
+			return "", "", false
+		} else if ty != "str" {
 			ty = "*mut " + ty
 		}
 	}
 	return name, ty, true
+}
+
+// matchParen returns the index of the parenthesis that closes the one at
+// open, or -1 when it is unbalanced. It ignores parentheses inside string
+// literals. Scanning for the paired paren (rather than the last one in the
+// statement) keeps trailing annotations such as `__attribute__((pure))`
+// out of the parameter list.
+func matchParen(s string, open int) int {
+	depth := 0
+	for i := open; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 // isBareType reports whether raw is only a type (an unnamed parameter).

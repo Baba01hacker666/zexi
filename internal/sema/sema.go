@@ -10,6 +10,7 @@ package sema
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -546,6 +547,12 @@ func (c *checker) makeFn(d *ast.FnDecl, recv *types.Type) *Fn {
 	seenDefault := false
 	for _, p := range d.Params {
 		if p.Self {
+			// Match the loop above: an invalid `self` (a top-level function)
+			// reported E0424 and appended no type, so it must not append a
+			// name/default slot either — Params and ParamNames would skew.
+			if recv == nil {
+				continue
+			}
 			fn.ParamNames = append(fn.ParamNames, "")
 			fn.Defaults = append(fn.Defaults, nil)
 			continue
@@ -1137,10 +1144,16 @@ func min3(a, b, c int) int {
 }
 
 // suggestName returns " (did you mean `x`?)" when one of the candidates
-// is within edit distance 2 of name, and "" otherwise.
+// is within edit distance 2 of name, and "" otherwise. Candidates are
+// sorted first so a tie between two equally-distant suggestions resolves
+// to the same one every run (callers build the list by ranging over Go
+// maps, whose iteration order is randomized).
 func suggestName(name string, candidates []string) string {
+	sorted := make([]string, len(candidates))
+	copy(sorted, candidates)
+	sort.Strings(sorted)
 	best, bestD := "", 3
-	for _, cand := range candidates {
+	for _, cand := range sorted {
 		if cand == name {
 			continue
 		}
@@ -1450,7 +1463,7 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 				want = st.Fields[i].Ty
 			}
 			at := c.checkExpr(a, want)
-			if want != nil && !c.argAssignable(want, at) {
+			if want != nil && !c.argAssignable(want, at, false) {
 				c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
 			}
 		}
@@ -1532,7 +1545,10 @@ func (c *checker) resolveArgs(sp token.Span, args []ast.Expr, names []string, de
 			continue
 		}
 		if pos >= len(names) {
-			break // the arity check below reports this
+			// `out` always has len(names) entries, so the caller's arity
+			// check never sees a surplus — report it here.
+			c.errf(a.Span(), "E0061", "%s takes %d argument(s) but more were supplied", label, len(names))
+			break
 		}
 		// Find the next unfilled slot for this positional argument; a
 		// positional argument may not follow a named one for a slot
@@ -1541,6 +1557,7 @@ func (c *checker) resolveArgs(sp token.Span, args []ast.Expr, names []string, de
 			pos++
 		}
 		if pos >= len(names) {
+			c.errf(a.Span(), "E0061", "%s takes %d argument(s) but more were supplied", label, len(names))
 			break
 		}
 		seen[pos] = true
@@ -1576,7 +1593,7 @@ func (c *checker) checkCallArgs(x *ast.CallExpr, fn *Fn, label string) *types.Ty
 			want = fn.Params[i]
 		}
 		at := c.checkExpr(a, want)
-		if want != nil && !c.argAssignable(want, at) {
+		if want != nil && !c.argAssignable(want, at, fn.Extern) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
 		}
 	}
@@ -1610,7 +1627,7 @@ func (c *checker) inferStringCtor(x *ast.CallExpr, name string) *types.Type {
 			wt = want[i]
 		}
 		at := c.checkExpr(a, wt)
-		if wt != nil && !c.argAssignable(wt, at) {
+		if wt != nil && !c.argAssignable(wt, at, false) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", wt, at)
 		}
 	}
@@ -1676,7 +1693,7 @@ func (c *checker) inferStringMethod(x *ast.MethodCallExpr) *types.Type {
 			wt = m.params[i]
 		}
 		at := c.checkExpr(a, wt)
-		if wt != nil && !c.argAssignable(wt, at) {
+		if wt != nil && !c.argAssignable(wt, at, false) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", wt, at)
 		}
 	}
@@ -1860,7 +1877,7 @@ func (c *checker) inferVariantCtor(x *ast.CallExpr, p *ast.PathExpr) *types.Type
 			want = v.Fields[i].Ty
 		}
 		at := c.checkExpr(a, want)
-		if want != nil && !c.argAssignable(want, at) {
+		if want != nil && !c.argAssignable(want, at, false) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
 		}
 	}
@@ -2338,7 +2355,7 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 			wt = want[i]
 		}
 		at := c.checkExpr(a, wt)
-		if wt != nil && !c.argAssignable(wt, at) {
+		if wt != nil && !c.argAssignable(wt, at, false) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", wt, at)
 		}
 	}
@@ -2735,18 +2752,22 @@ func (c *checker) assignable(dst, src *types.Type) bool {
 // borrows it for the duration of the call. It is deliberately *not* used for
 // `let`/field/return positions, where a longer-lived borrow from a temporary
 // could dangle.
-func (c *checker) argAssignable(want, got *types.Type) bool {
+//
+// ptrRefOK enables the pointer/reference interchange: at the C boundary a
+// reference and a raw pointer are the same machine pointer, so either may
+// be passed where the other is expected (with matching mutability). This
+// keeps `extern "C"` declarations pleasant — `time(&mut slot)` just works —
+// but it must stay confined to extern call sites: a raw `*T` (which an
+// extern function may return null) would otherwise become a `&T` with no
+// `unsafe`, removing the guarantee that a reference is valid.
+func (c *checker) argAssignable(want, got *types.Type, ptrRefOK bool) bool {
 	if c.assignable(want, got) {
 		return true
 	}
 	if want != nil && want.Kind == types.Str && got != nil && got.Kind == types.StringKind {
 		return true
 	}
-	// At the C boundary a reference and a raw pointer are the same
-	// machine pointer, so either may be passed where the other is
-	// expected (with matching mutability). This keeps `extern "C"`
-	// declarations pleasant: `time(&mut slot)` just works.
-	if want != nil && got != nil &&
+	if ptrRefOK && want != nil && got != nil &&
 		(want.Kind == types.Ptr || want.Kind == types.Ref) &&
 		(got.Kind == types.Ptr || got.Kind == types.Ref) {
 		if want.Mut && !got.Mut {
