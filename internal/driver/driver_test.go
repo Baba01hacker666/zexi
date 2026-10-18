@@ -19,6 +19,7 @@ import (
 func TestTypeCheckExamples(t *testing.T) {
 	files := []string{
 		"../../examples/hello.zx",
+		"../../examples/easy.zx",
 		"../../tests/tour.zx",
 		"../../tests/structs.zx",
 		"../../tests/enums.zx",
@@ -34,6 +35,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/robustness.zx",
 		"../../tests/sugar.zx",
 		"../../tests/keywords.zx",
+		"../../tests/easy.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -180,6 +182,17 @@ func TestRunPrograms(t *testing.T) {
 				`C:\new\test`, `say "hi" \n`, `a\tb`, "42", "",
 			}, "\n"),
 		},
+		{
+			file: "../../tests/easy.zx",
+			want: strings.Join([]string{
+				"hello, bob!", "hello, ada? x2", "hello, cy! x3",
+				"50", "15", "8",
+				"21", "welcome, zexi!",
+				"10", "6", "1024", "ababab", "00042",
+				"world #3 {ok}", "pi~3.5 ok=true grade=A",
+				"42", "6", "3", "",
+			}, "\n"),
+		},
 	}
 
 	for _, tc := range cases {
@@ -290,4 +303,60 @@ func waitPort(addr string, d time.Duration) bool {
 		time.Sleep(25 * time.Millisecond)
 	}
 	return false
+}
+
+// TestUseLoadsRelativeFile checks that `use "helper.zx";` pulls a sibling
+// file into the program.
+func TestUseLoadsRelativeFile(t *testing.T) {
+	dir := t.TempDir()
+	helper := "pub fn triple(n: i32) -> i32 { n * 3 }\n"
+	main := "use \"helper.zx\";\nfn main() -> i32 { println(triple(7)); 0 }\n"
+	if err := os.WriteFile(filepath.Join(dir, "helper.zx"), []byte(helper), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mainPath := filepath.Join(dir, "main.zx")
+	if err := os.WriteFile(mainPath, []byte(main), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	em := diag.NewEmitter()
+	if _, ok := driver.FrontEnd(mainPath, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("expected `use \"helper.zx\"` to load the library")
+	}
+}
+
+// TestUseEmbeddedStdlib checks that `use math;` finds the standard library
+// embedded in the compiler, from any directory.
+func TestUseEmbeddedStdlib(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	src := "use math;\nfn main() -> i32 { println(clampi(15, 0, 10), gcdi(12, 18)); 0 }\n"
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	em := diag.NewEmitter()
+	if _, ok := driver.FrontEnd(mainPath, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("expected `use math;` to load the embedded stdlib")
+	}
+}
+
+// TestUseMissingLibrary checks that an unresolvable `use` is a clean
+// diagnostic (E9022), not a crash.
+func TestUseMissingLibrary(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	src := "use nosuchlib;\nfn main() -> i32 { 0 }\n"
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	em := diag.NewEmitter()
+	if _, ok := driver.FrontEnd(mainPath, driver.Options{}, em); ok {
+		t.Fatal("expected a diagnostic for a missing library")
+	}
+	var buf bytes.Buffer
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E9022") {
+		t.Fatalf("expected E9022, got:\n%s", buf.String())
+	}
 }

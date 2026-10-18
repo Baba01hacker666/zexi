@@ -276,7 +276,50 @@ let m = big as i32;    // truncating integer cast
 let f = 3 as f64;
 ```
 
-## 7.13 Not implemented yet (roadmap M1+)
+## 7.13 Writing it the easy way
+
+Zexi borrows Python's ergonomics where they cost nothing at run time:
+
+```zx
+#!/usr/bin/env zexi          # `#` comments work (so do `//` and `/* */`);
+// Semicolons are optional: a newline ends a statement. Keep them if you like.
+let a = 1
+let b = 2;
+
+let name = "world"
+println(f"hello, {name}! 1 + 2 = {1 + 2}")   // interpolation, type String
+
+fn area(w: i64, h: i64 = 10) -> i64 { w * h }  // default argument
+area(5)              // 50
+area(5, h = 3)       // 15 — named (keyword) arguments, any order
+area(h = 4, w = 2)   // 8
+
+fn greet() { println("hi") }   // no return type needed when returning ()
+```
+
+- Defaults must be constant expressions (`= 10`, `= 20 + 22`, `= SOME_CONST`),
+  and only trailing parameters may have them.
+- In `f"..."`, `{{` and `}}` are literal braces. Interpolated values are
+  borrowed, never moved, and must be printable (numbers, `bool`, `char`,
+  `str`, `String`).
+
+Libraries: `use` imports whole files into your program — their `pub`
+functions, structs, enums, and constants become available unqualified.
+
+```zx
+use "helpers.zx";   // a file next to yours (path relative to your file)
+use math;           // standard library: searched next to your file, in a
+use std::text;      //   lib/ folder beside it, then in the embedded stdlib
+```
+
+Every file is loaded at most once and import cycles are harmless. The
+embedded standard library (sources in `internal/driver/std/`) currently has
+`math` (`mini`, `maxi`, `clampi`, `absi`, `signi`, `is_even`, `gcdi`,
+`powi`, `minf`, `maxf`, `clampf`, `absf`) and `text` (`repeat_text`,
+`exclaim`, `pad_start`, `join_with`, `shout`). Passing extra `.zx` files on
+the command line (`zexic run main.zx lib.zx`) still works too.
+
+## 7.14 Not implemented yet (roadmap M1+)
 
 Generics, traits, `mod`/`use`, `Vec`/`Box`, user-defined `Drop`, tuple values
 (tuple *structs* exist; `(a, b)` values and destructuring do not yet),

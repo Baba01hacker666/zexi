@@ -201,3 +201,31 @@ fn main() -> i32 {
 		t.Fatalf("expected a diagnostic for `defer` in expression position")
 	}
 }
+
+// TestEasySyntax covers the Python-flavoured surface: statements ended
+// by newlines instead of semicolons, default parameter values, named
+// arguments, and f-string interpolation.
+func TestEasySyntax(t *testing.T) {
+	src := `fn greet(name: str, punct: str = "!", times: i64 = 1) -> String {
+    f"hi {name}{punct}"
+}
+fn main() {
+    let a = greet("bob")
+    let b = greet(name = "ada", times = 2)
+    println(a, b)
+    let c = 40 +
+        2
+    println(c)
+}`
+	if _, n := parse(t, src); n != 0 {
+		t.Fatalf("unexpected diagnostics: %d", n)
+	}
+	// Two statements on one line still need a semicolon between them.
+	if _, n := parse(t, "fn main() -> i32 { let a = 1 let b = 2; 0 }"); n == 0 {
+		t.Fatal("expected a diagnostic for two statements on one line without `;`")
+	}
+	// An unterminated interpolation hole is a syntax error.
+	if _, n := parse(t, `fn main() -> i32 { println(f"oops {"); 0 }`); n == 0 {
+		t.Fatal("expected a diagnostic for unterminated `{` in f-string")
+	}
+}

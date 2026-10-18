@@ -8,6 +8,15 @@ This repository contains the **initial design and specification** of Zexi: the v
 > flow-sensitive move checker, lowers to C, and links a **native binary** you can
 > run.
 >
+> Easy to write, like Python: `#` or `//` comments; semicolons optional at
+> line ends; `f"hello, {name}!"` string interpolation; default arguments
+> (`fn area(w: i64, h: i64 = 10)`) and named arguments (`area(h = 4, w = 2)`);
+> functions may omit a return type when they return nothing. Libraries via
+> `use`: `use "helpers.zx";` imports a neighbouring file, and `use math;` /
+> `use text;` (or `use std::math;`) import the standard library embedded in
+> the compiler — see `internal/driver/std/`. Still compiled to a small,
+> fast native binary through C.
+>
 > Implemented: functions and recursion; `let`/`const`; `type` aliases; integer/
 > float/bool/char/`str` values; arithmetic, bitwise, comparison, and logical
 > operators; `as` casts; `if`/`elif`/`else`; `while`/`until`/`loop`/`for i in a..b`
@@ -44,6 +53,8 @@ go run ./cmd/zexic run tests/strings.zx   # owning heap String + methods
 go run ./cmd/zexic run tests/drop.zx      # deterministic destruction across control flow
 go run ./cmd/zexic run tests/syntax.zx    # a runnable tour of the whole syntax
 go run ./cmd/zexic run tests/keywords.zx  # until/elif/defer, or+range patterns, if let, type aliases
+go run ./cmd/zexic run tests/easy.zx      # the easy way: no semicolons, f-strings, defaults, libraries
+go run ./cmd/zexic run examples/easy.zx   # same ideas, as a small standalone demo
 go run ./cmd/zexic run tests/sugar.zx     # break-with-value, Type::new(..), print/format sugar
 go run ./cmd/zexic run tests/pi.zx        # 30 digits of π: big-int + Machin's formula
 go run ./cmd/zexic run examples/http_server.zx lib/http.zx   # an HTTP server, in Zexi

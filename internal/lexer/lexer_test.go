@@ -164,3 +164,32 @@ func TestUnderscorePlacementErrors(t *testing.T) {
 	}
 	eq(t, "1_000 0xFF_FF", token.KindInteger, token.KindInteger)
 }
+
+func TestHashCommentAndFStringTokens(t *testing.T) {
+	lx := lexer.New(0, []byte("# a comment\nlet x = f\"a {x} b\" # trailing\n#[copy]"))
+	var kinds []token.Kind
+	var fstr string
+	for _, tk := range lx.All() {
+		kinds = append(kinds, tk.Kind)
+		if tk.Kind == token.KindFString {
+			fstr = tk.Lit
+		}
+	}
+	if errs := lx.Errors(); len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if fstr != "a {x} b" {
+		t.Fatalf("f-string literal = %q, want %q", fstr, "a {x} b")
+	}
+	// The attribute form `#[...]` must survive: `#` opens a comment
+	// unless it is immediately followed by `[`.
+	foundHash := false
+	for _, k := range kinds {
+		if k == token.KindHash {
+			foundHash = true
+		}
+	}
+	if !foundHash {
+		t.Fatal("expected a Hash token for #[copy]")
+	}
+}

@@ -987,3 +987,81 @@ func TestDefer(t *testing.T) {
 		t.Fatalf("expected clean, got %v", codes)
 	}
 }
+
+func TestDefaultAndNamedArgs(t *testing.T) {
+	src := `fn area(w: i64, h: i64 = 10) -> i64 { w * h }
+fn main() -> i32 { println(area(5), area(5, h = 3), area(h = 4, w = 2)); 0 }`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	// Computed constant defaults are fine.
+	ok, codes := check(t, `fn f(a: i32, b: i32 = 20 + 22) -> i32 { a + b }
+fn main() -> i32 { println(f(0)); 0 }`)
+	if !ok {
+		t.Fatalf("expected clean const default, got %v", codes)
+	}
+	// Unknown parameter name.
+	ok, codes = check(t, `fn area(w: i64, h: i64 = 10) -> i64 { w * h }
+fn main() -> i32 { println(area(5, z = 1)); 0 }`)
+	if ok || !has(codes, "E0061") {
+		t.Fatalf("expected E0061 for unknown name, got ok=%v codes=%v", ok, codes)
+	}
+	// Same parameter twice (positionally and by name).
+	ok, codes = check(t, `fn area(w: i64, h: i64 = 10) -> i64 { w * h }
+fn main() -> i32 { println(area(5, w = 2)); 0 }`)
+	if ok || !has(codes, "E0062") {
+		t.Fatalf("expected E0062 for duplicate, got ok=%v codes=%v", ok, codes)
+	}
+	// A required argument is still required.
+	ok, codes = check(t, `fn area(w: i64, h: i64 = 10) -> i64 { w * h }
+fn main() -> i32 { println(area()); 0 }`)
+	if ok || !has(codes, "E0061") {
+		t.Fatalf("expected E0061 for missing arg, got ok=%v codes=%v", ok, codes)
+	}
+	// Defaults must be constant expressions.
+	ok, codes = check(t, `fn g() -> i32 { 1 }
+fn f(a: i32, b: i32 = g()) -> i32 { a + b }
+fn main() -> i32 { println(f(1)); 0 }`)
+	if ok || !has(codes, "E0602") {
+		t.Fatalf("expected E0602 for non-const default, got ok=%v codes=%v", ok, codes)
+	}
+	// A parameter without a default may not follow one with a default.
+	ok, codes = check(t, `fn f(a: i32 = 1, b: i32) -> i32 { a + b }
+fn main() -> i32 { println(f(1, 2)); 0 }`)
+	if ok || !has(codes, "E0061") {
+		t.Fatalf("expected E0061 for non-trailing default, got ok=%v codes=%v", ok, codes)
+	}
+	// Named arguments are not accepted by builtins.
+	ok, codes = check(t, `fn main() -> i32 { println(x = 1); 0 }`)
+	if ok || !has(codes, "E0061") {
+		t.Fatalf("expected E0061 for named arg to println, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestFStrings(t *testing.T) {
+	src := `fn main() -> i32 {
+    let name = "zexi";
+    let s = f"hi {name}, {1 + 2} + {2.5} = fun? {true} {'!'}";
+    println(s);
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	// Interpolating a String borrows it: it stays usable afterwards.
+	ok, codes := check(t, `fn main() -> i32 {
+    let s = String::from("x");
+    println(f"{s}");
+    println(s);
+    0
+}`)
+	if !ok {
+		t.Fatalf("expected clean String interpolation, got %v", codes)
+	}
+	// Non-printable values cannot be interpolated.
+	ok, codes = check(t, `struct P { x: i32 }
+fn main() -> i32 { let p = P { x: 1 }; println(f"{p}"); 0 }`)
+	if ok || !has(codes, "E0277") {
+		t.Fatalf("expected E0277 for struct interpolation, got ok=%v codes=%v", ok, codes)
+	}
+}
