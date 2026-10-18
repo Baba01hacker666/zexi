@@ -26,8 +26,8 @@ This is the *normative-shaped* spec for the M0 language. Features tagged
 | Boolean | `true`, `false` |
 | Unit/void | `()` |
 
-Integer literals are **untyped** until inference; they default to `i32`. There
-are no implicit numeric conversions (see 2.4).
+Integer literals are **untyped** until inference; they default to `i32` and may
+also adopt a float context. There are no implicit numeric conversions (see 2.4).
 
 ### Keywords
 
@@ -215,10 +215,12 @@ Traits provide bounds; `dyn Trait` gives type-erased dynamic dispatch (M2).
   `let x: u8 = 1;` both work).
 - **No implicit conversions**, including `i32 -> i64` and `bool -> int`. Use
   `as` for primitive casts; `as` between numeric types is the only implicit-ish
-  operation and is explicit. The one convenience is `+`/`+=` on a string, where
-  a number, `bool`, or `char` operand is rendered as text (`"n = " + n`); this
-  formats the value, it does not convert its type. Pointer/`unsafe` casts live
-  in `unsafe`.
+  operation and is explicit. An *untyped* integer literal, however, may be used
+  where a float is expected (`let x: f64 = 1`, `f(2)` for an `f64` parameter) —
+  literal typing, not a conversion. The other convenience is `+`/`+=` on a
+  string, where a number, `bool`, or `char` operand is rendered as text
+  (`"n = " + n`); this formats the value, it does not convert its type.
+  Pointer/`unsafe` casts live in `unsafe`.
 - **Coercions are limited to:** `&mut T -> &T`, `[T; N] -> [T]`,
   `T -> dyn Trait`, `never -> T`, and unsizing arrays to slices.
 - **Exhaustiveness:** `match` over an `enum` must be exhaustive.

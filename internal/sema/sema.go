@@ -772,6 +772,19 @@ func (c *checker) checkEscapes(x *ast.LiteralExpr) {
 func (c *checker) inferLiteral(x *ast.LiteralExpr, expected *types.Type) *types.Type {
 	switch x.Kind {
 	case token.KindInteger:
+		if expected != nil && expected.Kind.IsFloat() {
+			// An integer literal may initialize a float directly, so
+			// `let x: f64 = 1` and `f(2)` for an `f64` parameter both work.
+			// (This is literal typing, not a conversion: the literal is untyped
+			// until its context fixes it.)
+			s := strings.ReplaceAll(x.Text, "_", "")
+			if _, err := strconv.ParseInt(s, 0, 64); err != nil {
+				if _, err := strconv.ParseUint(s, 0, 64); err != nil {
+					c.errf(x.Sp, "E0080", "integer literal `%s` does not fit in any integer type", x.Text)
+				}
+			}
+			return expected
+		}
 		if expected != nil && expected.Kind.IsInt() {
 			if !intLitFits(x.Text, expected) {
 				c.errf(x.Sp, "E0080", "integer literal `%s` does not fit in `%s`", x.Text, expected)
@@ -839,6 +852,12 @@ func (c *checker) inferIdent(name string, sp token.Span) *types.Type {
 // `let x: i8 = -128` is rejected and `let x: u8 = -1` is accepted).
 func (c *checker) inferNegIntLit(x *ast.UnExpr, lit *ast.LiteralExpr, expected *types.Type) *types.Type {
 	text := "-" + lit.Text
+	if expected != nil && expected.Kind.IsFloat() {
+		// `-1` in a float context, e.g. `let x: f64 = -1`. Codegen emits the
+		// literal, which C converts to the float type.
+		c.info.Types[lit] = expected
+		return expected
+	}
 	t := expected
 	if t == nil || !t.Kind.IsInt() {
 		if intLitFits(text, types.I32T) {

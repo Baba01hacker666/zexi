@@ -45,7 +45,8 @@ impl Point {
 | other | `bool` · `char` · `str` (borrowed) · `String` (owning, heap) |
 | compound | `[T; N]` fixed array · `&T` `&mut T` · `()` unit |
 
-Integer literals are untyped until inference and default to `i32`. There are no
+Integer literals are untyped until inference and default to `i32`; they also
+adopt a float context (`let x: f64 = 1`, `1 + 2.5`). Otherwise there are no
 implicit numeric conversions — use `as`. (`+` on a string renders a number,
 `bool`, or `char` as text; that is a formatting convenience, not a numeric
 conversion.)

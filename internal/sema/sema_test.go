@@ -769,3 +769,29 @@ func TestNegativePatterns(t *testing.T) {
 		})
 	}
 }
+
+// TestIntLiteralInFloatContext covers an untyped integer literal adopting a
+// float type from its context.
+func TestIntLiteralInFloatContext(t *testing.T) {
+	accepted := []struct{ name, src string }{
+		{"let-annotation", "fn main() -> i32 { let x: f64 = 1; println(x); 0 }"},
+		{"let-annotation-neg", "fn main() -> i32 { let x: f64 = -1; println(x); 0 }"},
+		{"return-type", "fn f() -> f64 { 1 }\nfn main() -> i32 { println(f()); 0 }"},
+		{"call-arg", "fn f(x: f64) -> f64 { x }\nfn main() -> i32 { println(f(2)); 0 }"},
+		{"struct-field", "struct P { x: f64 }\nfn main() -> i32 { let p = P { x: 1 }; println(p.x); 0 }"},
+		{"arith-mixed", "fn main() -> i32 { println(1 + 2.5); 0 }"},
+		{"compare-mixed", "fn main() -> i32 { let x = 2.0; println(x == 2); 0 }"},
+		{"f32-context", "fn main() -> i32 { let x: f32 = 3; println(x); 0 }"},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			if ok, codes := check(t, tc.src); !ok {
+				t.Fatalf("expected clean, got %v", codes)
+			}
+		})
+	}
+
+	if ok, codes := check(t, "fn main() -> i32 { let x: f64 = 99999999999999999999; println(x); 0 }"); ok || !has(codes, "E0080") {
+		t.Fatalf("expected E0080 for an oversized literal, got %v", codes)
+	}
+}

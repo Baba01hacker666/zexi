@@ -108,5 +108,8 @@ fn main() -> i32 {
         -5 => println("cold"),
         _ => println("ok"),
     }
+    // an integer literal adopts a float context
+    let ratio: f64 = 1;
+    println("ratio:", ratio, 1 + 2.5);
     0
 }
