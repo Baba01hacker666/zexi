@@ -1,0 +1,67 @@
+// math — small numeric helpers, part of the Zexi standard library.
+// Import with `use math;` or `use std::math;`.
+
+pub fn mini(a: i64, b: i64) -> i64 {
+    if a < b { a } else { b }
+}
+
+pub fn maxi(a: i64, b: i64) -> i64 {
+    if a > b { a } else { b }
+}
+
+pub fn clampi(x: i64, lo: i64, hi: i64) -> i64 {
+    if x < lo { lo } elif x > hi { hi } else { x }
+}
+
+pub fn absi(x: i64) -> i64 {
+    if x < 0 { -x } else { x }
+}
+
+pub fn signi(x: i64) -> i64 {
+    if x < 0 { -1 } elif x > 0 { 1 } else { 0 }
+}
+
+pub fn is_even(x: i64) -> bool {
+    x % 2 == 0
+}
+
+pub fn is_odd(x: i64) -> bool {
+    x % 2 != 0
+}
+
+pub fn gcdi(a0: i64, b0: i64) -> i64 {
+    let mut a = absi(a0);
+    let mut b = absi(b0);
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+pub fn powi(base: i64, exp: i32) -> i64 {
+    let mut r: i64 = 1;
+    let mut i = 0;
+    while i < exp {
+        r *= base;
+        i += 1;
+    }
+    r
+}
+
+pub fn minf(a: f64, b: f64) -> f64 {
+    if a < b { a } else { b }
+}
+
+pub fn maxf(a: f64, b: f64) -> f64 {
+    if a > b { a } else { b }
+}
+
+pub fn clampf(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo { lo } elif x > hi { hi } else { x }
+}
+
+pub fn absf(x: f64) -> f64 {
+    if x < 0.0 { -x } else { x }
+}

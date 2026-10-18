@@ -1,0 +1,11 @@
+# easy_lib — a tiny project library for tests/easy.zx.
+# It is imported with `use "easy_lib.zx";` (a path relative to the
+# importing file), so it is not a standalone program.
+
+pub fn triple(n: i32) -> i32 {
+    n * 3
+}
+
+pub fn welcome(name: str) -> String {
+    f"welcome, {name}!"
+}

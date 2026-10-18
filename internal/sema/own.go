@@ -214,6 +214,13 @@ func (m *mover) use(e ast.Expr) {
 		}
 	case *ast.TryExpr:
 		m.use(x.X)
+	case *ast.InterpStrExpr:
+		// Interpolation reads (borrows) its values; it never moves them.
+		for _, part := range x.Parts {
+			m.use(part)
+		}
+	case *ast.NamedArgExpr:
+		m.use(x.Val)
 	}
 }
 

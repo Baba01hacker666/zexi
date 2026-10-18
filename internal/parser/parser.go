@@ -9,6 +9,8 @@
 package parser
 
 import (
+	"strings"
+
 	"zexi/internal/ast"
 	"zexi/internal/diag"
 	"zexi/internal/lexer"
@@ -255,7 +257,15 @@ func (p *parser) parseParams() []ast.Param {
 		}
 		p.expect(token.KindColon, " after parameter name")
 		ty := p.parseType()
-		params = append(params, ast.Param{Mut: mut, Name: name, Ty: ty, Sp: p.spanFrom(start)})
+		pr := ast.Param{Mut: mut, Name: name, Ty: ty, Sp: p.spanFrom(start)}
+		if p.accept(token.KindEq) {
+			// `name: i32 = 42` — a default value for callers that omit
+			// this (trailing) argument. Must be a constant expression;
+			// the checker enforces that.
+			pr.Default = p.parseExpr()
+			pr.Sp = p.spanFrom(start)
+		}
+		params = append(params, pr)
 		if !p.accept(token.KindComma) {
 			break
 		}
@@ -480,6 +490,13 @@ func (p *parser) parseMod(vis ast.Visibility, start token.Pos) ast.Item {
 func (p *parser) parseUse(start token.Pos) ast.Item {
 	p.bump() // use
 	d := &ast.UseDecl{}
+	if p.at(token.KindString) {
+		// `use "helpers.zx";` imports a file relative to this one.
+		d.File = p.bump().Lit
+		p.expectSemicolon()
+		d.Sp = p.spanFrom(start)
+		return d
+	}
 	d.Path = append(d.Path, p.expectIdentPath("use path"))
 	for p.accept(token.KindColonColon) {
 		d.Path = append(d.Path, p.expectIdentPath("use path segment"))
@@ -525,6 +542,9 @@ func (p *parser) parseBlock() *ast.Block {
 				b.Stmts = append(b.Stmts, &ast.ExprStmt{X: e, Sp: e.Span()})
 			case p.at(token.KindRBrace):
 				b.Tail = e
+			case p.newlineBeforeCur():
+				// No semicolon, but the statement ends at the newline.
+				b.Stmts = append(b.Stmts, &ast.ExprStmt{X: e, Sp: e.Span()})
 			default:
 				p.errf(p.cur(), "E0203", "expected `;` after expression statement")
 				p.skipTo(token.KindSemicolon, token.KindRBrace)
@@ -633,6 +653,19 @@ func (p *parser) parseLet() ast.Stmt {
 	return s
 }
 
+// newlineBeforeCur reports whether the current token starts on a later
+// line than the previous token ended. Zexi accepts a newline as a
+// statement terminator (semicolons are always allowed, never required at
+// a line end), which keeps code light to write without needing a separate
+// lexer pass: expressions still continue across lines wherever an
+// operator or opener makes that unambiguous.
+func (p *parser) newlineBeforeCur() bool {
+	if p.pos == 0 {
+		return false
+	}
+	return p.cur().Pos.Line > p.toks[p.pos-1].Pos.Line
+}
+
 func (p *parser) expectSemicolon() {
 	if p.accept(token.KindSemicolon) {
 		return
@@ -640,6 +673,10 @@ func (p *parser) expectSemicolon() {
 	// Allow `}` to stand in for a missing semicolon, like Rust, so a trailing
 	// statement before a block close does not cascade errors.
 	if p.at(token.KindRBrace) || p.at(token.KindEOF) {
+		return
+	}
+	// A newline also ends the statement.
+	if p.newlineBeforeCur() {
 		return
 	}
 	p.errf(p.cur(), "E0203", "expected `;`, found %s", p.cur().Kind)
@@ -921,6 +958,108 @@ func (p *parser) parsePostfix() ast.Expr {
 	}
 }
 
+// parseFString splits an `f"..."` literal into literal chunks and
+// interpolated expressions: `f"hi {name}, {n + 1} pts"`. `{{` and `}}`
+// are literal braces. Each hole is parsed by a fresh sub-parser over its
+// source text (with token offsets shifted back into the enclosing file,
+// so diagnostics keep pointing at the right place).
+func (p *parser) parseFString() ast.Expr {
+	tok := p.bump() // f"..."
+	src := tok.Lit
+	x := &ast.InterpStrExpr{Sp: token.Span{Start: tok.Pos.Offset, End: tok.End}}
+	var chunk strings.Builder
+	flush := func() {
+		if chunk.Len() > 0 {
+			x.Parts = append(x.Parts, &ast.LiteralExpr{Kind: token.KindString, Text: chunk.String(), Sp: x.Sp})
+			chunk.Reset()
+		}
+	}
+	i := 0
+	for i < len(src) {
+		c := src[i]
+		switch {
+		case c == '\\' && i+1 < len(src):
+			chunk.WriteString(src[i : i+2])
+			i += 2
+		case c == '{' && i+1 < len(src) && src[i+1] == '{':
+			chunk.WriteByte('{')
+			i += 2
+		case c == '}' && i+1 < len(src) && src[i+1] == '}':
+			chunk.WriteByte('}')
+			i += 2
+		case c == '{':
+			end := matchingBrace(src, i)
+			if end < 0 {
+				p.errf(tok, "E0202", "unterminated `{` in string interpolation (use `{{` for a literal brace)")
+				i = len(src)
+				break
+			}
+			flush()
+			x.Parts = append(x.Parts, p.parseInterpHole(src[i+1:end], tok, i+1))
+			i = end + 1
+		case c == '}':
+			p.errf(tok, "E0202", "unmatched `}` in string literal (use `}}` for a literal brace)")
+			i++
+		default:
+			chunk.WriteByte(c)
+			i++
+		}
+	}
+	flush()
+	return x
+}
+
+// matchingBrace returns the index of the `}` closing the `{` at src[i],
+// skipping nested braces and string/char literals, or -1 if there is none.
+func matchingBrace(src string, i int) int {
+	depth := 0
+	for j := i; j < len(src); j++ {
+		switch src[j] {
+		case '"', '\'':
+			q := src[j]
+			for j++; j < len(src) && src[j] != q; j++ {
+				if src[j] == '\\' {
+					j++
+				}
+			}
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return j
+			}
+		}
+	}
+	return -1
+}
+
+// parseInterpHole parses the inside of one `{...}` hole as an expression.
+// innerOff is the hole's byte offset within the f-string's inner text.
+func (p *parser) parseInterpHole(inner string, tok token.Token, innerOff int) ast.Expr {
+	lx := lexer.New(tok.Pos.FileID, []byte(inner))
+	toks := lx.All()
+	// Shift the sub-lexer tokens back into the enclosing file: the hole
+	// starts after `f"` plus innerOff bytes.
+	base := tok.Pos.Offset + token.Pos(2+innerOff)
+	for i := range toks {
+		toks[i].Pos.Offset += base
+		toks[i].End += base
+		if toks[i].Pos.Line > 1 {
+			toks[i].Pos.Line += tok.Pos.Line - 1
+		} else if tok.Pos.Line > 1 {
+			toks[i].Pos.Line = tok.Pos.Line
+		}
+	}
+	sub := &parser{fileID: tok.Pos.FileID, src: []byte(inner), toks: toks}
+	e := sub.parseExpr()
+	if len(lx.Errors()) > 0 || len(sub.errs) > 0 || !sub.at(token.KindEOF) || e == nil {
+		p.errf(tok, "E0202", "invalid expression in string interpolation")
+		return &ast.LiteralExpr{Kind: token.KindInteger, Text: "0", Sp: token.Span{Start: tok.Pos.Offset, End: tok.End}}
+	}
+	return e
+}
+
 // parseArrayLit parses `[a, b, c]` and the repeat form `[value; count]`.
 func (p *parser) parseArrayLit() ast.Expr {
 	start := p.cur().Pos.Offset
@@ -954,7 +1093,17 @@ func (p *parser) parseArgs() []ast.Expr {
 	var args []ast.Expr
 	p.bump() // (
 	for !p.at(token.KindRParen) && !p.at(token.KindEOF) {
-		args = append(args, p.parseExpr())
+		// `name = expr` is a named (keyword) argument, as in Python. The
+		// checker matches it to the parameter of that name.
+		if p.at(token.KindIdentifier) && p.tokAt(1).Kind == token.KindEq {
+			start := p.cur().Pos.Offset
+			name := p.bump().Lit
+			p.bump() // =
+			val := p.parseExpr()
+			args = append(args, &ast.NamedArgExpr{Name: name, Val: val, Sp: p.spanFrom(start)})
+		} else {
+			args = append(args, p.parseExpr())
+		}
 		if !p.accept(token.KindComma) {
 			break
 		}
@@ -971,6 +1120,9 @@ func (p *parser) parsePrimary() ast.Expr {
 		token.KindChar, token.KindByteChar, token.KindTrue, token.KindFalse:
 		p.bump()
 		return &ast.LiteralExpr{Kind: t.Kind, Text: t.Lit, Sp: p.spanFrom(start)}
+
+	case token.KindFString:
+		return p.parseFString()
 
 	case token.KindIdentifier:
 		p.bump()

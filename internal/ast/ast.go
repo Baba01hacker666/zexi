@@ -54,6 +54,9 @@ type Param struct {
 	Mut  bool
 	Name string
 	Ty   Type
+	// Default is the optional default value (`name: i32 = 42`). It must be
+	// a constant expression; calls may omit trailing defaulted arguments.
+	Default Expr
 	// Self marks the receiver parameter of a method. When set, Ty is nil for
 	// `self`, or a reference type for `&self` / `&mut self`.
 	Self    bool
@@ -144,9 +147,13 @@ type ModDecl struct {
 func (*ModDecl) itemNode()          {}
 func (d *ModDecl) Span() token.Span { return d.Sp }
 
-// UseDecl is `use path;`.
+// UseDecl is `use path;` or `use "file.zx";`. The driver resolves it to
+// source files (a library import) before type checking.
 type UseDecl struct {
 	Path []string
+	// File is the literal path of `use "file.zx";`, resolved relative to
+	// the importing file. Empty for the `use a::b;` form.
+	File string
 	As   string
 	Sp   token.Span
 }
@@ -392,6 +399,31 @@ type ArrayLitExpr struct {
 
 func (*ArrayLitExpr) exprNode()          {}
 func (e *ArrayLitExpr) Span() token.Span { return e.Sp }
+
+// NamedArgExpr is one `name = value` argument in a call. The checker
+// rewrites calls that use named arguments (or omit defaulted ones) into
+// plain positional argument lists, so later stages never see this node in
+// a resolved call.
+type NamedArgExpr struct {
+	Name string
+	Val  Expr
+	Sp   token.Span
+}
+
+func (*NamedArgExpr) exprNode()          {}
+func (e *NamedArgExpr) Span() token.Span { return e.Sp }
+
+// InterpStrExpr is an interpolated string `f"...{expr}..."`. Parts
+// alternates literal chunks (*LiteralExpr of kind string) and arbitrary
+// expressions whose values are converted to text. The whole expression
+// has type `String`.
+type InterpStrExpr struct {
+	Parts []Expr
+	Sp    token.Span
+}
+
+func (*InterpStrExpr) exprNode()          {}
+func (e *InterpStrExpr) Span() token.Span { return e.Sp }
 
 // CallExpr is `f(args)`.
 type CallExpr struct {

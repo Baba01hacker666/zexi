@@ -5,9 +5,12 @@
 package driver
 
 import (
+	"embed"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -45,35 +48,31 @@ func FrontEnd(path string, opts Options, em *diag.Emitter) (*Artifacts, bool) {
 
 // FrontEndFiles is FrontEnd for a program split across several source files.
 // The files are parsed independently (each keeps its own identity for
-// diagnostics) and their items are combined into one module, so a program can
-// be written against a library file without a module system. The first path is
-// treated as the program; later paths are typically `lib/*.zx`.
+// diagnostics) and their items are combined into one module. On top of that,
+// `use` declarations import library files: `use "helpers.zx";` loads a file
+// relative to the importing file, and `use math;` / `use std::math;` load a
+// library by name — searched next to the importing file, in a `lib/` folder
+// beside it, and finally in the standard library embedded in the compiler.
+// Imports are transitive, every file is loaded at most once, and import
+// cycles are harmless (a file being loaded counts as loaded). The first
+// path is treated as the program.
 func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, bool) {
 	if len(paths) == 0 {
 		em.Report(diag.New("E9021", "no input files"))
 		return nil, false
 	}
-	merged := &ast.File{}
+	l := &loader{em: em, merged: &ast.File{}, loaded: map[string]bool{}}
 	firstID := 0
 	for i, path := range paths {
-		src, err := os.ReadFile(path)
-		if err != nil {
-			em.Report(diag.New("E9020", "cannot read %s: %v", path, err))
-			return nil, false
-		}
-		fileID := em.AddFile(path, src)
+		id := l.loadDiskFile(path)
 		if i == 0 {
-			firstID = fileID
-		}
-		file, parseDiags := parser.Parse(fileID, src)
-		em.Report(parseDiags...)
-		if file != nil {
-			merged.Items = append(merged.Items, file.Items...)
+			firstID = id
 		}
 	}
 	if em.HasErrors() {
 		return nil, false
 	}
+	merged := l.merged
 
 	info, semaDiags := sema.Check(merged)
 	em.Report(semaDiags...)
@@ -87,6 +86,110 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 		return nil, false
 	}
 	return &Artifacts{Info: info, CSrc: csrc, FileID: firstID}, true
+}
+
+// stdFS holds the standard library: small Zexi source files embedded in
+// the compiler, importable from any program with `use math;`,
+// `use text;`, or `use std::math;` — no installation or paths needed.
+//
+//go:embed std/*.zx
+var stdFS embed.FS
+
+// loader reads source files (entry points plus everything they `use`),
+// parses them, and merges their items into one program.
+type loader struct {
+	em     *diag.Emitter
+	merged *ast.File
+	loaded map[string]bool // canonical file keys already loaded
+}
+
+// loadDiskFile loads one file from disk and everything it imports.
+func (l *loader) loadDiskFile(path string) int {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = filepath.Clean(path)
+	}
+	key := "file:" + abs
+	if l.loaded[key] {
+		return 0
+	}
+	src, err := os.ReadFile(path)
+	if err != nil {
+		l.em.Report(diag.New("E9020", "cannot read %s: %v", path, err))
+		return 0
+	}
+	return l.loadSource(key, path, src, filepath.Dir(abs))
+}
+
+// loadStdFile loads one embedded standard-library file by base name
+// (for example "math" for std/math.zx).
+func (l *loader) loadStdFile(name string) int {
+	key := "std:" + name
+	if l.loaded[key] {
+		return 0
+	}
+	display := "std/" + name + ".zx"
+	src, err := fs.ReadFile(stdFS, display)
+	if err != nil {
+		l.em.Report(diag.New("E9022", "there is no standard library module named `%s`", name))
+		return 0
+	}
+	return l.loadSource(key, display, src, "")
+}
+
+// loadSource parses one already-read file, records its items, and follows
+// its `use` declarations. dir is the directory relative imports resolve
+// against (empty for embedded files).
+func (l *loader) loadSource(key, display string, src []byte, dir string) int {
+	l.loaded[key] = true // mark first: import cycles load each file once
+	fileID := l.em.AddFile(display, src)
+	file, parseDiags := parser.Parse(fileID, src)
+	l.em.Report(parseDiags...)
+	if file == nil {
+		return fileID
+	}
+	for _, it := range file.Items {
+		if d, ok := it.(*ast.UseDecl); ok {
+			l.loadUse(d, dir)
+			continue // imports contribute their own items; never checked here
+		}
+		l.merged.Items = append(l.merged.Items, it)
+	}
+	return fileID
+}
+
+// loadUse resolves and loads one `use` declaration.
+func (l *loader) loadUse(d *ast.UseDecl, dir string) {
+	if d.File != "" {
+		// `use "helpers.zx";` — a path relative to the importing file.
+		l.loadDiskFile(filepath.Join(dir, filepath.FromSlash(d.File)))
+		return
+	}
+	if len(d.Path) == 0 {
+		return
+	}
+	if d.Path[0] == "std" {
+		if len(d.Path) < 2 {
+			l.em.Report(diag.New("E9022", "`use std;` needs a module name, such as `use std::math;`").WithSpan(d.Sp))
+			return
+		}
+		l.loadStdFile(d.Path[len(d.Path)-1])
+		return
+	}
+	// `use a::b;` names the file a/b.zx: look beside the importing file,
+	// then in a lib/ folder beside it, then in the embedded stdlib.
+	name := filepath.Join(d.Path...) + ".zx"
+	for _, cand := range []string{filepath.Join(dir, name), filepath.Join(dir, "lib", name)} {
+		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+			l.loadDiskFile(cand)
+			return
+		}
+	}
+	if _, err := fs.Stat(stdFS, path.Join("std", filepath.ToSlash(name))); err == nil {
+		l.loadStdFile(d.Path[len(d.Path)-1])
+		return
+	}
+	l.em.Report(diag.New("E9022", "cannot find a library named `%s` (looked for %s next to the importing file, in its lib/ folder, and in the standard library)", strings.Join(d.Path, "::"), name).WithSpan(d.Sp))
 }
 
 // Tokens returns the token stream for a file, for the `tokenize` command.

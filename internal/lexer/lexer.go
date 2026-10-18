@@ -55,6 +55,8 @@ func (l *Lexer) Next() token.Token {
 	// Prefix forms must be checked before the generic identifier case.
 	case c == 'r' && l.atRawString():
 		return l.scanRawString(startPos, startOff)
+	case c == 'f' && l.peekAt(1) == '"':
+		return l.scanFString(startPos, startOff)
 	case c == 'b' && l.peekAt(1) == '\'':
 		return l.scanChar(startPos, startOff, true)
 	case isIdentStart(c):
@@ -86,6 +88,16 @@ func (l *Lexer) skipTrivia() {
 				l.skipBlockComment()
 			} else {
 				return
+			}
+		case '#':
+			// A `#` that does not open an attribute (`#[...]`) starts a
+			// Python-style line comment. This also covers `#!` shebang
+			// lines at the top of a script.
+			if l.peekAt(1) == '[' {
+				return
+			}
+			for !l.atEnd() && l.peek() != '\n' {
+				l.advance()
 			}
 		default:
 			return
@@ -248,6 +260,35 @@ func (l *Lexer) scanString(startPos token.Position, startOff int) token.Token {
 	// Lit is the inner text (quotes excluded); escapes are decoded downstream.
 	inner := l.innerLit(startOff)
 	return l.tok(token.KindString, inner, startPos, startOff)
+}
+
+// scanFString scans an interpolated string `f"..."`. The literal keeps its
+// raw inner text (escapes and `{expr}` holes intact); the parser splits it
+// into literal chunks and expressions.
+func (l *Lexer) scanFString(startPos token.Position, startOff int) token.Token {
+	l.advance() // 'f'
+	l.advance() // opening quote
+	for {
+		if l.atEnd() {
+			l.errorf("E0001", startPos, "unterminated string literal")
+			break
+		}
+		c := l.advance()
+		if c == '\\' {
+			l.advance() // skip the escaped byte; decoding happens later
+			continue
+		}
+		if c == '"' {
+			break
+		}
+		if c == '\n' {
+			l.errorf("E0001", startPos, "unterminated string literal")
+			break
+		}
+	}
+	// Lit is the inner text (the `f"` prefix and closing quote excluded).
+	inner := l.safeSlice(startOff+2, l.off-1)
+	return l.tok(token.KindFString, inner, startPos, startOff)
 }
 
 // atRawString reports whether the cursor is at a raw string: `r"..."`,

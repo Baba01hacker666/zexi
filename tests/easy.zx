@@ -1,0 +1,60 @@
+#!/usr/bin/env zexi
+# easy.zx — writing Zexi the easy way: Python-style `#` comments next to
+# `//` comments, no semicolons needed at line ends, string interpolation,
+// default and named arguments, and libraries via `use`.
+
+use std::math;
+use text;
+use "easy_lib.zx";
+
+// Default arguments: callers may omit `punct` and `times`.
+fn greet(name: str, punct: str = "!", times: i64 = 1) -> String {
+    let base = f"hello, {name}{punct}"
+    if times > 1 { f"{base} x{times}" } else { base }
+}
+
+fn area(w: i64, h: i64 = 10) -> i64 {
+    w * h
+}
+
+// No return type and no `-> i32`: a function that returns nothing
+// needs no annotation, and `main` is happy with that too.
+fn main() {
+    println(greet("bob"))
+    println(greet(name = "ada", times = 2, punct = "?"))
+    println(greet("cy", times = 3))
+
+    println(area(5))
+    println(area(5, h = 3))
+    println(area(h = 4, w = 2))
+
+    println(triple(7))
+    println(welcome("zexi"))
+
+    println(clampi(15, 0, 10))
+    println(gcdi(12, 18))
+    println(powi(2, 10))
+    println(repeat_text("ab", 3))
+    println(pad_start("42", 5, '0'))
+
+    let who = "world"
+    let n = 3
+    println(f"{who} #{n} {{ok}}")
+    println(f"pi~{3.5} ok={true} grade={'A'}")
+
+    let big = 40 +
+        2
+    println(big)
+
+    let mut total = 0
+    for i in 1..4 {
+        total += i
+    }
+    println(total)
+
+    let mut i = 0
+    while i < 3 {
+        i += 1
+    }
+    println(i)
+}

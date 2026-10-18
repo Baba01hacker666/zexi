@@ -20,6 +20,7 @@ const (
 	KindFloat
 	KindString
 	KindRawString
+	KindFString
 	KindChar
 	KindByteChar
 
@@ -179,6 +180,7 @@ var kindNames = map[Kind]string{
 	KindFloat:      "float literal",
 	KindString:     "string literal",
 	KindRawString:  "raw string literal",
+	KindFString:    "interpolated string literal",
 	KindChar:       "char literal",
 	KindByteChar:   "byte literal",
 	KindAs:         "as",

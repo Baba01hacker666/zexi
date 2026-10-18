@@ -26,11 +26,17 @@ type Fn struct {
 	Name     string
 	QualName string // "Point::len_sq" for methods, else Name
 	Params   []*types.Type
-	Ret      *types.Type
-	Self     *SelfParam
-	Recv     *types.Type // receiver type for methods (struct or enum), else nil
-	Extern   bool
-	ABI      string
+	// ParamNames and Defaults are aligned with Params (the receiver, when
+	// present, occupies slot 0 with an empty name and no default).
+	// Defaults[i] is the materialized literal for parameter i's default
+	// value, or nil when the argument is required.
+	ParamNames []string
+	Defaults   []ast.Expr
+	Ret        *types.Type
+	Self       *SelfParam
+	Recv       *types.Type // receiver type for methods (struct or enum), else nil
+	Extern     bool
+	ABI        string
 }
 
 // SelfParam describes a method receiver.
@@ -533,6 +539,47 @@ func (c *checker) makeFn(d *ast.FnDecl, recv *types.Type) *Fn {
 		}
 		fn.Params = append(fn.Params, pt)
 	}
+	// Parameter names and default values, aligned with Params. A default
+	// must be a constant expression (a literal, a `const`, or arithmetic
+	// over those); it is materialized once, here, as a literal that call
+	// sites can substitute for an omitted argument.
+	seenDefault := false
+	for _, p := range d.Params {
+		if p.Self {
+			fn.ParamNames = append(fn.ParamNames, "")
+			fn.Defaults = append(fn.Defaults, nil)
+			continue
+		}
+		fn.ParamNames = append(fn.ParamNames, p.Name)
+		fn.Defaults = append(fn.Defaults, nil)
+		if p.Default == nil {
+			if seenDefault {
+				c.errf(p.Sp, "E0061", "parameter `%s` without a default value follows a parameter with one", p.Name)
+			}
+			continue
+		}
+		seenDefault = true
+		pt := fn.Params[len(fn.ParamNames)-1]
+		if lit, ok := p.Default.(*ast.LiteralExpr); ok {
+			// A literal default stands as-is; check it against the
+			// parameter type once, here, so a bad default is reported
+			// even if the function is never called.
+			c.checkExpr(lit, pt)
+			fn.Defaults[len(fn.Defaults)-1] = lit
+			continue
+		}
+		cv, ok := c.evalConst(p.Default)
+		if !ok {
+			c.errf(p.Default.Span(), "E0602", "default value for parameter `%s` is not a constant expression", p.Name)
+			continue
+		}
+		lit := constLiteralFor(cv, pt, p.Default.Span())
+		if lit == nil {
+			c.errf(p.Default.Span(), "E0602", "default value for parameter `%s` cannot be used as `%s`", p.Name, pt)
+			continue
+		}
+		fn.Defaults[len(fn.Defaults)-1] = lit
+	}
 	if d.Ret != nil {
 		fn.Ret = c.resolveType(d.Ret)
 	}
@@ -948,6 +995,26 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		return c.inferField(x)
 	case *ast.MethodCallExpr:
 		return c.inferMethodCall(x)
+	case *ast.InterpStrExpr:
+		// `f"...{expr}..."`: literal chunks are plain strings; every
+		// interpolated expression must have a printable type. The result
+		// is an owning `String`.
+		for _, part := range x.Parts {
+			at := c.checkExpr(part, nil)
+			if _, isLit := part.(*ast.LiteralExpr); isLit {
+				continue
+			}
+			if at != nil && at.Kind != types.Invalid && !isPrintable(at) {
+				c.errAt(part, "E0277", "value of type `%s` cannot be interpolated into a string", at)
+			}
+		}
+		return types.StringT
+	case *ast.NamedArgExpr:
+		// Named arguments are rewritten by resolveArgs before their
+		// values are checked; reaching here means the call target does
+		// not accept them (a builtin, constructor, or variant).
+		c.errAt(x, "E0061", "named arguments are only supported for function and method calls")
+		return c.checkExpr(x.Val, nil)
 	case *ast.StructLitExpr:
 		return c.inferStructLit(x)
 	case *ast.IndexExpr:
@@ -1322,10 +1389,102 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 	return c.checkCallArgs(x, fn, fmt.Sprintf("function `%s`", name))
 }
 
+// resolveArgs rewrites a call's argument list into plain positional
+// order: named arguments (`name = value`) are matched to parameters by
+// name, and omitted trailing parameters that have defaults are filled
+// with their default literals. names/defaults are aligned with the
+// callee's value parameters. When the call is already plain positional
+// with the right arity it is returned unchanged, so the caller's arity
+// diagnostic still fires for malformed calls.
+func (c *checker) resolveArgs(sp token.Span, args []ast.Expr, names []string, defaults []ast.Expr, label string) []ast.Expr {
+	hasNamed := false
+	for _, a := range args {
+		if _, ok := a.(*ast.NamedArgExpr); ok {
+			hasNamed = true
+			break
+		}
+	}
+	if !hasNamed {
+		if len(args) == len(names) {
+			return args
+		}
+		if len(args) < len(names) {
+			filled := make([]ast.Expr, len(names))
+			copy(filled, args)
+			ok := true
+			for i := len(args); i < len(names); i++ {
+				if defaults[i] == nil {
+					ok = false
+					break
+				}
+				filled[i] = defaults[i]
+			}
+			if ok {
+				return filled
+			}
+		}
+		return args
+	}
+	out := make([]ast.Expr, len(names))
+	seen := make([]bool, len(names))
+	pos := 0
+	for _, a := range args {
+		if na, ok := a.(*ast.NamedArgExpr); ok {
+			idx := -1
+			for i, n := range names {
+				if n == na.Name {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				c.errf(na.Sp, "E0061", "%s has no parameter named `%s`", label, na.Name)
+				continue
+			}
+			if seen[idx] {
+				c.errf(na.Sp, "E0062", "argument `%s` was specified more than once", na.Name)
+				continue
+			}
+			seen[idx] = true
+			out[idx] = na.Val
+			continue
+		}
+		if pos >= len(names) {
+			break // the arity check below reports this
+		}
+		// Find the next unfilled slot for this positional argument; a
+		// positional argument may not follow a named one for a slot
+		// that a named argument already claimed out of order.
+		for pos < len(names) && seen[pos] {
+			pos++
+		}
+		if pos >= len(names) {
+			break
+		}
+		seen[pos] = true
+		out[pos] = a
+		pos++
+	}
+	for i := range out {
+		if out[i] == nil && defaults != nil && defaults[i] != nil {
+			out[i] = defaults[i]
+			seen[i] = true
+		}
+	}
+	for i := range out {
+		if out[i] == nil {
+			c.errf(sp, "E0061", "%s is missing an argument for parameter `%s`", label, names[i])
+			out[i] = &ast.LiteralExpr{Kind: token.KindInteger, Text: "0", Sp: sp}
+		}
+	}
+	return out
+}
+
 // checkCallArgs records the resolved callee, checks a call's arguments against
 // its parameter list, and returns the callee's return type.
 func (c *checker) checkCallArgs(x *ast.CallExpr, fn *Fn, label string) *types.Type {
 	c.info.Resolved[x] = fn
+	x.Args = c.resolveArgs(x.Sp, x.Args, fn.ParamNames, fn.Defaults, label)
 	if len(x.Args) != len(fn.Params) {
 		c.errAt(x, "E0061", "%s takes %d argument(s) but %d were supplied", label, len(fn.Params), len(x.Args))
 	}
@@ -2005,9 +2164,14 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 	}
 	c.info.Resolved[x] = m
 	want := m.Params
+	names, defaults := m.ParamNames, m.Defaults
 	if m.Self != nil && len(want) > 0 {
 		want = want[1:] // skip the receiver
+		if len(names) > 0 {
+			names, defaults = names[1:], defaults[1:]
+		}
 	}
+	x.Args = c.resolveArgs(x.Sp, x.Args, names, defaults, fmt.Sprintf("method `%s::%s`", nominalName(base), x.Name))
 	if len(x.Args) != len(want) {
 		c.errAt(x, "E0061", "method `%s::%s` takes %d argument(s) but %d were supplied", nominalName(base), x.Name, len(want), len(x.Args))
 	}
@@ -2631,6 +2795,101 @@ type ConstVal struct {
 	// Untyped marks an integer value that came from a bare literal (defaulting
 	// to `i32`) and may still adopt an explicit integer type.
 	Untyped bool
+}
+
+// constLiteralFor materializes a folded constant as a literal expression
+// of the given parameter type, for use as a call-site default argument.
+// It returns nil when the value cannot be a literal of that type.
+func constLiteralFor(cv ConstVal, pt *types.Type, sp token.Span) ast.Expr {
+	invalid := pt == nil || pt.Kind == types.Invalid
+	switch {
+	case cv.IsStr:
+		if !invalid && pt.Kind != types.Str && pt.Kind != types.StringKind {
+			return nil
+		}
+		text := cv.Str
+		if cv.Raw {
+			text = escapeStringLit(cv.Str)
+		}
+		return &ast.LiteralExpr{Kind: token.KindString, Text: text, Sp: sp}
+	case cv.IsBool:
+		if !invalid && pt.Kind != types.Bool {
+			return nil
+		}
+		kind := token.KindFalse
+		if cv.Bool {
+			kind = token.KindTrue
+		}
+		return &ast.LiteralExpr{Kind: kind, Sp: sp}
+	case cv.IsFloat:
+		if !invalid && !pt.Kind.IsFloat() {
+			return nil
+		}
+		return &ast.LiteralExpr{Kind: token.KindFloat, Text: strconv.FormatFloat(cv.Float, 'g', -1, 64), Sp: sp}
+	default:
+		if !invalid && pt.Kind == types.Char {
+			r := rune(cv.Int)
+			if !utf8.ValidRune(r) {
+				return nil
+			}
+			return &ast.LiteralExpr{Kind: token.KindChar, Text: escapeCharLit(r), Sp: sp}
+		}
+		if !invalid && !pt.Kind.IsInt() {
+			return nil
+		}
+		text := strconv.FormatInt(cv.Int, 10)
+		if !invalid && pt.Kind.IsUnsigned() {
+			text = strconv.FormatUint(cv.Uint, 10)
+		}
+		return &ast.LiteralExpr{Kind: token.KindInteger, Text: text, Sp: sp}
+	}
+}
+
+// escapeStringLit renders a decoded string as the inner text of a string
+// literal (without the surrounding quotes).
+func escapeStringLit(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString("\\\"")
+		case '\\':
+			b.WriteString("\\\\")
+		case '\n':
+			b.WriteString("\\n")
+		case '\t':
+			b.WriteString("\\t")
+		case '\r':
+			b.WriteString("\\r")
+		default:
+			if r < 0x20 {
+				fmt.Fprintf(&b, "\\u{%X}", r)
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String()
+}
+
+// escapeCharLit renders a rune as the inner text of a char literal.
+func escapeCharLit(r rune) string {
+	switch r {
+	case '\'':
+		return "\\'"
+	case '\\':
+		return "\\\\"
+	case '\n':
+		return "\\n"
+	case '\t':
+		return "\\t"
+	case '\r':
+		return "\\r"
+	}
+	if r < 0x20 {
+		return fmt.Sprintf("\\u{%X}", r)
+	}
+	return string(r)
 }
 
 // evalConst folds a constant expression, supporting literals, unary minus, and

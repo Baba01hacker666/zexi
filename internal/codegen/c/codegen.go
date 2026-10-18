@@ -1052,6 +1052,9 @@ func (g *gen) value(e ast.Expr) string {
 	case *ast.CallExpr:
 		return g.callValue(x)
 
+	case *ast.InterpStrExpr:
+		return g.interpStrValue(x)
+
 	case *ast.IfExpr:
 		return g.ifValue(x)
 
@@ -1311,7 +1314,10 @@ func (g *gen) ifValue(x *ast.IfExpr) string {
 // value, wrapped as a statement expression.
 func (g *gen) branchValue(b *ast.Block, t *types.Type) string {
 	if len(b.Stmts) == 0 && b.Tail != nil {
-		return g.value(b.Tail)
+		// Consume, like blockValue does: a resource-owning place used as
+		// a branch value must move, or both the place and the branch
+		// result would own (and drop) the same buffer.
+		return g.consume(b.Tail)
 	}
 	return g.blockValue(b)
 }
@@ -2159,6 +2165,51 @@ func (g *gen) literal(x *ast.LiteralExpr) string {
 	return "0"
 }
 
+// interpStrValue lowers `f"...{expr}..."` to a GNU statement expression
+// that builds a fresh `String` part by part. Interpolated values are only
+// read, never moved: a `String` place is borrowed through its `str` view,
+// and a computed `String` is dropped after its text is copied out.
+func (g *gen) interpStrValue(x *ast.InterpStrExpr) string {
+	s := g.tmpName()
+	var b strings.Builder
+	b.WriteString("({ zx_String " + s + " = zx_string_new();")
+	for _, part := range x.Parts {
+		// Literal chunks are always string literals; an interpolated
+		// literal (`{3.5}`, `{true}`) goes through the typed switch.
+		if lit, ok := part.(*ast.LiteralExpr); ok && lit.Kind == token.KindString {
+			b.WriteString(" zx_string_push_str(&" + s + ", " + g.literal(lit) + ");")
+			continue
+		}
+		t := g.info.TypeOf(part)
+		v := g.value(part)
+		switch {
+		case t == nil || t.Kind == types.Invalid:
+			// Already diagnosed by the checker.
+		case t.Kind == types.Str:
+			b.WriteString(" zx_string_push_str(&" + s + ", " + v + ");")
+		case t.Kind == types.StringKind:
+			if isPlaceExpr(part) {
+				b.WriteString(" zx_string_push_str(&" + s + ", zx_string_as_str(&(" + v + ")));")
+			} else {
+				tm := g.tmpName()
+				b.WriteString(" { zx_String " + tm + " = " + v + "; zx_string_push_str(&" + s + ", zx_string_as_str(&" + tm + ")); zx_drop_String(&" + tm + "); }")
+			}
+		case t.Kind.IsInt() && t.Kind.IsSigned():
+			b.WriteString(" zx_string_push_i64(&" + s + ", (int64_t)(" + v + "));")
+		case t.Kind.IsInt():
+			b.WriteString(" zx_string_push_u64(&" + s + ", (uint64_t)(" + v + "));")
+		case t.Kind.IsFloat():
+			b.WriteString(" zx_string_push_f64(&" + s + ", (double)(" + v + "));")
+		case t.Kind == types.Bool:
+			b.WriteString(" zx_string_push_str(&" + s + ", (" + v + ") ? \"true\" : \"false\");")
+		case t.Kind == types.Char:
+			b.WriteString(" zx_string_push(&" + s + ", (uint32_t)(" + v + "));")
+		}
+	}
+	b.WriteString(" " + s + "; })")
+	return b.String()
+}
+
 // --- naming ---------------------------------------------------------------
 
 var cKeywords = map[string]bool{
@@ -2702,6 +2753,22 @@ static void zx_string_push_str(zx_String *s, const char *p) {
     /* memmove: the source may overlap the destination (self-append). */
     memmove(s->ptr + s->len, src, n + 1);
     s->len += n;
+}
+
+static void zx_string_push_i64(zx_String *s, int64_t v) {
+    char buf[32];
+    snprintf(buf, sizeof buf, "%lld", (long long)v);
+    zx_string_push_str(s, buf);
+}
+static void zx_string_push_u64(zx_String *s, uint64_t v) {
+    char buf[32];
+    snprintf(buf, sizeof buf, "%llu", (unsigned long long)v);
+    zx_string_push_str(s, buf);
+}
+static void zx_string_push_f64(zx_String *s, double v) {
+    char buf[64];
+    snprintf(buf, sizeof buf, "%g", v);
+    zx_string_push_str(s, buf);
 }
 
 static int zx_utf8_encode(unsigned int c, char *out) {
