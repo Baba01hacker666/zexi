@@ -1,0 +1,1438 @@
+// http — a high-level HTTP/1.x client and server for Zexi.
+//
+// Client (urllib/requests-flavoured):
+//
+//     use http;
+//
+//     fn main() {
+//         let r = fetch("http://example.com/");
+//         if r.ok() {
+//             println(r.status);
+//             println(r.body);
+//         } else {
+//             println(r.error);
+//         }
+//     }
+//
+// `Client` adds timeouts, extra headers, redirect following, and the usual
+// verbs. URLs are parsed with `parse_url`; query/form values are decoded for
+// you. Connections are plaintext HTTP only — `https://` reports an error.
+//
+// Server (microhttpd-flavoured):
+//
+//     let srv = listen("127.0.0.1", 8080);
+//     loop {
+//         let c = srv.accept();
+//         let req = read_request(&c);
+//         if !req.valid() { c.close(); continue; }
+//         let mut res = Response::html(200, "<h1>hi</h1>");
+//         res.set_header("X-Route", req.path_only().as_str());
+//         send_response(&c, &res);
+//         c.close();
+//     }
+//
+// Bodies are framed by Content-Length or chunked encoding (responses) and
+// Content-Length (requests); reads are bounded and client I/O has a timeout.
+
+use net;
+
+// File helpers live in the same C runtime as sockets. They are declared here
+// (rather than in `net`) so only programs that use HTTP pull them in.
+extern "C" fn zxn_file_open(path: str) -> i64;
+extern "C" fn zxn_file_read(handle: i64, buf: &mut [u8; 8192], cap: i32) -> i32;
+extern "C" fn zxn_file_close(handle: i64) -> i32;
+extern "C" fn zxn_file_size(path: str) -> i64;
+extern "C" fn zxn_write_file(path: str, buf: str, n: i32) -> i32;
+
+// --- limits and defaults ---------------------------------------------------
+
+// MAX_BODY caps how much response/request body is buffered.
+const MAX_BODY: usize = 16777216;
+// MAX_FILE caps a single static file or download.
+const MAX_FILE: usize = 33554432;
+// DEFAULT_TIMEOUT_MS bounds blocking I/O on client connections.
+const DEFAULT_TIMEOUT_MS: i32 = 30000;
+// DEFAULT_MAX_REDIRECTS is how many redirect hops a client follows.
+const DEFAULT_MAX_REDIRECTS: i32 = 5;
+
+// --- URLs ------------------------------------------------------------------
+
+pub struct Url {
+    pub scheme: String,
+    pub host: String,
+    pub port: i32,
+    // path has no query string; it starts with "/".
+    pub path: String,
+    // query is the raw text after "?" (not decoded).
+    pub query: String,
+    // error is non-empty when the URL could not be parsed.
+    pub error: String,
+}
+
+impl Url {
+    pub fn valid(&self) -> bool {
+        return self.error.len() == 0 && self.host.len() > 0;
+    }
+
+    // target is the request-target: path plus "?query" when present.
+    pub fn target(&self) -> String {
+        let mut out = self.path.clone();
+        if self.query.len() > 0 {
+            out.push_byte(63); // '?'
+            out.push_str(self.query.as_str());
+        }
+        return out;
+    }
+
+    // host_port is the Host header value, omitting the default port.
+    pub fn host_port(&self) -> String {
+        let mut out = self.host.clone();
+        if self.port != 80 {
+            out.push_byte(58); // ':'
+            push_int(&mut out, self.port as i64);
+        }
+        return out;
+    }
+
+    // origin is "http://host[:port]", used to resolve relative redirects.
+    pub fn origin(&self) -> String {
+        let mut out = String::from("http://");
+        let hp = self.host_port();
+        out.push_str(hp.as_str());
+        return out;
+    }
+}
+
+// parse_url splits an absolute http:// URL into its parts. On failure the
+// returned Url has a non-empty error and valid() is false.
+pub fn parse_url(raw: str) -> Url {
+    let s = String::from(raw);
+    let sep = s.find("://");
+    if sep < 0 {
+        return empty_url("missing URL scheme (expected http://host/path)");
+    }
+    let scheme_raw = s.substr(0, sep as usize);
+    let scheme = lower(&scheme_raw);
+    if scheme.as_str() != "http" {
+        if scheme.as_str() == "https" {
+            return empty_url("https is not supported (this client is plaintext HTTP only)");
+        }
+        return empty_url("unsupported URL scheme");
+    }
+
+    let after = s.substr((sep + 3) as usize, 4294967295);
+    let hash = after.find("#");
+    let rest = if hash < 0 { after } else { after.substr(0, hash as usize) };
+
+    // The authority ends at the first "/" or "?".
+    let slash = rest.find("/");
+    let qmark = rest.find("?");
+    let mut auth_end = rest.len();
+    if slash >= 0 && (slash as usize) < auth_end {
+        auth_end = slash as usize;
+    }
+    if qmark >= 0 && (qmark as usize) < auth_end {
+        auth_end = qmark as usize;
+    }
+    let authority = rest.substr(0, auth_end);
+    let tail = rest.substr(auth_end, 4294967295);
+
+    if authority.len() == 0 {
+        return empty_url("missing host in URL");
+    }
+
+    let colon = authority.find(":");
+    let host = if colon < 0 { authority.clone() } else { authority.substr(0, colon as usize) };
+    if host.len() == 0 {
+        return empty_url("missing host in URL");
+    }
+
+    let mut port: i32 = 80;
+    if colon >= 0 {
+        let ps = authority.substr((colon + 1) as usize, 4294967295);
+        let p = parse_dec(&ps);
+        if p <= 0 || p > 65535 {
+            return empty_url("invalid port in URL");
+        }
+        port = p as i32;
+    }
+
+    let mut path = String::from("/");
+    let mut query = String::new();
+    if tail.len() > 0 {
+        if tail.starts_with("/") {
+            let q = tail.find("?");
+            if q < 0 {
+                path = tail;
+            } else {
+                path = tail.substr(0, q as usize);
+                query = tail.substr((q + 1) as usize, 4294967295);
+            }
+        } else {
+            // tail starts with "?": no path was given.
+            query = tail.substr(1, 4294967295);
+        }
+    }
+    return Url { scheme: scheme, host: host, port: port, path: path, query: query, error: String::new() };
+}
+
+fn empty_url(err: str) -> Url {
+    return Url {
+        scheme: String::from("http"), host: String::new(), port: 80,
+        path: String::from("/"), query: String::new(), error: String::from(err),
+    };
+}
+
+// url_encode percent-encodes a value for use in a query string.
+pub fn url_encode(s: str) -> String {
+    let v = String::from(s);
+    let mut out = String::new();
+    let mut i: usize = 0;
+    while i < v.len() {
+        let b = v.byte_at(i);
+        if is_unreserved(b) {
+            out.push_byte(b as u8);
+        } else {
+            out.push_byte(37); // '%'
+            out.push_byte(hex_digit((b >> 4) & 15));
+            out.push_byte(hex_digit(b & 15));
+        }
+        i += 1;
+    }
+    return out;
+}
+
+// url_decode decodes %XX escapes and '+' as space.
+pub fn url_decode(s: str) -> String {
+    let v = String::from(s);
+    let mut out = String::new();
+    let mut i: usize = 0;
+    while i < v.len() {
+        let b = v.byte_at(i);
+        if b == 43 {
+            out.push_byte(32);
+            i += 1;
+        } else if b == 37 && i + 2 < v.len() {
+            let hi = hex_value(v.byte_at(i + 1));
+            let lo = hex_value(v.byte_at(i + 2));
+            if hi >= 0 && lo >= 0 {
+                out.push_byte((hi * 16 + lo) as u8);
+                i += 3;
+            } else {
+                out.push_byte(37);
+                i += 1;
+            }
+        } else {
+            out.push_byte(b as u8);
+            i += 1;
+        }
+    }
+    return out;
+}
+
+fn is_unreserved(b: i64) -> bool {
+    if b >= 48 && b <= 57 {
+        return true;
+    }
+    if b >= 65 && b <= 90 {
+        return true;
+    }
+    if b >= 97 && b <= 122 {
+        return true;
+    }
+    return b == 45 || b == 46 || b == 95 || b == 126;
+}
+
+fn hex_digit(n: i64) -> u8 {
+    if n < 10 {
+        return (48 + n) as u8;
+    }
+    return (55 + n) as u8;
+}
+
+fn hex_value(b: i64) -> i64 {
+    if b >= 48 && b <= 57 {
+        return b - 48;
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55;
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87;
+    }
+    return -1;
+}
+
+// query_value returns the decoded value of `name` in a raw query string, or
+// "" when absent. Works for both query strings and form bodies.
+pub fn query_value(raw: &String, name: str) -> String {
+    let want = String::from(name);
+    let mut pos: usize = 0;
+    while pos <= raw.len() {
+        let rest = raw.substr(pos, 4294967295);
+        let amp = rest.find("&");
+        let pair = if amp < 0 { rest.clone() } else { rest.substr(0, amp as usize) };
+        let eq = pair.find("=");
+        let key_raw = if eq < 0 { pair.clone() } else { pair.substr(0, eq as usize) };
+        let val_raw = if eq < 0 { String::new() } else { pair.substr((eq + 1) as usize, 4294967295) };
+        let key = url_decode(key_raw.as_str());
+        if key.as_str() == want.as_str() {
+            return url_decode(val_raw.as_str());
+        }
+        if amp < 0 {
+            break;
+        }
+        pos = pos + (amp as usize) + 1;
+    }
+    return String::new();
+}
+
+// --- model -----------------------------------------------------------------
+
+pub struct Request {
+    pub method: String,
+    // path includes the query string, as sent by the client.
+    pub path: String,
+    pub version: String,
+    // headers is the raw head block after the request line.
+    pub headers: String,
+    pub body: String,
+}
+
+pub struct Response {
+    pub status: i32,
+    pub reason: String,
+    // headers holds raw extra header lines (each ending in CRLF) for an
+    // outgoing response; for a parsed response it is the raw header block.
+    pub headers: String,
+    pub body: String,
+    pub content_type: String,
+    // error explains a client-side failure (status is 0 in that case).
+    pub error: String,
+    // keep_alive asks send_response to advertise a persistent connection.
+    pub keep_alive: bool,
+}
+
+impl Request {
+    // header returns the value of the named header (case-insensitive), or "".
+    pub fn header(&self, name: str) -> String {
+        return header_value(&self.headers, name);
+    }
+
+    // content_length returns Content-Length, or -1 when absent or invalid.
+    pub fn content_length(&self) -> i64 {
+        let value = header_value(&self.headers, "Content-Length");
+        return parse_dec(&value);
+    }
+
+    // body_complete reports whether the whole declared body was read.
+    pub fn body_complete(&self) -> bool {
+        let want = self.content_length();
+        if want < 0 {
+            return true;
+        }
+        return (self.body.len() as i64) >= want;
+    }
+
+    // body_too_large reports a Content-Length above the buffering cap.
+    pub fn body_too_large(&self) -> bool {
+        let want = self.content_length();
+        return want > MAX_BODY as i64;
+    }
+
+    // valid reports whether a request line was parsed.
+    pub fn valid(&self) -> bool {
+        return self.method.len() > 0;
+    }
+
+    // path_only is the path without its query string.
+    pub fn path_only(&self) -> String {
+        let q = self.path.find("?");
+        if q < 0 {
+            return self.path.clone();
+        }
+        return self.path.substr(0, q as usize);
+    }
+
+    // raw_query is the undecoded query string ("" when absent).
+    pub fn raw_query(&self) -> String {
+        let q = self.path.find("?");
+        if q < 0 {
+            return String::new();
+        }
+        return self.path.substr((q + 1) as usize, 4294967295);
+    }
+
+    // query returns a decoded query-string parameter.
+    pub fn query(&self, name: str) -> String {
+        let q = self.raw_query();
+        return query_value(&q, name);
+    }
+
+    // cookie returns the value of a Cookie header pair ("sid=abc" -> "abc").
+    pub fn cookie(&self, name: str) -> String {
+        let header = self.header("Cookie");
+        let want = String::from(name);
+        let mut pos: usize = 0;
+        while pos <= header.len() {
+            let rest = header.substr(pos, 4294967295);
+            let semi = rest.find(";");
+            let pair = if semi < 0 { rest.clone() } else { rest.substr(0, semi as usize) };
+            let eq = pair.find("=");
+            if eq >= 0 {
+                let key = pair.substr(0, eq as usize).trim();
+                if key.as_str() == want.as_str() {
+                    return pair.substr((eq + 1) as usize, 4294967295).trim();
+                }
+            }
+            if semi < 0 {
+                break;
+            }
+            pos = pos + (semi as usize) + 1;
+        }
+        return String::new();
+    }
+
+    // param looks in the query string first, then in an
+    // application/x-www-form-urlencoded body.
+    pub fn param(&self, name: str) -> String {
+        let q = self.raw_query();
+        let v = query_value(&q, name);
+        if v.len() > 0 {
+            return v;
+        }
+        let ct = self.header("Content-Type");
+        let ct_l = lower(&ct);
+        if ct_l.contains("application/x-www-form-urlencoded") {
+            return query_value(&self.body, name);
+        }
+        return String::new();
+    }
+
+    // wants_keep_alive reports whether the client asked to reuse the socket.
+    pub fn wants_keep_alive(&self) -> bool {
+        let cv = self.header("Connection");
+        let conn = lower(&cv);
+        if conn.contains("close") {
+            return false;
+        }
+        if self.version.as_str() == "HTTP/1.0" {
+            return conn.contains("keep-alive");
+        }
+        return true;
+    }
+}
+
+impl Response {
+    // new builds a text/plain response.
+    pub fn new(status: i32, body: str) -> Response {
+        return Response {
+            status: status,
+            reason: String::from(reason_phrase(status)),
+            headers: String::new(),
+            body: String::from(body),
+            content_type: String::from("text/plain; charset=utf-8"),
+            error: String::new(),
+            keep_alive: false,
+        };
+    }
+
+    // from_string takes an owning body without round-tripping through `str`,
+    // so binary data (including NUL bytes) survives intact.
+    pub fn from_string(status: i32, body: String) -> Response {
+        return Response {
+            status: status,
+            reason: String::from(reason_phrase(status)),
+            headers: String::new(),
+            body: body,
+            content_type: String::from("text/plain; charset=utf-8"),
+            error: String::new(),
+            keep_alive: false,
+        };
+    }
+
+    pub fn text(status: i32, body: str) -> Response {
+        return Response::new(status, body);
+    }
+
+    pub fn html(status: i32, body: str) -> Response {
+        let mut r = Response::new(status, body);
+        r.content_type = String::from("text/html; charset=utf-8");
+        return r;
+    }
+
+    pub fn json(status: i32, body: str) -> Response {
+        let mut r = Response::new(status, body);
+        r.content_type = String::from("application/json");
+        return r;
+    }
+
+    pub fn empty(status: i32) -> Response {
+        return Response::new(status, "");
+    }
+
+    // redirect builds a 302 with a Location header.
+    pub fn redirect(location: str) -> Response {
+        let mut r = Response::empty(302);
+        r.set_header("Location", location);
+        return r;
+    }
+
+    // set_header appends an extra header, ignoring CR/LF injection.
+    pub fn set_header(&mut self, name: str, value: str) {
+        if contains_crlf(name) || contains_crlf(value) {
+            return;
+        }
+        self.headers.push_str(name);
+        self.headers.push_str(": ");
+        self.headers.push_str(value);
+        self.headers.push_str("\r\n");
+    }
+
+    // set_cookie appends a Set-Cookie header for a simple name=value pair.
+    pub fn set_cookie(&mut self, name: str, value: str) {
+        if contains_crlf(name) || contains_crlf(value) {
+            return;
+        }
+        let mut cookie = String::from(name);
+        cookie.push_byte(61); // '='
+        cookie.push_str(value);
+        self.set_header("Set-Cookie", cookie.as_str());
+    }
+
+    // header returns the value of the named header (case-insensitive), or "".
+    pub fn header(&self, name: str) -> String {
+        return header_value(&self.headers, name);
+    }
+
+    // content_length returns Content-Length, or -1 when absent or invalid.
+    pub fn content_length(&self) -> i64 {
+        let value = header_value(&self.headers, "Content-Length");
+        return parse_dec(&value);
+    }
+
+    // valid reports whether a status line was parsed.
+    pub fn valid(&self) -> bool {
+        return self.status > 0;
+    }
+
+    // ok reports a 2xx status.
+    pub fn ok(&self) -> bool {
+        return self.status >= 200 && self.status < 300;
+    }
+}
+
+// --- server ----------------------------------------------------------------
+
+// reason_phrase returns the conventional reason phrase for a status code.
+pub fn reason_phrase(status: i32) -> str {
+    if status == 200 { return "OK"; }
+    if status == 201 { return "Created"; }
+    if status == 202 { return "Accepted"; }
+    if status == 204 { return "No Content"; }
+    if status == 206 { return "Partial Content"; }
+    if status == 301 { return "Moved Permanently"; }
+    if status == 302 { return "Found"; }
+    if status == 303 { return "See Other"; }
+    if status == 304 { return "Not Modified"; }
+    if status == 307 { return "Temporary Redirect"; }
+    if status == 308 { return "Permanent Redirect"; }
+    if status == 400 { return "Bad Request"; }
+    if status == 401 { return "Unauthorized"; }
+    if status == 403 { return "Forbidden"; }
+    if status == 404 { return "Not Found"; }
+    if status == 405 { return "Method Not Allowed"; }
+    if status == 409 { return "Conflict"; }
+    if status == 413 { return "Payload Too Large"; }
+    if status == 415 { return "Unsupported Media Type"; }
+    if status == 422 { return "Unprocessable Entity"; }
+    if status == 429 { return "Too Many Requests"; }
+    if status == 500 { return "Internal Server Error"; }
+    if status == 501 { return "Not Implemented"; }
+    if status == 502 { return "Bad Gateway"; }
+    if status == 503 { return "Service Unavailable"; }
+    if status == 504 { return "Gateway Timeout"; }
+    return "OK";
+}
+
+// response renders a complete text/plain response with Connection: close.
+pub fn response(status: i32, reason: str, body: str) -> String {
+    return response_type(status, reason, "text/plain; charset=utf-8", body);
+}
+
+// response_type renders a response with an explicit Content-Type.
+pub fn response_type(status: i32, reason: str, content_type: str, body: str) -> String {
+    let mut r = Response::new(status, body);
+    r.reason = String::from(reason);
+    r.content_type = String::from(content_type);
+    return render_response(&r);
+}
+
+// response_head serializes the status line and headers, ending with the blank
+// line that separates them from the body.
+pub fn response_head(r: &Response) -> String {
+    let mut out = String::new();
+    out.push_str("HTTP/1.1 ");
+    push_int(&mut out, r.status as i64);
+    out.push_str(" ");
+    if r.reason.len() == 0 {
+        out.push_str(reason_phrase(r.status));
+    } else {
+        out.push_str(r.reason.as_str());
+    }
+    out.push_str("\r\nContent-Type: ");
+    out.push_str(r.content_type.as_str());
+    out.push_str("\r\nContent-Length: ");
+    push_int(&mut out, r.body.len() as i64);
+    out.push_str("\r\n");
+    out.push_str(r.headers.as_str());
+    out.push_str("Connection: ");
+    if r.keep_alive {
+        out.push_str("keep-alive");
+    } else {
+        out.push_str("close");
+    }
+    out.push_str("\r\n\r\n");
+    return out;
+}
+
+// render_response serializes a response to a single string. It is meant for
+// text bodies: use send_response for binary payloads, which writes the body
+// separately and preserves NUL bytes.
+pub fn render_response(r: &Response) -> String {
+    let mut out = response_head(r);
+    out.push_str(r.body.as_str());
+    return out;
+}
+
+// send_response writes a complete response. Returns bytes sent, or -1.
+pub fn send_response(c: &Conn, r: &Response) -> i64 {
+    let head = response_head(r);
+    let sent = c.write(head);
+    if sent < 0 {
+        return -1;
+    }
+    if r.body.len() == 0 {
+        return sent;
+    }
+    let body_sent = c.write_raw(r.body.as_str(), r.body.len());
+    if body_sent < 0 {
+        return -1;
+    }
+    return sent + body_sent;
+}
+
+// parse_request splits a raw request into method, path, version, headers and
+// body. `raw` may be just the head (as returned by Conn.read_head) or a
+// complete request with a body.
+pub fn parse_request(raw: &String) -> Request {
+    let end = raw.find("\r\n");
+    if end < 0 {
+        return Request {
+            method: String::new(), path: String::new(), version: String::new(),
+            headers: String::new(), body: String::new(),
+        };
+    }
+    let line = raw.substr(0, end as usize);
+    let sp1 = line.find(" ");
+    let method = if sp1 < 0 { line.clone() } else { line.substr(0, sp1 as usize) };
+    let rest = if sp1 < 0 { String::new() } else { line.substr((sp1 + 1) as usize, 4294967295) };
+    let sp2 = rest.find(" ");
+    let path = if sp2 < 0 { rest.clone() } else { rest.substr(0, sp2 as usize) };
+    let version = if sp2 < 0 { String::new() } else { rest.substr((sp2 + 1) as usize, 4294967295).trim() };
+
+    let headers = header_block(raw);
+    let he = head_end(raw);
+    let body = if he < 0 { String::new() } else { raw.substr(he as usize, 4294967295) };
+    return Request { method: method, path: path, version: version, headers: headers, body: body };
+}
+
+// read_request reads a request head and then its body, using Content-Length
+// when the client declared one. Connections that send nothing (readiness
+// probes) yield an invalid request with an empty method and body.
+pub fn read_request(c: &Conn) -> Request {
+    let head = c.read_head();
+    let mut req = parse_request(&head);
+    let want = req.content_length();
+    if want > 0 && want <= MAX_BODY as i64 {
+        let have = req.body.len() as i64;
+        if have < want {
+            let take = want - have;
+            let more = c.read_exact(take as usize);
+            req.body.push_str(more);
+        }
+    }
+    return req;
+}
+
+// --- client ----------------------------------------------------------------
+
+// Client holds settings shared by a group of requests.
+pub struct Client {
+    pub timeout_ms: i32,
+    pub follow_redirects: bool,
+    pub max_redirects: i32,
+    pub user_agent: String,
+    // headers is raw extra header lines, each ending in CRLF.
+    pub headers: String,
+}
+
+impl Client {
+    pub fn new() -> Client {
+        return Client {
+            timeout_ms: DEFAULT_TIMEOUT_MS,
+            follow_redirects: true,
+            max_redirects: DEFAULT_MAX_REDIRECTS,
+            user_agent: String::from("zexi-http/0.2"),
+            headers: String::new(),
+        };
+    }
+
+    // set_header adds a header sent with every request from this client.
+    pub fn set_header(&mut self, name: str, value: str) {
+        if contains_crlf(name) || contains_crlf(value) {
+            return;
+        }
+        self.headers.push_str(name);
+        self.headers.push_str(": ");
+        self.headers.push_str(value);
+        self.headers.push_str("\r\n");
+    }
+
+    pub fn get(&self, url: str) -> Response {
+        return self.send("GET", url, "", "");
+    }
+
+    pub fn post(&self, url: str, body: str) -> Response {
+        return self.send("POST", url, body, "text/plain; charset=utf-8");
+    }
+
+    pub fn post_type(&self, url: str, body: str, content_type: str) -> Response {
+        return self.send("POST", url, body, content_type);
+    }
+
+    pub fn put(&self, url: str, body: str) -> Response {
+        return self.send("PUT", url, body, "text/plain; charset=utf-8");
+    }
+
+    pub fn delete(&self, url: str) -> Response {
+        return self.send("DELETE", url, "", "");
+    }
+
+    // post_form sends an application/x-www-form-urlencoded body.
+    pub fn post_form(&self, url: str, form: str) -> Response {
+        return self.send("POST", url, form, "application/x-www-form-urlencoded");
+    }
+
+    // download fetches a URL and writes its body to dest. The returned
+    // Response has `error` set when the file could not be written.
+    pub fn download(&self, url: str, dest: str) -> Response {
+        let mut resp = self.get(url);
+        if resp.ok() {
+            let body_len = resp.body.len();
+            let n = zxn_write_file(dest, resp.body.as_str(), body_len as i32);
+            if n < 0 {
+                resp.error = String::from("cannot write file");
+            }
+        }
+        return resp;
+    }
+
+    // send performs one logical request, following redirects when enabled.
+    pub fn send(&self, method: str, url: str, body: str, content_type: str) -> Response {
+        let m = String::from(method);
+        let u = String::from(url);
+        let b = String::from(body);
+        let ct = String::from(content_type);
+        return self.send_inner(&m, &u, &b, &ct, 0, true);
+    }
+
+    fn send_inner(&self, method: &String, url: &String, body: &String, content_type: &String, depth: i32, send_headers: bool) -> Response {
+        let u = parse_url(url.as_str());
+        if !u.valid() {
+            return bad_response(u.error.as_str());
+        }
+        let resp = self.one(&u, method, body, content_type, send_headers);
+        if self.follow_redirects && is_redirect(resp.status) {
+            let loc = resp.header("Location");
+            if loc.len() > 0 {
+                if depth >= self.max_redirects {
+                    return bad_response("too many redirects");
+                }
+                let next = resolve_location(&u, &loc);
+                let nu = parse_url(next.as_str());
+                let same_origin = nu.host.as_str() == u.host.as_str() && nu.port == u.port;
+                let next_headers = send_headers && same_origin;
+                if resp.status == 301 || resp.status == 302 || resp.status == 303 {
+                    let get = String::from("GET");
+                    let none = String::new();
+                    return self.send_inner(&get, &next, &none, &none, depth + 1, next_headers);
+                }
+                return self.send_inner(method, &next, body, content_type, depth + 1, next_headers);
+            }
+        }
+        return resp;
+    }
+
+    // one performs exactly one request/response exchange.
+    fn one(&self, u: &Url, method: &String, body: &String, content_type: &String, send_headers: bool) -> Response {
+        let mut c = connect(u.host.as_str(), u.port);
+        if c.fd < 0 {
+            return bad_response("connection failed");
+        }
+        c.set_timeout(self.timeout_ms);
+
+        let mut req = String::new();
+        req.push_str(method.as_str());
+        req.push_str(" ");
+        let target = u.target();
+        req.push_str(target.as_str());
+        req.push_str(" HTTP/1.1\r\nHost: ");
+        let hp = u.host_port();
+        req.push_str(hp.as_str());
+        req.push_str("\r\nUser-Agent: ");
+        req.push_str(self.user_agent.as_str());
+        req.push_str("\r\nAccept: */*\r\n");
+        if send_headers && self.headers.len() > 0 {
+            req.push_str(self.headers.as_str());
+        }
+        if body.len() > 0 {
+            req.push_str("Content-Type: ");
+            req.push_str(content_type.as_str());
+            req.push_str("\r\nContent-Length: ");
+            push_int(&mut req, body.len() as i64);
+            req.push_str("\r\n");
+        }
+        req.push_str("Connection: close\r\n\r\n");
+        req.push_str(body.as_str());
+
+        c.write(req);
+        let raw = read_raw(&c);
+        c.close();
+        let mut resp = parse_response(&raw);
+        if raw.len() == 0 {
+            resp.error = String::from("empty response");
+        } else if !resp.valid() {
+            resp.error = String::from("malformed response");
+        }
+        return resp;
+    }
+}
+
+// fetch is Client::new().get(url): a one-call GET that follows redirects.
+pub fn fetch(url: str) -> Response {
+    let c = Client::new();
+    return c.get(url);
+}
+
+// get performs a low-level GET against host:port and returns the raw response
+// text ("" on error). Kept for callers that build requests by hand.
+pub fn get(host: str, port: i32, path: str) -> String {
+    return send_request("GET", host, port, path, "", "");
+}
+
+// post performs a low-level POST and returns the raw response text.
+pub fn post(host: str, port: i32, path: str, body: str) -> String {
+    return send_request("POST", host, port, path, body, "text/plain; charset=utf-8");
+}
+
+fn send_request(method: str, host: str, port: i32, path: str, body: str, content_type: str) -> String {
+    let mut c = connect(host, port);
+    if c.fd < 0 {
+        return String::new();
+    }
+    c.set_timeout(DEFAULT_TIMEOUT_MS);
+
+    let mut req = String::new();
+    req.push_str(method);
+    req.push_str(" ");
+    if path.len() == 0 {
+        req.push_str("/");
+    } else {
+        req.push_str(path);
+    }
+    req.push_str(" HTTP/1.1\r\nHost: ");
+    req.push_str(host);
+    if port != 80 {
+        req.push_byte(58); // ':'
+        push_int(&mut req, port as i64);
+    }
+    req.push_str("\r\nUser-Agent: zexi-http/0.2\r\nAccept: */*\r\nConnection: close\r\n");
+    if len(body) > 0 {
+        req.push_str("Content-Type: ");
+        req.push_str(content_type);
+        req.push_str("\r\nContent-Length: ");
+        push_int(&mut req, len(body) as i64);
+        req.push_str("\r\n");
+    }
+    req.push_str("\r\n");
+    req.push_str(body);
+
+    c.write(req);
+    let raw = read_raw(&c);
+    c.close();
+    return raw;
+}
+
+// read_response is get plus parsing, for low-level callers.
+pub fn read_response(host: str, port: i32, path: str) -> Response {
+    let raw = get(host, port, path);
+    return parse_response(&raw);
+}
+
+// parse_response splits a raw response into status, reason, headers and body.
+pub fn parse_response(raw: &String) -> Response {
+    let end = raw.find("\r\n");
+    if end < 0 {
+        return Response {
+            status: 0, reason: String::new(), headers: String::new(), body: raw.clone(),
+            content_type: String::new(), error: String::new(), keep_alive: false,
+        };
+    }
+    let line = raw.substr(0, end as usize);
+    let sp1 = line.find(" ");
+    let rest = if sp1 < 0 { String::new() } else { line.substr((sp1 + 1) as usize, 4294967295) };
+    let sp2 = rest.find(" ");
+    let code = if sp2 < 0 { rest.clone() } else { rest.substr(0, sp2 as usize) };
+    let reason = if sp2 < 0 { String::new() } else { rest.substr((sp2 + 1) as usize, 4294967295).trim() };
+
+    let headers = header_block(raw);
+    let ct = header_value(&headers, "Content-Type");
+    let he = head_end(raw);
+    let body = if he < 0 { String::new() } else { raw.substr(he as usize, 4294967295) };
+    return Response {
+        status: parse_dec(&code) as i32, reason: reason, headers: headers, body: body,
+        content_type: ct, error: String::new(), keep_alive: false,
+    };
+}
+
+// read_raw reads one complete response: the head, then the body according to
+// Content-Length, chunked transfer encoding, or connection close.
+fn read_raw(c: &Conn) -> String {
+    let head = c.read_head();
+    let mut raw = head.clone();
+    if raw.len() > 0 {
+        let headers = header_block(&head);
+        let te_value = header_value(&headers, "Transfer-Encoding");
+        let te = lower(&te_value);
+        if te.contains("chunked") {
+            let body = read_chunked(c, MAX_BODY);
+            raw.push_str(body);
+        } else {
+            let cl_value = header_value(&headers, "Content-Length");
+            let cl = parse_dec(&cl_value);
+            if cl < 0 {
+                let body = c.read_all_max(MAX_BODY);
+                raw.push_str(body);
+            } else if cl > 0 {
+                let take = if cl > MAX_BODY as i64 { MAX_BODY } else { cl as usize };
+                let body = c.read_exact(take);
+                raw.push_str(body);
+            }
+        }
+    }
+    return raw;
+}
+
+fn bad_response(msg: str) -> Response {
+    let mut r = Response::empty(0);
+    r.error = String::from(msg);
+    return r;
+}
+
+fn is_redirect(status: i32) -> bool {
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+}
+
+// resolve_location turns a Location header into an absolute URL.
+fn resolve_location(base: &Url, loc: &String) -> String {
+    if loc.starts_with("http://") {
+        return loc.clone();
+    }
+    if loc.starts_with("//") {
+        let mut out = String::from("http:");
+        out.push_str(loc.as_str());
+        return out;
+    }
+    if loc.starts_with("/") {
+        let mut out = base.origin();
+        out.push_str(loc.as_str());
+        return out;
+    }
+    // Relative to the directory of the current path.
+    let mut out = base.origin();
+    let dir = dir_prefix(&base.path);
+    out.push_str(dir.as_str());
+    out.push_str(loc.as_str());
+    return out;
+}
+
+// dir_prefix returns everything up to and including the last '/'.
+fn dir_prefix(path: &String) -> String {
+    let mut cut: usize = 0;
+    let mut pos: usize = 0;
+    while pos < path.len() {
+        let rest = path.substr(pos, 4294967295);
+        let i = rest.find("/");
+        if i < 0 {
+            break;
+        }
+        cut = pos + (i as usize) + 1;
+        pos = cut;
+    }
+    return path.substr(0, cut);
+}
+
+// --- routing ---------------------------------------------------------------
+
+// MAX_ROUTES is how many handlers a Router can hold (fixed-size tables: the
+// language has no dynamic arrays yet).
+const MAX_ROUTES: i32 = 32;
+
+// not_found_handler is the default fallback.
+fn not_found_handler(req: &Request) -> Response {
+    return Response::empty(404);
+}
+
+// Router maps (method, exact path) pairs to handlers. Register routes once,
+// then call dispatch(req) or serve(conn). Paths are `str` values, so pass
+// literals; use Request.query for parameters rather than path patterns.
+pub struct Router {
+    methods: [str; 32],
+    paths: [str; 32],
+    handlers: [fn(&Request) -> Response; 32],
+    fallback: fn(&Request) -> Response,
+    count: i32,
+}
+
+impl Router {
+    pub fn new() -> Router {
+        return Router {
+            methods: [""; 32],
+            paths: [""; 32],
+            handlers: [not_found_handler; 32],
+            fallback: not_found_handler,
+            count: 0,
+        };
+    }
+
+    pub fn get(&mut self, path: str, handler: fn(&Request) -> Response) {
+        self.add("GET", path, handler);
+    }
+
+    pub fn post(&mut self, path: str, handler: fn(&Request) -> Response) {
+        self.add("POST", path, handler);
+    }
+
+    pub fn put(&mut self, path: str, handler: fn(&Request) -> Response) {
+        self.add("PUT", path, handler);
+    }
+
+    pub fn delete(&mut self, path: str, handler: fn(&Request) -> Response) {
+        self.add("DELETE", path, handler);
+    }
+
+    // set_fallback replaces the 404 handler.
+    pub fn set_fallback(&mut self, handler: fn(&Request) -> Response) {
+        self.fallback = handler;
+    }
+
+    pub fn add(&mut self, method: str, path: str, handler: fn(&Request) -> Response) {
+        if self.count >= MAX_ROUTES {
+            return;
+        }
+        let i = self.count as usize;
+        self.methods[i] = method;
+        self.paths[i] = path;
+        self.handlers[i] = handler;
+        self.count = self.count + 1;
+    }
+
+    // dispatch routes one parsed request.
+    pub fn dispatch(&self, req: &Request) -> Response {
+        if !req.valid() {
+            return Response::empty(400);
+        }
+        let path = req.path_only();
+        let mut i: usize = 0;
+        while i < (self.count as usize) {
+            if self.methods[i] == req.method.as_str() && path_matches(self.paths[i], &path) {
+                let handler = self.handlers[i];
+                return handler(req);
+            }
+            i += 1;
+        }
+        let fallback = self.fallback;
+        return fallback(req);
+    }
+
+    // serve reads one request from c, dispatches it, and writes the response.
+    // It returns false when the peer sent nothing usable (a probe or EOF).
+    pub fn serve(&self, c: &Conn) -> bool {
+        c.set_timeout(DEFAULT_TIMEOUT_MS);
+        let req = read_request(c);
+        if !req.valid() {
+            return false;
+        }
+        if req.body_too_large() {
+            let too_large = Response::empty(413);
+            send_response(c, &too_large);
+            return true;
+        }
+        if !req.body_complete() {
+            let bad = Response::empty(400);
+            send_response(c, &bad);
+            return true;
+        }
+        let res = self.dispatch(&req);
+        send_response(c, &res);
+        return true;
+    }
+}
+
+// path_matches supports exact routes and a trailing "/*" prefix; the bare
+// pattern "*" matches everything.
+fn path_matches(pattern: str, path: &String) -> bool {
+    let p = String::from(pattern);
+    if p.as_str() == "*" {
+        return true;
+    }
+    if p.ends_with("/*") {
+        let prefix = p.substr(0, p.len() - 1);
+        return path.starts_with(prefix.as_str());
+    }
+    return path.as_str() == p.as_str();
+}
+
+// --- files and static serving ----------------------------------------------
+
+// read_file reads a whole file as bytes (binary-safe, capped at MAX_FILE).
+// A missing file yields "".
+pub fn read_file(path: str) -> String {
+    let mut out = String::new();
+    let handle = zxn_file_open(path);
+    if handle >= 0 {
+        let mut buf: [u8; 8192] = [0; 8192];
+        loop {
+            let n = zxn_file_read(handle, &mut buf, 8192);
+            if n <= 0 {
+                break;
+            }
+            let mut i: usize = 0;
+            while i < (n as usize) {
+                out.push_byte(buf[i]);
+                i += 1;
+            }
+            if out.len() >= MAX_FILE {
+                break;
+            }
+        }
+        zxn_file_close(handle);
+    }
+    return out;
+}
+
+// write_file writes bytes to a file (binary-safe). Returns bytes written or -1.
+pub fn write_file(path: str, data: str) -> i32 {
+    return zxn_write_file(path, data, len(data) as i32);
+}
+
+// file_size returns the size of a regular file, or -1 when absent.
+pub fn file_size(path: str) -> i64 {
+    return zxn_file_size(path);
+}
+
+// serve_file builds a response from a filesystem path. Missing files get a
+// 404 and oversized files a 413; the content type follows the extension.
+// The body is copied byte-for-byte, so images and other binary files work.
+pub fn serve_file(path: str) -> Response {
+    let size = zxn_file_size(path);
+    if size < 0 {
+        return Response::empty(404);
+    }
+    if size > MAX_FILE as i64 {
+        return Response::empty(413);
+    }
+    let body = read_file(path);
+    let mut r = Response::from_string(200, body);
+    let p = String::from(path);
+    let ct = content_type_for(&p);
+    r.content_type = String::from(ct);
+    return r;
+}
+
+// serve_static maps a URL path onto a directory. "/" serves index.html;
+// traversal ("..", backslashes, NUL) is refused with 403.
+pub fn serve_static(root: str, url_path: str) -> Response {
+    let root_s = String::from(root);
+    let raw = String::from(url_path);
+    let q = raw.find("?");
+    let p0 = if q < 0 { raw.clone() } else { raw.substr(0, q as usize) };
+    let path = url_decode(p0.as_str());
+    if path.contains("..") || path.contains("\\") || has_byte(&path, 0) {
+        return Response::empty(403);
+    }
+    let rel = if path.len() == 0 || path.as_str() == "/" {
+        String::from("index.html")
+    } else if path.starts_with("/") {
+        path.substr(1, 4294967295)
+    } else {
+        path.clone()
+    };
+    let mut full = root_s.clone();
+    if !root_s.ends_with("/") {
+        full.push_byte(47); // '/'
+    }
+    full.push_str(rel.as_str());
+    return serve_file(full.as_str());
+}
+
+// content_type_for guesses a Content-Type from a filename extension.
+fn content_type_for(path: &String) -> str {
+    let mut dot: i64 = -1;
+    let mut i: usize = 0;
+    while i < path.len() {
+        if path.byte_at(i) == 46 { // '.'
+            dot = i as i64;
+        }
+        i += 1;
+    }
+    if dot < 0 {
+        return "application/octet-stream";
+    }
+    let ext_raw = path.substr((dot + 1) as usize, 4294967295);
+    let ext = lower(&ext_raw);
+    if ext.as_str() == "html" || ext.as_str() == "htm" { return "text/html; charset=utf-8"; }
+    if ext.as_str() == "css" { return "text/css; charset=utf-8"; }
+    if ext.as_str() == "js" { return "text/javascript; charset=utf-8"; }
+    if ext.as_str() == "json" { return "application/json"; }
+    if ext.as_str() == "txt" { return "text/plain; charset=utf-8"; }
+    if ext.as_str() == "xml" { return "application/xml"; }
+    if ext.as_str() == "svg" { return "image/svg+xml"; }
+    if ext.as_str() == "png" { return "image/png"; }
+    if ext.as_str() == "jpg" || ext.as_str() == "jpeg" { return "image/jpeg"; }
+    if ext.as_str() == "gif" { return "image/gif"; }
+    if ext.as_str() == "ico" { return "image/x-icon"; }
+    if ext.as_str() == "wasm" { return "application/wasm"; }
+    if ext.as_str() == "pdf" { return "application/pdf"; }
+    if ext.as_str() == "woff2" { return "font/woff2"; }
+    return "application/octet-stream";
+}
+
+fn has_byte(s: &String, want: i64) -> bool {
+    let mut i: usize = 0;
+    while i < s.len() {
+        if s.byte_at(i) == want {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+// --- helpers ---------------------------------------------------------------
+
+// head_end returns the index just past the blank line ending the head, or -1.
+fn head_end(raw: &String) -> i64 {
+    let at = raw.find("\r\n\r\n");
+    if at < 0 {
+        return -1;
+    }
+    return at + 4;
+}
+
+// header_block returns the raw header lines between the start line and the
+// blank line, without line terminators at either end.
+fn header_block(raw: &String) -> String {
+    let first = raw.find("\r\n");
+    let he = head_end(raw);
+    if first < 0 || he < 0 {
+        return String::new();
+    }
+    let start = (first + 2) as usize;
+    let stop = (he - 4) as usize;
+    if stop <= start {
+        return String::new();
+    }
+    return raw.substr(start, stop - start);
+}
+
+// header_value returns the value of the named header, matched
+// case-insensitively, with surrounding whitespace removed. Absent headers
+// yield "".
+fn header_value(headers: &String, name: str) -> String {
+    let want = String::from(name);
+    let mut pos: usize = 0;
+    while pos < headers.len() {
+        let rest = headers.substr(pos, 4294967295);
+        let nl = rest.find("\r\n");
+        let line = if nl < 0 { rest.clone() } else { rest.substr(0, nl as usize) };
+        let colon = line.find(":");
+        if colon > 0 {
+            let key = line.substr(0, colon as usize).trim();
+            if same_ignore_case(&key, &want) {
+                return line.substr((colon + 1) as usize, 4294967295).trim();
+            }
+        }
+        if nl < 0 {
+            break;
+        }
+        pos = pos + (nl as usize) + 2;
+    }
+    return String::new();
+}
+
+// same_ignore_case compares two ASCII strings without regard to case.
+fn same_ignore_case(a: &String, b: &String) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len() {
+        if lower_byte(a.byte_at(i)) != lower_byte(b.byte_at(i)) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+fn contains_crlf(s: str) -> bool {
+    let v = String::from(s);
+    return v.find("\r") >= 0 || v.find("\n") >= 0;
+}
+
+fn lower_byte(b: i64) -> i64 {
+    if b >= 65 && b <= 90 {
+        return b + 32;
+    }
+    return b;
+}
+
+// lower returns an ASCII-lowercased copy of s.
+fn lower(s: &String) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i: usize = 0;
+    while i < s.len() {
+        out.push_byte(lower_byte(s.byte_at(i)) as u8);
+        i += 1;
+    }
+    return out;
+}
+
+// parse_dec parses a non-negative decimal integer, or returns -1.
+fn parse_dec(s: &String) -> i64 {
+    if s.len() == 0 {
+        return -1;
+    }
+    let mut v: i64 = 0;
+    let mut i: usize = 0;
+    while i < s.len() {
+        let b = s.byte_at(i);
+        if b < 48 || b > 57 {
+            return -1;
+        }
+        if v > 922337203685477579 {
+            return -1; // would overflow
+        }
+        v = v * 10 + (b - 48);
+        i += 1;
+    }
+    return v;
+}
+
+// parse_hex parses a hexadecimal chunk size, ignoring chunk extensions.
+fn parse_hex(s: &String) -> i64 {
+    let mut v: i64 = 0;
+    let mut digits: i32 = 0;
+    let mut i: usize = 0;
+    while i < s.len() {
+        let b = s.byte_at(i);
+        let mut d: i64 = -1;
+        if b >= 48 && b <= 57 {
+            d = b - 48;
+        } else if b >= 65 && b <= 70 {
+            d = b - 55;
+        } else if b >= 97 && b <= 102 {
+            d = b - 87;
+        }
+        if d < 0 {
+            break;
+        }
+        if v > 268435455 {
+            return -1; // would overflow a sane chunk size
+        }
+        v = v * 16 + d;
+        digits += 1;
+        i += 1;
+    }
+    if digits == 0 {
+        return -1;
+    }
+    return v;
+}
+
+// read_chunked decodes a chunked body, stopping at the terminating zero
+// chunk (and draining any trailer lines) or at max bytes.
+fn read_chunked(c: &Conn, max: usize) -> String {
+    let mut body = String::new();
+    loop {
+        let line = c.read_line();
+        if line.len() == 0 {
+            break;
+        }
+        let size = parse_hex(&line);
+        if size < 0 {
+            break;
+        }
+        if size == 0 {
+            loop {
+                let trailer = c.read_line();
+                if trailer.len() == 0 {
+                    break;
+                }
+            }
+            break;
+        }
+        if body.len() + (size as usize) > max {
+            break;
+        }
+        let chunk = c.read_exact(size as usize);
+        let got = chunk.len();
+        body.push_str(chunk);
+        if got < (size as usize) {
+            break;
+        }
+        let crlf = c.read_exact(2);
+        if crlf.len() < 2 {
+            break;
+        }
+    }
+    return body;
+}
+
+fn push_int(s: &mut String, n: i64) {
+    if n == 0 {
+        s.push_byte(48);
+        return;
+    }
+    let neg = n < 0;
+    let mut v = n;
+    if neg {
+        v = 0 - v;
+    }
+    let mut digits: [u8; 24] = [0; 24];
+    let mut i: usize = 0;
+    while v > 0 {
+        digits[i] = ((v % 10) as u8) + (48 as u8);
+        v = v / 10;
+        i += 1;
+    }
+    if neg {
+        s.push_byte(45);
+    }
+    while i > 0 {
+        i -= 1;
+        s.push_byte(digits[i]);
+    }
+}

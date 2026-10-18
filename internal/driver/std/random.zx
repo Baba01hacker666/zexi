@@ -1,15 +1,75 @@
-// random — small random helpers over the C library's rand(),
-// part of the Zexi standard library. Import with `use random;`.
+// random — random helpers, part of the Zexi standard library.
+// Import with `use random;` or `use std::random;`.
+//
+// Two layers: a deterministic xorshift64 `Rng` you own (reproducible, no
+// global state — Go's `rand.New(rand.NewSource(seed))` style), and thin
+// wrappers over libc's rand() for throwaway use.
 
 extern "C" fn rand() -> i32;
 extern "C" fn srand(seed: u32);
-extern "C" fn time(t: *mut i64) -> i64;
 
-// seed_random seeds the generator with an explicit value (same seed,
-// same sequence — handy for tests and reproducible games).
+// --- owned generator -------------------------------------------------------
+
+pub struct Rng {
+    pub state: u64,
+}
+
+// DEFAULT_SEED substitutes for a zero seed (xorshift would never escape 0).
+const DEFAULT_SEED: u64 = 88172645463325252;
+// MUL is the xorshift64* output multiplier.
+const MUL: u64 = 6364136223846793005;
+
+impl Rng {
+    // new creates a generator. The same seed always yields the same
+    // sequence; seed 0 is remapped to a fixed constant.
+    pub fn new(seed: u64) -> Rng {
+        let s = if seed == 0 { DEFAULT_SEED } else { seed };
+        return Rng { state: s };
+    }
+
+    // next_u64 returns the raw 64-bit output (xorshift64*).
+    pub fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x = x ^ (x >> 12);
+        x = x ^ (x << 25);
+        x = x ^ (x >> 27);
+        self.state = x;
+        return x * MUL;
+    }
+
+    // int returns a random integer in [lo, hi], inclusive (hi <= lo -> lo).
+    pub fn int(&mut self, lo: i64, hi: i64) -> i64 {
+        if hi <= lo {
+            return lo;
+        }
+        let span = (hi - lo + 1) as u64;
+        return lo + (self.next_u64() % span) as i64;
+    }
+
+    // float returns a random float in [0.0, 1.0).
+    pub fn float(&mut self) -> f64 {
+        return ((self.next_u64() >> 11) as f64) / 9007199254740992.0;
+    }
+
+    // coin returns true or false with even odds.
+    pub fn coin(&mut self) -> bool {
+        return (self.next_u64() & 1) == 1;
+    }
+
+    // fork spawns an independent generator derived from this one.
+    pub fn fork(&mut self) -> Rng {
+        return Rng::new(self.next_u64());
+    }
+}
+
+// --- libc-backed helpers ---------------------------------------------------
+
+// seed_random seeds the process-wide generator (same seed, same sequence).
 pub fn seed_random(seed: i64) {
     srand(seed as u32);
 }
+
+extern "C" fn time(t: *mut i64) -> i64;
 
 // seed_from_time seeds the generator from the wall clock.
 pub fn seed_from_time() {
@@ -17,8 +77,7 @@ pub fn seed_from_time() {
     srand(time(&mut slot) as u32);
 }
 
-// rand_int returns a random integer in [lo, hi], inclusive on both
-// ends (like Python's randint). With no room to vary it returns lo.
+// rand_int returns a random integer in [lo, hi], inclusive on both ends.
 pub fn rand_int(lo: i64, hi: i64) -> i64 {
     if hi <= lo { return lo; }
     lo + (rand() as i64) % (hi - lo + 1)

@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"zexi/internal/bindgen"
@@ -40,6 +41,9 @@ type cli struct {
 	linkLibs    []string
 	libDirs     []string
 	includeDirs []string
+	// jobs is how many C translation units to compile in parallel
+	// (0 = automatic, 1 = single file).
+	jobs int
 }
 
 func parseArgs(args []string) cli {
@@ -73,6 +77,10 @@ func parseArgs(args []string) cli {
 			c.libDirs = append(c.libDirs, strings.TrimPrefix(a, "--lib-dir="))
 		case strings.HasPrefix(a, "--include="):
 			c.includeDirs = append(c.includeDirs, strings.TrimPrefix(a, "--include="))
+		case strings.HasPrefix(a, "--jobs="):
+			if n, err := strconv.Atoi(strings.TrimPrefix(a, "--jobs=")); err == nil && n >= 0 {
+				c.jobs = n
+			}
 		case strings.HasPrefix(a, "-"):
 			// Unknown flag: ignore for forward compatibility.
 		default:
@@ -90,6 +98,7 @@ func (c cli) opts() driver.Options {
 		LinkLibs:    c.linkLibs,
 		LibDirs:     c.libDirs,
 		IncludeDirs: c.includeDirs,
+		Jobs:        c.jobs,
 	}
 }
 
@@ -245,7 +254,9 @@ func cmdEmit(c cli) int {
 		return 2
 	}
 	em := diag.NewEmitter()
-	art, ok := driver.FrontEndFiles(paths, c.opts(), em)
+	opts := c.opts()
+	opts.Jobs = 1 // emit prints one translation unit
+	art, ok := driver.FrontEndFiles(paths, opts, em)
 	if !ok {
 		em.Render(os.Stderr, emFileID(em))
 		return 1
@@ -312,5 +323,6 @@ C bridge options (build/run):
   --link=<lib>               library to link, like -l<lib> (repeatable)
   --lib-dir=<dir>            library search directory (repeatable)
   --include=<dir>            header search directory for --csrc files (repeatable)
+  --jobs=<n>                 parallel C compile units (0 = auto, 1 = single file)
 `)
 }

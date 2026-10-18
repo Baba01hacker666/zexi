@@ -1,0 +1,29 @@
+// Function values: binding, passing, returning, and calling callbacks.
+
+fn double(x: i32) -> i32 {
+    return x * 2;
+}
+
+fn triple(x: i32) -> i32 {
+    return x * 3;
+}
+
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(x);
+}
+
+fn pick(use_triple: bool) -> fn(i32) -> i32 {
+    if use_triple {
+        return triple;
+    }
+    return double;
+}
+
+fn main() -> i32 {
+    println(apply(double, 21));
+    let f = triple;
+    println(f(7));
+    let g = pick(true);
+    println(g(5));
+    0
+}

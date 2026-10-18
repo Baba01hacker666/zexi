@@ -15,6 +15,7 @@ package c
 
 import (
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -53,6 +54,14 @@ type gen struct {
 	// never shadow one of these (a local `motto` would hide the C
 	// function `zx_motto` it may need to call).
 	externNames map[string]bool
+	// used is the set of functions reachable from `main`; unreachable
+	// functions are omitted from the output entirely.
+	used map[*sema.Fn]bool
+	// split marks multi-unit emission: user functions, drop helpers, and
+	// constants get external linkage so cross-unit references link, and
+	// their definitions are collected in core (emitted into unit 0).
+	split bool
+	core  *writer
 }
 
 // loopLabel are the jump targets of one source-level loop.
@@ -101,12 +110,76 @@ func (w *writer) raw(s string) { w.b.WriteString(s) }
 
 // Generate emits a complete C translation unit for the program.
 func Generate(info *sema.Info, opts Options) (string, error) {
+	g := newGen(info, opts)
+	g.emitPrefix()
+	g.w.raw("// Command-line argument storage (defined once per program).\nint zx_argc;\nchar **zx_argv;\n\n")
+	for _, fn := range g.reachableFns() {
+		g.funcDef(fn)
+	}
+	g.charRuntime()
+	return g.w.b.String(), nil
+}
+
+// GenerateSplit emits the program as one shared header plus n translation
+// units (reachable function bodies dealt round-robin), so the driver can
+// compile them in parallel. Every generated symbol is `static` except the
+// argument globals, so each unit may include the full header without link
+// conflicts and the linker's section GC drops what a unit does not use.
+func GenerateSplit(info *sema.Info, opts Options, n int) (string, []string, error) {
+	if n <= 1 {
+		s, err := Generate(info, opts)
+		return s, nil, err
+	}
+	g := newGen(info, opts)
+	g.split = true
+	g.core = &writer{}
+	g.emitPrefix()
+	header := g.w.b.String()
+
+	fns := g.reachableFns()
+	if len(fns) == 0 {
+		return header, nil, nil
+	}
+	if len(fns) < n {
+		n = len(fns)
+	}
+	writers := make([]*writer, n)
+	for i := range writers {
+		writers[i] = &writer{}
+	}
+	for i, fn := range fns {
+		g.w = writers[i%n]
+		g.funcDef(fn)
+	}
+	// The char printer is discovered while emitting bodies; each unit gets
+	// its own static copy (unused ones are dropped by the linker).
+	units := make([]string, n)
+	for i, w := range writers {
+		g.w = w
+		g.charRuntime()
+		body := w.b.String()
+		if i == 0 {
+			body = "// Command-line argument storage (defined once per program).\nint zx_argc;\nchar **zx_argv;\n\n" + g.core.b.String() + body
+		}
+		units[i] = body
+	}
+	return header, units, nil
+}
+
+func newGen(info *sema.Info, opts Options) *gen {
 	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}, arrays: map[string]*types.Type{}, arrSeen: map[string]bool{}, dropSeen: map[string]bool{}, externNames: map[string]bool{}}
+	g.used = usedFns(info)
 	for _, fn := range info.FnOrder {
 		if fn.Extern || fn.Name == "main" {
 			g.externNames[funcName(fn)] = true
 		}
 	}
+	return g
+}
+
+// emitPrefix emits everything that is not a user function body: preamble,
+// array/drop helpers, runtime, type definitions, constants, prototypes.
+func (g *gen) emitPrefix() {
 	g.preamble()
 	g.collectArrayTypes()
 	g.collectDropTypes()
@@ -115,13 +188,103 @@ func Generate(info *sema.Info, opts Options) (string, error) {
 	g.dropFuncs()
 	g.constants()
 	g.prototypes()
-	for _, fn := range info.FnOrder {
-		if fn.Decl.Body != nil {
-			g.funcDef(fn)
+}
+
+// reachableFns returns the emitted function bodies, in declaration order.
+func (g *gen) reachableFns() []*sema.Fn {
+	var out []*sema.Fn
+	for _, fn := range g.info.FnOrder {
+		if fn.Decl.Body != nil && g.used[fn] {
+			out = append(out, fn)
 		}
 	}
-	g.charRuntime()
-	return g.w.b.String(), nil
+	return out
+}
+
+// usedFns computes the set of functions reachable from `main`, following
+// direct calls, method calls, and names used as values (callbacks). Only
+// reachable functions are emitted, so importing a large library costs
+// nothing unless its functions are actually called — the C side stays small
+// and fast to compile. When there is no entry point (defensive), everything
+// is kept.
+func usedFns(info *sema.Info) map[*sema.Fn]bool {
+	if info.Main == nil || info.Main.Decl == nil || info.Main.Decl.Body == nil {
+		all := map[*sema.Fn]bool{}
+		for _, f := range info.FnOrder {
+			all[f] = true
+		}
+		return all
+	}
+	used := map[*sema.Fn]bool{}
+	var queue []*sema.Fn
+	add := func(f *sema.Fn) {
+		if f != nil && !used[f] {
+			used[f] = true
+			queue = append(queue, f)
+		}
+	}
+	add(info.Main)
+	for len(queue) > 0 {
+		f := queue[0]
+		queue = queue[1:]
+		if f.Decl == nil || f.Decl.Body == nil {
+			continue
+		}
+		walkExprs(f.Decl.Body, func(e ast.Expr) {
+			switch x := e.(type) {
+			case *ast.CallExpr:
+				if r := info.Resolved[x]; r != nil {
+					add(r)
+				}
+			case *ast.MethodCallExpr:
+				if r := info.Resolved[x]; r != nil {
+					add(r)
+				}
+			case *ast.IdentExpr:
+				// A name in value position (callback argument, binding).
+				if r := info.Fns[x.Name]; r != nil {
+					add(r)
+				}
+			case *ast.PathExpr:
+				if len(x.Segments) == 1 {
+					if r := info.Fns[x.Segments[0]]; r != nil {
+						add(r)
+					}
+				}
+			}
+		})
+	}
+	return used
+}
+
+// walkExprs visits every expression in a syntax subtree (via reflection, so
+// new AST node kinds are covered automatically).
+func walkExprs(root any, fn func(ast.Expr)) {
+	var walk func(v reflect.Value)
+	walk = func(v reflect.Value) {
+		if !v.IsValid() {
+			return
+		}
+		switch v.Kind() {
+		case reflect.Pointer, reflect.Interface:
+			if v.IsNil() {
+				return
+			}
+			if e, ok := v.Interface().(ast.Expr); ok {
+				fn(e)
+			}
+			walk(v.Elem())
+		case reflect.Struct:
+			for i := 0; i < v.NumField(); i++ {
+				walk(v.Field(i))
+			}
+		case reflect.Slice, reflect.Array:
+			for i := 0; i < v.Len(); i++ {
+				walk(v.Index(i))
+			}
+		}
+	}
+	walk(reflect.ValueOf(root))
 }
 
 // charRuntime emits the UTF-8 `char` printer, but only for programs that print
@@ -164,8 +327,8 @@ func (g *gen) preamble() {
 	g.w.line("static int zx_print_char(uint32_t c);")
 	g.w.line("")
 	g.w.line("// Command-line arguments, captured by `main` for arg_count()/arg_at().")
-	g.w.line("static int zx_argc;")
-	g.w.line("static char **zx_argv;")
+	g.w.line("extern int zx_argc;")
+	g.w.line("extern char **zx_argv;")
 	g.w.line("static int zx_arg_count(void) { return zx_argc; }")
 	g.w.line("")
 }
@@ -203,6 +366,12 @@ func (g *gen) constants() { // Emit in source order for stable output.
 		}
 		cn, ok := g.info.Consts[d.Name]
 		if !ok {
+			continue
+		}
+		if g.split {
+			// Declaration in the header, definition in the core unit.
+			g.w.line("extern const %s %s;", ctype(cn.Ty), cname(cn.Name))
+			g.core.line("const %s %s = %s;", ctype(cn.Ty), cname(cn.Name), constLiteral(cn.Val, cn.Ty))
 			continue
 		}
 		g.w.line("static const %s %s = %s;", ctype(cn.Ty), cname(cn.Name), constLiteral(cn.Val, cn.Ty))
@@ -382,22 +551,34 @@ func (g *gen) dropFuncs() {
 	if len(g.dropTypes) == 0 {
 		return
 	}
+	link := "static "
+	if g.split {
+		// Definitions land in the core unit; every other unit sees an
+		// external prototype, so cross-unit drops link correctly.
+		link = ""
+	}
 	for _, d := range g.dropTypes {
 		ct := ctype(d.t)
-		g.w.line("static void zx_drop_%s(%s *v);", d.name, ct)
-		g.w.line("static %s zx_move_%s(%s *v);", ct, d.name, ct)
+		g.w.line("%svoid zx_drop_%s(%s *v);", link, d.name, ct)
+		g.w.line("%s%s zx_move_%s(%s *v);", link, ct, d.name, ct)
 	}
 	g.w.line("")
+	if g.split {
+		g.w, g.core = g.core, g.w
+	}
 	for _, d := range g.dropTypes {
 		g.emitDropFunc(d)
 	}
 	g.w.line("")
+	if g.split {
+		g.w, g.core = g.core, g.w
+	}
 }
 
 func (g *gen) emitDropFunc(d *dropType) {
 	t := d.t
 	ct := ctype(t)
-	g.w.line("static void zx_drop_%s(%s *v) {", d.name, ct)
+	g.w.line("%svoid zx_drop_%s(%s *v) {", g.linkPrefix(), d.name, ct)
 	g.w.indent++
 	switch t.Kind {
 	case types.StructKind:
@@ -444,7 +625,16 @@ func (g *gen) emitDropFunc(d *dropType) {
 	}
 	g.w.indent--
 	g.w.line("}")
-	g.w.line("static %s zx_move_%s(%s *v) { %s t = *v; memset(v, 0, sizeof *v); return t; }", ct, d.name, ct, ct)
+	g.w.line("%s%s zx_move_%s(%s *v) { %s t = *v; memset(v, 0, sizeof *v); return t; }", g.linkPrefix(), ct, d.name, ct, ct)
+}
+
+// linkPrefix is the storage-class prefix for drop/move helpers (static, or
+// external when emitting several translation units).
+func (g *gen) linkPrefix() string {
+	if g.split {
+		return ""
+	}
+	return "static "
 }
 
 func (g *gen) emitStructDef(s *types.Struct) {
@@ -629,7 +819,14 @@ func typeMangle(t *types.Type) string {
 func (g *gen) prototypes() {
 	for _, fn := range g.info.FnOrder {
 		if fn.Decl.Body != nil && !fn.Extern && fn.Name != "main" {
-			g.w.line("static %s;", fnSignature(fn))
+			if !g.used[fn] {
+				continue // unreachable: never emitted, never declared
+			}
+			link := "static "
+			if g.split {
+				link = ""
+			}
+			g.w.line("%s%s;", link, fnSignature(fn))
 		} else if fn.Extern {
 			g.w.line("%s;", fnSignature(fn))
 		}
@@ -686,7 +883,7 @@ func (g *gen) funcDef(fn *sema.Fn) {
 		params = []string{"int zx_argc_in", "char **zx_argv_in"}
 	}
 
-	g.w.line("%s%s %s(%s) {", staticPrefix(fn), retC, funcName(fn), strings.Join(params, ", "))
+	g.w.line("%s%s %s(%s) {", g.staticPrefix(fn), retC, funcName(fn), strings.Join(params, ", "))
 	g.w.indent++
 	g.openDropFrame() // body frame
 	if fn.Name == "main" {
@@ -701,8 +898,13 @@ func (g *gen) funcDef(fn *sema.Fn) {
 	g.w.line("")
 }
 
-func staticPrefix(fn *sema.Fn) string {
+func (g *gen) staticPrefix(fn *sema.Fn) string {
 	if fn.Extern || fn.Name == "main" {
+		return ""
+	}
+	if g.split {
+		// Multi-unit output: bodies live in different translation units, so
+		// user functions need external linkage.
 		return ""
 	}
 	return "static "
@@ -1390,6 +1592,25 @@ func (g *gen) identValue(name string, _ token.Span) string {
 func (g *gen) callValue(x *ast.CallExpr) string {
 	if p, ok := x.Callee.(*ast.PathExpr); ok && len(p.Segments) == 2 && p.Segments[0] == "String" {
 		return g.stringCtorValue(x, p.Segments[1])
+	}
+	// Calling a function value (a local, parameter, or field) needs an
+	// explicit function-pointer cast: the value itself has C type `void *`.
+	if ft := g.info.Indirect[x]; ft != nil {
+		params := make([]string, len(ft.Params))
+		for i, p := range ft.Params {
+			params[i] = ctype(p)
+		}
+		sig := ctype(ft.Ret) + " (*)("
+		if len(params) == 0 {
+			sig += "void"
+		} else {
+			sig += strings.Join(params, ", ")
+		}
+		sig += ")"
+		callee := g.value(x.Callee)
+		return g.withArgs(x.Args, ft.Params, g.exprStmtType(x), func(ps []string) string {
+			return "((" + sig + ")" + callee + ")(" + strings.Join(ps, ", ") + ")"
+		})
 	}
 	if ctor := g.info.Ctors[x]; ctor != nil {
 		return g.enumConstruct(ctor, x.Args)

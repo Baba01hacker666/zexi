@@ -39,13 +39,22 @@ This repository contains the **initial design and specification** of Zexi: the v
 > destruction (`Drop`)**, string-parsing methods, and text-building sugar
 > (`"n = " + n`, `s += n`); **`extern "C"` FFI** for
 > calling libc; and compiling **several source files into one binary** — enough
-> to ship an HTTP client/server in [`lib/http.zx`](lib/http.zx) (see
+> to ship an HTTP client/server in [`lib/http.zx`](lib/http.zx), plus embedded
+> `net`/`http` modules (`use http;`) with URL parsing, redirects, headers,
+> query/form decoding, chunked bodies, timeouts, response builders, cookies,
+> static-file serving with MIME detection, downloads, and a fixed-capacity
+> router built on function values (see
 > [`docs/08-networking.md`](docs/08-networking.md)).
 >
 > Not yet implemented: generics, traits/`impl Trait`, modules/`mod`, `Box`/`Vec`,
 > user-defined `Drop`, borrow-lifetime analysis (bound `&`/`*` aliases are not yet
 > tracked), and `Result`/`?`. Enum variants cannot carry owning payloads yet. See
 > `docs/05-roadmap.md`.
+
+## How it works
+
+See [`workings.md`](workings.md) for a walkthrough of the compiler pipeline and
+runtime.
 
 ## Try it
 

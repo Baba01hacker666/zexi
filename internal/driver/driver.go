@@ -5,6 +5,7 @@
 package driver
 
 import (
+	"bytes"
 	"embed"
 	"fmt"
 	"io/fs"
@@ -12,7 +13,9 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 
 	"zexi/internal/ast"
 	zenc "zexi/internal/codegen/c"
@@ -40,6 +43,9 @@ type Options struct {
 	// IncludeDirs are extra header search directories, as `-I<dir>`,
 	// used when compiling CFiles.
 	IncludeDirs []string
+	// Jobs is how many translation units to compile in parallel (0 picks
+	// automatically; 1 forces the single-file path).
+	Jobs int
 }
 
 // Artifacts is the result of a successful front end + codegen run.
@@ -48,6 +54,14 @@ type Artifacts struct {
 	CSrc string
 	// FileID is the id of the source file in the emitter's table.
 	FileID int
+	// CExtra holds additional C source contents (as strings) to compile
+	// and link into the binary, such as the networking runtime.
+	CExtra []string
+	// CHeader and CUnits hold the program split into several translation
+	// units (a shared header plus function bodies) when compiling in
+	// parallel; when empty, CSrc is the whole program.
+	CHeader string
+	CUnits  []string
 }
 
 // FrontEnd runs lexing, parsing, type checking, and C generation. It returns
@@ -91,12 +105,65 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 		return nil, false
 	}
 
-	csrc, cerr := zenc.Generate(info, zenc.Options{})
-	if cerr != nil {
-		em.Report(diag.New("E9001", "code generation failed: %v", cerr))
-		return nil, false
+	art := &Artifacts{Info: info, FileID: firstID}
+	if jobs := splitJobs(opts, len(info.FnOrder)); jobs > 1 {
+		header, units, cerr := zenc.GenerateSplit(info, zenc.Options{}, jobs)
+		if cerr != nil {
+			em.Report(diag.New("E9001", "code generation failed: %v", cerr))
+			return nil, false
+		}
+		if len(units) > 1 {
+			art.CHeader, art.CUnits = header, units
+		} else if len(units) == 1 {
+			art.CSrc = header + units[0]
+		} else {
+			art.CSrc = header
+		}
+	} else {
+		csrc, cerr := zenc.Generate(info, zenc.Options{})
+		if cerr != nil {
+			em.Report(diag.New("E9001", "code generation failed: %v", cerr))
+			return nil, false
+		}
+		art.CSrc = csrc
 	}
-	return &Artifacts{Info: info, CSrc: csrc, FileID: firstID}, true
+	if l.usesNet {
+		art.CExtra = append(art.CExtra, string(netCSource))
+	}
+	if l.usesSys {
+		art.CExtra = append(art.CExtra, string(sysCSource))
+	}
+	return art, true
+}
+
+// splitJobs decides how many translation units to compile in parallel: one
+// for small programs (a second cc invocation would cost more than it saves),
+// otherwise a capped number of CPUs.
+func splitJobs(opts Options, fns int) int {
+	if opts.Jobs == 1 {
+		return 1
+	}
+	// Size-focused builds keep the single-file path: splitting duplicates
+	// small runtime helpers across units, which costs a few KB of binary.
+	if opts.OptLevel == "s" || opts.OptLevel == "z" {
+		if opts.Jobs <= 0 {
+			return 1
+		}
+	}
+	n := opts.Jobs
+	if n <= 0 {
+		if fns < 64 {
+			return 1
+		}
+		n = runtime.NumCPU()
+		if n > 8 {
+			n = 8
+		}
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 // stdFS holds the standard library: small Zexi source files embedded in
@@ -106,12 +173,27 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 //go:embed std/*.zx
 var stdFS embed.FS
 
+// netCSource is the C networking runtime compiled into programs that
+// `use net;` or `use http;`. Embedded so it needs no installation and
+// stays in sync with the Zexi bindings.
+//
+//go:embed zxnet_c.txt
+var netCSource []byte
+
+// sysCSource is the C shim for the `sys` module (env, clocks, sleep, pid),
+// embedded like the networking runtime.
+//
+//go:embed zxsys_c.txt
+var sysCSource []byte
+
 // loader reads source files (entry points plus everything they `use`),
 // parses them, and merges their items into one program.
 type loader struct {
-	em     *diag.Emitter
-	merged *ast.File
-	loaded map[string]bool // canonical file keys already loaded
+	em      *diag.Emitter
+	merged  *ast.File
+	loaded  map[string]bool // canonical file keys already loaded
+	usesNet bool            // program imports net/http (needs the C runtime)
+	usesSys bool            // program imports sys (needs the C shim)
 }
 
 // loadDiskFile loads one file from disk and everything it imports.
@@ -155,7 +237,8 @@ func (l *loader) loadStdFile(name string) int {
 
 // loadSource parses one already-read file, records its items, and follows
 // its `use` declarations. dir is the directory relative imports resolve
-// against (empty for embedded files).
+// against (empty for embedded files). It reports whether the program
+// uses the C networking runtime (`use net;` / `use http;`).
 func (l *loader) loadSource(key, display string, src []byte, dir string) int {
 	l.loaded[key] = true // mark first: import cycles load each file once
 	fileID := l.em.AddFile(display, src)
@@ -167,6 +250,15 @@ func (l *loader) loadSource(key, display string, src []byte, dir string) int {
 	for _, it := range file.Items {
 		if d, ok := it.(*ast.UseDecl); ok {
 			l.loadUse(d, dir)
+			if d.File == "" && len(d.Path) > 0 {
+				name := d.Path[len(d.Path)-1]
+				if name == "net" || name == "http" {
+					l.usesNet = true
+				}
+				if name == "sys" {
+					l.usesSys = true
+				}
+			}
 			continue // imports contribute their own items; never checked here
 		}
 		l.merged.Items = append(l.merged.Items, it)
@@ -235,10 +327,34 @@ func BuildFiles(paths []string, outPath string, opts Options, em *diag.Emitter) 
 	if !ok {
 		return "", false
 	}
+	// When the program uses net/http, append the C networking runtime
+	// (written to a temp file, like the generated C).
+	if len(art.CExtra) > 0 {
+		for _, extra := range art.CExtra {
+			f, err := os.CreateTemp("", "zexic-extra-*.c")
+			if err != nil {
+				em.Report(diag.New("E9002", "%v", err))
+				return "", false
+			}
+			defer os.Remove(f.Name())
+			if _, err := f.WriteString(extra); err != nil {
+				f.Close()
+				em.Report(diag.New("E9002", "%v", err))
+				return "", false
+			}
+			f.Close()
+			opts.CFiles = append(opts.CFiles, f.Name())
+		}
+	}
 	if outPath == "" {
 		outPath = DefaultOutput(paths[0])
 	}
-	if err := CompileC(art.CSrc, outPath, opts); err != nil {
+	if len(art.CUnits) > 1 {
+		if err := CompileUnits(art.CHeader, art.CUnits, outPath, opts); err != nil {
+			em.Report(diag.New("E9002", "%v", err))
+			return "", false
+		}
+	} else if err := CompileC(art.CSrc, outPath, opts); err != nil {
 		em.Report(diag.New("E9002", "%v", err))
 		return "", false
 	}
@@ -271,6 +387,9 @@ func CompileC(csrc, outPath string, opts Options) error {
 	}
 
 	args := []string{"-std=gnu11", optFlag(opts.OptLevel)}
+	// Tree-shaking: each function/data gets its own section so the linker
+	// can drop what the program never calls (only include what is used).
+	args = append(args, "-ffunction-sections", "-fdata-sections")
 	for _, dir := range opts.IncludeDirs {
 		args = append(args, "-I"+dir)
 	}
@@ -284,10 +403,99 @@ func CompileC(csrc, outPath string, opts Options) error {
 	for _, lib := range opts.LinkLibs {
 		args = append(args, "-l"+lib)
 	}
+	// Drop sections no referenced symbol keeps alive (tree-shaking).
+	if runtime.GOOS == "darwin" {
+		args = append(args, "-Wl,-dead_strip")
+	} else {
+		args = append(args, "-Wl,--gc-sections")
+	}
 	cmd := exec.Command(cc, args...)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("C compiler (%s %s) failed: %w", cc, strings.Join(args, " "), err)
+	}
+	return nil
+}
+
+// CompileUnits compiles several translation units in parallel (each is the
+// shared header plus one slice of function bodies) and links them with the
+// extra C sources into a native binary at outPath. The units are the modular
+// form of the generated C: the compiler front end never changes, only how
+// the back end hands work to `cc`.
+func CompileUnits(header string, units []string, outPath string, opts Options) error {
+	dir, err := os.MkdirTemp("", "zexic-mod-")
+	if err != nil {
+		return fmt.Errorf("creating temp dir: %w", err)
+	}
+	defer os.RemoveAll(dir)
+
+	if err := os.WriteFile(filepath.Join(dir, "zexi_gen.h"), []byte(header), 0o644); err != nil {
+		return fmt.Errorf("writing generated header: %w", err)
+	}
+
+	cc := opts.CC
+	if cc == "" {
+		cc = os.Getenv("CC")
+	}
+	if cc == "" {
+		cc = "cc"
+	}
+	if _, err := exec.LookPath(cc); err != nil {
+		return fmt.Errorf("C compiler %q not found; install gcc or clang, or set CC", cc)
+	}
+
+	base := []string{"-std=gnu11", optFlag(opts.OptLevel), "-ffunction-sections", "-fdata-sections", "-I" + dir}
+	objs := make([]string, len(units))
+	errs := make([]string, len(units))
+	var wg sync.WaitGroup
+	for i, src := range units {
+		cfile := filepath.Join(dir, fmt.Sprintf("unit%d.c", i))
+		if err := os.WriteFile(cfile, []byte("#include \"zexi_gen.h\"\n"+src), 0o644); err != nil {
+			return fmt.Errorf("writing unit: %w", err)
+		}
+		objs[i] = filepath.Join(dir, fmt.Sprintf("unit%d.o", i))
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			args := append(append([]string{}, base...), "-c", cfile, "-o", objs[i])
+			var stderr bytes.Buffer
+			cmd := exec.Command(cc, args...)
+			cmd.Stderr = &stderr
+			if err := cmd.Run(); err != nil {
+				errs[i] = fmt.Sprintf("compiling unit %d (%s): %v\n%s", i, cfile, err, stderr.String())
+			}
+		}(i)
+	}
+	wg.Wait()
+	for _, e := range errs {
+		if e != "" {
+			return fmt.Errorf("%s", e)
+		}
+	}
+
+	args := []string{"-std=gnu11", optFlag(opts.OptLevel), "-ffunction-sections", "-fdata-sections"}
+	for _, inc := range opts.IncludeDirs {
+		args = append(args, "-I"+inc)
+	}
+	args = append(args, "-o", outPath)
+	args = append(args, objs...)
+	args = append(args, opts.CFiles...)
+	for _, libDir := range opts.LibDirs {
+		args = append(args, "-L"+libDir)
+	}
+	for _, lib := range opts.LinkLibs {
+		args = append(args, "-l"+lib)
+	}
+	if runtime.GOOS == "darwin" {
+		args = append(args, "-Wl,-dead_strip")
+	} else {
+		args = append(args, "-Wl,--gc-sections")
+	}
+	cmd := exec.Command(cc, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("linker (%s) failed: %v\n%s", cc, err, stderr.String())
 	}
 	return nil
 }

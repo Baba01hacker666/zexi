@@ -1,5 +1,10 @@
-// math — small numeric helpers, part of the Zexi standard library.
+// math — numeric helpers, part of the Zexi standard library.
 // Import with `use math;` or `use std::math;`.
+//
+// Pure Zexi (no libm link required). Integer math uses wrapping C semantics;
+// the floor/ceil variants correct the truncated division explicitly.
+
+// --- integers --------------------------------------------------------------
 
 pub fn mini(a: i64, b: i64) -> i64 {
     if a < b { a } else { b }
@@ -29,6 +34,33 @@ pub fn is_odd(x: i64) -> bool {
     x % 2 != 0
 }
 
+// div_floor rounds division toward negative infinity (C truncates toward 0).
+pub fn div_floor(a: i64, b: i64) -> i64 {
+    let q = a / b;
+    if a % b != 0 && ((a < 0) != (b < 0)) {
+        return q - 1;
+    }
+    return q;
+}
+
+// mod_floor is the Euclidean-style non-negative remainder.
+pub fn mod_floor(a: i64, b: i64) -> i64 {
+    let r = a % b;
+    if r != 0 && ((a < 0) != (b < 0)) {
+        return r + b;
+    }
+    return r;
+}
+
+// div_ceil rounds division toward positive infinity.
+pub fn div_ceil(a: i64, b: i64) -> i64 {
+    let q = a / b;
+    if a % b != 0 && ((a > 0) == (b > 0)) {
+        return q + 1;
+    }
+    return q;
+}
+
 pub fn gcdi(a0: i64, b0: i64) -> i64 {
     let mut a = absi(a0);
     let mut b = absi(b0);
@@ -40,6 +72,14 @@ pub fn gcdi(a0: i64, b0: i64) -> i64 {
     a
 }
 
+// lcmi is the least common multiple (0 when either input is 0).
+pub fn lcmi(a: i64, b: i64) -> i64 {
+    if a == 0 || b == 0 {
+        return 0;
+    }
+    return absi(a / gcdi(a, b) * b);
+}
+
 pub fn powi(base: i64, exp: i32) -> i64 {
     let mut r: i64 = 1;
     let mut i = 0;
@@ -49,6 +89,103 @@ pub fn powi(base: i64, exp: i32) -> i64 {
     }
     r
 }
+
+// isqrt is the integer square root (floor), by binary search; no libm.
+pub fn isqrt(n: i64) -> i64 {
+    if n <= 0 {
+        return 0;
+    }
+    let mut lo: i64 = 0;
+    let mut hi: i64 = mini(n, 3037000499); // 2^63/2^31: avoids overflow at mid*mid
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if mid * mid <= n {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return lo;
+}
+
+// pow_mod computes (base^exp) mod m with binary exponentiation in unsigned
+// 64-bit arithmetic. Results are exact only when m <= 4294967296, since
+// b*b and result*b can overflow u64 for larger moduli.
+pub fn pow_mod(base: i64, exp: i64, m: i64) -> i64 {
+    if m <= 1 {
+        return 0;
+    }
+    let mut result: u64 = 1;
+    let mut bm = base % m;
+    if bm < 0 {
+        bm += m;
+    }
+    let mut b: u64 = bm as u64;
+    let mut e = exp;
+    while e > 0 {
+        if e % 2 == 1 {
+            result = (result * b) % (m as u64);
+        }
+        b = (b * b) % (m as u64);
+        e = e / 2;
+    }
+    return (result as i64) % m;
+}
+
+// --- bits ------------------------------------------------------------------
+
+// popcount is the number of set bits.
+pub fn popcount(x: u64) -> i32 {
+    let mut v = x;
+    let mut n: i32 = 0;
+    while v != 0 {
+        n += (v & 1) as i32;
+        v = v >> 1;
+    }
+    return n;
+}
+
+// trailing_zeros is the number of zero low bits (0 for 0).
+pub fn trailing_zeros(x: u64) -> i32 {
+    if x == 0 {
+        return 64;
+    }
+    let mut v = x;
+    let mut n: i32 = 0;
+    while v & 1 == 0 {
+        v = v >> 1;
+        n += 1;
+    }
+    return n;
+}
+
+// leading_zeros is the number of zero high bits (64 for 0).
+pub fn leading_zeros(x: u64) -> i32 {
+    if x == 0 {
+        return 64;
+    }
+    let mut n: i32 = 0;
+    let mut v = x;
+    while v < 9223372036854775808 { // bit 63 not set
+        v = v << 1;
+        n += 1;
+    }
+    return n;
+}
+
+pub fn is_pow2(x: u64) -> bool {
+    return x != 0 && (x & (x - 1)) == 0;
+}
+
+// log2_floor is floor(log2(x)) for x > 0 (0 for 0).
+pub fn log2_floor(x: u64) -> i32 {
+    if x == 0 {
+        return 0;
+    }
+    return 63 - leading_zeros(x);
+}
+
+// --- floats (pure Zexi; no libm) -------------------------------------------
 
 pub fn minf(a: f64, b: f64) -> f64 {
     if a < b { a } else { b }
@@ -64,4 +201,37 @@ pub fn clampf(x: f64, lo: f64, hi: f64) -> f64 {
 
 pub fn absf(x: f64) -> f64 {
     if x < 0.0 { -x } else { x }
+}
+
+// floor_f rounds toward negative infinity.
+pub fn floor_f(x: f64) -> f64 {
+    let t = x as i64; // truncates toward zero
+    let f = t as f64;
+    if f > x {
+        return f - 1.0;
+    }
+    return f;
+}
+
+// ceil_f rounds toward positive infinity.
+pub fn ceil_f(x: f64) -> f64 {
+    let t = x as i64;
+    let f = t as f64;
+    if f < x {
+        return f + 1.0;
+    }
+    return f;
+}
+
+// round_f rounds half away from zero.
+pub fn round_f(x: f64) -> f64 {
+    if x < 0.0 {
+        return 0.0 - floor_f(0.0 - x + 0.5);
+    }
+    return floor_f(x + 0.5);
+}
+
+// trunc_f rounds toward zero.
+pub fn trunc_f(x: f64) -> f64 {
+    return (x as i64) as f64;
 }

@@ -1,0 +1,58 @@
+// sys — operating-system helpers: environment, clocks, sleeping, pid.
+// Import with `use sys;` or `use std::sys;`.
+//
+// A small C shim (`zxs_*`) is linked in only when this module is used.
+
+extern "C" fn zxs_env_get(name: str, buf: &mut [u8; 4096], cap: i32) -> i32;
+extern "C" fn zxs_time_ms() -> i64;
+extern "C" fn zxs_mono_ms() -> i64;
+extern "C" fn zxs_sleep_ms(ms: i64);
+extern "C" fn zxs_pid() -> i32;
+
+// env_get returns the value of an environment variable ("" when unset or
+// empty).
+pub fn env_get(name: str) -> String {
+    let mut buf: [u8; 4096] = [0; 4096];
+    let n = zxs_env_get(name, &mut buf, 4096);
+    let mut out = String::new();
+    if n > 0 {
+        let mut i: usize = 0;
+        while i < (n as usize) {
+            out.push_byte(buf[i]);
+            i += 1;
+        }
+    }
+    return out;
+}
+
+// time_ms is wall-clock time in milliseconds since the Unix epoch.
+pub fn time_ms() -> i64 {
+    return zxs_time_ms();
+}
+
+// time_s is wall-clock time in whole seconds.
+pub fn time_s() -> i64 {
+    return zxs_time_ms() / 1000;
+}
+
+// mono_ms is a monotonic clock in milliseconds (for measuring intervals;
+// it never jumps, unlike the wall clock).
+pub fn mono_ms() -> i64 {
+    return zxs_mono_ms();
+}
+
+// sleep_ms pauses the current thread for at least `ms` milliseconds.
+pub fn sleep_ms(ms: i64) {
+    zxs_sleep_ms(ms);
+}
+
+// pid is the current process id.
+pub fn pid() -> i32 {
+    return zxs_pid();
+}
+
+// millis_since returns how many milliseconds have passed since `start`,
+// measured with the monotonic clock.
+pub fn millis_since(start: i64) -> i64 {
+    return zxs_mono_ms() - start;
+}

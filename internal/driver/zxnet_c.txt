@@ -1,0 +1,264 @@
+/* zxnet.c — self-contained networking runtime for Zexi.
+ *
+ * No external dependencies: only POSIX sockets + libc. Linked into the
+ * program only when `use net;` or `use http;` is seen, and pruned to just
+ * the functions the program calls by the linker (compiled with
+ * -ffunction-sections -fdata-sections, linked with --gc-sections).
+ *
+ * Functions use the zxn_ prefix to avoid colliding with Zexi's own zx_
+ * name mangling in the generated C.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <stdint.h>
+
+int zxn_htons(int hostshort) { return (int)htons((unsigned short)hostshort); }
+
+unsigned int zxn_inet_addr(const char *s) { return inet_addr(s); }
+
+int zxn_socket(int domain, int type, int protocol) {
+    int fd = socket(domain, type, protocol);
+#ifdef SO_NOSIGPIPE
+    /* macOS/BSD: a peer that closes early must not kill the process. */
+    if (fd >= 0) {
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+    }
+#endif
+    return fd;
+}
+
+int zxn_connect(int fd, const char *host, int port, int timeout_ms) {
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((unsigned short)port);
+    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL)
+            return -1;
+        memcpy(&sa.sin_addr, &((struct sockaddr_in *)res->ai_addr)->sin_addr, sizeof sa.sin_addr);
+        freeaddrinfo(res);
+    }
+    if (timeout_ms <= 0) timeout_ms = 30000;
+    /* Make the socket non-blocking so connect() can be bounded by select(). */
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int rc = connect(fd, (struct sockaddr *)&sa, sizeof sa);
+    if (rc < 0 && errno != EINPROGRESS) {
+        if (flags >= 0) fcntl(fd, F_SETFL, flags);
+        return -1;
+    }
+    if (rc == 0) {
+        if (flags >= 0) fcntl(fd, F_SETFL, flags);
+        return 0;
+    }
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    int sel = select(fd + 1, NULL, &wfds, NULL, &tv);
+    if (sel <= 0) {
+        if (flags >= 0) fcntl(fd, F_SETFL, flags);
+        return -1;
+    }
+    int err = 0;
+    socklen_t len = sizeof err;
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0) {
+        if (flags >= 0) fcntl(fd, F_SETFL, flags);
+        return -1;
+    }
+    if (flags >= 0) fcntl(fd, F_SETFL, flags);
+    return 0;
+}
+
+int zxn_bind(int fd, const char *host, int port) {
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((unsigned short)port);
+    if (host == NULL || strcmp(host, "0.0.0.0") == 0 || strcmp(host, "*") == 0) {
+        sa.sin_addr.s_addr = INADDR_ANY;
+    } else if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
+        /* Not a literal address: resolve it instead of silently binding ANY. */
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL)
+            return -1;
+        memcpy(&sa.sin_addr, &((struct sockaddr_in *)res->ai_addr)->sin_addr, sizeof sa.sin_addr);
+        freeaddrinfo(res);
+    }
+    return bind(fd, (struct sockaddr *)&sa, sizeof sa);
+}
+
+int zxn_listen(int fd, int backlog) { return listen(fd, backlog); }
+
+int zxn_accept(int fd) {
+    for (;;) {
+        int c = accept(fd, NULL, NULL);
+        if (c < 0 && errno == EINTR) continue;
+        return c;
+    }
+}
+
+int zxn_setsockopt_reuseaddr(int fd) {
+    int one = 1;
+    return setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+}
+
+/* zxn_set_timeout bounds blocking send/recv calls; 0 disables the timeout. */
+int zxn_set_timeout(int fd, int ms) {
+    struct timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    int rc = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) != 0)
+        rc = -1;
+    return rc;
+}
+
+int zxn_send_all(int fd, const char *buf, int n) {
+    int sent = 0;
+    while (sent < n) {
+#ifdef MSG_NOSIGNAL
+        /* Linux: no SIGPIPE when the peer has gone away. */
+        ssize_t r = send(fd, buf + sent, n - sent, MSG_NOSIGNAL);
+#else
+        ssize_t r = send(fd, buf + sent, n - sent, 0);
+#endif
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            return -1;
+        }
+        sent += (int)r;
+    }
+    return sent;
+}
+
+int zxn_recv(int fd, char *buf, int cap) {
+    for (;;) {
+        ssize_t r = recv(fd, buf, cap, 0);
+        if (r < 0 && errno == EINTR) continue;
+        return (int)r;
+    }
+}
+
+int zxn_close(int fd) { return close(fd); }
+
+/* --- file helpers (static files and downloads) ---------------------------
+ * Handles are FILE* pointers as integers, so binary data can be streamed
+ * through the same byte-buffer path as sockets without NUL truncation. */
+
+long zxn_file_open(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    return (long)(intptr_t)f;
+}
+
+int zxn_file_read(long handle, char *buf, int cap) {
+    FILE *f = (FILE *)(intptr_t)handle;
+    if (!f || cap <= 0) return -1;
+    size_t n = fread(buf, 1, (size_t)cap, f);
+    if (n == 0 && ferror(f)) return -1;
+    return (int)n;
+}
+
+int zxn_file_close(long handle) {
+    FILE *f = (FILE *)(intptr_t)handle;
+    if (!f) return -1;
+    return fclose(f);
+}
+
+long zxn_file_size(const char *path) {
+    struct stat st;
+    if (!path || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+    return (long)st.st_size;
+}
+
+int zxn_write_file(const char *path, const char *buf, int n) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    size_t wrote = fwrite(buf, 1, (size_t)n, f);
+    if (fclose(f) != 0) return -1;
+    return wrote == (size_t)n ? n : -1;
+}
+
+/* zxn_read_head reads until "\r\n\r\n" (end of HTTP head) or the buffer is
+ * full. Returns the number of bytes read, or -1 on error. */
+int zxn_read_head(int fd, char *buf, int cap) {
+    int total = 0;
+    while (total < cap - 1) {
+        ssize_t r = recv(fd, buf + total, 1, 0);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            break;
+        }
+        total++;
+        if (total >= 4 && memcmp(buf + total - 4, "\r\n\r\n", 4) == 0)
+            break;
+    }
+    buf[total] = '\0';
+    return total;
+}
+
+/* zxn_http_send writes a complete HTTP response. */
+int zxn_http_send(int fd, const char *status_line, const char *body) {
+    int r = zxn_send_all(fd, status_line, (int)strlen(status_line));
+    if (r < 0) return -1;
+    return zxn_send_all(fd, body, (int)strlen(body));
+}
+
+/* zxn_http_get performs a simple HTTP GET and returns the full response as a
+ * malloc'd string (caller frees), or NULL on failure. */
+char *zxn_http_get(const char *host, int port, const char *path) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return NULL;
+    if (zxn_connect(fd, host, port, 30000) != 0) {
+        close(fd);
+        return NULL;
+    }
+    char req[4096];
+    int n = snprintf(req, sizeof req,
+        "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: zexi-net/0.1\r\n"
+        "Accept: */*\r\nConnection: close\r\n\r\n",
+        path, host);
+    if (zxn_send_all(fd, req, n) < 0) {
+        close(fd);
+        return NULL;
+    }
+    int cap = 1 << 16;
+    char *out = malloc(cap);
+    if (!out) { close(fd); return NULL; }
+    int total = 0;
+    for (;;) {
+        if (total >= cap - 1) break;
+        ssize_t r = recv(fd, out + total, cap - total - 1, 0);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            break;
+        }
+        total += (int)r;
+    }
+    out[total] = '\0';
+    close(fd);
+    return out;
+}

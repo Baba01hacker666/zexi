@@ -2,10 +2,13 @@ package driver_test
 
 import (
 	"bytes"
+	"io"
 	"net"
+	stdhttp "net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +40,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/match_guards.zx",
 		"../../tests/robustness.zx",
 		"../../tests/sugar.zx",
+		"../../tests/function_values.zx",
 		"../../tests/keywords.zx",
 		"../../tests/easy.zx",
 	}
@@ -170,6 +174,10 @@ func TestRunPrograms(t *testing.T) {
 			}, "\n"),
 		},
 		{
+			file: "../../tests/function_values.zx",
+			want: strings.Join([]string{"42", "21", "15", ""}, "\n"),
+		},
+		{
 			file: "../../tests/keywords.zx",
 			want: strings.Join([]string{
 				"A", "B", "C", "F", "4", "4",
@@ -291,6 +299,566 @@ func TestHTTPExamplesTypeCheck(t *testing.T) {
 			em.Render(os.Stderr, em.FirstFileID())
 			t.Errorf("%s + lib/http.zx: front end reported errors", f)
 		}
+	}
+}
+
+// TestStdNetHTTPRoundTrip builds a server and a client against the embedded
+// standard-library modules (`use http;` / `use std::http;`). Neither program
+// names a C source file: the driver must recognise the import and link the
+// embedded socket runtime (zxnet) by itself. The client also checks that a
+// server can read a request head with Conn::read_head.
+func TestStdNetHTTPRoundTrip(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end network test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+
+	dir := t.TempDir()
+	serverSrc := `use http;
+
+fn main() -> i32 {
+    let mut srv = listen("127.0.0.1", 18082);
+    if srv.fd < 0 {
+        println("bind failed");
+        return 1;
+    }
+    let mut served: i32 = 0;
+    while served < 3 {
+        let mut c = srv.accept();
+        if c.fd < 0 {
+            continue;
+        }
+        let req = read_request(&c);
+        if !req.valid() {
+            c.close();
+            continue;
+        }
+        print(req.method);
+        print(" ");
+        print(req.path);
+        print(" ");
+        println(req.body.len());
+        let body = if req.path == "/pi" { "3.141592653589793238462643383279" } else { "index" };
+        let resp = response(200, reason_phrase(200), body);
+        c.write(resp);
+        c.close();
+        served += 1;
+    }
+    srv.close();
+    0
+}
+`
+	clientSrc := `use std::http;
+
+fn main() -> i32 {
+    let a = get("127.0.0.1", 18082, "/");
+    let ra = parse_response(&a);
+    print(ra.status);
+    print(" ");
+    print(ra.body.trim());
+    print(" ");
+    println(ra.header("content-length"));
+
+    let b = get("127.0.0.1", 18082, "/pi");
+    let rb = parse_response(&b);
+    print(rb.status);
+    print(" ");
+    println(rb.body.trim());
+
+    let p = post("127.0.0.1", 18082, "/echo", "hello body");
+    let rp = parse_response(&p);
+    print(rp.status);
+    print(" ");
+    println(rp.body.trim());
+    0
+}
+`
+	serverPath := filepath.Join(dir, "server.zx")
+	clientPath := filepath.Join(dir, "client.zx")
+	if err := os.WriteFile(serverPath, []byte(serverSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(clientPath, []byte(clientSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srvBin := filepath.Join(dir, "server")
+	cliBin := filepath.Join(dir, "client")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(serverPath, srvBin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build the stdlib HTTP server")
+	}
+	em = diag.NewEmitter()
+	if _, ok := driver.Build(clientPath, cliBin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build the stdlib HTTP client")
+	}
+
+	var srvOut bytes.Buffer
+	server := exec.Command(srvBin)
+	server.Stdout = &srvOut
+	server.Stderr = &srvOut
+	if err := server.Start(); err != nil {
+		t.Fatalf("starting server: %v", err)
+	}
+	defer server.Process.Kill()
+
+	if !waitPort("127.0.0.1:18082", 5*time.Second) {
+		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
+	}
+
+	out, err := exec.Command(cliBin).Output()
+	if err != nil {
+		t.Fatalf("running client: %v", err)
+	}
+	wantClient := "200 index 5\n200 3.141592653589793238462643383279\n200 index\n"
+	if string(out) != wantClient {
+		t.Fatalf("client output mismatch\n got: %q\nwant: %q", string(out), wantClient)
+	}
+
+	done := make(chan struct{})
+	go func() { server.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not exit after serving three requests")
+	}
+	if wantLog := "GET / 0\nGET /pi 0\nPOST /echo 10\n"; srvOut.String() != wantLog {
+		t.Fatalf("server log mismatch\n got: %q\nwant: %q", srvOut.String(), wantLog)
+	}
+}
+
+// TestStdHTTPClientReadsBodies checks that the client stops at the declared
+// end of a body instead of waiting for the peer to close: one response is
+// chunked, the other uses Content-Length. The raw server keeps each
+// connection open for three seconds, so finishing quickly proves the client
+// understood the body framing.
+func TestStdHTTPClientReadsBodies(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end network test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	payloads := []string{
+		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nhello world",
+	}
+	go func() {
+		for _, payload := range payloads {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// Serve concurrently: the connections stay open for a while, and
+			// the client must open the second one without waiting for the first
+			// to close.
+			go func(conn net.Conn, payload string) {
+				buf := make([]byte, 4096)
+				total := 0
+				for total < len(buf) {
+					n, err := conn.Read(buf[total:])
+					if err != nil {
+						break
+					}
+					total += n
+					if strings.Contains(string(buf[:total]), "\r\n\r\n") {
+						break
+					}
+				}
+				conn.Write([]byte(payload))
+				time.Sleep(3 * time.Second)
+				conn.Close()
+			}(conn, payload)
+		}
+	}()
+
+	dir := t.TempDir()
+	clientPath := filepath.Join(dir, "client.zx")
+	clientSrc := `use http;
+
+fn main() -> i32 {
+    let port = String::from(arg_at(1)).parse_i64() as i32;
+    let a = get("127.0.0.1", port, "/");
+    let ra = parse_response(&a);
+    print(ra.status);
+    print(" [");
+    print(ra.body);
+    println("]");
+
+    let b = get("127.0.0.1", port, "/");
+    let rb = parse_response(&b);
+    print(rb.status);
+    print(" [");
+    print(rb.body);
+    println("]");
+    0
+}
+`
+	if err := os.WriteFile(clientPath, []byte(clientSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cliBin := filepath.Join(dir, "client")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(clientPath, cliBin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build the HTTP client")
+	}
+
+	port := ln.Addr().(*net.TCPAddr).Port
+	start := time.Now()
+	out, err := exec.Command(cliBin, strconv.Itoa(port)).Output()
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("running client: %v", err)
+	}
+	want := "200 [hello world]\n200 [hello world]\n"
+	if string(out) != want {
+		t.Fatalf("client output mismatch\n got: %q\nwant: %q", string(out), want)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("client waited %v; it should stop at the end of the body, not at EOF", elapsed)
+	}
+}
+
+// TestStdHTTPHighLevelAPI exercises the urllib-style client (URL parsing,
+// headers, redirects, query decoding, POST bodies, https rejection) against a
+// server built from the Response builders and send_response.
+func TestStdHTTPHighLevelAPI(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end network test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+
+	dir := t.TempDir()
+	serverSrc := `use http;
+
+fn hello_handler(req: &Request) -> Response {
+    println(req.path_only());
+    let mut r = Response::html(200, "<h1>hello</h1>");
+    r.set_header("X-Route", "hello");
+    r.set_cookie("sid", "abc");
+    return r;
+}
+
+fn old_handler(req: &Request) -> Response {
+    println(req.path_only());
+    return Response::redirect("/hello");
+}
+
+fn echo_handler(req: &Request) -> Response {
+    println(req.path_only());
+    let mut body = req.query("x");
+    body.push_str(":");
+    body.push_str(req.body.as_str());
+    return Response::text(200, body.as_str());
+}
+
+fn cookie_handler(req: &Request) -> Response {
+    println(req.path_only());
+    let v = req.cookie("sid");
+    return Response::text(200, v.as_str());
+}
+
+fn form_handler(req: &Request) -> Response {
+    println(req.path_only());
+    let v = req.param("name");
+    return Response::text(200, v.as_str());
+}
+
+fn main() -> i32 {
+    let mut srv = listen("127.0.0.1", 18088);
+    if !srv.ok() {
+        println("bind failed");
+        return 1;
+    }
+    let mut router = Router::new();
+    router.get("/hello", hello_handler);
+    router.get("/old", old_handler);
+    router.post("/api/*", echo_handler);
+    router.get("/cookie", cookie_handler);
+    router.post("/form", form_handler);
+
+    let mut served: i32 = 0;
+    while served < 6 {
+        let mut c = srv.accept();
+        if !c.ok() {
+            continue;
+        }
+        if router.serve(&c) {
+            served += 1;
+        }
+        c.close();
+    }
+    srv.close();
+    0
+}
+`
+	clientSrc := `use http;
+
+fn main() -> i32 {
+    let mut c = Client::new();
+    c.set_header("Cookie", "sid=abc");
+    let a = c.get("http://127.0.0.1:18088/hello");
+    print(a.status);
+    print(" ");
+    print(a.header("content-type"));
+    print(" ");
+    print(a.header("x-route"));
+    print(" ");
+    print(a.header("set-cookie"));
+    print(" ");
+    println(a.body);
+
+    let b = fetch("http://127.0.0.1:18088/old");
+    print(b.status);
+    print(" ");
+    println(b.body);
+
+    let d = c.post("http://127.0.0.1:18088/api/echo?x=hi%20there", "body text");
+    print(d.status);
+    print(" ");
+    println(d.body);
+
+    let e = c.get("https://127.0.0.1:18088/hello");
+    print(e.status);
+    print(" ");
+    println(e.error);
+
+    let f = c.get("http://127.0.0.1:18088/cookie");
+    print(f.status);
+    print(" ");
+    println(f.body);
+
+    let g = c.post_form("http://127.0.0.1:18088/form", "name=zexi%20lang");
+    print(g.status);
+    print(" ");
+    println(g.body);
+    0
+}
+`
+	serverPath := filepath.Join(dir, "server.zx")
+	clientPath := filepath.Join(dir, "client.zx")
+	if err := os.WriteFile(serverPath, []byte(serverSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(clientPath, []byte(clientSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srvBin := filepath.Join(dir, "server")
+	cliBin := filepath.Join(dir, "client")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(serverPath, srvBin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build the high-level server")
+	}
+	em = diag.NewEmitter()
+	if _, ok := driver.Build(clientPath, cliBin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build the high-level client")
+	}
+
+	var srvOut bytes.Buffer
+	server := exec.Command(srvBin)
+	server.Stdout = &srvOut
+	server.Stderr = &srvOut
+	if err := server.Start(); err != nil {
+		t.Fatalf("starting server: %v", err)
+	}
+	defer server.Process.Kill()
+
+	if !waitPort("127.0.0.1:18088", 5*time.Second) {
+		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
+	}
+
+	out, err := exec.Command(cliBin).Output()
+	if err != nil {
+		t.Fatalf("running client: %v", err)
+	}
+	want := "200 text/html; charset=utf-8 hello sid=abc <h1>hello</h1>\n" +
+		"200 <h1>hello</h1>\n" +
+		"200 hi there:body text\n" +
+		"0 https is not supported (this client is plaintext HTTP only)\n" +
+		"200 abc\n" +
+		"200 zexi lang\n"
+	if string(out) != want {
+		t.Fatalf("client output mismatch\n got: %q\nwant: %q", string(out), want)
+	}
+
+	done := make(chan struct{})
+	go func() { server.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not exit after serving six requests")
+	}
+	if wantLog := "/hello\n/old\n/hello\n/api/echo\n/cookie\n/form\n"; srvOut.String() != wantLog {
+		t.Fatalf("server log mismatch\n got: %q\nwant: %q", srvOut.String(), wantLog)
+	}
+}
+
+// TestStdHTTPStaticFiles serves a directory with serve_static and checks it
+// with Go's HTTP client: MIME types, exact binary bytes, 404 fallback, and
+// rejection of encoded path traversal.
+func TestStdHTTPStaticFiles(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end network test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+
+	dir := t.TempDir()
+	web := filepath.Join(dir, "web")
+	if err := os.MkdirAll(web, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	index := []byte("<h1>index</h1>")
+	blob := make([]byte, 256)
+	for i := range blob {
+		blob[i] = byte(i)
+	}
+	if err := os.WriteFile(filepath.Join(web, "index.html"), index, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(web, "blob.bin"), blob, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	serverSrc := `use http;
+
+fn main() -> i32 {
+    let root = String::from(arg_at(1));
+    let mut srv = listen("127.0.0.1", 18089);
+    if !srv.ok() {
+        println("bind failed");
+        return 1;
+    }
+    let mut served: i32 = 0;
+    while served < 4 {
+        let mut c = srv.accept();
+        if !c.ok() {
+            continue;
+        }
+        let req = read_request(&c);
+        if !req.valid() {
+            c.close();
+            continue;
+        }
+        let r = serve_static(root.as_str(), req.path_only().as_str());
+        send_response(&c, &r);
+        c.close();
+        served += 1;
+    }
+    srv.close();
+    0
+}
+`
+	serverPath := filepath.Join(dir, "server.zx")
+	if err := os.WriteFile(serverPath, []byte(serverSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srvBin := filepath.Join(dir, "server")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(serverPath, srvBin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build the static-file server")
+	}
+
+	var srvOut bytes.Buffer
+	server := exec.Command(srvBin, web)
+	server.Stdout = &srvOut
+	server.Stderr = &srvOut
+	if err := server.Start(); err != nil {
+		t.Fatalf("starting server: %v", err)
+	}
+	defer server.Process.Kill()
+
+	if !waitPort("127.0.0.1:18089", 5*time.Second) {
+		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
+	}
+
+	base := "http://127.0.0.1:18089"
+	get := func(path string) (int, string, []byte) {
+		resp, err := stdhttp.Get(base + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("reading %s: %v", path, err)
+		}
+		return resp.StatusCode, resp.Header.Get("Content-Type"), body
+	}
+
+	if status, ctype, body := get("/index.html"); status != 200 || ctype != "text/html; charset=utf-8" || !bytes.Equal(body, index) {
+		t.Fatalf("index: status=%d type=%q body=%q", status, ctype, body)
+	}
+	if status, ctype, body := get("/blob.bin"); status != 200 || ctype != "application/octet-stream" || !bytes.Equal(body, blob) {
+		t.Fatalf("blob: status=%d type=%q len=%d identical=%v", status, ctype, len(body), bytes.Equal(body, blob))
+	}
+	if status, _, _ := get("/missing.txt"); status != 404 {
+		t.Fatalf("missing file: status=%d, want 404", status)
+	}
+	if status, _, _ := get("/%2e%2e/secret.txt"); status != 403 {
+		t.Fatalf("traversal: status=%d, want 403", status)
+	}
+
+	done := make(chan struct{})
+	go func() { server.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not exit after serving four requests")
+	}
+}
+
+// TestParallelCUnitsMatchSingleFile checks that the multi-unit (parallel cc)
+// build path produces byte-identical program output to the single-file path.
+func TestParallelCUnitsMatchSingleFile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+
+	for _, file := range []string{"../../tests/pi.zx", "../../tests/strings.zx"} {
+		t.Run(filepath.Base(file), func(t *testing.T) {
+			dir := t.TempDir()
+			outputs := make([][]byte, 2)
+			for i, jobs := range []int{1, 4} {
+				out := filepath.Join(dir, "prog"+strconv.Itoa(jobs))
+				em := diag.NewEmitter()
+				if _, ok := driver.Build(file, out, driver.Options{Jobs: jobs}, em); !ok {
+					em.Render(os.Stderr, em.FirstFileID())
+					t.Fatalf("build with jobs=%d failed", jobs)
+				}
+				raw, err := exec.Command(out).Output()
+				if err != nil {
+					t.Fatalf("running jobs=%d binary: %v", jobs, err)
+				}
+				outputs[i] = raw
+			}
+			if string(outputs[0]) != string(outputs[1]) {
+				t.Fatalf("outputs differ\njobs=1: %q\njobs=4: %q", outputs[0], outputs[1])
+			}
+		})
 	}
 }
 

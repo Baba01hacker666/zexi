@@ -75,6 +75,7 @@ type Info struct {
 	EnumOrd    []*types.Enum
 	Methods    map[string]map[string]*Fn  // struct name -> method name -> fn
 	Resolved   map[ast.Expr]*Fn           // resolved call / method target
+	Indirect   map[ast.Expr]*types.Type   // calls through a function value
 	Ctors      map[ast.Expr]*Ctor         // resolved enum-variant construction
 	TupleCtors map[ast.Expr]*types.Struct // resolved tuple-struct construction
 	Aliases    map[string]*types.Type     // resolved `type` aliases
@@ -104,6 +105,7 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 			Enums:      map[string]*types.Enum{},
 			Methods:    map[string]map[string]*Fn{},
 			Resolved:   map[ast.Expr]*Fn{},
+			Indirect:   map[ast.Expr]*types.Type{},
 			Ctors:      map[ast.Expr]*Ctor{},
 			TupleCtors: map[ast.Expr]*types.Struct{},
 			Aliases:    map[string]*types.Type{},
@@ -1468,6 +1470,25 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 			}
 		}
 		return &types.Type{Kind: types.StructKind, St: st}
+	}
+	// A local binding of function type can be called directly: this is the
+	// indirect call the router/handler APIs are built on.
+	if ft := c.lookupScope(name); ft != nil && ft.Kind == types.Fn {
+		c.info.Indirect[x] = ft
+		if len(x.Args) != len(ft.Params) {
+			c.errAt(x, "E0061", "function value takes %d argument(s) but %d were supplied", len(ft.Params), len(x.Args))
+		}
+		for i, a := range x.Args {
+			var want *types.Type
+			if i < len(ft.Params) {
+				want = ft.Params[i]
+			}
+			at := c.checkExpr(a, want)
+			if want != nil && !c.argAssignable(want, at, false) {
+				c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
+			}
+		}
+		return ft.Ret
 	}
 	fn, ok := c.info.Fns[name]
 	if !ok {
@@ -2957,6 +2978,16 @@ func isPrintable(t *types.Type) bool {
 		return true
 	}
 	return t.Kind.IsNumeric()
+}
+
+// lookupScope returns the type of a local binding, or nil.
+func (c *checker) lookupScope(name string) *types.Type {
+	for i := len(c.scope) - 1; i >= 0; i-- {
+		if t, ok := c.scope[i][name]; ok {
+			return t
+		}
+	}
+	return nil
 }
 
 func calleeName(e ast.Expr) (string, bool) {
