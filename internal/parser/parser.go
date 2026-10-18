@@ -943,9 +943,29 @@ func (p *parser) parsePostfix() ast.Expr {
 			}
 		case token.KindLBracket:
 			p.bump()
-			idx := p.parseExpr()
+			// Python-style slice: `xs[lo:hi]`, with either bound optional.
+			if p.at(token.KindColon) {
+				p.bump()
+				var high ast.Expr
+				if !p.at(token.KindRBracket) {
+					high = p.parseExpr()
+				}
+				p.expect(token.KindRBracket, " to close slice expression")
+				e = &ast.SliceExpr{Recv: e, Low: nil, High: high, Sp: token.Span{Start: e.Span().Start, End: p.prevEnd()}}
+				continue
+			}
+			low := p.parseExpr()
+			if p.accept(token.KindColon) {
+				var high ast.Expr
+				if !p.at(token.KindRBracket) {
+					high = p.parseExpr()
+				}
+				p.expect(token.KindRBracket, " to close slice expression")
+				e = &ast.SliceExpr{Recv: e, Low: low, High: high, Sp: token.Span{Start: e.Span().Start, End: p.prevEnd()}}
+				continue
+			}
 			p.expect(token.KindRBracket, " to close index expression")
-			e = &ast.IndexExpr{Recv: e, Index: idx, Sp: token.Span{Start: e.Span().Start, End: p.prevEnd()}}
+			e = &ast.IndexExpr{Recv: e, Index: low, Sp: token.Span{Start: e.Span().Start, End: p.prevEnd()}}
 		case token.KindLParen:
 			args := p.parseArgs()
 			e = &ast.CallExpr{Callee: e, Args: args, Sp: token.Span{Start: e.Span().Start, End: p.prevEnd()}}

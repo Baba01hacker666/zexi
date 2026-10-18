@@ -349,6 +349,7 @@ func (g *gen) boundsHelper() {
 	g.w.line("// Bounds-checked array index: aborts with a message instead of reading")
 	g.w.line("// out of bounds. (M0-alpha: no backtrace yet.)")
 	g.w.line("static inline int64_t zx_bounds(int64_t i, int64_t n) {")
+	g.w.line("    if (i < 0) { i += n; }")
 	g.w.line("    if (i < 0 || i >= n) {")
 	g.w.line(`        fprintf(stderr, "zexi: index %%lld out of bounds (len %%lld)\n", (long long)i, (long long)n);`)
 	g.w.line("        abort();")
@@ -1307,6 +1308,9 @@ func (g *gen) value(e ast.Expr) string {
 	case *ast.IndexExpr:
 		return g.indexValue(x)
 
+	case *ast.SliceExpr:
+		return g.sliceValue(x)
+
 	case *ast.MatchExpr:
 		return g.matchValue(x)
 
@@ -2026,6 +2030,57 @@ func (g *gen) indexValue(x *ast.IndexExpr) string {
 		return "(" + recv + ").e[zx_bounds(" + idx + ", " + strconv.FormatInt(rt.Len, 10) + ")]"
 	}
 	return "(" + recv + ")[" + idx + "]"
+}
+
+// sliceValue emits a Python-style slice `s[lo:hi]` as an owning String.
+func (g *gen) sliceValue(x *ast.SliceExpr) string {
+	recv := g.value(x.Recv)
+	rt := g.info.TypeOf(x.Recv)
+	low := "0"
+	if x.Low != nil {
+		low = g.value(x.Low)
+	}
+	high := ""
+	if x.High != nil {
+		high = g.value(x.High)
+	}
+	if rt != nil && rt.Kind == types.StringKind {
+		if isPlaceExpr(x.Recv) {
+			p := g.tmpName()
+			r := g.tmpName()
+			expr := "({ const char *" + p + " = zx_string_as_str(&(" + recv + ")); "
+			if high != "" {
+				expr += "zx_String " + r + " = zx_string_slice(" + p + ", " + low + ", " + high + "); "
+			} else {
+				expr += "zx_String " + r + " = zx_string_slice(" + p + ", " + low + ", strlen(" + p + ")); "
+			}
+			expr += r + "; })"
+			return expr
+		}
+		tm := g.tmpName()
+		p := g.tmpName()
+		r := g.tmpName()
+		expr := "({ zx_String " + tm + " = " + recv + "; const char *" + p + " = zx_string_as_str(&" + tm + "); "
+		if high != "" {
+			expr += "zx_String " + r + " = zx_string_slice(" + p + ", " + low + ", " + high + "); "
+		} else {
+			expr += "zx_String " + r + " = zx_string_slice(" + p + ", " + low + ", strlen(" + p + ")); "
+		}
+		expr += "zx_drop_String(&" + tm + "); " + r + "; })"
+		return expr
+	}
+	// str (const char *)
+	if isPlaceExpr(x.Recv) {
+		if high != "" {
+			return "zx_string_slice(" + recv + ", " + low + ", " + high + ")"
+		}
+		return "zx_string_slice(" + recv + ", " + low + ", strlen(" + recv + "))"
+	}
+	tm := g.tmpName()
+	if high != "" {
+		return "({ const char *" + tm + " = " + recv + "; zx_string_slice(" + tm + ", " + low + ", " + high + "); })"
+	}
+	return "({ const char *" + tm + " = " + recv + "; zx_string_slice(" + tm + ", " + low + ", strlen(" + tm + ")); })"
 }
 
 // cstrValue emits the C-bridge builtin `cstr(x)`: a borrowed `*u8`
@@ -3044,6 +3099,26 @@ static zx_String zx_string_concat(const char *a, const char *b) {
 }
 
 static size_t zx_string_len(const zx_String *s) { return s->len; }
+
+static zx_String zx_string_slice(const char *s, int64_t lo, int64_t hi) {
+    if (!s) s = "";
+    int64_t n = (int64_t)strlen(s);
+    if (lo < 0) lo += n;
+    if (hi < 0) hi += n;
+    if (lo < 0) lo = 0;
+    if (hi < 0) hi = 0;
+    if (lo > n) lo = n;
+    if (hi > n) hi = n;
+    if (hi < lo) { lo = hi; }
+    size_t len = (size_t)(hi - lo);
+    zx_String r;
+    r.len = len;
+    r.ptr = (char *)malloc(len + 1);
+    if (!r.ptr) { fputs("zexi: out of memory\\n", stderr); abort(); }
+    if (len) memcpy(r.ptr, s + lo, len);
+    r.ptr[len] = 0;
+    return r;
+}
 static bool zx_string_is_empty(const zx_String *s) { return s->len == 0; }
 static const char *zx_string_as_str(const zx_String *s) { return s->ptr ? s->ptr : ""; }
 static void zx_string_clear(zx_String *s) { if (s->ptr) s->ptr[0] = 0; s->len = 0; }

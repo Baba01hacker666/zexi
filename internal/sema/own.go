@@ -176,6 +176,14 @@ func (m *mover) use(e ast.Expr) {
 	case *ast.IndexExpr:
 		m.use(x.Recv)
 		m.use(x.Index)
+	case *ast.SliceExpr:
+		m.use(x.Recv)
+		if x.Low != nil {
+			m.use(x.Low)
+		}
+		if x.High != nil {
+			m.use(x.High)
+		}
 	case *ast.ArrayLitExpr:
 		if x.Repeat {
 			m.use(x.Count)
@@ -252,6 +260,14 @@ func (m *mover) consume(e ast.Expr) {
 			if base, ok := x.Recv.(*ast.IdentExpr); ok {
 				m.moved[base.Name] = true
 			}
+		}
+	case *ast.SliceExpr:
+		m.use(x.Recv)
+		if x.Low != nil {
+			m.use(x.Low)
+		}
+		if x.High != nil {
+			m.use(x.High)
 		}
 	case *ast.ArrayLitExpr:
 		// Each element is moved into the array, matching codegen.
@@ -338,6 +354,14 @@ func (m *mover) assign(x *ast.AssignExpr) {
 	case *ast.IndexExpr:
 		m.use(l.Recv)
 		m.use(l.Index)
+	case *ast.SliceExpr:
+		m.use(l.Recv)
+		if l.Low != nil {
+			m.use(l.Low)
+		}
+		if l.High != nil {
+			m.use(l.High)
+		}
 	default:
 		m.use(x.Lhs)
 	}
