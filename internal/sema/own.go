@@ -236,6 +236,28 @@ func (m *mover) consume(e ast.Expr) {
 				m.moved[base.Name] = true
 			}
 		}
+	case *ast.ArrayLitExpr:
+		// Each element is moved into the array, matching codegen.
+		if x.Repeat {
+			m.use(x.Count)
+			if x.Value != nil {
+				m.consume(x.Value)
+			}
+			return
+		}
+		for _, el := range x.Elems {
+			m.consume(el)
+		}
+	case *ast.StructLitExpr:
+		for _, fi := range x.Fields {
+			if fi.Val != nil {
+				m.consume(fi.Val)
+			}
+		}
+	case *ast.TupleExpr:
+		for _, el := range x.Elems {
+			m.consume(el)
+		}
 	default:
 		m.use(e)
 	}

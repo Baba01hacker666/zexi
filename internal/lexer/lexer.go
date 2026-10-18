@@ -148,16 +148,25 @@ func (l *Lexer) scanNumber(startPos token.Position, startOff int) token.Token {
 		case 'x', 'X':
 			l.advance()
 			l.advance()
+			if !isHexDigit(l.peek()) {
+				l.errorf("E0005", startPos, "hexadecimal literal requires at least one digit")
+			}
 			l.consumeDigits(isHexDigit)
 			return l.tok(kind, l.lit(startOff), startPos, startOff)
 		case 'b', 'B':
 			l.advance()
 			l.advance()
+			if !isBinDigit(l.peek()) {
+				l.errorf("E0005", startPos, "binary literal requires at least one digit")
+			}
 			l.consumeDigits(isBinDigit)
 			return l.tok(kind, l.lit(startOff), startPos, startOff)
 		case 'o', 'O':
 			l.advance()
 			l.advance()
+			if !isOctDigit(l.peek()) {
+				l.errorf("E0005", startPos, "octal literal requires at least one digit")
+			}
 			l.consumeDigits(isOctDigit)
 			return l.tok(kind, l.lit(startOff), startPos, startOff)
 		}

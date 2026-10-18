@@ -218,3 +218,84 @@ func TestArrayLitAdoptsExpectedElemType(t *testing.T) {
 		t.Fatalf("expected clean, got %v", codes)
 	}
 }
+
+// TestNewDiagnostics covers the checks added in the robustness pass.
+func TestNewDiagnostics(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		code string
+	}{
+		{"return-value-in-unit-fn",
+			"fn f() { return 5; }\nfn main() -> i32 { f(); 0 }", "E0308"},
+		{"match-on-string",
+			"fn main() -> i32 { let s = String::from(\"x\"); match s { _ => println(1) } 0 }", "E0308"},
+		{"duplicate-catch-all",
+			"enum E { A, B }\nfn main() -> i32 { match E::A { _ => println(1), _ => println(2) } 0 }", "E0001"},
+		{"duplicate-variant-arm",
+			"enum E { A, B }\nfn main() -> i32 { match E::A { E::A => println(1), E::A => println(2), _ => println(3) } 0 }", "E0001"},
+		{"float-percent",
+			"fn main() -> i32 { let x = 5.0 % 2.0; println(x); 0 }", "E0308"},
+		{"negative-array-len",
+			"fn main() -> i32 { let xs: [i32; -1] = [0; -1]; println(len(xs)); 0 }", "E0080"},
+		{"method-without-self",
+			"struct F { n: i32 }\nimpl F { fn make() -> i32 { 7 } }\nfn main() -> i32 { let f = F { n: 1 }; println(f.make()); 0 }", "E0599"},
+		{"ref-to-temporary",
+			"fn main() -> i32 { let r = &String::from(\"x\"); 0 }", "E0716"},
+		{"recursive-type",
+			"struct S { s: S }\nfn main() -> i32 { 0 }", "E0072"},
+		{"array-repeat-non-copy",
+			"fn main() -> i32 { let s = String::from(\"hi\"); let xs: [String; 3] = [s; 3]; println(xs[0]); 0 }", "E0204"},
+		{"int-literal-out-of-range",
+			"fn main() -> i32 { let x: u8 = 300; println(x); 0 }", "E0080"},
+		{"nested-enum-pattern",
+			"enum I { A, B }\nenum O { W(I), N }\nfn main() -> i32 { let o = O::W(I::B); match o { O::W(I::A) => println(1), O::N => println(2), _ => println(3) } 0 }", "E0900"},
+		{"array-literal-moves-twice",
+			"fn main() -> i32 { let a = String::from(\"x\"); let xs = [a, a]; println(xs[0]); 0 }", "E0382"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			if ok || !has(codes, tc.code) {
+				t.Fatalf("expected %s, got %v", tc.code, codes)
+			}
+		})
+	}
+}
+
+// TestErgonomicsAccepted covers the additive syntax changes.
+func TestErgonomicsAccepted(t *testing.T) {
+	cases := []struct{ name, src string }{
+		{"for-in-array",
+			"fn main() -> i32 { let xs: [i32; 3] = [1, 2, 3]; let mut t = 0; for x in xs { t += x; } println(t); 0 }"},
+		{"for-in-array-non-copy-rejected",
+			"fn main() -> i32 { let xs = [String::from(\"a\")]; for x in xs { println(x); } 0 }"},
+		{"string-concat",
+			"fn f(a: str) -> String { return \"hi \" + a + \"!\"; }\nfn main() -> i32 { let s = String::from(\"bob\"); println(f(s)); 0 }"},
+		{"string-pluseq",
+			"fn main() -> i32 { let mut s = String::from(\"a\"); s += \"b\"; println(s); 0 }"},
+		{"string-as-str-arg",
+			"fn f(a: str) -> usize { return len(a); }\nfn main() -> i32 { let s = String::from(\"abcd\"); println(f(s)); 0 }"},
+		{"string-eq-str",
+			"fn main() -> i32 { let s = String::from(\"x\"); if s == \"x\" { println(1); } 0 }"},
+		{"len-sugar",
+			"fn main() -> i32 { let xs: [i32; 4] = [0; 4]; let s = String::from(\"hi\"); println(xs.len()); println(len(s)); 0 }"},
+		{"match-self-ref",
+			"enum E { A, B }\nimpl E { fn v(&self) -> i32 { match self { E::A => 1, E::B => 2 } } }\nfn main() -> i32 { let e = E::B; println(e.v()); 0 }"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			rejected := has(codes, "E0507")
+			if tc.name == "for-in-array-non-copy-rejected" {
+				if ok || !rejected {
+					t.Fatalf("expected E0507, got %v", codes)
+				}
+				return
+			}
+			if !ok {
+				t.Fatalf("expected clean, got %v", codes)
+			}
+		})
+	}
+}

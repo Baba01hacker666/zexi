@@ -85,6 +85,9 @@ func TestErrors(t *testing.T) {
 		{`"unterminated`, "E0001"},
 		{"/* open", "E0003"},
 		{"`", "E0002"},
+		{"0x", "E0005"},
+		{"0b", "E0005"},
+		{"0o", "E0005"},
 	}
 	for _, c := range cases {
 		lx := lexer.New(0, []byte(c.src))

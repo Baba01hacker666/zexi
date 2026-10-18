@@ -254,6 +254,21 @@ func (g *gen) collectArrayTypes() {
 	for _, t := range g.info.DeclTypes {
 		walk(t)
 	}
+	// Also walk declared structs/enums directly: an otherwise-unused type still
+	// has a C definition emitted, so a `String` field must pull in its typedef
+	// (and any array wrappers it needs).
+	for _, s := range g.info.Structs {
+		for _, f := range s.Fields {
+			walk(f.Ty)
+		}
+	}
+	for _, e := range g.info.Enums {
+		for _, v := range e.Variants {
+			for _, f := range v.Fields {
+				walk(f.Ty)
+			}
+		}
+	}
 }
 
 // collectDropTypes records every type that owns a heap resource and therefore
@@ -665,6 +680,13 @@ func (g *gen) letStmt(st *ast.LetStmt) {
 	if ty == nil {
 		ty = g.info.TypeOf(st.Val)
 	}
+	if ty != nil && ty.Kind == types.Never {
+		// `let x = if c { return .. } else { .. };` never binds a value.
+		if st.Val != nil {
+			g.discard(st.Val)
+		}
+		return
+	}
 	name := ""
 	switch p := st.Pat.(type) {
 	case *ast.BindPat:
@@ -674,7 +696,7 @@ func (g *gen) letStmt(st *ast.LetStmt) {
 	}
 	if name == "" || name == "_" {
 		if st.Val != nil {
-			g.w.line("%s;", g.value(st.Val))
+			g.discard(st.Val)
 		}
 		return
 	}
@@ -707,10 +729,21 @@ func (g *gen) stmtExpr(e ast.Expr) {
 		g.w.indent--
 		g.w.line("}")
 	default:
-		v := g.value(e)
-		if v != "" {
-			g.w.line("%s;", v)
-		}
+		g.discard(e)
+	}
+}
+
+// discard evaluates e for its side effects. If the result is a temporary that
+// owns a heap resource (e.g. an ignored `String` return value), it is freed.
+func (g *gen) discard(e ast.Expr) {
+	if t := g.info.TypeOf(e); t != nil && t.NeedsDrop() && !isPlaceExpr(e) {
+		tm := g.tmpName()
+		g.w.line("%s %s = %s;", ctype(t), tm, g.value(e))
+		g.w.line("zx_drop_%s(&%s);", typeMangle(t), tm)
+		return
+	}
+	if v := g.value(e); v != "" {
+		g.w.line("%s;", v)
 	}
 }
 
@@ -783,6 +816,12 @@ func (g *gen) forStmt(x *ast.LoopExpr) {
 	if rng.Op == token.KindDotDotEq {
 		op = "<="
 	}
+	// Evaluate both bounds once, before the loop, so a bound that is a call is
+	// not re-run on every iteration.
+	lo := g.tmpName()
+	hi := g.tmpName()
+	g.w.line("%s %s = %s;", ctype(lt), lo, g.value(rng.L))
+	g.w.line("%s %s = %s;", ctype(lt), hi, g.value(rng.R))
 	g.pushScope()
 	name := ""
 	switch p := x.Pat.(type) {
@@ -791,7 +830,7 @@ func (g *gen) forStmt(x *ast.LoopExpr) {
 	default:
 		name = g.fresh("i")
 	}
-	g.w.line("for (%s %s = %s; %s %s %s; %s++) {", ctype(lt), name, g.value(rng.L), name, op, g.value(rng.R), name)
+	g.w.line("for (%s %s = %s; %s %s %s; %s++) {", ctype(lt), name, lo, name, op, hi, name)
 	g.w.indent++
 	g.openLoop()
 	g.blockStmts(x.Body, nil)
@@ -1080,7 +1119,7 @@ func (g *gen) binValue(x *ast.BinExpr) string {
 
 func (g *gen) ifValue(x *ast.IfExpr) string {
 	t := g.info.TypeOf(x)
-	if t == nil || t.Kind == types.Unit {
+	if t == nil || t.Kind == types.Unit || t.Kind == types.Never {
 		// Not a value; evaluate for effect.
 		sub := &writer{indent: g.w.indent + 1}
 		save := g.w
@@ -1308,8 +1347,8 @@ func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
 				}
 			} else {
 				if isPtr {
-					if t := g.info.TypeOf(x.Recv); t != nil && t.NeedsDrop() {
-						args = append(args, "zx_move_"+typeMangle(t)+"("+g.value(x.Recv)+")")
+					if t := g.info.TypeOf(x.Recv); t != nil && t.Elem != nil && t.Elem.NeedsDrop() {
+						args = append(args, "zx_move_"+typeMangle(t.Elem)+"("+g.value(x.Recv)+")")
 					} else {
 						args = append(args, "(*"+g.value(x.Recv)+")")
 					}
@@ -1550,6 +1589,11 @@ func (g *gen) matchValue(x *ast.MatchExpr) string {
 	g.pushScope()
 	st := g.info.TypeOf(x.Scrutinee)
 	scrut := g.value(x.Scrutinee)
+	if st != nil && (st.Kind == types.Ref || st.Kind == types.Ptr) {
+		// `match self` / `match &e`: switch on the pointee.
+		scrut = "(*" + scrut + ")"
+		st = st.Elem
+	}
 	m := g.fresh("m")
 	sub.line("%s %s = %s;", ctype(st), m, scrut)
 	result := ""
@@ -1718,16 +1762,8 @@ func litPatLabel(p *ast.LitPat) string {
 		return "1"
 	case token.KindFalse:
 		return "0"
-	case token.KindChar:
-		s := strings.Trim(p.Text, "'")
-		if len(s) > 0 {
-			return strconv.FormatInt(int64([]rune(s)[0]), 10)
-		}
-	case token.KindByteChar:
-		s := strings.Trim(p.Text, "'")
-		if len(s) > 0 {
-			return strconv.FormatInt(int64([]rune(s)[0]), 10)
-		}
+	case token.KindChar, token.KindByteChar:
+		return strconv.FormatInt(int64(firstRune(p.Text)), 10)
 	}
 	return "0"
 }
@@ -1788,7 +1824,8 @@ func funcName(fn *sema.Fn) string {
 		return "zx_" + safeIdent(fn.Recv.String()) + "_" + safeIdent(fn.Name)
 	}
 	if fn.Name == "main" || fn.Extern {
-		return safeIdent(fn.Name)
+		// `main` and `extern "C"` functions keep their exact C name.
+		return fn.Name
 	}
 	return "zx_" + safeIdent(fn.Name)
 }
@@ -1811,10 +1848,28 @@ func safeIdent(name string) string {
 	if name == "" {
 		return "zx_anon"
 	}
-	if cKeywords[name] {
-		return name + "_"
+	// Mangle injectively: escape `_` as `_5f`, and hex-encode anything that is
+	// not an identifier character. This keeps distinct Zexi names distinct in C
+	// (e.g. `int` -> `z_int`, `int_` -> `int_5f`).
+	var b strings.Builder
+	for i := 0; i < len(name); i++ {
+		ch := name[i]
+		switch {
+		case ch == '_':
+			b.WriteString("_5f")
+		case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9':
+			b.WriteByte(ch)
+		default:
+			b.WriteByte('_')
+			b.WriteString(strconv.FormatInt(int64(ch), 16))
+			b.WriteByte('_')
+		}
 	}
-	return name
+	s := b.String()
+	if cKeywords[s] {
+		s = "z_" + s
+	}
+	return s
 }
 
 // localName renders a parameter/local name for the *signature*; binding uses
@@ -1909,9 +1964,12 @@ func (g *gen) registerDrop(cname string, t *types.Type) {
 // --- moves ----------------------------------------------------------------
 
 func isPlaceExpr(e ast.Expr) bool {
-	switch e.(type) {
+	switch x := e.(type) {
 	case *ast.IdentExpr, *ast.FieldExpr, *ast.IndexExpr:
 		return true
+	case *ast.UnExpr:
+		// A dereference `*p` denotes the pointee, which is a place.
+		return x.Op == token.KindStar
 	}
 	return false
 }
@@ -2067,7 +2125,11 @@ func zeroValue(t *types.Type) string {
 func constLiteral(v sema.ConstVal, t *types.Type) string {
 	switch {
 	case v.IsStr:
-		return cString(v.Str)
+		s, ok := sema.DecodeString(v.Str)
+		if !ok {
+			s = v.Str
+		}
+		return cString(s)
 	case v.IsBool:
 		if v.Bool {
 			return "true"

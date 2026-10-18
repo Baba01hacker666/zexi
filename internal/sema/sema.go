@@ -175,6 +175,81 @@ func (c *checker) collect() {
 			c.errf(d.Sp, "E0900", "`use` is not supported by the compiler yet (roadmap M1)")
 		}
 	}
+	// Finally, reject types that contain themselves by value: they have
+	// infinite size and cannot be emitted as a C struct.
+	c.checkTypeCycles()
+}
+
+// checkTypeCycles rejects structs and enums that reach themselves through
+// by-value fields (including enum payloads and array elements). A reference or
+// pointer breaks the cycle and is allowed.
+func (c *checker) checkTypeCycles() {
+	edges := map[string][]string{}
+	addType := func(from string, t *types.Type) {
+		for t != nil {
+			switch t.Kind {
+			case types.Ref, types.Ptr, types.Slice:
+				return
+			case types.Array:
+				t = t.Elem
+				continue
+			case types.StructKind:
+				if t.St != nil {
+					edges[from] = append(edges[from], t.St.Name)
+				}
+				return
+			case types.EnumKind:
+				if t.En != nil {
+					edges[from] = append(edges[from], t.En.Name)
+				}
+				return
+			default:
+				return
+			}
+		}
+	}
+	for _, st := range c.info.StructOrd {
+		for _, f := range st.Fields {
+			addType(st.Name, f.Ty)
+		}
+	}
+	for _, en := range c.info.EnumOrd {
+		for _, v := range en.Variants {
+			for _, f := range v.Fields {
+				addType(en.Name, f.Ty)
+			}
+		}
+	}
+	// reachesSelf reports whether `start` is reachable from itself.
+	reachesSelf := func(start string) bool {
+		stack := append([]string{}, edges[start]...)
+		seen := map[string]bool{}
+		for len(stack) > 0 {
+			n := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if n == start {
+				return true
+			}
+			if seen[n] {
+				continue
+			}
+			seen[n] = true
+			stack = append(stack, edges[n]...)
+		}
+		return false
+	}
+	for _, it := range c.info.File.Items {
+		switch d := it.(type) {
+		case *ast.StructDecl:
+			if reachesSelf(d.Name) {
+				c.errf(d.Sp, "E0072", "recursive type `%s` has infinite size; store it behind a pointer or reference", d.Name)
+			}
+		case *ast.EnumDecl:
+			if reachesSelf(d.Name) {
+				c.errf(d.Sp, "E0072", "recursive type `%s` has infinite size; store it behind a pointer or reference", d.Name)
+			}
+		}
+	}
 }
 
 func (c *checker) registerEnum(d *ast.EnumDecl) {
@@ -654,7 +729,22 @@ func (c *checker) inferLiteral(x *ast.LiteralExpr, expected *types.Type) *types.
 	switch x.Kind {
 	case token.KindInteger:
 		if expected != nil && expected.Kind.IsInt() {
+			if !intLitFits(x.Text, expected) {
+				c.errf(x.Sp, "E0080", "integer literal `%s` does not fit in `%s`", x.Text, expected)
+			}
 			return expected
+		}
+		// Un-annotated: prefer i32, widening to i64/u64 when the value is bigger
+		// rather than silently truncating.
+		if !intLitFits(x.Text, types.I32T) {
+			s := strings.ReplaceAll(x.Text, "_", "")
+			if _, err := strconv.ParseInt(s, 0, 64); err == nil {
+				return types.I64T
+			}
+			if _, err := strconv.ParseUint(s, 0, 64); err == nil {
+				return &types.Type{Kind: types.U64}
+			}
+			c.errf(x.Sp, "E0080", "integer literal `%s` does not fit in any integer type", x.Text)
 		}
 		return types.I32T
 	case token.KindFloat:
@@ -718,6 +808,9 @@ func (c *checker) inferUnary(x *ast.UnExpr, expected *types.Type) *types.Type {
 		return nil
 	case token.KindAmp:
 		t := c.checkExpr(x.X, nil)
+		if !c.isPlace(x.X) {
+			c.errAt(x.X, "E0716", "cannot take a reference to a temporary value; bind it to a variable first")
+		}
 		return types.RefTo(t, x.Mut)
 	}
 	return nil
@@ -786,9 +879,14 @@ func (c *checker) inferBinary(x *ast.BinExpr) *types.Type {
 			c.errAt(x, "E0308", "bitwise operators require integers, found `%s`", lt)
 		}
 		return lt
-	case token.KindPlus, token.KindMinus, token.KindStar, token.KindSlash, token.KindPercent:
+	case token.KindPlus, token.KindMinus, token.KindStar, token.KindSlash:
 		if !lt.Kind.IsNumeric() {
 			c.errAt(x, "E0308", "arithmetic operators require numbers, found `%s`", lt)
+		}
+		return lt
+	case token.KindPercent:
+		if !lt.Kind.IsInt() {
+			c.errAt(x, "E0308", "`%%` requires integers, found `%s`", lt)
 		}
 		return lt
 	}
@@ -811,6 +909,8 @@ func (c *checker) inferAssign(x *ast.AssignExpr) *types.Type {
 			if !isStrLike(rt) {
 				c.errAt(x.Rhs, "E0308", "cannot append `%s` to a `String`", rt)
 			}
+		} else if x.Op == token.KindPercentEq && !lt.Kind.IsInt() {
+			c.errAt(x, "E0308", "`%%=` requires integers, found `%s`", lt)
 		} else if !lt.Kind.IsNumeric() {
 			c.errAt(x, "E0308", "compound assignment requires a numeric type, found `%s`", lt)
 		}
@@ -1029,6 +1129,9 @@ func (c *checker) inferArrayLit(x *ast.ArrayLitExpr, expected *types.Type) *type
 			return &types.Type{Kind: types.Array, Elem: types.I32T, Len: 0}
 		}
 		v := c.checkExpr(x.Value, wantElem)
+		if v != nil && !v.IsCopy() {
+			c.errAt(x.Value, "E0204", "array repeat requires a `Copy` element type, found `%s`; the value would be duplicated into every slot", v)
+		}
 		return &types.Type{Kind: types.Array, Elem: v, Len: n.Int}
 	}
 	if len(x.Elems) == 0 {
@@ -1094,17 +1197,26 @@ func isCatchAll(p ast.Pattern) bool {
 func (c *checker) inferMatch(x *ast.MatchExpr) *types.Type {
 	st := c.checkExpr(x.Scrutinee, nil)
 	base := recvBase(st)
+	if base == nil || (base.Kind != types.EnumKind && !base.Kind.IsInt()) {
+		c.errAt(x.Scrutinee, "E0308", "`match` requires an enum or integer scrutinee, found `%s`", st)
+	}
 	var result *types.Type
 	covered := map[string]bool{}
 	catchAll := false
 	for _, arm := range x.Arms {
 		if isCatchAll(arm.Pat) {
+			if catchAll {
+				c.errf(arm.Pat.Span(), "E0001", "unreachable pattern: an earlier arm already matches everything")
+			}
 			catchAll = true
 		}
 		c.pushScope()
 		c.checkPattern(arm.Pat, st)
 		if pp, ok := arm.Pat.(*ast.PathPat); ok {
 			if v := c.info.PatVariant[pp]; v != nil {
+				if covered[v.Name] {
+					c.errf(arm.Pat.Span(), "E0001", "unreachable pattern: `%s` is already covered", v.Name)
+				}
 				covered[v.Name] = true
 			}
 		}
@@ -1183,6 +1295,7 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type) {
 			if i >= len(v.Fields) {
 				break
 			}
+			c.rejectNestedPat(sub)
 			c.checkPattern(sub, v.Fields[i].Ty)
 		}
 		for _, fp := range pt.Fields {
@@ -1195,11 +1308,22 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type) {
 			if sub == nil {
 				sub = &ast.BindPat{Name: fp.Name, Sp: fp.Sp}
 			}
+			c.rejectNestedPat(sub)
 			c.checkPattern(sub, f.Ty)
 		}
 		return
 	default:
 		c.errf(p.Span(), "E0900", "this pattern is not supported by the compiler yet (roadmap M0)")
+	}
+}
+
+// rejectNestedPat diagnoses refutable sub-patterns. Codegen discriminates only
+// the outer variant, so a nested variant or literal pattern would silently pick
+// the wrong arm (or emit a duplicate `case`), so we reject it for now.
+func (c *checker) rejectNestedPat(p ast.Pattern) {
+	switch p.(type) {
+	case *ast.PathPat, *ast.LitPat:
+		c.errf(p.Span(), "E0900", "nested patterns are not supported by the compiler yet (roadmap M0)")
 	}
 }
 
@@ -1260,6 +1384,13 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 			c.checkExpr(a, nil)
 		}
 		return nil
+	}
+	if m.Self == nil {
+		c.errAt(x, "E0599", "`%s::%s` takes no `self`, so it cannot be called with `.`", base.St.Name, x.Name)
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return m.Ret
 	}
 	if m.Self != nil && m.Self.ByRef && rt.Kind != types.Ref && rt.Kind != types.Ptr {
 		// Taking `&self` from a value receiver is allowed (a temporary is
@@ -1480,7 +1611,11 @@ func (c *checker) inferJump(x *ast.JumpExpr) *types.Type {
 			return types.NeverT
 		}
 		vt := c.checkExpr(x.Val, c.cur.Ret)
-		if c.cur.Ret.Kind != types.Unit && !c.assignable(c.cur.Ret, vt) {
+		if c.cur.Ret.Kind == types.Unit {
+			if vt != nil && vt.Kind != types.Unit && vt.Kind != types.Never {
+				c.errAt(x.Val, "E0308", "this function returns `()`, so `return` cannot take a value")
+			}
+		} else if !c.assignable(c.cur.Ret, vt) {
 			c.errAt(x.Val, "E0308", "mismatched types: expected `%s`, found `%s`", c.cur.Ret, vt)
 		}
 		return types.NeverT
@@ -1545,6 +1680,10 @@ func (c *checker) resolveType(t ast.Type) *types.Type {
 		n, ok := c.evalConst(x.Len)
 		if !ok || n.Ty == nil || !n.Ty.Kind.IsInt() {
 			c.errf(x.Sp, "E0308", "array length must be an integer constant")
+			return &types.Type{Kind: types.Array, Elem: elem}
+		}
+		if n.Int < 0 {
+			c.errf(x.Sp, "E0080", "array length must be non-negative, found `%d`", n.Int)
 			return &types.Type{Kind: types.Array, Elem: elem}
 		}
 		return &types.Type{Kind: types.Array, Elem: elem, Len: n.Int}
@@ -1618,6 +1757,44 @@ func (c *checker) declare(sp token.Span, name string, ty *types.Type) {
 func isIntLiteral(e ast.Expr) bool {
 	l, ok := e.(*ast.LiteralExpr)
 	return ok && l.Kind == token.KindInteger
+}
+
+// intLitFits reports whether the integer literal text fits in the integer type
+// t. It ignores underscores and accepts decimal/hex/binary/octal forms.
+func intLitFits(text string, t *types.Type) bool {
+	if t == nil || !t.Kind.IsInt() {
+		return true
+	}
+	s := strings.ReplaceAll(text, "_", "")
+	bits := uint(0)
+	switch t.Kind {
+	case types.I8, types.U8:
+		bits = 8
+	case types.I16, types.U16:
+		bits = 16
+	case types.I32, types.U32:
+		bits = 32
+	case types.I64, types.Isize, types.U64, types.Usize:
+		bits = 64
+	default:
+		return true
+	}
+	if t.Kind.IsUnsigned() {
+		if u, err := strconv.ParseUint(s, 0, 64); err == nil {
+			return bits == 64 || u <= (uint64(1)<<bits)-1
+		}
+		return false
+	}
+	i, err := strconv.ParseInt(s, 0, 64)
+	if err != nil {
+		return false
+	}
+	if bits == 64 {
+		return true
+	}
+	min := -(int64(1) << (bits - 1))
+	max := (int64(1) << (bits - 1)) - 1
+	return i >= min && i <= max
 }
 
 func isPrintable(t *types.Type) bool {
