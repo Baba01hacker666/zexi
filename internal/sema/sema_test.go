@@ -299,3 +299,93 @@ func TestErgonomicsAccepted(t *testing.T) {
 		})
 	}
 }
+
+// TestImmutableBindings covers the `mut` enforcement pass.
+func TestImmutableBindings(t *testing.T) {
+	rejected := []struct{ name, src string }{
+		{"assign-to-let",
+			"fn main() -> i32 { let x = 1; x = 2; println(x); 0 }"},
+		{"compound-assign-to-let",
+			"fn main() -> i32 { let x = 1; x += 2; println(x); 0 }"},
+		{"field-assign-through-let",
+			"struct S { n: i32 }\nfn main() -> i32 { let s = S { n: 1 }; s.n = 2; println(s.n); 0 }"},
+		{"index-assign-through-let",
+			"fn main() -> i32 { let xs: [i32; 2] = [1, 2]; xs[0] = 9; println(xs[0]); 0 }"},
+		{"ref-mut-of-let",
+			"fn f(p: &mut i32) { *p = 1; }\nfn main() -> i32 { let x = 0; f(&mut x); println(x); 0 }"},
+		{"str-method-on-let",
+			"fn main() -> i32 { let s = String::from(\"a\"); s.push(98); println(s); 0 }"},
+		{"str-pluseq-on-let",
+			"fn main() -> i32 { let s = String::from(\"a\"); s += \"b\"; println(s); 0 }"},
+		{"assign-field-in-ref-self",
+			"struct C { n: i32 }\nimpl C { fn bad(&self) { self.n += 1; } }\nfn main() -> i32 { let c = C { n: 0 }; c.bad(); 0 }"},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			if ok || !has(codes, "E0596") {
+				t.Fatalf("expected E0596, got %v", codes)
+			}
+		})
+	}
+
+	accepted := []struct{ name, src string }{
+		{"assign-to-mut-let",
+			"fn main() -> i32 { let mut x = 1; x = 2; x += 3; println(x); 0 }"},
+		{"field-assign-through-mut",
+			"struct S { n: i32 }\nfn main() -> i32 { let mut s = S { n: 1 }; s.n = 2; println(s.n); 0 }"},
+		{"ref-mut-of-mut-let",
+			"fn f(p: &mut i32) { *p = 1; }\nfn main() -> i32 { let mut x = 0; f(&mut x); println(x); 0 }"},
+		{"assign-through-mut-handle",
+			"struct S { n: i32 }\nfn main() -> i32 { let mut s = S { n: 1 }; let r = &mut s; r.n = 5; println(s.n); 0 }"},
+		{"mutate-self-in-ref-mut-self",
+			"struct C { n: i32 }\nimpl C { fn inc(&mut self) { self.n += 1; } }\nfn main() -> i32 { let mut c = C { n: 0 }; c.inc(); println(c.n); 0 }"},
+		{"param-mutation-permissive",
+			"fn f(mut n: i32) -> i32 { n += 1; n }\nfn main() -> i32 { println(f(1)); 0 }"},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			if ok, codes := check(t, tc.src); !ok {
+				t.Fatalf("expected clean, got %v", codes)
+			}
+		})
+	}
+}
+
+// TestMatchGuards covers exhaustiveness and typing of `pat if cond` arms.
+func TestMatchGuards(t *testing.T) {
+	rejected := []struct{ name, src, code string }{
+		{"guarded-arm-not-exhaustive",
+			"enum E { A, B }\nfn main() -> i32 { match E::A { _ if true => println(1) } 0 }", "E0004"},
+		{"guarded-variant-not-exhaustive",
+			"enum E { A, B }\nfn main() -> i32 { match E::A { E::A if true => println(1), E::B => println(2) } 0 }", "E0004"},
+		{"int-guard-needs-catch-all",
+			"fn main() -> i32 { match 1 { x if x > 0 => println(1) } 0 }", "E0004"},
+		{"non-bool-guard",
+			"fn main() -> i32 { match 1 { x if x => println(1), _ => println(2) } 0 }", "E0308"},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			if ok || !has(codes, tc.code) {
+				t.Fatalf("expected %s, got %v", tc.code, codes)
+			}
+		})
+	}
+
+	accepted := []struct{ name, src string }{
+		{"guard-with-fallthrough-and-catch-all",
+			"fn main() -> i32 { match 5 { x if x > 10 => println(1), x if x > 3 => println(2), _ => println(3) } 0 }"},
+		{"same-variant-twice-when-guarded",
+			"enum E { A(i32), B }\nfn main() -> i32 { match E::A(1) { E::A(n) if n > 0 => println(1), E::A(n) => println(n), E::B => println(0) } 0 }"},
+		{"guarded-wildcard-then-uncovered",
+			"enum E { A, B }\nfn main() -> i32 { match E::A { _ if true => println(1), E::A => println(2), E::B => println(3) } 0 }"},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			if ok, codes := check(t, tc.src); !ok {
+				t.Fatalf("expected clean, got %v", codes)
+			}
+		})
+	}
+}

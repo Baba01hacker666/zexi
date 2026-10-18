@@ -119,6 +119,7 @@ type checker struct {
 	errs []diag.Diagnostic
 
 	scope     []map[string]*types.Type // local bindings, innermost last
+	mutScope  []map[string]bool        // mutability of tracked bindings (else permissive)
 	cur       *Fn
 	loopDepth int
 }
@@ -501,6 +502,10 @@ func (c *checker) checkBodies() {
 			}
 			c.declare(p.Sp, p.Name, fn.Params[i])
 		}
+		if fn.Self != nil && fn.Self.ByRef && !fn.Self.Mut {
+			// `&self` methods may not mutate the receiver.
+			c.markMut("self", false)
+		}
 		bt := c.checkBlock(fn.Decl.Body)
 		if fn.Ret.Kind != types.Unit {
 			if !c.exprAlwaysReturns(fn.Decl.Body) && bt.Kind != types.Never {
@@ -591,6 +596,9 @@ func (c *checker) checkStmt(s ast.Stmt) {
 		}
 		c.info.DeclTypes[st] = ty
 		c.bindPattern(st.Pat, ty, true)
+		if bp, ok := st.Pat.(*ast.BindPat); ok {
+			c.markMut(bp.Name, st.Mut)
+		}
 	case *ast.ExprStmt:
 		c.checkExpr(st.X, nil)
 	default:
@@ -811,6 +819,9 @@ func (c *checker) inferUnary(x *ast.UnExpr, expected *types.Type) *types.Type {
 		if !c.isPlace(x.X) {
 			c.errAt(x.X, "E0716", "cannot take a reference to a temporary value; bind it to a variable first")
 		}
+		if x.Mut {
+			c.checkMutable(x.X, x.X.Span(), "cannot borrow `%s` as mutable, as it is not declared `mut`")
+		}
 		return types.RefTo(t, x.Mut)
 	}
 	return nil
@@ -897,6 +908,7 @@ func (c *checker) inferAssign(x *ast.AssignExpr) *types.Type {
 	if !c.isPlace(x.Lhs) {
 		c.errAt(x.Lhs, "E0384", "cannot assign to this expression")
 	}
+	c.checkMutable(x.Lhs, x.Lhs.Span(), "cannot assign to `%s`, as it is not declared `mut`")
 	lt := c.checkExpr(x.Lhs, nil)
 	rt := c.checkExpr(x.Rhs, lt)
 	if x.Op == token.KindEq {
@@ -1063,6 +1075,9 @@ func (c *checker) inferStringMethod(x *ast.MethodCallExpr) *types.Type {
 	if len(x.Args) != len(m.params) {
 		c.errAt(x, "E0061", "method `String::%s` takes %d argument(s) but %d were supplied", x.Name, len(m.params), len(x.Args))
 	}
+	if m.mut {
+		c.checkMutable(x.Recv, x.Recv.Span(), "cannot borrow `%s` as mutable, as it is not declared `mut`")
+	}
 	for i, a := range x.Args {
 		var wt *types.Type
 		if i < len(m.params) {
@@ -1204,7 +1219,8 @@ func (c *checker) inferMatch(x *ast.MatchExpr) *types.Type {
 	covered := map[string]bool{}
 	catchAll := false
 	for _, arm := range x.Arms {
-		if isCatchAll(arm.Pat) {
+		guarded := arm.Guard != nil
+		if !guarded && isCatchAll(arm.Pat) {
 			if catchAll {
 				c.errf(arm.Pat.Span(), "E0001", "unreachable pattern: an earlier arm already matches everything")
 			}
@@ -1212,7 +1228,7 @@ func (c *checker) inferMatch(x *ast.MatchExpr) *types.Type {
 		}
 		c.pushScope()
 		c.checkPattern(arm.Pat, st)
-		if pp, ok := arm.Pat.(*ast.PathPat); ok {
+		if pp, ok := arm.Pat.(*ast.PathPat); ok && !guarded {
 			if v := c.info.PatVariant[pp]; v != nil {
 				if covered[v.Name] {
 					c.errf(arm.Pat.Span(), "E0001", "unreachable pattern: `%s` is already covered", v.Name)
@@ -1225,7 +1241,6 @@ func (c *checker) inferMatch(x *ast.MatchExpr) *types.Type {
 			if gt == nil || gt.Kind != types.Bool {
 				c.errAt(arm.Guard, "E0308", "match guard must be `bool`, found `%s`", gt)
 			}
-			c.errAt(arm.Guard, "E0900", "match guards are not supported by the compiler yet (roadmap M0)")
 		}
 		bt := c.checkExpr(arm.Body, result)
 		switch {
@@ -1391,6 +1406,9 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 			c.checkExpr(a, nil)
 		}
 		return m.Ret
+	}
+	if m.Self != nil && m.Self.ByRef && m.Self.Mut {
+		c.checkMutable(x.Recv, x.Recv.Span(), "cannot borrow `%s` as mutable, as it is not declared `mut`")
 	}
 	if m.Self != nil && m.Self.ByRef && rt.Kind != types.Ref && rt.Kind != types.Ptr {
 		// Taking `&self` from a value receiver is allowed (a temporary is
@@ -1734,11 +1752,80 @@ func (c *checker) argAssignable(want, got *types.Type) bool {
 
 // --- scope helpers --------------------------------------------------------
 
-func (c *checker) pushScope() { c.scope = append(c.scope, map[string]*types.Type{}) }
+func (c *checker) pushScope() {
+	c.scope = append(c.scope, map[string]*types.Type{})
+	c.mutScope = append(c.mutScope, map[string]bool{})
+}
 func (c *checker) popScope() {
 	if len(c.scope) > 0 {
 		c.scope = c.scope[:len(c.scope)-1]
 	}
+	if len(c.mutScope) > 0 {
+		c.mutScope = c.mutScope[:len(c.mutScope)-1]
+	}
+}
+
+// markMut records whether a `let`/`for` binding is mutable. Names that are
+// never marked (parameters, `self`, match bindings) are treated as mutable so
+// the check only ever rejects code we are certain about.
+func (c *checker) markMut(name string, mut bool) {
+	if name == "" || name == "_" || len(c.mutScope) == 0 {
+		return
+	}
+	c.mutScope[len(c.mutScope)-1][name] = mut
+}
+
+// isMut reports whether binding `name` may be assigned to or mutably borrowed.
+func (c *checker) isMut(name string) bool {
+	for i := len(c.mutScope) - 1; i >= 0; i-- {
+		if m, ok := c.mutScope[i][name]; ok {
+			return m
+		}
+	}
+	return true
+}
+
+// lookupType resolves the declared type of a local binding, if any.
+func (c *checker) lookupType(name string) *types.Type {
+	for i := len(c.scope) - 1; i >= 0; i-- {
+		if t, ok := c.scope[i][name]; ok {
+			return t
+		}
+	}
+	return nil
+}
+
+// mutRoot returns the identifier at the root of a field/index access chain, so
+// `a.b[i].c` yields "a". A dereference stops the walk (the mutability of a
+// pointee is governed by the reference, not by the binding), in which case it
+// returns "".
+func mutRoot(e ast.Expr) string {
+	switch x := e.(type) {
+	case *ast.IdentExpr:
+		if x.Name == "_" {
+			return ""
+		}
+		return x.Name
+	case *ast.FieldExpr:
+		return mutRoot(x.Recv)
+	case *ast.IndexExpr:
+		return mutRoot(x.Recv)
+	}
+	return ""
+}
+
+// checkMutable reports an error if `e` is rooted at a binding that is not
+// `mut` and is not already a mutable reference or pointer. `format` is the
+// diagnostic message, with one `%s` for the binding name.
+func (c *checker) checkMutable(e ast.Expr, sp token.Span, format string) {
+	name := mutRoot(e)
+	if name == "" || c.isMut(name) {
+		return
+	}
+	if t := c.lookupType(name); t != nil && (t.Kind == types.Ptr || (t.Kind == types.Ref && t.Mut)) {
+		return // the binding is an immutable handle to mutable data
+	}
+	c.errf(sp, "E0596", format, name)
 }
 
 func (c *checker) declare(sp token.Span, name string, ty *types.Type) {

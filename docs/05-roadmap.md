@@ -5,18 +5,22 @@
 > move checker, and a C backend that produces a runnable native binary.
 > Implemented language surface: functions and recursion; `let`/`const`;
 > integer/float/bool/char/`str`; arithmetic, bitwise, comparison, and logical
-> operators; `as` casts; `if`/`else`; `while`/`loop`/`for i in a..b`;
-> `print`/`println`; `len`; structs (named and tuple) with `impl` methods
+> operators; `as` casts; `if`/`else`; `while`/`loop`/`for i in a..b` and
+> `for x in arr` (value iteration over `Copy` elements); `print`/`println`;
+> `len(x)` / `x.len()`; structs (named and tuple) with `impl` methods
 > (`self`, `&self`, `&mut self`); enums (unit/tuple/struct variants) with
-> `match` and exhaustiveness checking; first-class arrays with bounds-checked
-> indexing; use-after-move errors for non-`Copy` values (`#[copy]` opts in);
-> and the built-in owning heap type **`String`** with **deterministic
-> destruction (`Drop`)** — buffers are freed exactly once at scope exit, on
-> early `return`/`break`/`continue`, and on reassignment, while moves transfer
-> ownership and leave the source empty. `extern "C"` declarations bind C
-> functions (libc), and several `.zx` files compile together into one program;
-> on top of that, `lib/http.zx` is a working HTTP/1.x client and server
-> (see docs/08).
+> `match`, guards (`pat if cond`), and exhaustiveness checking; first-class
+> arrays with bounds-checked indexing; `mut` enforcement (a non-`mut` binding
+> cannot be assigned through, `&mut`-borrowed, or mutated via a `&mut self`
+> method); use-after-move errors for non-`Copy` values (`#[copy]` opts in);
+> `String` concatenation with `+`/`+=` and implicit `String`→`str` coercion in
+> argument position; and the built-in owning heap type **`String`** with
+> **deterministic destruction (`Drop`)** — buffers are freed exactly once at
+> scope exit, on early `return`/`break`/`continue`, and on reassignment, while
+> moves transfer ownership and leave the source empty. `extern "C"`
+> declarations bind C functions (libc), and several `.zx` files compile together
+> into one program; on top of that, `lib/http.zx` is a working HTTP/1.x client
+> and server (see docs/08).
 > Not yet implemented: generics, traits, modules/`use`, `Vec`/`Box`, user-defined
 > `Drop`, borrow-lifetime analysis (so bound `&`/`*` aliases are not tracked), and
 > `Result`/`?`. Enum variants may not carry resource-owning payloads yet (a

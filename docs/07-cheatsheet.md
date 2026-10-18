@@ -64,6 +64,10 @@ let mut b: i64 = 2;  // mutable, annotated
 b += 3;
 ```
 
+A non-`mut` binding cannot be assigned to — not directly, not through a field
+or index (`a.x = 1`, `xs[0] = 1`), not by taking `&mut`, and not by calling a
+`&mut self` method (E0596).
+
 ## 7.6 Operators
 
 ```
@@ -112,6 +116,22 @@ match d {
     _ => 0,                            // wildcard; matches must be exhaustive
 }
 ```
+
+An arm may carry a guard, `pat if cond => body`. When the pattern matches but
+the guard fails, the following arms are tried, so a variant may appear more than
+once. A guarded arm does not count towards exhaustiveness.
+
+```zx
+match n {
+    0 => "zero",
+    x if x < 0 => "negative",
+    x if x > 100 => "big",
+    _ => "small",
+}
+```
+
+`break`, `continue`, and `return` may be used directly as an arm body
+(`_ => continue`).
 
 ## 7.9 Arrays
 

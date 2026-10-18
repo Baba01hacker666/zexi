@@ -207,6 +207,10 @@ Traits provide bounds; `dyn Trait` gives type-erased dynamic dispatch (M2).
 - **Coercions are limited to:** `&mut T -> &T`, `[T; N] -> [T]`,
   `T -> dyn Trait`, `never -> T`, and unsizing arrays to slices.
 - **Exhaustiveness:** `match` over an `enum` must be exhaustive.
+- **Mutability:** a `let` binding is immutable. Assigning to it, to a field or
+  element reachable from it, taking `&mut` of it, or calling a `&mut self`
+  method on it requires `let mut` (or a binding that is already a `&mut`/`*mut`
+  handle). `&self` methods may not mutate the receiver.
 - **Null:** there is no null pointer value in safe code. Absence is `Option<T>`,
   and `*T` is only dereferenceable in `unsafe`.
 

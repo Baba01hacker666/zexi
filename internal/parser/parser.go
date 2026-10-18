@@ -966,7 +966,12 @@ func (p *parser) parsePrimary() ast.Expr {
 	case token.KindReturn, token.KindBreak, token.KindContinue:
 		p.bump()
 		j := &ast.JumpExpr{Kind: t.Kind}
-		if !p.at(token.KindSemicolon) && !p.at(token.KindRBrace) && !p.at(token.KindEOF) {
+		// `return <expr>` and `break <expr>` may take a value; `continue` never
+		// does. A `,` (match arm / argument list) also ends the jump, so that
+		// `_ => continue,` and `_ => break,` parse.
+		if t.Kind != token.KindContinue &&
+			!p.at(token.KindSemicolon) && !p.at(token.KindRBrace) &&
+			!p.at(token.KindEOF) && !p.at(token.KindComma) {
 			j.Val = p.parseExpr()
 		}
 		j.Sp = p.spanFrom(start)

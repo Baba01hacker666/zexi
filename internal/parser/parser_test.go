@@ -86,3 +86,24 @@ func FuzzParse(f *testing.F) {
 		}
 	})
 }
+
+// TestMatchGuardsAndJumpsInArmBodies covers `pat if cond => body` arms and bare
+// `break`/`continue`/`return` as arm bodies.
+func TestMatchGuardsAndJumpsInArmBodies(t *testing.T) {
+	src := `fn main() -> i32 {
+    for i in 0..3 {
+        match i {
+            0 => continue,
+            1 if i == 1 => break,
+            _ => println(i),
+        }
+    }
+    match 1 {
+        x if x > 0 => return 0,
+        _ => return 1,
+    }
+}`
+	if _, n := parse(t, src); n != 0 {
+		t.Fatalf("unexpected diagnostics: %d", n)
+	}
+}

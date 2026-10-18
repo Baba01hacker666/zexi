@@ -1589,11 +1589,7 @@ func (g *gen) matchValue(x *ast.MatchExpr) string {
 	g.pushScope()
 	st := g.info.TypeOf(x.Scrutinee)
 	scrut := g.value(x.Scrutinee)
-	if st != nil && (st.Kind == types.Ref || st.Kind == types.Ptr) {
-		// `match self` / `match &e`: switch on the pointee.
-		scrut = "(*" + scrut + ")"
-		st = st.Elem
-	}
+	st, scrut = g.matchScrutinee(st, scrut)
 	m := g.fresh("m")
 	sub.line("%s %s = %s;", ctype(st), m, scrut)
 	result := ""
@@ -1601,7 +1597,7 @@ func (g *gen) matchValue(x *ast.MatchExpr) string {
 		result = g.fresh("r")
 		sub.line("%s %s;", ctype(t), result)
 	}
-	g.emitSwitch(x, st, m, result, sub)
+	g.emitMatchArms(x, st, m, result, sub)
 	if result != "" {
 		sub.line("%s;", result)
 	}
@@ -1610,14 +1606,95 @@ func (g *gen) matchValue(x *ast.MatchExpr) string {
 	return "({ " + sub.b.String() + " })"
 }
 
+// matchHasGuard reports whether any arm of the match carries a guard.
+func matchHasGuard(x *ast.MatchExpr) bool {
+	for _, a := range x.Arms {
+		if a.Guard != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// matchScrutinee dereferences a `&T`/`*T` scrutinee so the match tests the value
+// itself (`match self`).
+func (g *gen) matchScrutinee(st *types.Type, scrut string) (*types.Type, string) {
+	if st != nil && (st.Kind == types.Ref || st.Kind == types.Ptr) {
+		return st.Elem, "(*" + scrut + ")"
+	}
+	return st, scrut
+}
+
+// emitMatchArms lowers the arms. A `switch` is used when no arm has a guard;
+// guarded arms need fall-through on guard failure, which a C `switch` cannot
+// express, so they are lowered to an if-chain inside a `do { } while (0)`.
+func (g *gen) emitMatchArms(x *ast.MatchExpr, st *types.Type, m, result string, w *writer) {
+	if matchHasGuard(x) {
+		g.emitGuardedArms(x, st, m, result, w)
+		return
+	}
+	g.emitSwitch(x, st, m, result, w)
+}
+
+// emitGuardedArms emits one block per arm. When an arm's pattern matches but its
+// guard fails, control simply falls through to the next arm; when it matches and
+// the guard holds, the body runs and `break` leaves the enclosing do-while(0).
+func (g *gen) emitGuardedArms(x *ast.MatchExpr, st *types.Type, m, result string, w *writer) {
+	isEnum := st != nil && st.Kind == types.EnumKind
+	disc := m
+	if isEnum {
+		disc = m + ".tag"
+	}
+	w.line("do {")
+	w.indent++
+	for _, arm := range x.Arms {
+		label, catchAll := g.armLabel(arm.Pat, isEnum)
+		w.line("{")
+		w.indent++
+		if !catchAll {
+			w.line("if (%s == %s) {", disc, label)
+			w.indent++
+		}
+		g.pushScope()
+		g.bindArm(w, arm.Pat, st, m, isEnum)
+		if arm.Guard != nil {
+			w.line("if (%s) {", g.value(arm.Guard))
+			w.indent++
+		}
+		if result != "" {
+			w.line("%s = %s;", result, g.consume(arm.Body))
+		} else {
+			save := g.w
+			g.w = w
+			g.stmtExpr(arm.Body)
+			g.w = save
+		}
+		w.line("break;")
+		if arm.Guard != nil {
+			w.indent--
+			w.line("}")
+		}
+		g.popScope()
+		if !catchAll {
+			w.indent--
+			w.line("}")
+		}
+		w.indent--
+		w.line("}")
+	}
+	w.indent--
+	w.line("} while (0);")
+}
+
 // matchStmt emits a `match` in statement position.
 func (g *gen) matchStmt(x *ast.MatchExpr) {
 	g.pushScope()
 	st := g.info.TypeOf(x.Scrutinee)
 	scrut := g.value(x.Scrutinee)
+	st, scrut = g.matchScrutinee(st, scrut)
 	m := g.fresh("m")
 	g.w.line("%s %s = %s;", ctype(st), m, scrut)
-	g.emitSwitch(x, st, m, "", g.w)
+	g.emitMatchArms(x, st, m, "", g.w)
 	g.popScope()
 }
 
