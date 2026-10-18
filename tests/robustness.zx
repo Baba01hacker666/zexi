@@ -1,0 +1,68 @@
+// tests/robustness.zx
+// Regression coverage for correctness fixes: a value must be read before the
+// destructors of the scope it uses run, self-append must not read freed memory,
+// a field of a temporary is an rvalue, `break`/`continue` in a `match` arm
+// target the enclosing loop, and negative literal bounds are checked.
+
+struct Box {
+    s: String,
+}
+
+fn make() -> Box {
+    return Box { s: String::from("box") };
+}
+
+fn tail_from_local() -> i64 {
+    let s = String::from("abcd");
+    s.len() as i64
+}
+
+fn take(s: String) -> i64 {
+    return s.len() as i64;
+}
+
+impl Box {
+    fn label(&self) -> str {
+        return "boxed";
+    }
+}
+
+fn main() -> i32 {
+    // a tail expression that reads a local, before its drop
+    println(tail_from_local());
+    // a by-value parameter read before its drop
+    println(take(String::from("abcde")));
+    // a block value that reads a local
+    let n = { let s = String::from("abcdef"); s.len() as i64 };
+    println(n);
+    // assignment whose right-hand side reads the value being overwritten
+    let mut acc = String::from("x");
+    acc = acc + "y";
+    println(acc);
+    // `+=` with the string itself
+    acc += acc;
+    println(acc);
+    // a field/method of a temporary is an rvalue
+    println(make().s);
+    println(make().s.len());
+    println(make().label());
+    // `break`/`continue` in a match arm belong to the loop
+    let mut sum = 0;
+    let mut i = 0;
+    while i < 6 {
+        i += 1;
+        match i {
+            2 => continue,
+            5 => break,
+            _ => { sum += i; }
+        }
+        sum += 10;
+    }
+    println(sum);
+    // negative literal bounds
+    let low: i8 = -128;
+    let neg = -300;
+    println(low);
+    println(neg);
+    0
+}

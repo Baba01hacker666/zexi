@@ -389,3 +389,87 @@ func TestMatchGuards(t *testing.T) {
 		})
 	}
 }
+
+// TestLiteralAndArrayBounds covers range checking of (negative) integer
+// literals and array lengths.
+func TestLiteralAndArrayBounds(t *testing.T) {
+	rejected := []struct{ name, src, code string }{
+		{"neg-repeat-count",
+			"fn main() -> i32 { let a = [0; -1]; println(len(a)); 0 }", "E0080"},
+		{"huge-repeat-count",
+			"fn main() -> i32 { let a = [0; 99999999999]; println(len(a)); 0 }", "E0080"},
+		{"huge-array-type",
+			"fn main() -> i32 { let a: [i32; 99999999999] = [0; 3]; println(len(a)); 0 }", "E0080"},
+		{"neg-array-type",
+			"fn main() -> i32 { let a: [i8; -3] = [0; 3]; println(len(a)); 0 }", "E0080"},
+		{"u8-underflow",
+			"fn main() -> i32 { let x: u8 = -1; println(x); 0 }", "E0080"},
+		{"i8-underflow",
+			"fn main() -> i32 { let x: i8 = -129; println(x); 0 }", "E0080"},
+		{"i8-overflow",
+			"fn main() -> i32 { let x: i8 = 128; println(x); 0 }", "E0080"},
+		{"ref-to-temporary-field",
+			"struct P { a: i32 }\nfn mk() -> P { return P { a: 1 }; }\nfn main() -> i32 { let r = &mk().a; println(*r); 0 }", "E0716"},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			if ok || !has(codes, tc.code) {
+				t.Fatalf("expected %s, got %v", tc.code, codes)
+			}
+		})
+	}
+
+	accepted := []struct{ name, src string }{
+		{"i8-min-literal",
+			"fn main() -> i32 { let x: i8 = -128; println(x); 0 }"},
+		{"i32-min-literal",
+			"fn main() -> i32 { let x: i32 = -2147483648; println(x); 0 }"},
+		{"i64-min-literal",
+			"fn main() -> i32 { let x: i64 = -9223372036854775808; println(x); 0 }"},
+		{"inferred-negative",
+			"fn main() -> i32 { let x = -5; println(x); 0 }"},
+		{"field-of-temporary",
+			"struct P { a: i32 }\nfn mk() -> P { return P { a: 1 }; }\nfn main() -> i32 { println(mk().a); 0 }"},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			if ok, codes := check(t, tc.src); !ok {
+				t.Fatalf("expected clean, got %v", codes)
+			}
+		})
+	}
+}
+
+// TestConstRange covers range checking of folded integer constants.
+func TestConstRange(t *testing.T) {
+	rejected := []struct{ name, src, code string }{
+		{"u8-overflow", "const X: u8 = 300; fn main() -> i32 { println(X); 0 }", "E0080"},
+		{"u8-sum-overflow", "const X: u8 = 200 + 100; fn main() -> i32 { println(X); 0 }", "E0080"},
+		{"i8-overflow", "const X: i8 = 200; fn main() -> i32 { println(X); 0 }", "E0080"},
+		{"u8-negative", "const X: u8 = -1; fn main() -> i32 { println(X); 0 }", "E0080"},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			if ok || !has(codes, tc.code) {
+				t.Fatalf("expected %s, got %v", tc.code, codes)
+			}
+		})
+	}
+
+	accepted := []struct{ name, src string }{
+		{"u8-max", "const X: u8 = 255; fn main() -> i32 { println(X); 0 }"},
+		{"i8-min", "const X: i8 = -128; fn main() -> i32 { println(X); 0 }"},
+		{"i64-min", "const X: i64 = -9223372036854775808; fn main() -> i32 { println(X); 0 }"},
+		{"u64-max", "const X: u64 = 18446744073709551615; fn main() -> i32 { println(X); 0 }"},
+		{"inferred", "const X = -5000000000; fn main() -> i32 { println(X); 0 }"},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			if ok, codes := check(t, tc.src); !ok {
+				t.Fatalf("expected clean, got %v", codes)
+			}
+		})
+	}
+}

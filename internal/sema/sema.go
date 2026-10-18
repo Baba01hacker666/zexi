@@ -475,6 +475,10 @@ func (c *checker) collectConst(d *ast.ConstDecl) {
 	}
 	if declared != nil {
 		if val.Untyped && declared.Kind.IsInt() && declared.Kind != types.Invalid {
+			if !intValFits(val, declared) {
+				c.errf(d.Val.Span(), "E0080", "constant `%s` does not fit in `%s`", d.Name, declared)
+				return
+			}
 			val.Ty = declared
 		} else if !c.assignable(declared, val.Ty) {
 			c.errf(d.Val.Span(), "E0308", "mismatched types: expected `%s`, found `%s`", declared, val.Ty)
@@ -792,9 +796,32 @@ func (c *checker) inferIdent(name string, sp token.Span) *types.Type {
 	return nil
 }
 
+// inferNegIntLit types `-<integer literal>`. The sign and the digits are one
+// constant, so the range check must see the negative value (otherwise
+// `let x: i8 = -128` is rejected and `let x: u8 = -1` is accepted).
+func (c *checker) inferNegIntLit(x *ast.UnExpr, lit *ast.LiteralExpr, expected *types.Type) *types.Type {
+	text := "-" + lit.Text
+	t := expected
+	if t == nil || !t.Kind.IsInt() {
+		if intLitFits(text, types.I32T) {
+			t = types.I32T
+		} else {
+			t = types.I64T
+		}
+	}
+	if !intLitFits(text, t) {
+		c.errf(x.Sp, "E0080", "integer literal `%s` does not fit in `%s`", text, t)
+	}
+	c.info.Types[lit] = t
+	return t
+}
+
 func (c *checker) inferUnary(x *ast.UnExpr, expected *types.Type) *types.Type {
 	switch x.Op {
 	case token.KindMinus:
+		if lit, ok := x.X.(*ast.LiteralExpr); ok && lit.Kind == token.KindInteger {
+			return c.inferNegIntLit(x, lit, expected)
+		}
 		t := c.checkExpr(x.X, expected)
 		if !t.Kind.IsNumeric() {
 			c.errAt(x, "E0308", "cannot apply unary `-` to `%s`", t)
@@ -937,8 +964,10 @@ func (c *checker) isPlace(e ast.Expr) bool {
 		return x.Name != "_"
 	case *ast.UnExpr:
 		return x.Op == token.KindStar
-	case *ast.FieldExpr, *ast.IndexExpr:
-		return true
+	case *ast.FieldExpr:
+		return c.isPlace(x.Recv)
+	case *ast.IndexExpr:
+		return c.isPlace(x.Recv)
 	}
 	return false
 }
@@ -1144,6 +1173,14 @@ func (c *checker) inferArrayLit(x *ast.ArrayLitExpr, expected *types.Type) *type
 			return &types.Type{Kind: types.Array, Elem: types.I32T, Len: 0}
 		}
 		v := c.checkExpr(x.Value, wantElem)
+		if n.Int < 0 {
+			c.errAt(x.Count, "E0080", "array length must be non-negative, found `%d`", n.Int)
+			return &types.Type{Kind: types.Array, Elem: v, Len: 0}
+		}
+		if n.Int > maxArrayLen {
+			c.errAt(x.Count, "E0080", "array length `%d` is too large (maximum %d)", n.Int, maxArrayLen)
+			return &types.Type{Kind: types.Array, Elem: v, Len: 0}
+		}
 		if v != nil && !v.IsCopy() {
 			c.errAt(x.Value, "E0204", "array repeat requires a `Copy` element type, found `%s`; the value would be duplicated into every slot", v)
 		}
@@ -1704,6 +1741,10 @@ func (c *checker) resolveType(t ast.Type) *types.Type {
 			c.errf(x.Sp, "E0080", "array length must be non-negative, found `%d`", n.Int)
 			return &types.Type{Kind: types.Array, Elem: elem}
 		}
+		if n.Int > maxArrayLen {
+			c.errf(x.Sp, "E0080", "array length `%d` is too large (maximum %d)", n.Int, maxArrayLen)
+			return &types.Type{Kind: types.Array, Elem: elem}
+		}
 		return &types.Type{Kind: types.Array, Elem: elem, Len: n.Int}
 	case *ast.FnType:
 		f := &types.Type{Kind: types.Fn}
@@ -1841,9 +1882,45 @@ func (c *checker) declare(sp token.Span, name string, ty *types.Type) {
 
 // --- helpers --------------------------------------------------------------
 
+// maxArrayLen bounds array lengths. Array literals are expanded element by
+// element into C, so an enormous length would exhaust the compiler's memory
+// long before the C compiler saw it.
+const maxArrayLen = 1 << 20
+
 func isIntLiteral(e ast.Expr) bool {
 	l, ok := e.(*ast.LiteralExpr)
 	return ok && l.Kind == token.KindInteger
+}
+
+// intValFits reports whether a folded integer constant fits in the integer type
+// t. Unlike intLitFits it works on a computed value, so it also covers negated
+// and combined constants (`const X: u8 = 200 + 100`).
+func intValFits(v ConstVal, t *types.Type) bool {
+	bits := uint(0)
+	switch t.Kind {
+	case types.I8, types.U8:
+		bits = 8
+	case types.I16, types.U16:
+		bits = 16
+	case types.I32, types.U32:
+		bits = 32
+	case types.I64, types.Isize, types.U64, types.Usize:
+		bits = 64
+	default:
+		return true
+	}
+	if t.Kind.IsUnsigned() {
+		if v.Int < 0 {
+			return false
+		}
+		return bits == 64 || v.Uint <= (uint64(1)<<bits)-1
+	}
+	if bits == 64 {
+		return true
+	}
+	min := -(int64(1) << (bits - 1))
+	max := (int64(1) << (bits - 1)) - 1
+	return v.Int >= min && v.Int <= max
 }
 
 // intLitFits reports whether the integer literal text fits in the integer type
@@ -1966,6 +2043,15 @@ func (c *checker) evalConst(e ast.Expr) (ConstVal, bool) {
 		if x.Op == token.KindMinus {
 			v.Int = -v.Int
 			v.Uint = uint64(v.Int)
+			// A magnitude that becomes representable after negation (e.g.
+			// `-9223372036854775808`) is a plain integer again, so it can adopt
+			// a declared type.
+			if v.Int >= -2147483648 && v.Int <= 2147483647 {
+				v.Ty = types.I32T
+			} else {
+				v.Ty = types.I64T
+			}
+			v.Untyped = true
 		} else {
 			v.Int = ^v.Int
 			v.Uint = ^v.Uint

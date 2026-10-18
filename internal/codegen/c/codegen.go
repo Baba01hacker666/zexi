@@ -44,7 +44,15 @@ type gen struct {
 	dropTypes  []*dropType
 	dropSeen   map[string]bool
 	loopFrames []int // drop-frame depth at the start of each active loop body
-	hasString  bool  // whether the program uses the builtin `String`
+	loopLabels []loopLabel
+	trapDepth  int  // compiler-generated constructs (matches) since the innermost loop
+	hasString  bool // whether the program uses the builtin `String`
+}
+
+// loopLabel are the jump targets of one source-level loop.
+type loopLabel struct {
+	brk, cont string
+	outerTrap int // trapDepth to restore when the loop body ends
 }
 
 // dropFrame is the set of locals declared in one lexical scope, in declaration
@@ -785,21 +793,26 @@ func (g *gen) ifStmt(x *ast.IfExpr) {
 func (g *gen) loopStmt(x *ast.LoopExpr) {
 	switch x.Kind {
 	case token.KindLoop:
+		brk, cont := g.openLoop()
 		g.w.line("for (;;) {")
 		g.w.indent++
-		g.openLoop()
 		g.blockStmts(x.Body, nil)
 		g.closeLoop()
+		g.endLoopBody(cont)
 		g.w.indent--
 		g.w.line("}")
+		g.w.line("%s: ;", brk)
 	case token.KindWhile:
-		g.w.line("while (%s) {", g.value(x.Cond))
+		cond := g.value(x.Cond)
+		brk, cont := g.openLoop()
+		g.w.line("while (%s) {", cond)
 		g.w.indent++
-		g.openLoop()
 		g.blockStmts(x.Body, nil)
 		g.closeLoop()
+		g.endLoopBody(cont)
 		g.w.indent--
 		g.w.line("}")
+		g.w.line("%s: ;", brk)
 	case token.KindFor:
 		g.forStmt(x)
 	}
@@ -832,11 +845,13 @@ func (g *gen) forStmt(x *ast.LoopExpr) {
 	}
 	g.w.line("for (%s %s = %s; %s %s %s; %s++) {", ctype(lt), name, lo, name, op, hi, name)
 	g.w.indent++
-	g.openLoop()
+	brk, cont := g.openLoop()
 	g.blockStmts(x.Body, nil)
 	g.closeLoop()
+	g.endLoopBody(cont)
 	g.w.indent--
 	g.w.line("}")
+	g.w.line("%s: ;", brk)
 	g.popScope()
 }
 
@@ -860,11 +875,13 @@ func (g *gen) forArray(x *ast.LoopExpr) {
 	g.w.line("for (size_t zx_i = 0; zx_i < %d; zx_i++) {", it.Len)
 	g.w.indent++
 	g.w.line("%s %s = %s.e[zx_i];", ctype(it.Elem), name, arr)
-	g.openLoop()
+	brk, cont := g.openLoop()
 	g.blockStmts(x.Body, nil)
 	g.closeLoop()
+	g.endLoopBody(cont)
 	g.w.indent--
 	g.w.line("}")
+	g.w.line("%s: ;", brk)
 	g.popScope()
 }
 
@@ -876,13 +893,28 @@ func (g *gen) jumpStmt(x *ast.JumpExpr) {
 		if len(g.loopFrames) > 0 {
 			g.emitDropsFrom(g.loopFrames[len(g.loopFrames)-1])
 		}
-		g.w.line("break;")
+		g.w.line("%s", g.loopJump("break", "brk"))
 	case token.KindContinue:
 		if len(g.loopFrames) > 0 {
 			g.emitDropsFrom(g.loopFrames[len(g.loopFrames)-1])
 		}
-		g.w.line("continue;")
+		g.w.line("%s", g.loopJump("continue", "cont"))
 	}
+}
+
+// loopJump renders a `break`/`continue`. When a compiler-generated construct
+// (a `match` lowered to a switch or do-while) sits between the jump and its
+// loop, a bare `break`/`continue` would target the wrong construct, so jump to
+// the loop's label instead.
+func (g *gen) loopJump(kw, which string) string {
+	if g.trapDepth == 0 || len(g.loopLabels) == 0 {
+		return kw + ";"
+	}
+	l := g.loopLabels[len(g.loopLabels)-1]
+	if which == "brk" {
+		return "goto " + l.brk + ";"
+	}
+	return "goto " + l.cont + ";"
 }
 
 // --- expressions ----------------------------------------------------------
@@ -909,6 +941,13 @@ func (g *gen) value(e ast.Expr) string {
 	case *ast.UnExpr:
 		switch x.Op {
 		case token.KindMinus:
+			if lit, ok := x.X.(*ast.LiteralExpr); ok && lit.Kind == token.KindInteger {
+				if macro, ok := intMinMacro(lit.Text); ok {
+					// `-9223372036854775808` is not a valid C constant; the
+					// <stdint.h> macro is.
+					return macro
+				}
+			}
 			return "(-" + g.value(x.X) + ")"
 		case token.KindBang:
 			return "(!" + g.value(x.X) + ")"
@@ -1174,9 +1213,11 @@ func (g *gen) blockValue(b *ast.Block) string {
 	final := "(void)0"
 	if b.Tail != nil {
 		t := g.info.TypeOf(b.Tail)
-		if t != nil && t.NeedsDrop() && isPlaceExpr(b.Tail) {
+		if t != nil && t.Kind != types.Unit && t.Kind != types.Never {
+			// Materialize before the scope's destructors run: the tail may read
+			// locals that the drops would otherwise free first.
 			tm := g.tmpName()
-			g.w.line("%s %s = zx_move_%s(&%s);", ctype(t), tm, typeMangle(t), g.value(b.Tail))
+			g.w.line("%s %s = %s;", ctype(t), tm, g.consume(b.Tail))
 			final = tm
 		} else {
 			final = g.value(b.Tail)
@@ -1339,11 +1380,14 @@ func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
 		if m.Self != nil {
 			isPtr := rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr)
 			if m.Self.ByRef {
-				recv := g.value(x.Recv)
 				if isPtr {
-					args = append(args, recv)
+					args = append(args, g.value(x.Recv))
+				} else if isPlaceExpr(x.Recv) {
+					args = append(args, "(&"+g.value(x.Recv)+")")
 				} else {
-					args = append(args, "(&"+recv+")")
+					// A temporary receiver: bind it to a local so its address
+					// can be taken.
+					args = append(args, "(&"+g.materialize(x.Recv)+")")
 				}
 			} else {
 				if isPtr {
@@ -1657,6 +1701,7 @@ func (g *gen) emitGuardedArms(x *ast.MatchExpr, st *types.Type, m, result string
 		}
 		g.pushScope()
 		g.bindArm(w, arm.Pat, st, m, isEnum)
+		g.trapDepth++
 		if arm.Guard != nil {
 			w.line("if (%s) {", g.value(arm.Guard))
 			w.indent++
@@ -1674,6 +1719,7 @@ func (g *gen) emitGuardedArms(x *ast.MatchExpr, st *types.Type, m, result string
 			w.indent--
 			w.line("}")
 		}
+		g.trapDepth--
 		g.popScope()
 		if !catchAll {
 			w.indent--
@@ -1718,6 +1764,7 @@ func (g *gen) emitSwitch(x *ast.MatchExpr, st *types.Type, m, result string, w *
 		w.indent++
 		g.pushScope()
 		g.bindArm(w, arm.Pat, st, m, isEnum)
+		g.trapDepth++
 		if result != "" {
 			w.line("%s = %s;", result, g.consume(arm.Body))
 		} else {
@@ -1726,6 +1773,7 @@ func (g *gen) emitSwitch(x *ast.MatchExpr, st *types.Type, m, result string, w *
 			g.stmtExpr(arm.Body)
 			g.w = save
 		}
+		g.trapDepth--
 		g.popScope()
 		w.line("break;")
 		w.indent--
@@ -1845,10 +1893,36 @@ func litPatLabel(p *ast.LitPat) string {
 	return "0"
 }
 
+// intMinMacro maps a bare magnitude that is exactly the minimum of a signed
+// type to the matching <stdint.h> macro. Writing the positive magnitude in C
+// would either overflow a signed type or be silently treated as unsigned.
+func intMinMacro(text string) (string, bool) {
+	switch strings.ReplaceAll(text, "_", "") {
+	case "9223372036854775808":
+		return "INT64_MIN", true
+	case "2147483648":
+		return "INT32_MIN", true
+	case "32768":
+		return "INT16_MIN", true
+	case "128":
+		return "INT8_MIN", true
+	}
+	return "", false
+}
+
 func (g *gen) literal(x *ast.LiteralExpr) string {
 	switch x.Kind {
 	case token.KindInteger:
 		s := strings.ReplaceAll(x.Text, "_", "")
+		// C has no `0o` prefix, and `0b` is only a GNU extension: emit those
+		// forms in decimal.
+		if len(s) > 2 && s[0] == '0' {
+			if v, err := strconv.ParseUint(s[2:], 8, 64); err == nil && (s[1] == 'o' || s[1] == 'O') {
+				s = strconv.FormatUint(v, 10)
+			} else if v, err := strconv.ParseUint(s[2:], 2, 64); err == nil && (s[1] == 'b' || s[1] == 'B') {
+				s = strconv.FormatUint(v, 10)
+			}
+		}
 		if t := g.info.TypeOf(x); t != nil && t.Kind.IsFloat() {
 			return s + ".0"
 		}
@@ -1983,25 +2057,43 @@ func (g *gen) popScope() {
 	}
 }
 
+// tmpName returns a fresh compiler-generated C identifier. The `__` can never
+// appear in a mangled user name (safeIdent escapes every `_`), so temporaries
+// cannot collide with locals.
 func (g *gen) tmpName() string {
 	g.tmp++
-	return fmt.Sprintf("zx_t%d", g.tmp)
+	return fmt.Sprintf("zx__t%d", g.tmp)
 }
 
 // --- drop frames ----------------------------------------------------------
 
 func (g *gen) openDropFrame() { g.dropFrames = append(g.dropFrames, &dropFrame{}) }
 
-// openLoop opens the lexical scope of a loop body and marks it so that `break`
-// and `continue` know which frames to run destructors for.
-func (g *gen) openLoop() {
+// openLoop enters a loop body: it opens the body's drop frame and records jump
+// labels for `break`/`continue`. `break`/`continue` inside a `match` lowered to
+// a C `switch` or `do { } while (0)` would otherwise target that construct, so
+// they are instead emitted as `goto` to these labels (see trapDepth).
+func (g *gen) openLoop() (brk, cont string) {
 	g.openDropFrame()
 	g.loopFrames = append(g.loopFrames, len(g.dropFrames)-1)
+	brk, cont = g.tmpName(), g.tmpName()
+	g.loopLabels = append(g.loopLabels, loopLabel{brk: brk, cont: cont, outerTrap: g.trapDepth})
+	g.trapDepth = 0
+	return brk, cont
 }
+
+// endLoopBody emits the `continue` target at the tail of a loop body. It must
+// be emitted *after* closeLoop, so that a `goto` to it lands past the
+// end-of-iteration destructors (which the jump ran itself).
+func (g *gen) endLoopBody(cont string) { g.w.line("%s: ;", cont) }
 
 func (g *gen) closeLoop() {
 	if len(g.loopFrames) > 0 {
 		g.loopFrames = g.loopFrames[:len(g.loopFrames)-1]
+	}
+	if len(g.loopLabels) > 0 {
+		g.trapDepth = g.loopLabels[len(g.loopLabels)-1].outerTrap
+		g.loopLabels = g.loopLabels[:len(g.loopLabels)-1]
 	}
 	g.closeDropFrame()
 }
@@ -2030,6 +2122,16 @@ func (g *gen) emitDropsFrom(start int) {
 	}
 }
 
+// materialize binds an rvalue expression to a temporary in the current block so
+// that its address can be taken, and schedules it for dropping at scope exit.
+func (g *gen) materialize(e ast.Expr) string {
+	t := g.info.TypeOf(e)
+	tm := g.tmpName()
+	g.w.line("%s %s = %s;", ctype(t), tm, g.consume(e))
+	g.registerDrop(tm, t)
+	return tm
+}
+
 func (g *gen) registerDrop(cname string, t *types.Type) {
 	if t == nil || !t.NeedsDrop() || len(g.dropFrames) == 0 {
 		return
@@ -2040,10 +2142,16 @@ func (g *gen) registerDrop(cname string, t *types.Type) {
 
 // --- moves ----------------------------------------------------------------
 
+// isPlaceExpr reports whether e denotes an addressable location (an lvalue).
+// A field or index is only a place if its base is: `f().x` is an rvalue.
 func isPlaceExpr(e ast.Expr) bool {
 	switch x := e.(type) {
-	case *ast.IdentExpr, *ast.FieldExpr, *ast.IndexExpr:
+	case *ast.IdentExpr:
 		return true
+	case *ast.FieldExpr:
+		return isPlaceExpr(x.Recv)
+	case *ast.IndexExpr:
+		return isPlaceExpr(x.Recv)
 	case *ast.UnExpr:
 		// A dereference `*p` denotes the pointee, which is a place.
 		return x.Op == token.KindStar
@@ -2078,15 +2186,25 @@ func (g *gen) emitReturn(val ast.Expr) {
 		return
 	}
 	t := g.info.TypeOf(val)
-	if t != nil && t.NeedsDrop() {
-		tmp := g.tmpName()
-		g.w.line("%s %s = %s;", ctype(t), tmp, g.consume(val))
-		g.emitDropsFrom(0)
-		g.w.line("return %s;", tmp)
+	if t != nil && t.Kind == types.Never {
+		// The expression diverges, so there is nothing to return.
+		g.w.line("%s;", g.value(val))
 		return
 	}
+	if t == nil || t.Kind == types.Unit {
+		if v := g.value(val); v != "" && v != "0" {
+			g.w.line("%s;", v)
+		}
+		g.emitDropsFrom(0)
+		g.w.line("return;")
+		return
+	}
+	// Materialize the value *before* running destructors: the expression may
+	// read locals (or by-value parameters) that the drops are about to free.
+	tmp := g.tmpName()
+	g.w.line("%s %s = %s;", ctype(t), tmp, g.consume(val))
 	g.emitDropsFrom(0)
-	g.w.line("return %s;", g.value(val))
+	g.w.line("return %s;", tmp)
 }
 
 // assignValue emits an assignment; for resource-owning targets the old value is
@@ -2107,7 +2225,10 @@ func (g *gen) assignValue(x *ast.AssignExpr) string {
 	rhs := g.consume(x.Rhs)
 	if lt != nil && lt.NeedsDrop() && isPlaceExpr(x.Lhs) {
 		lhs := g.value(x.Lhs)
-		return "({ zx_drop_" + typeMangle(lt) + "(&" + lhs + "); " + lhs + " = " + rhs + "; })"
+		// Materialize the RHS first: it may read the value being overwritten
+		// (e.g. `s = s + "x"`), which the drop would free.
+		tmp := g.tmpName()
+		return "({ " + ctype(lt) + " " + tmp + " = " + rhs + "; zx_drop_" + typeMangle(lt) + "(&" + lhs + "); " + lhs + " = " + tmp + "; })"
 	}
 	return "(" + g.value(x.Lhs) + " = " + rhs + ")"
 }
@@ -2220,7 +2341,16 @@ func constLiteral(v sema.ConstVal, t *types.Type) string {
 		return s
 	default:
 		if t != nil && t.Kind.IsUnsigned() {
-			return strconv.FormatUint(v.Uint, 10)
+			s := strconv.FormatUint(v.Uint, 10)
+			if (t.Kind == types.U64 || t.Kind == types.Usize) && v.Uint > 9223372036854775807 {
+				// Otherwise C treats the constant as unsigned with a warning.
+				s += "ULL"
+			}
+			return s
+		}
+		if t != nil && (t.Kind == types.I64 || t.Kind == types.Isize) && v.Int == -9223372036854775808 {
+			// `-9223372036854775808` is not a valid C constant.
+			return "INT64_MIN"
 		}
 		return strconv.FormatInt(v.Int, 10)
 	}
@@ -2321,10 +2451,21 @@ static void zx_string_clear(zx_String *s) { if (s->ptr) s->ptr[0] = 0; s->len = 
 static void zx_string_push_str(zx_String *s, const char *p) {
     if (!p) return;
     size_t n = strlen(p);
+    /* p may point into this string's own buffer (e.g. s.push_str(s.as_str())
+       or s += s); remember its offset and re-derive it after realloc, which
+       may move the buffer. */
+    const char *src = p;
+    long off = -1;
+    if (s->ptr) {
+        uintptr_t base = (uintptr_t)s->ptr, here = (uintptr_t)p;
+        if (here >= base && here <= base + (uintptr_t)s->len) off = (long)(here - base);
+    }
     char *np = (char *)realloc(s->ptr, s->len + n + 1);
     if (!np) { fputs("zexi: out of memory\n", stderr); abort(); }
     s->ptr = np;
-    memcpy(s->ptr + s->len, p, n + 1);
+    if (off >= 0) src = s->ptr + off;
+    /* memmove: the source may overlap the destination (self-append). */
+    memmove(s->ptr + s->len, src, n + 1);
     s->len += n;
 }
 
