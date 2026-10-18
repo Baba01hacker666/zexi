@@ -30,6 +30,7 @@ const (
 	KindContinue
 	KindDefer
 	KindElse
+	KindElif
 	KindEnum
 	KindExtern
 	KindFalse
@@ -49,6 +50,7 @@ const (
 	KindTrue
 	KindType
 	KindUnsafe
+	KindUntil
 	KindUse
 	KindWhile
 
@@ -115,6 +117,7 @@ var keywords = map[string]Kind{
 	"continue": KindContinue,
 	"defer":    KindDefer,
 	"else":     KindElse,
+	"elif":     KindElif,
 	"enum":     KindEnum,
 	"extern":   KindExtern,
 	"false":    KindFalse,
@@ -134,6 +137,7 @@ var keywords = map[string]Kind{
 	"true":     KindTrue,
 	"type":     KindType,
 	"unsafe":   KindUnsafe,
+	"until":    KindUntil,
 	"use":      KindUse,
 	"while":    KindWhile,
 }
@@ -183,6 +187,7 @@ var kindNames = map[Kind]string{
 	KindContinue:   "continue",
 	KindDefer:      "defer",
 	KindElse:       "else",
+	KindElif:       "elif",
 	KindEnum:       "enum",
 	KindExtern:     "extern",
 	KindFalse:      "false",
@@ -202,6 +207,7 @@ var kindNames = map[Kind]string{
 	KindTrue:       "true",
 	KindType:       "type",
 	KindUnsafe:     "unsafe",
+	KindUntil:      "until",
 	KindUse:        "use",
 	KindWhile:      "while",
 	KindPlus:       "+",

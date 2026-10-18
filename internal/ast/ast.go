@@ -271,6 +271,18 @@ type ExprStmt struct {
 func (*ExprStmt) stmtNode()          {}
 func (s *ExprStmt) Span() token.Span { return s.Sp }
 
+// DeferStmt is `defer expr;`: the expression is evaluated when the enclosing
+// block scope exits — by falling off the end, or via `return`, `break`, or
+// `continue` — after the deferred expressions registered later in the same
+// scope (LIFO) and before the scope's locals are dropped.
+type DeferStmt struct {
+	X  Expr
+	Sp token.Span
+}
+
+func (*DeferStmt) stmtNode()          {}
+func (s *DeferStmt) Span() token.Span { return s.Sp }
+
 // --- expressions ----------------------------------------------------------
 
 // Expr is an expression.
@@ -460,10 +472,10 @@ type MatchArm struct {
 	Sp    token.Span
 }
 
-// LoopExpr covers `loop`, `while`, and `for`.
+// LoopExpr covers `loop`, `while`, `until`, and `for`.
 type LoopExpr struct {
-	Kind token.Kind // KindLoop, KindWhile, or KindFor
-	Cond Expr       // while
+	Kind token.Kind // KindLoop, KindWhile, KindUntil, or KindFor
+	Cond Expr       // while / until
 	Pat  Pattern    // for
 	Iter Expr       // for
 	Body *Block
@@ -563,3 +575,24 @@ type FieldPat struct {
 	Pat  Pattern
 	Sp   token.Span
 }
+
+// OrPat is `pat | pat | ...` in a `match` arm or `if let`/`while let`: the arm
+// is taken when any alternative matches. Alternatives may not bind variables
+// (which alternative bound the value would be ambiguous).
+type OrPat struct {
+	Alts []Pattern
+	Sp   token.Span
+}
+
+func (*OrPat) patternNode()       {}
+func (p *OrPat) Span() token.Span { return p.Sp }
+
+// RangePat is `lo..hi` or `lo..=hi` over integer or `char` literal endpoints.
+type RangePat struct {
+	Lo, Hi    *LitPat
+	Inclusive bool // true for `..=`
+	Sp        token.Span
+}
+
+func (*RangePat) patternNode()       {}
+func (p *RangePat) Span() token.Span { return p.Sp }

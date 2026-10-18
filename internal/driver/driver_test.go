@@ -33,6 +33,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/match_guards.zx",
 		"../../tests/robustness.zx",
 		"../../tests/sugar.zx",
+		"../../tests/keywords.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -161,6 +162,22 @@ func TestRunPrograms(t *testing.T) {
 				"n = 42", "42 items", "answer: true!",
 				"count: 42 / 1.5", "empty", "yes", "z", "cold",
 				"ratio: 1 3.5", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/keywords.zx",
+			want: strings.Join([]string{
+				"A", "B", "C", "F", "4", "4",
+				"block body", "deferred-1", "deferred-2", "xy",
+				"early cleanup", "1", "no return", "early cleanup", "2",
+				"body 1", "iter 1", "iter 2", "body 3", "iter 3",
+				"42", "6", "3 4", "7", "bob 7",
+				"zero", "small", "mid", "high", "huge", "10", "20",
+				"deep freeze", "freezing", "ok",
+				"lower", "upper", "digit", "other",
+				"horizontal", "vertical", "5", "-1",
+				"got 10", "none", "done", "30",
+				`C:\new\test`, `say "hi" \n`, `a\tb`, "42", "",
 			}, "\n"),
 		},
 	}

@@ -58,9 +58,11 @@ type loopLabel struct {
 }
 
 // dropFrame is the set of locals declared in one lexical scope, in declaration
-// order; destructors run in reverse.
+// order; destructors run in reverse. It also holds the scope's deferred
+// expressions, which run (last-in-first-out) before the destructors.
 type dropFrame struct {
-	vars []dropVar
+	vars   []dropVar
+	defers []ast.Expr
 }
 
 type dropVar struct {
@@ -709,6 +711,15 @@ func (g *gen) stmt(s ast.Stmt) {
 	switch st := s.(type) {
 	case *ast.LetStmt:
 		g.letStmt(st)
+	case *ast.DeferStmt:
+		// Register the expression on the innermost scope frame; it is
+		// emitted when that frame exits (see emitFrameExit).
+		if len(g.dropFrames) > 0 {
+			f := g.dropFrames[len(g.dropFrames)-1]
+			f.defers = append(f.defers, st.X)
+		} else {
+			g.discard(st.X)
+		}
 	case *ast.ExprStmt:
 		g.stmtExpr(st.X)
 	default:
@@ -837,8 +848,11 @@ func (g *gen) loopStmt(x *ast.LoopExpr) string {
 		g.w.line("}")
 		g.w.line("%s: ;", brk)
 		return res
-	case token.KindWhile:
+	case token.KindWhile, token.KindUntil:
 		cond := g.value(x.Cond)
+		if x.Kind == token.KindUntil {
+			cond = "!(" + cond + ")"
+		}
 		res := g.loopResult(x)
 		brk, cont := g.openLoop(res)
 		g.w.line("while (%s) {", cond)
@@ -1351,6 +1365,21 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 	if ctor := g.info.Ctors[x]; ctor != nil {
 		return g.enumConstruct(ctor, x.Args)
 	}
+	if st := g.info.TupleCtors[x]; st != nil {
+		// `Pair(1, 2)`: a compound literal in field order.
+		if len(st.Fields) == 0 {
+			return "((" + typeName(st.Name) + "){ 0 })"
+		}
+		var parts []string
+		for i, f := range st.Fields {
+			s := zeroValue(f.Ty)
+			if i < len(x.Args) {
+				s = g.consume(x.Args[i])
+			}
+			parts = append(parts, "."+fieldName(f.Name)+" = "+s)
+		}
+		return "((" + typeName(st.Name) + "){ " + strings.Join(parts, ", ") + " })"
+	}
 	if fn := g.info.Resolved[x]; fn != nil {
 		return g.withArgs(x.Args, fn.Params, g.exprStmtType(x), func(ps []string) string {
 			return funcName(fn) + "(" + strings.Join(ps, ", ") + ")"
@@ -1797,15 +1826,61 @@ func (g *gen) matchScrutinee(st *types.Type, scrut string) (*types.Type, string)
 	return st, scrut
 }
 
-// emitMatchArms lowers the arms. A `switch` is used when no arm has a guard;
-// guarded arms need fall-through on guard failure, which a C `switch` cannot
-// express, so they are lowered to an if-chain inside a `do { } while (0)`.
+// emitMatchArms lowers the arms. A `switch` is used when no arm has a guard
+// or a complex (or/range) pattern; those need fall-through on guard failure
+// or tests a C `switch` cannot express, so they are lowered to an if-chain
+// inside a `do { } while (0)`.
 func (g *gen) emitMatchArms(x *ast.MatchExpr, st *types.Type, m, result string, w *writer) {
-	if matchHasGuard(x) {
+	if matchHasGuard(x) || matchHasComplexPat(x) {
 		g.emitGuardedArms(x, st, m, result, w)
 		return
 	}
 	g.emitSwitch(x, st, m, result, w)
+}
+
+// matchHasComplexPat reports whether any arm uses an or-pattern or a range
+// pattern, which a C `switch` cannot express directly.
+func matchHasComplexPat(x *ast.MatchExpr) bool {
+	for _, a := range x.Arms {
+		switch a.Pat.(type) {
+		case *ast.OrPat, *ast.RangePat:
+			return true
+		}
+	}
+	return false
+}
+
+// patCond renders the C test for a pattern against disc (the scrutinee value,
+// or its `.tag` for enums), or "" when the pattern always matches.
+func (g *gen) patCond(p ast.Pattern, disc string, isEnum bool) string {
+	switch pt := p.(type) {
+	case *ast.WildcardPat, *ast.BindPat:
+		return ""
+	case *ast.PathPat:
+		if v := g.info.PatVariant[pt]; v != nil && isEnum {
+			return disc + " == " + strconv.Itoa(v.Index)
+		}
+		return ""
+	case *ast.LitPat:
+		return disc + " == " + litPatLabel(pt)
+	case *ast.OrPat:
+		var parts []string
+		for _, alt := range pt.Alts {
+			c := g.patCond(alt, disc, isEnum)
+			if c == "" {
+				return "" // a catch-all alternative matches everything
+			}
+			parts = append(parts, "("+c+")")
+		}
+		return strings.Join(parts, " || ")
+	case *ast.RangePat:
+		op := "<"
+		if pt.Inclusive {
+			op = "<="
+		}
+		return disc + " >= " + litPatLabel(pt.Lo) + " && " + disc + " " + op + " " + litPatLabel(pt.Hi)
+	}
+	return ""
 }
 
 // emitGuardedArms emits one block per arm. When an arm's pattern matches but its
@@ -1820,11 +1895,11 @@ func (g *gen) emitGuardedArms(x *ast.MatchExpr, st *types.Type, m, result string
 	w.line("do {")
 	w.indent++
 	for _, arm := range x.Arms {
-		label, catchAll := g.armLabel(arm.Pat, isEnum)
+		cond := g.patCond(arm.Pat, disc, isEnum)
 		w.line("{")
 		w.indent++
-		if !catchAll {
-			w.line("if (%s == %s) {", disc, label)
+		if cond != "" {
+			w.line("if (%s) {", cond)
 			w.indent++
 		}
 		g.pushScope()
@@ -1849,7 +1924,7 @@ func (g *gen) emitGuardedArms(x *ast.MatchExpr, st *types.Type, m, result string
 		}
 		g.trapDepth--
 		g.popScope()
-		if !catchAll {
+		if cond != "" {
 			w.indent--
 			w.line("}")
 		}
@@ -2061,12 +2136,15 @@ func (g *gen) literal(x *ast.LiteralExpr) string {
 			s += ".0"
 		}
 		return s
-	case token.KindString, token.KindRawString:
+	case token.KindString:
 		decoded, ok := sema.DecodeString(x.Text)
 		if !ok {
 			decoded = x.Text
 		}
 		return cString(decoded)
+	case token.KindRawString:
+		// Raw strings are literal text: backslashes are not escapes.
+		return cString(x.Text)
 	case token.KindChar:
 		r := firstRune(x.Text)
 		return "(uint32_t)" + strconv.FormatInt(int64(r), 10)
@@ -2246,8 +2324,19 @@ func (g *gen) closeDropFrame() {
 		return
 	}
 	f := g.dropFrames[len(g.dropFrames)-1]
-	g.emitDrops(f)
+	g.emitFrameExit(f)
 	g.dropFrames = g.dropFrames[:len(g.dropFrames)-1]
+}
+
+// emitFrameExit emits everything that must happen when a scope is left: its
+// deferred expressions first, in reverse order of their `defer` statements
+// (so they can still read the locals), then the destructors of the locals
+// declared in the scope.
+func (g *gen) emitFrameExit(f *dropFrame) {
+	for i := len(f.defers) - 1; i >= 0; i-- {
+		g.discard(f.defers[i])
+	}
+	g.emitDrops(f)
 }
 
 func (g *gen) emitDrops(f *dropFrame) {
@@ -2257,11 +2346,12 @@ func (g *gen) emitDrops(f *dropFrame) {
 	}
 }
 
-// emitDropsFrom runs destructors for every frame from the innermost down to and
-// including frame `start`. Used on `return`, `break`, and `continue`.
+// emitDropsFrom runs deferred expressions and destructors for every frame
+// from the innermost down to and including frame `start`. Used on `return`,
+// `break`, and `continue`.
 func (g *gen) emitDropsFrom(start int) {
 	for i := len(g.dropFrames) - 1; i >= start; i-- {
-		g.emitDrops(g.dropFrames[i])
+		g.emitFrameExit(g.dropFrames[i])
 	}
 }
 
@@ -2466,9 +2556,11 @@ func zeroValue(t *types.Type) string {
 func constLiteral(v sema.ConstVal, t *types.Type) string {
 	switch {
 	case v.IsStr:
-		s, ok := sema.DecodeString(v.Str)
-		if !ok {
-			s = v.Str
+		s := v.Str
+		if !v.Raw {
+			if decoded, ok := sema.DecodeString(v.Str); ok {
+				s = decoded
+			}
 		}
 		return cString(s)
 	case v.IsBool:

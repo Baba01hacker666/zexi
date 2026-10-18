@@ -53,7 +53,7 @@ func (l *Lexer) Next() token.Token {
 	c := l.peek()
 	switch {
 	// Prefix forms must be checked before the generic identifier case.
-	case c == 'r' && l.peekAt(1) == '"':
+	case c == 'r' && l.atRawString():
 		return l.scanRawString(startPos, startOff)
 	case c == 'b' && l.peekAt(1) == '\'':
 		return l.scanChar(startPos, startOff, true)
@@ -152,6 +152,7 @@ func (l *Lexer) scanNumber(startPos token.Position, startOff int) token.Token {
 				l.errorf("E0005", startPos, "hexadecimal literal requires at least one digit")
 			}
 			l.consumeDigits(isHexDigit)
+			l.checkUnderscores(l.lit(startOff), startPos)
 			return l.tok(kind, l.lit(startOff), startPos, startOff)
 		case 'b', 'B':
 			l.advance()
@@ -160,6 +161,7 @@ func (l *Lexer) scanNumber(startPos token.Position, startOff int) token.Token {
 				l.errorf("E0005", startPos, "binary literal requires at least one digit")
 			}
 			l.consumeDigits(isBinDigit)
+			l.checkUnderscores(l.lit(startOff), startPos)
 			return l.tok(kind, l.lit(startOff), startPos, startOff)
 		case 'o', 'O':
 			l.advance()
@@ -168,6 +170,7 @@ func (l *Lexer) scanNumber(startPos token.Position, startOff int) token.Token {
 				l.errorf("E0005", startPos, "octal literal requires at least one digit")
 			}
 			l.consumeDigits(isOctDigit)
+			l.checkUnderscores(l.lit(startOff), startPos)
 			return l.tok(kind, l.lit(startOff), startPos, startOff)
 		}
 	}
@@ -191,7 +194,22 @@ func (l *Lexer) scanNumber(startPos token.Position, startOff int) token.Token {
 			l.consumeDigits(isDigit)
 		}
 	}
+	l.checkUnderscores(l.lit(startOff), startPos)
 	return l.tok(kind, l.lit(startOff), startPos, startOff)
+}
+
+// checkUnderscores rejects misplaced `_` separators in a numeric literal
+// (`1_`, `1__2`, `0x_FF`): each underscore must sit between two digits.
+func (l *Lexer) checkUnderscores(lit string, startPos token.Position) {
+	for i := 0; i < len(lit); i++ {
+		if lit[i] != '_' {
+			continue
+		}
+		if i == 0 || i == len(lit)-1 || !isHexDigit(lit[i-1]) || !isHexDigit(lit[i+1]) {
+			l.errorf("E0005", startPos, "underscores in a numeric literal must sit between digits")
+			return
+		}
+	}
 }
 
 func (l *Lexer) consumeDigits(pred func(byte) bool) {
@@ -232,20 +250,54 @@ func (l *Lexer) scanString(startPos token.Position, startOff int) token.Token {
 	return l.tok(token.KindString, inner, startPos, startOff)
 }
 
+// atRawString reports whether the cursor is at a raw string: `r"..."`,
+// `r#"..."#`, `r##"..."##`, and so on. The `#` run lets the literal contain
+// bare double quotes.
+func (l *Lexer) atRawString() bool {
+	if l.peek() != 'r' {
+		return false
+	}
+	i := 1
+	for l.peekAt(i) == '#' {
+		i++
+	}
+	return l.peekAt(i) == '"'
+}
+
 func (l *Lexer) scanRawString(startPos token.Position, startOff int) token.Token {
 	l.advance() // 'r'
+	hashes := 0
+	for l.peek() == '#' {
+		hashes++
+		l.advance()
+	}
 	l.advance() // opening quote
+	contentStart := l.off
 	for {
 		if l.atEnd() {
 			l.errorf("E0001", startPos, "unterminated raw string literal")
-			break
+			return l.tok(token.KindRawString, l.safeSlice(contentStart, l.off), startPos, startOff)
 		}
-		if l.advance() == '"' {
-			break
+		if l.peek() == '"' {
+			closed := true
+			for i := 0; i < hashes; i++ {
+				if l.peekAt(1+i) != '#' {
+					closed = false
+					break
+				}
+			}
+			if closed {
+				contentEnd := l.off
+				l.advance() // closing quote
+				for i := 0; i < hashes; i++ {
+					l.advance()
+				}
+				inner := l.safeSlice(contentStart, contentEnd)
+				return l.tok(token.KindRawString, inner, startPos, startOff)
+			}
 		}
+		l.advance()
 	}
-	inner := l.safeSlice(startOff+2, l.off-1)
-	return l.tok(token.KindRawString, inner, startPos, startOff)
 }
 
 func (l *Lexer) scanChar(startPos token.Position, startOff int, isByte bool) token.Token {

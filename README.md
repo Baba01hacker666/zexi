@@ -8,13 +8,16 @@ This repository contains the **initial design and specification** of Zexi: the v
 > flow-sensitive move checker, lowers to C, and links a **native binary** you can
 > run.
 >
-> Implemented: functions and recursion; `let`/`const`; integer/float/bool/char/
-> `str` values; arithmetic, bitwise, comparison, and logical operators; `as`
-> casts; `if`/`else`; `while`/`loop`/`for i in a..b` (a `loop` can yield a value
-> via `break <expr>`); `print`/`println` of any number of values; `len`;
+> Implemented: functions and recursion; `let`/`const`; `type` aliases; integer/
+> float/bool/char/`str` values; arithmetic, bitwise, comparison, and logical
+> operators; `as` casts; `if`/`elif`/`else`; `while`/`until`/`loop`/`for i in a..b`
+> (a `loop` can yield a value via `break <expr>`); `if let`/`while let`;
+> `defer` (scope-exit actions, run in LIFO order before destructors);
+> `print`/`println` of any number of values; `len`;
 > **structs** (named and tuple) with **`impl` methods** (`self`, `&self`,
 > `&mut self`) and **associated functions** (`Point::new(1, 2)`); **enums** with
-> tuple/struct/unit variants and **`match`** with exhaustiveness checking;
+> tuple/struct/unit variants and **`match`** with exhaustiveness checking,
+> or-patterns (`A | B`), and range patterns (`1..=9`, `'a'..='z'`);
 > **first-class arrays** with bounds-checked indexing;
 > a **use-after-move checker** for non-`Copy` values (opt into copying with
 > `#[copy]`); the built-in owning heap type **`String`** with **deterministic
@@ -40,6 +43,7 @@ go run ./cmd/zexic run tests/arrays.zx    # arrays + bounds checks
 go run ./cmd/zexic run tests/strings.zx   # owning heap String + methods
 go run ./cmd/zexic run tests/drop.zx      # deterministic destruction across control flow
 go run ./cmd/zexic run tests/syntax.zx    # a runnable tour of the whole syntax
+go run ./cmd/zexic run tests/keywords.zx  # until/elif/defer, or+range patterns, if let, type aliases
 go run ./cmd/zexic run tests/sugar.zx     # break-with-value, Type::new(..), print/format sugar
 go run ./cmd/zexic run tests/pi.zx        # 30 digits of π: big-int + Machin's formula
 go run ./cmd/zexic run examples/http_server.zx lib/http.zx   # an HTTP server, in Zexi

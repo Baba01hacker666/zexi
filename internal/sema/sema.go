@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"zexi/internal/ast"
 	"zexi/internal/diag"
@@ -65,9 +66,11 @@ type Info struct {
 	StructOrd  []*types.Struct
 	Enums      map[string]*types.Enum
 	EnumOrd    []*types.Enum
-	Methods    map[string]map[string]*Fn // struct name -> method name -> fn
-	Resolved   map[ast.Expr]*Fn          // resolved call / method target
-	Ctors      map[ast.Expr]*Ctor        // resolved enum-variant construction
+	Methods    map[string]map[string]*Fn  // struct name -> method name -> fn
+	Resolved   map[ast.Expr]*Fn           // resolved call / method target
+	Ctors      map[ast.Expr]*Ctor         // resolved enum-variant construction
+	TupleCtors map[ast.Expr]*types.Struct // resolved tuple-struct construction
+	Aliases    map[string]*types.Type     // resolved `type` aliases
 	PatVariant map[ast.Pattern]*types.Variant
 	Types      map[ast.Expr]*types.Type
 	DeclTypes  map[ast.Stmt]*types.Type
@@ -95,10 +98,15 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 			Methods:    map[string]map[string]*Fn{},
 			Resolved:   map[ast.Expr]*Fn{},
 			Ctors:      map[ast.Expr]*Ctor{},
+			TupleCtors: map[ast.Expr]*types.Struct{},
+			Aliases:    map[string]*types.Type{},
 			PatVariant: map[ast.Pattern]*types.Variant{},
 			Types:      map[ast.Expr]*types.Type{},
 			DeclTypes:  map[ast.Stmt]*types.Type{},
 		},
+		aliasDecls: map[string]*ast.TypeAlias{},
+		aliasTypes: map[string]*types.Type{},
+		aliasBusy:  map[string]bool{},
 	}
 	c.collect()
 	c.checkBodies()
@@ -117,6 +125,10 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 type checker struct {
 	info *Info
 	errs []diag.Diagnostic
+
+	aliasDecls map[string]*ast.TypeAlias
+	aliasTypes map[string]*types.Type
+	aliasBusy  map[string]bool
 
 	scope     []map[string]*types.Type // local bindings, innermost last
 	mutScope  []map[string]bool        // mutability of tracked bindings (else permissive)
@@ -147,22 +159,45 @@ func (c *checker) errAt(e ast.Expr, code, format string, args ...any) {
 // --- collection pass ------------------------------------------------------
 
 func (c *checker) collect() {
-	// Pass 1: register struct and enum names so fields can refer to one
-	// another.
+	// Pass 1: register struct, enum, and type-alias names so fields can refer
+	// to one another.
 	for _, it := range c.info.File.Items {
 		switch d := it.(type) {
 		case *ast.StructDecl:
 			c.registerStruct(d)
 		case *ast.EnumDecl:
 			c.registerEnum(d)
+		case *ast.TypeAlias:
+			c.registerAlias(d)
 		}
 	}
 	// Pass 2: constants, so their values are available to array lengths and
-	// other constant positions in the declarations below.
+	// other constant positions in the declarations below. A constant may
+	// refer to one declared later in the file, so collect to a fixpoint and
+	// only then report the ones that never became constant.
+	var pending []*ast.ConstDecl
 	for _, it := range c.info.File.Items {
 		if d, ok := it.(*ast.ConstDecl); ok {
-			c.collectConst(d)
+			pending = append(pending, d)
 		}
+	}
+	for len(pending) > 0 {
+		progress := false
+		var rest []*ast.ConstDecl
+		for _, d := range pending {
+			if c.tryCollectConst(d) {
+				progress = true
+			} else {
+				rest = append(rest, d)
+			}
+		}
+		if !progress {
+			for _, d := range rest {
+				c.errf(d.Val.Span(), "E0602", "constant `%s` is not a compile-time constant expression", d.Name)
+			}
+			break
+		}
+		pending = rest
 	}
 	// Pass 3: fill in struct fields and enum variants.
 	for _, it := range c.info.File.Items {
@@ -180,17 +215,70 @@ func (c *checker) collect() {
 			c.collectFn(d, false, "")
 		case *ast.ImplBlock:
 			c.collectImpl(d)
-		case *ast.TypeAlias:
-			c.errf(d.Sp, "E0900", "`type` aliases are not supported by the compiler yet (roadmap M1)")
 		case *ast.ModDecl:
 			c.errf(d.Sp, "E0900", "`mod` is not supported by the compiler yet (roadmap M1)")
 		case *ast.UseDecl:
 			c.errf(d.Sp, "E0900", "`use` is not supported by the compiler yet (roadmap M1)")
 		}
 	}
+	// Resolve every alias eagerly, so unknown or cyclic aliases are reported
+	// even when nothing uses them.
+	for _, it := range c.info.File.Items {
+		if d, ok := it.(*ast.TypeAlias); ok {
+			c.resolveAlias(d.Name, d.Sp)
+		}
+	}
 	// Finally, reject types that contain themselves by value: they have
 	// infinite size and cannot be emitted as a C struct.
 	c.checkTypeCycles()
+}
+
+// registerAlias records a `type Name = Ty;` declaration. Aliases share the
+// type namespace, so the name must not collide with a struct, enum, builtin,
+// or another alias.
+func (c *checker) registerAlias(d *ast.TypeAlias) {
+	if _, dup := c.aliasDecls[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the type alias `%s` is defined multiple times", d.Name)
+		return
+	}
+	if _, dup := c.info.Structs[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
+		return
+	}
+	if _, dup := c.info.Enums[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
+		return
+	}
+	if _, dup := types.Builtins[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
+		return
+	}
+	c.aliasDecls[d.Name] = d
+}
+
+// resolveAlias resolves an alias name to the type it stands for, recursively
+// (an alias may name another alias). Cyclic aliases are rejected.
+func (c *checker) resolveAlias(name string, sp token.Span) *types.Type {
+	if t, ok := c.aliasTypes[name]; ok {
+		return t
+	}
+	d, ok := c.aliasDecls[name]
+	if !ok {
+		return nil
+	}
+	if c.aliasBusy[name] {
+		c.errf(sp, "E0072", "type alias `%s` is cyclic", name)
+		return &types.Type{Kind: types.Invalid}
+	}
+	c.aliasBusy[name] = true
+	t := c.resolveType(d.Ty)
+	delete(c.aliasBusy, name)
+	if t == nil {
+		t = &types.Type{Kind: types.Invalid}
+	}
+	c.aliasTypes[name] = t
+	c.info.Aliases[name] = t
+	return t
 }
 
 // checkTypeCycles rejects structs and enums that reach themselves through
@@ -270,6 +358,10 @@ func (c *checker) registerEnum(d *ast.EnumDecl) {
 		c.errf(d.Sp, "E0428", "the enum `%s` is defined multiple times", d.Name)
 		return
 	}
+	if _, dup := c.aliasDecls[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
+		return
+	}
 	en := &types.Enum{Name: d.Name, Copy: types.CopyAttr(d.Attrs)}
 	c.info.Enums[d.Name] = en
 	c.info.EnumOrd = append(c.info.EnumOrd, en)
@@ -319,6 +411,10 @@ func (c *checker) collectEnumVariants(d *ast.EnumDecl) {
 func (c *checker) registerStruct(d *ast.StructDecl) {
 	if _, dup := c.info.Structs[d.Name]; dup {
 		c.errf(d.Sp, "E0428", "the struct `%s` is defined multiple times", d.Name)
+		return
+	}
+	if _, dup := c.aliasDecls[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
 		return
 	}
 	st := &types.Struct{Name: d.Name, Tuple: d.Tuple, Copy: types.CopyAttr(d.Attrs)}
@@ -471,10 +567,14 @@ func typePathName(t ast.Type) string {
 	return "<error>"
 }
 
-func (c *checker) collectConst(d *ast.ConstDecl) {
+// tryCollectConst folds and registers one constant. It returns false only
+// when the value is not (yet) a compile-time constant — for example because
+// it refers to a constant declared later, which the fixpoint loop in collect
+// retries. All other outcomes (success and hard errors) return true.
+func (c *checker) tryCollectConst(d *ast.ConstDecl) bool {
 	if _, dup := c.info.Consts[d.Name]; dup {
 		c.errf(d.Sp, "E0428", "the constant `%s` is defined multiple times", d.Name)
-		return
+		return true
 	}
 	var declared *types.Type
 	if d.Ty != nil {
@@ -482,24 +582,24 @@ func (c *checker) collectConst(d *ast.ConstDecl) {
 	}
 	val, ok := c.evalConst(d.Val)
 	if !ok {
-		c.errf(d.Val.Span(), "E0602", "constant `%s` is not a compile-time constant expression", d.Name)
-		return
+		return false
 	}
 	if declared != nil {
 		if val.Untyped && declared.Kind.IsInt() && declared.Kind != types.Invalid {
 			if !intValFits(val, declared) {
 				c.errf(d.Val.Span(), "E0080", "constant `%s` does not fit in `%s`", d.Name, declared)
-				return
+				return true
 			}
 			val.Ty = declared
 		} else if !c.assignable(declared, val.Ty) {
 			c.errf(d.Val.Span(), "E0308", "mismatched types: expected `%s`, found `%s`", declared, val.Ty)
-			return
+			return true
 		} else {
 			val.Ty = declared
 		}
 	}
 	c.info.Consts[d.Name] = &Const{Decl: d, Name: d.Name, Ty: val.Ty, Val: val}
+	return true
 }
 
 // --- body checking --------------------------------------------------------
@@ -626,11 +726,113 @@ func (c *checker) checkStmt(s ast.Stmt) {
 		if bp, ok := st.Pat.(*ast.BindPat); ok {
 			c.markMut(bp.Name, st.Mut)
 		}
+	case *ast.DeferStmt:
+		if exprHasJump(st.X) {
+			c.errf(st.Sp, "E0268", "`return`, `break`, and `continue` cannot be used inside a `defer` expression")
+		}
+		c.checkExpr(st.X, nil)
 	case *ast.ExprStmt:
 		c.checkExpr(st.X, nil)
 	default:
 		c.errf(s.Span(), "E0900", "unsupported statement")
 	}
+}
+
+// exprHasJump reports whether e contains a `return`, `break`, or `continue`
+// anywhere inside it. Such jumps cannot be deferred: the deferred expression
+// runs at scope exit, where the jump's target no longer exists.
+func exprHasJump(e ast.Expr) bool {
+	switch x := e.(type) {
+	case nil:
+		return false
+	case *ast.JumpExpr:
+		return true
+	case *ast.Block:
+		for _, s := range x.Stmts {
+			switch st := s.(type) {
+			case *ast.LetStmt:
+				if exprHasJump(st.Val) {
+					return true
+				}
+			case *ast.DeferStmt:
+				if exprHasJump(st.X) {
+					return true
+				}
+			case *ast.ExprStmt:
+				if exprHasJump(st.X) {
+					return true
+				}
+			}
+		}
+		return exprHasJump(x.Tail)
+	case *ast.BinExpr:
+		return exprHasJump(x.L) || exprHasJump(x.R)
+	case *ast.UnExpr:
+		return exprHasJump(x.X)
+	case *ast.CastExpr:
+		return exprHasJump(x.X)
+	case *ast.TryExpr:
+		return exprHasJump(x.X)
+	case *ast.AssignExpr:
+		return exprHasJump(x.Lhs) || exprHasJump(x.Rhs)
+	case *ast.FieldExpr:
+		return exprHasJump(x.Recv)
+	case *ast.IndexExpr:
+		return exprHasJump(x.Recv) || exprHasJump(x.Index)
+	case *ast.CallExpr:
+		if exprHasJump(x.Callee) {
+			return true
+		}
+		for _, a := range x.Args {
+			if exprHasJump(a) {
+				return true
+			}
+		}
+	case *ast.MethodCallExpr:
+		if exprHasJump(x.Recv) {
+			return true
+		}
+		for _, a := range x.Args {
+			if exprHasJump(a) {
+				return true
+			}
+		}
+	case *ast.StructLitExpr:
+		for _, f := range x.Fields {
+			if exprHasJump(f.Val) {
+				return true
+			}
+		}
+	case *ast.ArrayLitExpr:
+		if exprHasJump(x.Value) || exprHasJump(x.Count) {
+			return true
+		}
+		for _, el := range x.Elems {
+			if exprHasJump(el) {
+				return true
+			}
+		}
+	case *ast.TupleExpr:
+		for _, el := range x.Elems {
+			if exprHasJump(el) {
+				return true
+			}
+		}
+	case *ast.IfExpr:
+		return exprHasJump(x.Cond) || exprHasJump(x.Then) || exprHasJump(x.Else)
+	case *ast.LoopExpr:
+		return exprHasJump(x.Cond) || exprHasJump(x.Iter) || exprHasJump(x.Body)
+	case *ast.MatchExpr:
+		if exprHasJump(x.Scrutinee) {
+			return true
+		}
+		for _, a := range x.Arms {
+			if exprHasJump(a.Guard) || exprHasJump(a.Body) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (c *checker) bindPattern(p ast.Pattern, ty *types.Type, let bool) {
@@ -818,10 +1020,14 @@ func (c *checker) inferLiteral(x *ast.LiteralExpr, expected *types.Type) *types.
 		// Raw strings are not decoded, so escapes are literal text.
 		return types.StrT
 	case token.KindChar:
-		c.checkEscapes(x)
+		if _, ok := decodeCharLiteral(x.Text); !ok {
+			c.errf(x.Sp, "E0001", "char literal must contain exactly one character")
+		}
 		return types.CharT
 	case token.KindByteChar:
-		c.checkEscapes(x)
+		if r, ok := decodeCharLiteral(x.Text); !ok || r > 0xFF {
+			c.errf(x.Sp, "E0001", "byte literal must contain exactly one byte")
+		}
 		return &types.Type{Kind: types.U8}
 	}
 	return nil
@@ -1078,6 +1284,32 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 	}
 	if name == "len" {
 		return c.inferLen(x)
+	}
+	// `Pair(1, 2)` constructs a tuple struct; a named struct used this way
+	// gets a pointed error rather than "cannot find function".
+	if st, ok := c.info.Structs[name]; ok {
+		if !st.Tuple {
+			c.errAt(x.Callee, "E0061", "struct `%s` is not a tuple struct; construct it as `%s { field: value }`", name, name)
+			for _, a := range x.Args {
+				c.checkExpr(a, nil)
+			}
+			return &types.Type{Kind: types.StructKind, St: st}
+		}
+		c.info.TupleCtors[x] = st
+		if len(x.Args) != len(st.Fields) {
+			c.errAt(x, "E0061", "tuple struct `%s` takes %d field(s) but %d were supplied", name, len(st.Fields), len(x.Args))
+		}
+		for i, a := range x.Args {
+			var want *types.Type
+			if i < len(st.Fields) {
+				want = st.Fields[i].Ty
+			}
+			at := c.checkExpr(a, want)
+			if want != nil && !c.argAssignable(want, at) {
+				c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
+			}
+		}
+		return &types.Type{Kind: types.StructKind, St: st}
 	}
 	fn, ok := c.info.Fns[name]
 	if !ok {
@@ -1408,12 +1640,12 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 			}
 			catchAll = true
 		}
-		if lp, ok := arm.Pat.(*ast.LitPat); ok && !guarded {
+		noteLit := func(lp *ast.LitPat) {
 			// Each literal becomes one C `case`, and duplicate cases are invalid
 			// C, so catch them here with a real diagnostic.
 			key := litPatKey(lp)
 			if litCovered[key] {
-				c.errf(arm.Pat.Span(), "E0001", "unreachable pattern: this value is already covered")
+				c.errf(lp.Sp, "E0001", "unreachable pattern: this value is already covered")
 			}
 			litCovered[key] = true
 			if lp.Kind == token.KindTrue {
@@ -1421,6 +1653,24 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 			}
 			if lp.Kind == token.KindFalse {
 				boolsCovered["false"] = true
+			}
+		}
+		if lp, ok := arm.Pat.(*ast.LitPat); ok && !guarded {
+			noteLit(lp)
+		}
+		if op, ok := arm.Pat.(*ast.OrPat); ok && !guarded {
+			// An or-pattern covers the union of its alternatives; a catch-all
+			// alternative makes the whole arm a catch-all.
+			for _, alt := range op.Alts {
+				if isCatchAll(alt) {
+					if catchAll {
+						c.errf(alt.Span(), "E0001", "unreachable pattern: an earlier arm already matches everything")
+					}
+					catchAll = true
+				}
+				if lp, ok := alt.(*ast.LitPat); ok {
+					noteLit(lp)
+				}
 			}
 		}
 		c.pushScope()
@@ -1431,6 +1681,22 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 					c.errf(arm.Pat.Span(), "E0001", "unreachable pattern: `%s` is already covered", v.Name)
 				}
 				covered[v.Name] = true
+			}
+		}
+		if op, ok := arm.Pat.(*ast.OrPat); ok && !guarded {
+			seenHere := map[string]bool{}
+			for _, alt := range op.Alts {
+				pp, ok := alt.(*ast.PathPat)
+				if !ok {
+					continue
+				}
+				if v := c.info.PatVariant[pp]; v != nil && !seenHere[v.Name] {
+					seenHere[v.Name] = true
+					if covered[v.Name] {
+						c.errf(alt.Span(), "E0001", "unreachable pattern: `%s` is already covered", v.Name)
+					}
+					covered[v.Name] = true
+				}
 			}
 		}
 		if arm.Guard != nil {
@@ -1484,7 +1750,25 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type) {
 			c.declare(pt.Sp, pt.Name, st)
 		}
 		return
+	case *ast.OrPat:
+		for _, alt := range pt.Alts {
+			if patternBinds(alt) {
+				// Which alternative matched would be ambiguous, and codegen
+				// binds nothing for an or-pattern arm.
+				c.errf(alt.Span(), "E0900", "or-pattern alternatives cannot bind variables; match on the whole value and destructure in the arm body instead")
+			}
+			c.checkPattern(alt, st)
+		}
+		return
+	case *ast.RangePat:
+		c.checkRangePat(pt, st)
+		return
 	case *ast.LitPat:
+		if pt.Kind == token.KindChar || pt.Kind == token.KindByteChar {
+			if r, ok := decodeCharLiteral(pt.Text); !ok || (pt.Kind == token.KindByteChar && r > 0xFF) {
+				c.errf(pt.Sp, "E0001", "invalid char literal in pattern")
+			}
+		}
 		switch {
 		case st != nil && st.Kind.IsInt():
 			if pt.Kind != token.KindInteger && pt.Kind != token.KindByteChar {
@@ -1546,12 +1830,103 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type) {
 	}
 }
 
+// patternBinds reports whether p introduces a variable binding anywhere
+// inside it (including struct-pattern field shorthand).
+func patternBinds(p ast.Pattern) bool {
+	switch pt := p.(type) {
+	case *ast.BindPat:
+		return true
+	case *ast.TuplePat:
+		for _, el := range pt.Elems {
+			if patternBinds(el) {
+				return true
+			}
+		}
+	case *ast.OrPat:
+		for _, alt := range pt.Alts {
+			if patternBinds(alt) {
+				return true
+			}
+		}
+	case *ast.PathPat:
+		for _, sub := range pt.Sub {
+			if patternBinds(sub) {
+				return true
+			}
+		}
+		for _, fp := range pt.Fields {
+			if fp.Pat == nil || patternBinds(fp.Pat) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// checkRangePat validates a `lo..hi` / `lo..=hi` pattern against the
+// scrutinee type: endpoints must be literals of the matching kind, must fit,
+// and must not describe an empty range.
+func (c *checker) checkRangePat(pt *ast.RangePat, st *types.Type) {
+	switch {
+	case st != nil && st.Kind.IsInt():
+		if pt.Lo.Kind != token.KindInteger || pt.Hi.Kind != token.KindInteger {
+			c.errf(pt.Sp, "E0308", "range pattern endpoints must be integer literals for an integer scrutinee")
+			return
+		}
+		for _, ep := range []*ast.LitPat{pt.Lo, pt.Hi} {
+			if !intLitFits(ep.Text, st) {
+				c.errf(ep.Sp, "E0080", "pattern `%s` does not fit in `%s`", ep.Text, st)
+			}
+		}
+		if lo, ok1 := intLitValue(pt.Lo.Text); ok1 {
+			if hi, ok2 := intLitValue(pt.Hi.Text); ok2 && rangeIsEmpty(lo, hi, pt.Inclusive) {
+				c.errf(pt.Sp, "E0080", "range pattern `%s` is empty and can never match", rangePatText(pt))
+			}
+		}
+	case st != nil && st.Kind == types.Char:
+		if pt.Lo.Kind != token.KindChar || pt.Hi.Kind != token.KindChar {
+			c.errf(pt.Sp, "E0308", "range pattern endpoints must be char literals for a `char` scrutinee")
+			return
+		}
+		lo, hi := firstRune(pt.Lo.Text), firstRune(pt.Hi.Text)
+		if rangeIsEmpty(int64(lo), int64(hi), pt.Inclusive) {
+			c.errf(pt.Sp, "E0080", "range pattern `%s` is empty and can never match", rangePatText(pt))
+		}
+	default:
+		c.errf(pt.Sp, "E0308", "range patterns require an integer or `char` scrutinee, found `%s`", st)
+	}
+}
+
+// intLitValue parses an integer literal pattern's text, if it fits in an i64.
+func intLitValue(text string) (int64, bool) {
+	s := strings.ReplaceAll(text, "_", "")
+	v, err := strconv.ParseInt(s, 0, 64)
+	return v, err == nil
+}
+
+// rangeIsEmpty reports whether lo..hi (or lo..=hi) matches no value.
+func rangeIsEmpty(lo, hi int64, inclusive bool) bool {
+	if inclusive {
+		return lo > hi
+	}
+	return lo >= hi
+}
+
+// rangePatText renders a range pattern for diagnostics.
+func rangePatText(pt *ast.RangePat) string {
+	op := ".."
+	if pt.Inclusive {
+		op = "..="
+	}
+	return pt.Lo.Text + op + pt.Hi.Text
+}
+
 // rejectNestedPat diagnoses refutable sub-patterns. Codegen discriminates only
 // the outer variant, so a nested variant or literal pattern would silently pick
 // the wrong arm (or emit a duplicate `case`), so we reject it for now.
 func (c *checker) rejectNestedPat(p ast.Pattern) {
 	switch p.(type) {
-	case *ast.PathPat, *ast.LitPat:
+	case *ast.PathPat, *ast.LitPat, *ast.OrPat, *ast.RangePat:
 		c.errf(p.Span(), "E0900", "nested patterns are not supported by the compiler yet (roadmap M0)")
 	}
 }
@@ -1615,7 +1990,7 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 		return nil
 	}
 	if m.Self == nil {
-		c.errAt(x, "E0599", "`%s::%s` takes no `self`, so it cannot be called with `.`", base.St.Name, x.Name)
+		c.errAt(x, "E0599", "`%s::%s` takes no `self`, so it cannot be called with `.`", nominalName(base), x.Name)
 		for _, a := range x.Args {
 			c.checkExpr(a, nil)
 		}
@@ -1634,7 +2009,7 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 		want = want[1:] // skip the receiver
 	}
 	if len(x.Args) != len(want) {
-		c.errAt(x, "E0061", "method `%s::%s` takes %d argument(s) but %d were supplied", base.St.Name, x.Name, len(want), len(x.Args))
+		c.errAt(x, "E0061", "method `%s::%s` takes %d argument(s) but %d were supplied", nominalName(base), x.Name, len(want), len(x.Args))
 	}
 	for i, a := range x.Args {
 		var wt *types.Type
@@ -1782,11 +2157,11 @@ func (c *checker) inferLoop(x *ast.LoopExpr, expected *types.Type) *types.Type {
 		// No `break` at all: the loop can only be left by `return` (or by
 		// running forever), so its type is the never type.
 		return types.NeverT
-	case token.KindWhile:
-		c.pushBreak(token.KindWhile, nil)
+	case token.KindWhile, token.KindUntil:
+		c.pushBreak(x.Kind, nil)
 		ct := c.checkExpr(x.Cond, types.BoolT)
 		if ct.Kind != types.Bool {
-			c.errAt(x.Cond, "E0308", "`while` condition must be `bool`, found `%s`", ct)
+			c.errAt(x.Cond, "E0308", "`%s` condition must be `bool`, found `%s`", loopKindName(x.Kind), ct)
 		}
 		c.loopDepth++
 		c.checkBlock(x.Body)
@@ -1935,6 +2310,8 @@ func loopKindName(k token.Kind) string {
 	switch k {
 	case token.KindWhile:
 		return "while"
+	case token.KindUntil:
+		return "until"
 	case token.KindFor:
 		return "for"
 	}
@@ -1965,6 +2342,9 @@ func (c *checker) resolveType(t ast.Type) *types.Type {
 		}
 		if en, ok := c.info.Enums[x.Segments[0]]; ok {
 			return &types.Type{Kind: types.EnumKind, En: en}
+		}
+		if _, ok := c.aliasDecls[x.Segments[0]]; ok {
+			return c.resolveAlias(x.Segments[0], x.Sp)
 		}
 		c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope", x.Segments[0])
 		return nil
@@ -2246,6 +2626,7 @@ type ConstVal struct {
 	Bool    bool
 	IsFloat bool
 	IsStr   bool
+	Raw     bool // a raw string literal: Str holds undecoded source text
 	IsBool  bool
 	// Untyped marks an integer value that came from a bare literal (defaulting
 	// to `i32`) and may still adopt an explicit integer type.
@@ -2336,8 +2717,10 @@ func (c *checker) evalConstLiteral(x *ast.LiteralExpr) (ConstVal, bool) {
 		return ConstVal{Ty: types.BoolT, Bool: true, IsBool: true}, true
 	case token.KindFalse:
 		return ConstVal{Ty: types.BoolT, Bool: false, IsBool: true}, true
-	case token.KindString, token.KindRawString:
+	case token.KindString:
 		return ConstVal{Ty: types.StrT, Str: x.Text, IsStr: true}, true
+	case token.KindRawString:
+		return ConstVal{Ty: types.StrT, Str: x.Text, IsStr: true, Raw: true}, true
 	case token.KindChar:
 		r := firstRune(x.Text)
 		return ConstVal{Ty: types.CharT, Int: int64(r), Uint: uint64(r)}, true
@@ -2421,6 +2804,46 @@ func firstRune(s string) rune {
 	return r
 }
 
+// decodeCharLiteral decodes the inner text of a char or byte literal,
+// requiring exactly one character: a single rune, or one escape sequence.
+// (A multi-character or empty literal used to be silently truncated to
+// its first byte.)
+func decodeCharLiteral(s string) (rune, bool) {
+	if s == "" {
+		return 0, false
+	}
+	if s[0] != '\\' {
+		r, size := utf8.DecodeRuneInString(s)
+		return r, size == len(s)
+	}
+	r, ok := decodeEscape(s[1:])
+	if !ok {
+		return 0, false
+	}
+	return r, 1+escapeLen(s[1:]) == len(s)
+}
+
+// escapeLen returns the length of the escape sequence at the start of s,
+// where s is the text following the backslash.
+func escapeLen(s string) int {
+	if s == "" {
+		return 0
+	}
+	switch s[0] {
+	case 'x':
+		if len(s) >= 3 {
+			return 3
+		}
+		return len(s)
+	case 'u':
+		if i := strings.IndexByte(s, '}'); i >= 0 {
+			return i + 1
+		}
+		return len(s)
+	}
+	return 1
+}
+
 // decodeCharInner decodes one character (with escapes) from a char literal's
 // inner text.
 func decodeCharInner(s string) (rune, bool) {
@@ -2465,7 +2888,10 @@ func decodeEscape(s string) (rune, bool) {
 		if len(s) >= 2 && s[1] == '{' {
 			if i := strings.IndexByte(s, '}'); i > 2 {
 				if v, err := strconv.ParseUint(s[2:i], 16, 32); err == nil {
-					return rune(v), true
+					// Only Unicode scalar values are valid `char`s.
+					if v <= 0x10FFFF && !(v >= 0xD800 && v <= 0xDFFF) {
+						return rune(v), true
+					}
 				}
 			}
 		}

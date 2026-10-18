@@ -146,3 +146,58 @@ func TestNegativeLiteralPattern(t *testing.T) {
 		t.Fatalf("expected a diagnostic for `-x` in a pattern")
 	}
 }
+
+// TestNewKeywordsAndSyntax covers `until`, `elif`, `defer`, `if let` /
+// `while let`, or-patterns, range patterns, `mut` bindings in patterns, and
+// tuple-struct construction.
+func TestNewKeywordsAndSyntax(t *testing.T) {
+	src := `struct Pair(i32, i32);
+enum E { V(i32), None }
+fn make(i: i32) -> E { if i < 2 { E::V(i) } else { E::None } }
+fn grade(n: i32) -> str {
+    if n > 90 { "A" } elif n > 50 { "B" } else { "F" }
+}
+fn f(n: i32) -> i32 {
+    match n {
+        1 | 2 => 10,
+        3..=5 => 30,
+        6..9 => 60,
+        -5..-1 => 40,
+        _ => 0,
+    }
+}
+fn g(e: E) -> i32 {
+    match e {
+        E::V(mut x) => x,
+        E::None => 0,
+    }
+}
+fn main() -> i32 {
+    let p = Pair(1, 2);
+    let mut i = 0;
+    until i >= 3 { i += 1; }
+    defer println("done", p.0);
+    if let E::V(x) = make(1) {
+        println(x);
+    } else {
+        println("none");
+    }
+    while let E::V(x) = make(i) {
+        i += 1;
+        if x > 10 { break; }
+    }
+    let c = match 'q' {
+        'a'..='z' => 1,
+        _ => 0,
+    };
+    println(grade(95), f(4), c);
+    0
+}`
+	if _, n := parse(t, src); n != 0 {
+		t.Fatalf("unexpected diagnostics: %d", n)
+	}
+	// `defer` used as an expression is a syntax error.
+	if _, n := parse(t, "fn main() -> i32 { let x = defer println(1); 0 }"); n == 0 {
+		t.Fatalf("expected a diagnostic for `defer` in expression position")
+	}
+}

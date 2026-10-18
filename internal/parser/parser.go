@@ -505,6 +505,8 @@ func (p *parser) parseBlock() *ast.Block {
 		before := p.pos
 		if p.at(token.KindLet) {
 			b.Stmts = append(b.Stmts, p.parseLet())
+		} else if p.at(token.KindDefer) {
+			b.Stmts = append(b.Stmts, p.parseDefer())
 		} else if p.at(token.KindSemicolon) {
 			p.bump() // stray semicolon
 		} else {
@@ -605,6 +607,15 @@ func (p *parser) parseStructLit(path []string, start token.Pos) ast.Expr {
 	return lit
 }
 
+// parseDefer parses `defer expr;`.
+func (p *parser) parseDefer() ast.Stmt {
+	start := p.cur().Pos.Offset
+	p.bump() // defer
+	x := p.parseExpr()
+	p.expectSemicolon()
+	return &ast.DeferStmt{X: x, Sp: p.spanFrom(start)}
+}
+
 func (p *parser) parseLet() ast.Stmt {
 	start := p.cur().Pos.Offset
 	p.bump() // let
@@ -638,9 +649,38 @@ func (p *parser) expectSemicolon() {
 
 // --- patterns -------------------------------------------------------------
 
+// parsePattern parses a pattern, including top-level or-patterns
+// (`A | B | 1..=9`). Or-patterns are only meaningful where the checker can
+// test alternatives (match arms, `if let`, `while let`); elsewhere it rejects
+// them.
 func (p *parser) parsePattern() ast.Pattern {
 	start := p.cur().Pos.Offset
+	first := p.parseSinglePattern()
+	if !p.at(token.KindPipe) {
+		return first
+	}
+	alts := []ast.Pattern{first}
+	for p.accept(token.KindPipe) {
+		alts = append(alts, p.parseSinglePattern())
+	}
+	return &ast.OrPat{Alts: alts, Sp: p.spanFrom(start)}
+}
+
+func (p *parser) parseSinglePattern() ast.Pattern {
+	start := p.cur().Pos.Offset
 	switch p.cur().Kind {
+	case token.KindMut:
+		p.bump()
+		if p.at(token.KindIdentifier) {
+			name := p.bump().Lit
+			if p.at(token.KindColonColon) || p.at(token.KindLParen) || p.at(token.KindLBrace) {
+				p.errf(p.cur(), "E0202", "`mut` cannot precede a variant pattern")
+				return p.finishPathPattern(false, name, start)
+			}
+			return &ast.BindPat{Mut: true, Name: name, Sp: p.spanFrom(start)}
+		}
+		p.errf(p.cur(), "E0202", "expected a binding name after `mut` in a pattern")
+		return &ast.WildcardPat{Sp: p.spanFrom(start)}
 	case token.KindUnderscore:
 		p.bump()
 		return &ast.WildcardPat{Sp: p.spanFrom(start)}
@@ -658,13 +698,13 @@ func (p *parser) parsePattern() ast.Pattern {
 	case token.KindInteger, token.KindFloat, token.KindString, token.KindRawString,
 		token.KindChar, token.KindByteChar, token.KindTrue, token.KindFalse:
 		t := p.bump()
-		return &ast.LitPat{Kind: t.Kind, Text: t.Lit, Sp: p.spanFrom(start)}
+		return p.maybeRangePat(&ast.LitPat{Kind: t.Kind, Text: t.Lit, Sp: p.spanFrom(start)}, start)
 	case token.KindMinus:
 		// A negative number pattern, e.g. `-1`.
 		p.bump()
 		if p.at(token.KindInteger) || p.at(token.KindFloat) {
 			t := p.bump()
-			return &ast.LitPat{Kind: t.Kind, Text: "-" + t.Lit, Sp: p.spanFrom(start)}
+			return p.maybeRangePat(&ast.LitPat{Kind: t.Kind, Text: "-" + t.Lit, Sp: p.spanFrom(start)}, start)
 		}
 		p.errf(p.cur(), "E0202", "expected a number after `-` in a pattern")
 		return &ast.WildcardPat{Sp: p.spanFrom(start)}
@@ -683,6 +723,35 @@ func (p *parser) parsePattern() ast.Pattern {
 		p.bump()
 		return &ast.WildcardPat{Sp: p.spanFrom(start)}
 	}
+}
+
+// maybeRangePat extends a literal pattern into a range pattern when `..` or
+// `..=` follows (`1..=9`, `'a'..'z'`, `-10..-1`). Only integer and char
+// literals can be range endpoints.
+func (p *parser) maybeRangePat(lo *ast.LitPat, start token.Pos) ast.Pattern {
+	if lo.Kind != token.KindInteger && lo.Kind != token.KindChar && lo.Kind != token.KindByteChar {
+		return lo
+	}
+	var inclusive bool
+	if p.accept(token.KindDotDotEq) {
+		inclusive = true
+	} else if !p.accept(token.KindDotDot) {
+		return lo
+	}
+	hiStart := p.cur().Pos.Offset
+	neg := p.accept(token.KindMinus)
+	t := p.cur()
+	if t.Kind != token.KindInteger && t.Kind != token.KindChar && t.Kind != token.KindByteChar {
+		p.errf(t, "E0202", "expected an integer or char literal to end a range pattern")
+		return &ast.RangePat{Lo: lo, Hi: lo, Inclusive: inclusive, Sp: p.spanFrom(start)}
+	}
+	p.bump()
+	text := t.Lit
+	if neg {
+		text = "-" + text
+	}
+	hi := &ast.LitPat{Kind: t.Kind, Text: text, Sp: p.spanFrom(hiStart)}
+	return &ast.RangePat{Lo: lo, Hi: hi, Inclusive: inclusive, Sp: p.spanFrom(start)}
 }
 
 func (p *parser) finishPathPattern(_ bool, first string, start token.Pos) ast.Pattern {
@@ -956,11 +1025,23 @@ func (p *parser) parsePrimary() ast.Expr {
 
 	case token.KindWhile:
 		p.bump()
+		if p.at(token.KindLet) {
+			return p.parseWhileLet(start)
+		}
 		p.noStructLit++
 		cond := p.parseExpr()
 		p.noStructLit--
 		body := p.parseBlock()
 		return &ast.LoopExpr{Kind: token.KindWhile, Cond: cond, Body: body, Sp: p.spanFrom(start)}
+
+	case token.KindUntil:
+		// `until cond { .. }` loops while the condition is false.
+		p.bump()
+		p.noStructLit++
+		cond := p.parseExpr()
+		p.noStructLit--
+		body := p.parseBlock()
+		return &ast.LoopExpr{Kind: token.KindUntil, Cond: cond, Body: body, Sp: p.spanFrom(start)}
 
 	case token.KindFor:
 		p.bump()
@@ -993,7 +1074,7 @@ func (p *parser) parsePrimary() ast.Expr {
 	case token.KindDefer:
 		p.bump()
 		x := p.parseExpr()
-		p.errf(t, "E0900", "`defer` is not supported yet (design milestone M1)")
+		p.errf(t, "E0202", "`defer` is only allowed as a statement, e.g. `defer cleanup();`")
 		return x
 
 	default:
@@ -1006,20 +1087,93 @@ func (p *parser) parsePrimary() ast.Expr {
 func (p *parser) parseIf() ast.Expr {
 	start := p.cur().Pos.Offset
 	p.bump() // if
+	return p.parseIfTail(start)
+}
+
+// parseIfTail parses `cond { .. } [else/elif ..]` or, when the next token is
+// `let`, an `if let` (see parseIfLet). The `if`/`elif` keyword is already
+// consumed; start is its offset.
+func (p *parser) parseIfTail(start token.Pos) ast.Expr {
+	if p.at(token.KindLet) {
+		return p.parseIfLet(start)
+	}
 	p.noStructLit++
 	cond := p.parseExpr()
 	p.noStructLit--
 	then := p.parseBlock()
 	e := &ast.IfExpr{Cond: cond, Then: then}
-	if p.accept(token.KindElse) {
-		if p.at(token.KindIf) {
-			e.Else = p.parseIf()
-		} else {
-			e.Else = p.parseBlock()
-		}
-	}
+	e.Else = p.parseElseBranch()
 	e.Sp = p.spanFrom(start)
 	return e
+}
+
+// parseElseBranch parses an `else { .. }`, `else if ..`, or bare `elif ..`
+// chain after a then-block, returning nil when there is none. `elif` is sugar
+// for `else if` without the extra keyword.
+func (p *parser) parseElseBranch() ast.Expr {
+	if p.accept(token.KindElse) {
+		switch {
+		case p.at(token.KindIf):
+			return p.parseIf()
+		case p.at(token.KindElif):
+			start := p.cur().Pos.Offset
+			p.bump()
+			return p.parseIfTail(start)
+		default:
+			return p.parseBlock()
+		}
+	}
+	if p.at(token.KindElif) {
+		start := p.cur().Pos.Offset
+		p.bump()
+		return p.parseIfTail(start)
+	}
+	return nil
+}
+
+// parseIfLet parses `let pat = expr { .. } [else/elif ..]` after `if`/`elif`
+// and desugars it to a two-arm `match`: the pattern arm runs the then-block,
+// the wildcard arm runs the else-branch (or nothing). All pattern, binding,
+// exhaustiveness, and code generation behaviour is inherited from `match`.
+func (p *parser) parseIfLet(start token.Pos) ast.Expr {
+	p.bump() // let
+	pat := p.parsePattern()
+	p.expect(token.KindEq, " after the `if let` pattern")
+	p.noStructLit++
+	scrut := p.parseExpr()
+	p.noStructLit--
+	then := p.parseBlock()
+	elseE := p.parseElseBranch()
+	if elseE == nil {
+		elseE = &ast.Block{Sp: p.spanFrom(start)}
+	}
+	m := &ast.MatchExpr{Scrutinee: scrut, Arms: []ast.MatchArm{
+		{Pat: pat, Body: then, Sp: then.Sp},
+		{Pat: &ast.WildcardPat{Sp: p.spanFrom(start)}, Body: elseE, Sp: elseE.Span()},
+	}}
+	m.Sp = p.spanFrom(start)
+	return m
+}
+
+// parseWhileLet parses `let pat = expr { .. }` after `while` and desugars it
+// to `loop { match expr { pat => { .. }, _ => break } }`, so the scrutinee is
+// re-evaluated each iteration and `break`/`continue` in the body behave as
+// they do in any loop.
+func (p *parser) parseWhileLet(start token.Pos) ast.Expr {
+	p.bump() // let
+	pat := p.parsePattern()
+	p.expect(token.KindEq, " after the `while let` pattern")
+	p.noStructLit++
+	scrut := p.parseExpr()
+	p.noStructLit--
+	body := p.parseBlock()
+	m := &ast.MatchExpr{Scrutinee: scrut, Arms: []ast.MatchArm{
+		{Pat: pat, Body: body, Sp: body.Sp},
+		{Pat: &ast.WildcardPat{Sp: p.spanFrom(start)}, Body: &ast.JumpExpr{Kind: token.KindBreak, Sp: p.spanFrom(start)}},
+	}}
+	m.Sp = p.spanFrom(start)
+	loopBody := &ast.Block{Tail: m, Sp: body.Sp}
+	return &ast.LoopExpr{Kind: token.KindLoop, Body: loopBody, Sp: p.spanFrom(start)}
 }
 
 // isBlockLikeExpr reports whether e ends in `}`, so that a match arm using it as

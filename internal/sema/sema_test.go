@@ -795,3 +795,195 @@ func TestIntLiteralInFloatContext(t *testing.T) {
 		t.Fatalf("expected E0080 for an oversized literal, got %v", codes)
 	}
 }
+
+func TestCharLiteralMustBeOneChar(t *testing.T) {
+	for _, src := range []string{
+		`fn main() -> i32 { let c = 'ab'; 0 }`,
+		`fn main() -> i32 { let c = ''; 0 }`,
+		"fn main() -> i32 { let b = b'\\u{1F600}'; 0 }",
+		"fn main() -> i32 { let c = '\\u{D800}'; 0 }",
+		`fn main() -> i32 { match 'x' { 'ab' => 1, _ => 0 } }`,
+	} {
+		ok, codes := check(t, src)
+		if ok || !has(codes, "E0001") {
+			t.Fatalf("%q: expected E0001, got ok=%v codes=%v", src, ok, codes)
+		}
+	}
+	// Valid forms still check cleanly.
+	for _, src := range []string{
+		`fn main() -> i32 { let c = 'a'; let b = b'x'; let u = '\u{1F600}'; 0 }`,
+	} {
+		if ok, codes := check(t, src); !ok {
+			t.Fatalf("%q: expected clean, got %v", src, codes)
+		}
+	}
+}
+
+func TestTypeAliases(t *testing.T) {
+	src := `type Meters = i64;
+type Distance = Meters;
+type Scores = [i32; 2];
+fn add(a: Meters, b: Meters) -> Meters { a + b }
+fn main() -> i32 {
+    let d: Distance = 40;
+    let s: Scores = [5, 6];
+    println(add(d, 2) + s[1] as i64);
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestCyclicTypeAlias(t *testing.T) {
+	src := `type A = B;
+type B = A;
+fn main() -> i32 { 0 }`
+	ok, codes := check(t, src)
+	if ok || !has(codes, "E0072") {
+		t.Fatalf("expected E0072, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestConstForwardReference(t *testing.T) {
+	src := `const LIMIT = BASE + 2;
+const BASE = 40;
+fn main() -> i32 { println(LIMIT); 0 }`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	// A genuinely non-constant initializer is still rejected.
+	ok, codes := check(t, `const X = f(1);
+fn f(n: i32) -> i32 { n }
+fn main() -> i32 { 0 }`)
+	if ok || !has(codes, "E0602") {
+		t.Fatalf("expected E0602, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestTupleStructConstruction(t *testing.T) {
+	src := `struct Pair(i32, i32);
+fn main() -> i32 { let p = Pair(3, 4); println(p.0 + p.1); 0 }`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	ok, codes := check(t, `struct Pair(i32, i32);
+fn main() -> i32 { let p = Pair(3); 0 }`)
+	if ok || !has(codes, "E0061") {
+		t.Fatalf("expected E0061 for arity, got ok=%v codes=%v", ok, codes)
+	}
+	ok, codes = check(t, `struct Named { x: i32 }
+fn main() -> i32 { let p = Named(3); 0 }`)
+	if ok || !has(codes, "E0061") {
+		t.Fatalf("expected E0061 for named struct called as tuple, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestEnumAssociatedFnViaDotDoesNotPanic(t *testing.T) {
+	// Regression: this used to dereference a nil struct pointer and crash
+	// the compiler when the receiver was an enum.
+	src := `enum E { A, B }
+impl E { fn make() -> E { E::A } }
+fn main() -> i32 { let e = E::A; println(e.make()); 0 }`
+	ok, codes := check(t, src)
+	if ok || !has(codes, "E0599") {
+		t.Fatalf("expected E0599, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestOrAndRangePatterns(t *testing.T) {
+	src := `enum E { A, B, C }
+fn f(n: i32) -> i32 {
+    match n {
+        1 | 2 => 10,
+        3..=5 => 30,
+        6..9 => 60,
+        _ => 0,
+    }
+}
+fn g(e: E) -> i32 {
+    match e {
+        E::A | E::B => 1,
+        E::C => 2,
+    }
+}
+fn main() -> i32 { f(2) + g(E::B) }`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestOrPatternCannotBind(t *testing.T) {
+	src := `fn main() -> i32 {
+    match 1 {
+        x | _ => x,
+    }
+}`
+	ok, codes := check(t, src)
+	if ok || !has(codes, "E0900") {
+		t.Fatalf("expected E0900, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestEmptyRangePattern(t *testing.T) {
+	src := `fn main() -> i32 {
+    match 1 {
+        5..=1 => 1,
+        _ => 0,
+    }
+}`
+	ok, codes := check(t, src)
+	if ok || !has(codes, "E0080") {
+		t.Fatalf("expected E0080, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestIfLetAndWhileLet(t *testing.T) {
+	src := `enum E { V(i32), None }
+fn make(i: i32) -> E { if i < 2 { E::V(i) } else { E::None } }
+fn main() -> i32 {
+    let mut total = 0;
+    if let E::V(x) = make(1) {
+        total += x;
+    } else {
+        total += 100;
+    }
+    let mut i = 0;
+    while let E::V(x) = make(i) {
+        total += x;
+        i += 1;
+    }
+    total
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestUntilAndElif(t *testing.T) {
+	src := `fn grade(n: i32) -> str {
+    if n > 90 { "A" } elif n > 50 { "B" } else { "F" }
+}
+fn main() -> i32 {
+    let mut i = 0;
+    until i >= 3 { i += 1; }
+    println(grade(95), i);
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestDefer(t *testing.T) {
+	src := `fn main() -> i32 {
+    let mut s = String::from("x");
+    defer println(s);
+    defer println("later");
+    s.push_str("y");
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}

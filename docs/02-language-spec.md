@@ -22,7 +22,7 @@ This is the *normative-shaped* spec for the M0 language. Features tagged
 | Byte | `b'A'`, `b'\n'` |
 | Char (a Unicode scalar) | `'A'`, `'\u{1F600}'` |
 | String (UTF-8, immutable) | `"hi\n"`, `"élan"` |
-| Raw string | `r"C:\path"` |
+| Raw string (no escapes) | `r"C:\path"`, `r#"say "hi""#`, `r##"a #" b"##` |
 | Boolean | `true`, `false` |
 | Unit/void | `()` |
 
@@ -32,10 +32,10 @@ also adopt a float context. There are no implicit numeric conversions (see 2.4).
 ### Keywords
 
 ```
-as      break   const   continue  defer   else    enum    extern
+as      break   const   continue  defer   else    elif    enum    extern
 false   fn      for     if        impl    in      let     loop
 match   mod     mut     pub       return  struct  true    type
-unsafe  use     while   i8 i16 i32 i64 isize u8 u16 u32 u64 usize f32 f64
+unsafe  until   use     while   i8 i16 i32 i64 isize u8 u16 u32 u64 usize f32 f64
 bool    char    str     never
 ```
 
@@ -80,8 +80,9 @@ use_item    = "use" path [ "as" ident ] ";" ;
 impl_item   = "impl" [ generics ] type [ "for" type ] "{" { fn_item } "}" ;
 
 block       = "{" { stmt } [ expr ] "}" ;
-stmt        = let_stmt | item | expr [ ";" ] ;
+stmt        = let_stmt | defer_stmt | item | expr [ ";" ] ;
 let_stmt    = "let" "mut"? pattern [ ":" type ] [ "=" expr ] ";" ;
+defer_stmt  = "defer" expr ";" ;
 
 expr        = assign ;
 assign      = logic_or [ ( "=" | op="=" ) expr ] ;
@@ -107,10 +108,16 @@ primary     = literal | ident | path
             | "(" [ expr { "," expr } ] ")"
             | "[" [ expr { "," expr } ] "]"
             | "{" block } | "if" if_expr | "match" match_expr
-            | "loop" block | "while" expr block | "for" pattern "in" expr block
+            | "loop" block | "while" expr block | "while" "let" pattern "=" expr block
+            | "until" expr block | "for" pattern "in" expr block
             | "return" [ expr ] | "break" [ expr ] | "continue"
-            | "defer" expr | "unsafe" block
+            | "unsafe" block
             | path struct_lit ;
+if_expr     = "if" expr block { "elif" expr block } [ "else" ( if_expr | block ) ]
+            | "if" "let" pattern "=" expr block [ "else" ( if_expr | block ) ] ;
+pattern     = single_pat { "|" single_pat } ;
+single_pat  = "_" | "mut"? ident | path [ "(" patterns ")" | "{" field_pats "}" ]
+            | literal | "-" number | literal ( ".." | "..=" ) literal ;
 struct_lit  = "{" [ field_init { "," field_init } ] "}" ;
 path        = ident { "::" ident } ;
 ```
@@ -251,10 +258,34 @@ fn abs(n: i64) -> i64 {
 }
 ```
 
-Loops: `loop { }` (infinite), `while cond { }`, and `for pat in iter { }` over an
-integer range (`1..4`) or an array. `break`/`continue` behave as expected. A
-`loop` may yield a value with `break <expr>`, and the loop expression then has
-the type of that value (`while`/`for` always evaluate to `()`).
+Loops: `loop { }` (infinite), `while cond { }`, `until cond { }` (loops while
+the condition is false), and `for pat in iter { }` over an integer range
+(`1..4`) or an array. `break`/`continue` behave as expected. A `loop` may yield
+a value with `break <expr>`, and the loop expression then has the type of that
+value (`while`/`until`/`for` always evaluate to `()`).
+
+`elif` is sugar for `else if`. `if let pat = expr { .. } else { .. }` and
+`while let pat = expr { .. }` are sugar over `match`: the block runs when the
+pattern matches; `while let` re-evaluates `expr` each iteration and stops at
+the first non-match. Patterns in `match` arms and `let`-patterns may be
+combined with `|` (or-patterns, whose alternatives may not bind variables),
+may be inclusive/exclusive ranges over integer or `char` literals
+(`1..=9`, `'a'..'z'`; an empty range is an error), and a binding may be marked
+`mut` (`Step::More(mut v)`).
+
+`defer expr;` evaluates `expr` when the enclosing block scope exits — by
+falling off the end or via `return`/`break`/`continue` — in LIFO order per
+scope, before that scope's locals are dropped. The expression is evaluated at
+exit time, so it observes the locals' final values; `return`/`break`/
+`continue` inside a deferred expression are rejected.
+
+`type Name = Ty;` declares a type alias. An alias is transparent — it is the
+same type as `Ty` everywhere (including in `impl` targets and array lengths),
+may name another alias, and may not be cyclic. A tuple struct
+`struct Pair(i32, i32);` is constructed with call syntax, `Pair(1, 2)`, and
+its fields are read as `.0`, `.1`, and so on. Constants may refer to constants
+declared later in the same file. A `char` literal holds exactly one Unicode
+scalar value; `''` and `'ab'` are errors.
 
 ```zexi
 let first = loop {
