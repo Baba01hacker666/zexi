@@ -8,12 +8,14 @@
 // and response formatting, parsing, a connection type and a tiny server — is
 // ordinary Zexi code.
 //
-// There is no module system yet, so compile a program *with* this file:
+// Import it from your program with `use "lib/http.zx";` (the path is
+// relative to your file), or compile the files together:
 //
 //     zexic run app.zx lib/http.zx
 //
 // The first file is the program (it owns `main`); the rest are compiled into
-// it. See docs/08-networking.md.
+// it. See docs/08-networking.md, and docs/09-c-bridge.md for how the
+// `extern "C"` layer underneath works.
 
 // ---------------------------------------------------------------------------
 // TCP over the C ABI

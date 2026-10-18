@@ -48,6 +48,11 @@ type gen struct {
 	trapDepth  int  // compiler-generated constructs (matches) since the innermost loop
 	hasString  bool // whether the program uses the builtin `String`
 	hasChar    bool // whether a `char` value is printed (needs the UTF-8 helper)
+	// externNames is the set of C-visible function names (`extern "C"`
+	// declarations and `main`): locals mangle to `zx_<name>`, which must
+	// never shadow one of these (a local `motto` would hide the C
+	// function `zx_motto` it may need to call).
+	externNames map[string]bool
 }
 
 // loopLabel are the jump targets of one source-level loop.
@@ -96,7 +101,12 @@ func (w *writer) raw(s string) { w.b.WriteString(s) }
 
 // Generate emits a complete C translation unit for the program.
 func Generate(info *sema.Info, opts Options) (string, error) {
-	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}, arrays: map[string]*types.Type{}, arrSeen: map[string]bool{}, dropSeen: map[string]bool{}}
+	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}, arrays: map[string]*types.Type{}, arrSeen: map[string]bool{}, dropSeen: map[string]bool{}, externNames: map[string]bool{}}
+	for _, fn := range info.FnOrder {
+		if fn.Extern || fn.Name == "main" {
+			g.externNames[funcName(fn)] = true
+		}
+	}
 	g.preamble()
 	g.collectArrayTypes()
 	g.collectDropTypes()
@@ -1406,6 +1416,16 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 	if name == "len" {
 		return g.lenValue(x)
 	}
+	if name == "cstr" {
+		return g.cstrValue(x)
+	}
+	if name == "from_cstr" {
+		if len(x.Args) != 1 {
+			return "0"
+		}
+		// Copy the C string into an owning zx_String.
+		return "zx_string_from((const char *)(" + g.value(x.Args[0]) + "))"
+	}
 	fn, ok := g.info.Fns[name]
 	if !ok {
 		return "0 /* call to unknown function */"
@@ -1763,6 +1783,29 @@ func (g *gen) indexValue(x *ast.IndexExpr) string {
 		return "(" + recv + ").e[zx_bounds(" + idx + ", " + strconv.FormatInt(rt.Len, 10) + ")]"
 	}
 	return "(" + recv + ")[" + idx + "]"
+}
+
+// cstrValue emits the C-bridge builtin `cstr(x)`: a borrowed `*u8`
+// pointing at NUL-terminated text. A `str` already is a C string; a
+// `String` place lends its buffer. A computed `String` temporary is
+// materialized and intentionally not dropped — its buffer must outlive
+// the pointer, mirroring how C code treats such hand-offs (bind the
+// String to a variable first if that is not acceptable).
+func (g *gen) cstrValue(x *ast.CallExpr) string {
+	if len(x.Args) != 1 {
+		return "0"
+	}
+	arg := x.Args[0]
+	t := g.info.TypeOf(arg)
+	if t != nil && t.Kind == types.StringKind {
+		if isPlaceExpr(arg) {
+			return "((uint8_t *)zx_string_as_str(&(" + g.value(arg) + ")))"
+		}
+		tm := g.tmpName()
+		return "({ zx_String " + tm + " = " + g.value(arg) +
+			"; (uint8_t *)zx_string_as_str(&" + tm + "); })"
+	}
+	return "((uint8_t *)(" + g.value(arg) + "))"
 }
 
 // lenValue emits the builtin `len(x)`.
@@ -2290,6 +2333,11 @@ func (g *gen) bind(name string) string {
 	c := "zx_" + safeIdent(name)
 	if g.counts[name] > 0 {
 		c = fmt.Sprintf("%s_%d", c, g.counts[name])
+	}
+	// Never shadow a C-visible function: a local whose mangled name
+	// would hide an `extern "C"` function it may call gets a suffix.
+	for g.externNames[c] {
+		c += "_"
 	}
 	g.counts[name]++
 	if len(g.scopes) > 0 {

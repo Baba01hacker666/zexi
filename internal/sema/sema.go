@@ -1352,6 +1352,12 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 	if name == "len" {
 		return c.inferLen(x)
 	}
+	if name == "cstr" {
+		return c.inferCStr(x)
+	}
+	if name == "from_cstr" {
+		return c.inferFromCStr(x)
+	}
 	// `Pair(1, 2)` constructs a tuple struct; a named struct used this way
 	// gets a pointed error rather than "cannot find function".
 	if st, ok := c.info.Structs[name]; ok {
@@ -1599,6 +1605,43 @@ func (c *checker) inferStringMethod(x *ast.MethodCallExpr) *types.Type {
 		}
 	}
 	return m.ret
+}
+
+// inferCStr checks the C-bridge builtin `cstr(x)`: it borrows a
+// NUL-terminated C string (`*u8`) from a `str` or a `String`, for
+// passing to `extern "C"` functions that take `const char *`. The value
+// is only borrowed; the argument is never consumed.
+func (c *checker) inferCStr(x *ast.CallExpr) *types.Type {
+	if len(x.Args) != 1 {
+		c.errAt(x, "E0061", "`cstr` takes 1 argument but %d were supplied", len(x.Args))
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return types.PtrTo(types.U8T)
+	}
+	at := c.checkExpr(x.Args[0], nil)
+	if at != nil && at.Kind != types.Invalid && at.Kind != types.Str && at.Kind != types.StringKind {
+		c.errAt(x.Args[0], "E0308", "`cstr` expects a `str` or `String`, found `%s`", at)
+	}
+	return types.PtrTo(types.U8T)
+}
+
+// inferFromCStr checks the C-bridge builtin `from_cstr(p)`: it copies a
+// NUL-terminated C string into an owning Zexi `String`. The caller must
+// guarantee that p points to a valid C string.
+func (c *checker) inferFromCStr(x *ast.CallExpr) *types.Type {
+	if len(x.Args) != 1 {
+		c.errAt(x, "E0061", "`from_cstr` takes 1 argument but %d were supplied", len(x.Args))
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return types.StringT
+	}
+	at := c.checkExpr(x.Args[0], nil)
+	if at != nil && at.Kind != types.Invalid && at.Kind != types.Ptr {
+		c.errAt(x.Args[0], "E0308", "`from_cstr` expects a `*u8` C string pointer, found `%s`", at)
+	}
+	return types.StringT
 }
 
 // inferLen checks the builtin `len(x)` for arrays and strings.

@@ -1,0 +1,33 @@
+// cbridge.zx — using a C library from Zexi.
+//
+// Zexi compiles to C, so the whole C ecosystem is one bridge away:
+//
+//   1. Declarations: `extern "C" fn ...` — write them by hand, or
+//      generate them from the library's header with `zexic bindgen`.
+//   2. Marshalling: `str` already is a C `const char *`; `cstr(x)`
+//      borrows a C string pointer from a `str`/`String`, and
+//      `from_cstr(p)` copies a C string into an owning `String`.
+//   3. Linking: the C implementation joins the build with --csrc, and
+//      system libraries with --link.
+//
+// Build and run this example with its glue file and libm:
+//
+//     zexic run examples/cbridge.zx --csrc=examples/cbridge_glue.c --link=m
+
+extern "C" fn zx_add(a: i32, b: i32) -> i32;
+extern "C" fn zx_exclaim_len(s: str) -> i32;
+extern "C" fn zx_count_a(s: *u8) -> i32;
+extern "C" fn zx_motto() -> *u8;
+extern "C" fn sqrt(x: f64) -> f64;
+
+fn main() -> i32 {
+    println(zx_add(20, 22));                 // a plain C function
+    println(zx_exclaim_len("zexi"));         // `str` passes straight through
+
+    let motto = from_cstr(zx_motto());       // C string -> owning String
+    println(motto);
+    println(zx_count_a(cstr(motto)));        // String -> borrowed C string
+
+    println(sqrt(2.25));                     // libm, via --link=m
+    0
+}

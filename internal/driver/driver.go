@@ -29,6 +29,17 @@ type Options struct {
 	OptLevel string
 	// CC is the C compiler to invoke. Empty means $CC or "cc".
 	CC string
+	// CFiles are extra C source files compiled and linked together with
+	// the generated code — the implementation side of the C bridge (your
+	// own glue code, or a C library's sources).
+	CFiles []string
+	// LinkLibs are libraries to link, as `-l<name>` (for example "m").
+	LinkLibs []string
+	// LibDirs are extra library search directories, as `-L<dir>`.
+	LibDirs []string
+	// IncludeDirs are extra header search directories, as `-I<dir>`,
+	// used when compiling CFiles.
+	IncludeDirs []string
 }
 
 // Artifacts is the result of a successful front end + codegen run.
@@ -254,7 +265,20 @@ func CompileC(csrc, outPath string, opts Options) error {
 		return fmt.Errorf("C compiler %q not found; install gcc or clang, or set CC", cc)
 	}
 
-	args := []string{"-std=gnu11", optFlag(opts.OptLevel), "-o", outPath, cfile}
+	args := []string{"-std=gnu11", optFlag(opts.OptLevel)}
+	for _, dir := range opts.IncludeDirs {
+		args = append(args, "-I"+dir)
+	}
+	args = append(args, "-o", outPath, cfile)
+	// Extra C sources (the C side of the bridge) compile and link with
+	// the generated code; libraries come last, as linkers require.
+	args = append(args, opts.CFiles...)
+	for _, dir := range opts.LibDirs {
+		args = append(args, "-L"+dir)
+	}
+	for _, lib := range opts.LinkLibs {
+		args = append(args, "-l"+lib)
+	}
 	cmd := exec.Command(cc, args...)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
