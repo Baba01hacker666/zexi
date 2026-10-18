@@ -37,7 +37,7 @@ Use the result like any library file: `use "math_bindings.zx";`.
 | `str` | `const char *` | string literals and `String` buffers are NUL-terminated |
 | `String` | `zx_String` (internal) | pass to C as `str` or via `cstr(...)` |
 | `*T` / `*mut T` | `T *` | raw pointers, for opaque C handles |
-| `&T` / `&mut T` | `T *` | how `lib/http.zx` passes `sockaddr_in` |
+| `&T` / `&mut T` | `T *` | how `lib/http.zx` passes `sockaddr_in`; a reference may be passed wherever a raw pointer is expected (and vice versa), so `time(&mut slot)` just works |
 | `struct` | C struct | field order matches; model C structs field-by-field like `SockAddrIn` in `lib/http.zx` |
 
 Two builtins move strings across the boundary:

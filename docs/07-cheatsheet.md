@@ -187,7 +187,7 @@ match n {
 }
 ```
 
-The scrutinee may be an `enum`, an integer, a `bool`, or a `char`. Integers and
+The scrutinee may be an `enum`, an integer, a `bool`, a `char`, or a `str`. Integers and
 `char`s need a `_` arm; a `bool` may instead cover both `true` and `false`.
 Negative literal patterns are allowed (`-1 => ..`), out-of-range patterns are
 rejected (`E0080`), and duplicate literal arms are rejected (`E0001`).
@@ -213,6 +213,17 @@ match c {
 
 A binding may be declared mutable inside a pattern: `Shape::Circle(mut r)`.
 Pattern bindings in a `let` use `let mut` as usual.
+
+Strings match too (compared by value, needs a `_` arm) — handy for
+command dispatch; match a `String` via `.as_str()`:
+
+```zx
+match arg_at(1).as_str() {
+    "quit" | "exit" => 0,
+    "help" => 1,
+    _ => 2,
+}
+```
 
 `break`, `continue`, and `return` may be used directly as an arm body
 (`_ => continue`). The comma after an arm is optional when the body ends in `}`
@@ -315,9 +326,16 @@ use std::text;      //   lib/ folder beside it, then in the embedded stdlib
 Every file is loaded at most once and import cycles are harmless. The
 embedded standard library (sources in `internal/driver/std/`) currently has
 `math` (`mini`, `maxi`, `clampi`, `absi`, `signi`, `is_even`, `gcdi`,
-`powi`, `minf`, `maxf`, `clampf`, `absf`) and `text` (`repeat_text`,
-`exclaim`, `pad_start`, `join_with`, `shout`). Passing extra `.zx` files on
-the command line (`zexic run main.zx lib.zx`) still works too.
+`powi`, `minf`, `maxf`, `clampf`, `absf`), `text` (`repeat_text`,
+`exclaim`, `pad_start`, `join_with`, `shout`), `io` (`read_line`,
+`prompt_line`), and `random` (`seed_random`, `seed_from_time`, `rand_int`,
+`rand_bool`, `rand_float`). Passing extra `.zx` files on the command line
+(`zexic run main.zx lib.zx`) still works too.
+
+Command-line arguments are builtins: `arg_count()` counts them (index 0
+is the program name) and `arg_at(i)` returns argument `i` as a `String`
+(`""` when out of range) — see `examples/args.zx`. For a complete small
+program that ties it all together, see `examples/guess.zx`.
 
 ## 7.14 Not implemented yet (roadmap M1+)
 
