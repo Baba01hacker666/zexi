@@ -340,6 +340,27 @@ access checks `pub`: a private item is E0603, a missing one E0412, and using a
 module as a value/type is E0433. Every file is loaded at most once and cycles
 are harmless.
 
+### Projects: compile just the entry
+
+There is no manifest. Point the compiler at a file or a **directory**; for a
+directory it looks for `main.zx`, then `src/main.zx`, and takes that directory
+as the project root. Named imports are then searched next to the importing
+file, in its `lib/`, at the project root, and in the root's `lib/` before the
+standard library — so `src/main.zx` can `use util;` and `mod pkg;` from the
+project root.
+
+```zx
+// project/util.zx          ->  use util;            ... util::double(21)
+// project/pkg/a.zx         ->  use pkg;             ... pkg::a()
+// project/pkg/b.zx             (pkg/ is loaded whole: every .zx file in it)
+// project/src/main.zx      ->  zexic run .   (entry discovered automatically)
+```
+
+A directory used as a module loads **all** its `.zx` files as one package
+(`main.zx` and `_`-prefixed files are skipped); its public names are reachable
+through the package qualifier, and a private one is E0603. `--root=dir` pins
+the project root explicitly.
+
 Under the hood the merged program is still **flat**: unqualified names from a
 plain import keep working, and `pub` is enforced only for *qualified* paths, so
 the preview does not yet isolate same-named items from two modules. Passing

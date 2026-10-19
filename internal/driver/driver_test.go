@@ -1434,6 +1434,149 @@ fn main() -> i32 {
 	}
 }
 
+// TestProjectDirectoryEntry covers convention-only project builds: a directory
+// entry (`main.zx` or `src/main.zx`), a project root derived from it, and named
+// imports that reach modules at the root from a file in `src/`.
+func TestProjectDirectoryEntry(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"util.zx":     "pub fn double(n: i32) -> i32 { n * 2 }\n",
+		"src/main.zx": "use util;\nfn main() -> i32 { println(util::double(21)); 0 }\n",
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entry, root, err := driver.ResolveEntry(dir)
+	if err != nil {
+		t.Fatalf("ResolveEntry(%s): %v", dir, err)
+	}
+	if want := filepath.Join(dir, "src", "main.zx"); entry != want {
+		t.Fatalf("entry = %q, want %q", entry, want)
+	}
+	if root != dir {
+		t.Fatalf("root = %q, want %q", root, dir)
+	}
+
+	// The same root is derived whether the directory, the entry file, or a
+	// file inside `src` is named on the command line.
+	for _, in := range []string{dir, entry, filepath.Join(dir, "src")} {
+		_, r, err := driver.ResolveEntry(in)
+		if err != nil {
+			t.Fatalf("ResolveEntry(%s): %v", in, err)
+		}
+		if r != dir {
+			t.Fatalf("ResolveEntry(%s) root = %q, want %q", in, r, dir)
+		}
+	}
+
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(entry, out, driver.Options{Root: root}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("project build failed")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running project program: %v", err)
+	}
+	if got := string(raw); got != "42\n" {
+		t.Fatalf("output mismatch: got %q want %q", got, "42\n")
+	}
+}
+
+// TestDirectoryPackage loads a whole folder for one import: `use util;` pulls
+// every .zx file in util/, whose public names are reachable through the
+// package qualifier while private ones are not.
+func TestDirectoryPackage(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "util"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"util/a.zx":  "pub fn a() -> i32 { 1 }\n",
+		"util/b.zx":  "pub fn b() -> i32 { 2 }\nfn hidden() -> i32 { 9 }\n",
+		"main.zx":    "use util;\nfn main() -> i32 { println(util::a(), util::b()); 0 }\n",
+		"badmain.zx": "use util;\nfn main() -> i32 { util::hidden() }\n",
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	em := diag.NewEmitter()
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "main.zx"), driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("directory package failed to type-check")
+	}
+
+	em = diag.NewEmitter()
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "badmain.zx"), driver.Options{}, em); ok {
+		t.Fatal("expected a private package item to be rejected")
+	}
+	var buf bytes.Buffer
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E0603") {
+		t.Fatalf("expected E0603 for package-private item, got:\n%s", buf.String())
+	}
+}
+
+// TestProjectRootReachability checks that a module in a subdirectory can import
+// a module at the project root by name.
+func TestProjectRootReachability(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"util.zx":          "pub fn base() -> i32 { 40 }\n",
+		"nested/helper.zx": "use util;\npub fn seven() -> i32 { util::base() + 7 }\n",
+		"main.zx":          "use nested::helper;\nfn main() -> i32 { println(helper::seven()); 0 }\n",
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entry, root, err := driver.ResolveEntry(filepath.Join(dir, "main.zx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(entry, out, driver.Options{Root: root}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("project-root build failed")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running project program: %v", err)
+	}
+	if got := string(raw); got != "47\n" {
+		t.Fatalf("output mismatch: got %q want %q", got, "47\n")
+	}
+}
+
+// TestProjectNoEntry checks the diagnostic for a directory that has no entry
+// point.
+func TestProjectNoEntry(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := driver.ResolveEntry(dir); err == nil {
+		t.Fatal("expected an error for a directory with no main.zx")
+	}
+}
+
 // TestModuleQualifiedAccess exercises scoped modules end to end: an aliased
 // file import, qualified functions/constants/types/associated functions/enum
 // variants, a `mod name;` qualifier, and an inline `mod { ... }` qualifier.

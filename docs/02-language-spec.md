@@ -405,6 +405,19 @@ preview:
   for a missing one, **E0433** for using a module as a value).
 - Imports are transitive, every file is loaded once, and cycles are harmless.
 
+**Projects (convention only, no manifest).** The compiler accepts a directory as
+well as a file. For a directory, `main.zx` is tried first, then `src/main.zx`;
+the **project root** is that directory (for `zexic run src/main.zx`, the root is
+the directory above `src`). Named imports (`use foo;`, `use a::b;`, `mod foo;`)
+are searched in this order: the importing file's directory, its `lib/` folder,
+the project root, the root's `lib/` folder, then the embedded standard library.
+If a lookup names a **directory** instead of a file, the whole folder is loaded
+as one package: every `.zx` file in it (except `main.zx` and `_`-prefixed files)
+is compiled in, and its public names are reachable through the package
+qualifier. So a project can be `main.zx` plus a handful of files, or a tree of
+folders, and `zexic run .` compiles the entry and everything it links to.
+`--root=<dir>` overrides the discovered root.
+
 The preview remains **flat underneath**: items are still merged into one
 program namespace, so plain imports continue to expose their names unqualified
 (this keeps existing code working and means `pub` is not yet enforced for

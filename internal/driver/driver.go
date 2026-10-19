@@ -28,6 +28,12 @@ type Options struct {
 	OptLevel string
 	// CC is the C compiler to invoke. Empty means $CC or "cc".
 	CC string
+	// Root is the project root directory. Named imports (`use foo;`,
+	// `use pkg::util;`, `mod foo;`) are searched here as well as next to the
+	// importing file, so a `src/main.zx` entry can reach modules at the
+	// project root. Empty means derive it from the entry file (see
+	// ProjectRoot).
+	Root string
 	// CFiles are extra C source files compiled and linked together with
 	// the generated code — the implementation side of the C bridge (your
 	// own glue code, or a C library's sources).
@@ -86,6 +92,7 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 		return nil, false
 	}
 	l := newLoader(em)
+	l.root = ProjectRoot(paths[0], opts.Root)
 	for i, path := range paths {
 		id := l.loadDiskFile(path)
 		if i == 0 {

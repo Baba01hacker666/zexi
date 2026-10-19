@@ -72,6 +72,23 @@ This repository contains the **initial design and specification** of Zexi: the v
 See [`workings.md`](workings.md) for a walkthrough of the compiler pipeline and
 runtime.
 
+## Projects
+
+A program can be one file or a whole folder. Point `zexic` at a project
+directory and it finds `main.zx` (or `src/main.zx`), then pulls in everything
+the entry links to — no manifest and no file list:
+
+```sh
+zexic run .                 # entry discovered, every import compiled in
+zexic run src/main.zx       # the root above src/ is searched for modules
+zexic build . -o app
+```
+
+Named imports are searched next to the importing file, in its `lib/`, at the
+project root, and in the root's `lib/`, before the embedded standard library.
+`use util;` where `util/` is a directory loads the **whole folder** (every `.zx`
+inside it) as one package; `--root=dir` pins the root explicitly.
+
 ## Try it
 
 ```sh

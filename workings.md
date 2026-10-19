@@ -45,6 +45,10 @@ handles strings, printing, arrays, and the standard library's C shims.
     `import io.fs;` → embedded standard-library modules
     (`internal/driver/std/*.zx`)
   - `mod name;` → `name.zx` or `name/mod.zx` beside the declaring file
+- Project mode (`project.go`): a directory argument finds `main.zx` or
+  `src/main.zx`; the project root is searched alongside the importing file for
+  named imports and `mod`. A directory named by an import (`use util;` with
+  `util/`) loads every `.zx` file in that folder as one aggregate package.
 - Imports create qualifiers: `as alias`, else the full path and its last
   segment; `mod` creates a qualifier too.
 - Items are then flattened into one program namespace for this M1-preview

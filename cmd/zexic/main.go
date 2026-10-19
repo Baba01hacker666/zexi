@@ -24,7 +24,7 @@ import (
 	"zexi/internal/token"
 )
 
-const version = "zexi 0.1.0 (M0-alpha + M1 foundations: imports, stdlib, native C)"
+const version = "zexi 0.1.0 (M0-alpha + M1 foundations: modules, projects, stdlib, native C)"
 
 func main() { os.Exit(run(os.Args[1:])) }
 
@@ -36,6 +36,8 @@ type cli struct {
 	emit       string
 	optLevel   string
 	cc         string
+	// root overrides the project root for named imports and `mod` (--root).
+	root string
 	// C bridge options.
 	cFiles      []string
 	linkLibs    []string
@@ -69,6 +71,8 @@ func parseArgs(args []string) cli {
 			c.optLevel = strings.TrimPrefix(a, "--opt-level=")
 		case strings.HasPrefix(a, "--cc="):
 			c.cc = strings.TrimPrefix(a, "--cc=")
+		case strings.HasPrefix(a, "--root="):
+			c.root = strings.TrimPrefix(a, "--root=")
 		case strings.HasPrefix(a, "--csrc="):
 			c.cFiles = append(c.cFiles, strings.TrimPrefix(a, "--csrc="))
 		case strings.HasPrefix(a, "--link="):
@@ -94,6 +98,7 @@ func (c cli) opts() driver.Options {
 	return driver.Options{
 		OptLevel:    c.optLevel,
 		CC:          c.cc,
+		Root:        c.root,
 		CFiles:      c.cFiles,
 		LinkLibs:    c.linkLibs,
 		LibDirs:     c.libDirs,
@@ -144,14 +149,21 @@ func requireFile(c cli, cmd string) (string, bool) {
 	return c.positional[0], true
 }
 
-// requireFiles returns all positional inputs. The first is the program; the
-// rest are usually library files compiled into it.
-func requireFiles(c cli, cmd string) ([]string, bool) {
+// resolveInputs resolves the first positional argument as a project entry: a
+// `.zx` file or a directory containing `main.zx`/`src/main.zx`. It returns the
+// entry plus any extra files and the project root to pass through Options.
+func resolveInputs(c cli, cmd string) ([]string, string, bool) {
 	if len(c.positional) == 0 {
-		fmt.Fprintf(os.Stderr, "zexic %s: expected a .zx file argument\n", cmd)
-		return nil, false
+		fmt.Fprintf(os.Stderr, "zexic %s: expected a .zx file or a project directory\n", cmd)
+		return nil, "", false
 	}
-	return c.positional, true
+	entry, root, err := driver.ResolveEntry(c.positional[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "zexic %s: %v\n", cmd, err)
+		return nil, "", false
+	}
+	paths := append([]string{entry}, c.positional[1:]...)
+	return paths, root, true
 }
 
 func cmdTokenize(c cli) int {
@@ -176,10 +188,11 @@ func cmdTokenize(c cli) int {
 }
 
 func cmdCheck(c cli) int {
-	paths, ok := requireFiles(c, "check")
+	paths, root, ok := resolveInputs(c, "check")
 	if !ok {
 		return 2
 	}
+	c.root = root
 	em := diag.NewEmitter()
 	art, ok := driver.FrontEndFiles(paths, c.opts(), em)
 	if !ok {
@@ -191,10 +204,11 @@ func cmdCheck(c cli) int {
 }
 
 func cmdBuild(c cli) int {
-	paths, ok := requireFiles(c, "build")
+	paths, root, ok := resolveInputs(c, "build")
 	if !ok {
 		return 2
 	}
+	c.root = root
 	em := diag.NewEmitter()
 	out, ok := driver.BuildFiles(paths, c.out, c.opts(), em)
 	if !ok {
@@ -206,10 +220,11 @@ func cmdBuild(c cli) int {
 }
 
 func cmdRun(c cli) int {
-	paths, ok := requireFiles(c, "run")
+	paths, root, ok := resolveInputs(c, "run")
 	if !ok {
 		return 2
 	}
+	c.root = root
 	// Arguments after a `--` separator belong to the program, not to the
 	// compiler: `zexic run app.zx -- arg1 arg2` runs app with arg1 arg2.
 	progArgs := c.progArgs
@@ -242,10 +257,11 @@ func cmdRun(c cli) int {
 }
 
 func cmdEmit(c cli) int {
-	paths, ok := requireFiles(c, "emit")
+	paths, root, ok := resolveInputs(c, "emit")
 	if !ok {
 		return 2
 	}
+	c.root = root
 	if c.emit == "" {
 		c.emit = "c"
 	}
@@ -309,14 +325,19 @@ commands:
   bindgen    generate Zexi extern declarations from a C header
   version    print the compiler version
 
-Multiple .zx files are compiled together into one program (the first is the
-entry file; the rest are usually library files).
+Project builds: the first argument may be a project directory. main.zx is
+tried first, then src/main.zx. Named imports (use foo;, mod foo;) are
+resolved next to the importing file, in its lib/ folder, at the project root,
+and finally in the standard library. A directory package (use util; with a
+util/ folder holding .zx files) loads the whole folder. Extra .zx files may
+still be passed explicitly and are compiled together with the entry.
 
 options:
   -o <path>                  output path for build (or for bindgen)
   --opt-level=<0|1|2|3|s>    optimization profile (default 2, 's' for size)
   --cc=<path>                C compiler to use (default $CC or cc)
   --emit=<c>                 intermediate form to print
+  --root=<dir>               project root for named imports and mod
 
 C bridge options (build/run):
   --csrc=<file.c>            extra C source compiled and linked in (repeatable)

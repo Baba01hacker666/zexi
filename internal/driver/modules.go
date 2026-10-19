@@ -17,6 +17,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"zexi/internal/ast"
@@ -101,6 +102,10 @@ type importBinding struct {
 type loader struct {
 	em     *diag.Emitter
 	merged *ast.File
+
+	// root is the project root named imports and `mod` search from, after the
+	// importing file's own directory (see ProjectRoot).
+	root string
 
 	mods  map[string]*module // load key -> module
 	order []*module          // load order, for deterministic merging
@@ -255,19 +260,37 @@ func (l *loader) collectImports(m *module, items []ast.Item, prefix []string) {
 }
 
 // bindMod resolves `mod name;` using the conventional `name.zx` and
-// `name/mod.zx` layouts and records the `name::` qualifier (respecting any
-// enclosing inline-module prefix).
+// `name/mod.zx` layouts, and directory packages (`name/` with one or more .zx
+// files), searching next to the declaring file and at the project root. It
+// records the `name::` qualifier (respecting any enclosing inline-module
+// prefix).
 func (l *loader) bindMod(m *module, d *ast.ModDecl, prefix []string) {
-	for _, cand := range []string{
-		filepath.Join(m.dir, d.Name+".zx"),
-		filepath.Join(m.dir, d.Name, "mod.zx"),
-	} {
+	qual := append(append([]string{}, prefix...), d.Name)
+	for _, dir := range l.searchDirs(m.dir) {
+		cand := filepath.Join(dir, d.Name+".zx")
 		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
 			if target := l.loadDisk(cand); target != nil {
-				l.bind(m, append(append([]string{}, prefix...), d.Name), target, d.Sp)
+				l.bind(m, qual, target, d.Sp)
 			}
 			return
 		}
+	}
+	for _, dir := range l.searchDirs(m.dir) {
+		pkgDir := filepath.Join(dir, d.Name)
+		st, err := os.Stat(pkgDir)
+		if err != nil || !st.IsDir() {
+			continue
+		}
+		if modFile := filepath.Join(pkgDir, "mod.zx"); fileExists(modFile) {
+			if target := l.loadDisk(modFile); target != nil {
+				l.bind(m, qual, target, d.Sp)
+			}
+			return
+		}
+		if pkg := l.loadPackage(pkgDir); pkg != nil {
+			l.bind(m, qual, pkg, d.Sp)
+		}
+		return
 	}
 	l.em.Report(diag.New("E9023", "cannot find module `%s` (looked for %s.zx and %s/mod.zx)", d.Name, d.Name, d.Name).WithSpan(d.Sp))
 }
@@ -346,7 +369,8 @@ func (l *loader) resolveUse(m *module, d *ast.UseDecl) (*module, []string, bool)
 	// `use a::b;` / `import a.b;` names a/b.zx: local modules win over
 	// embedded ones so applications can provide their own package trees.
 	name := filepath.Join(parts...) + ".zx"
-	for _, cand := range []string{filepath.Join(m.dir, name), filepath.Join(m.dir, "lib", name)} {
+	for _, dir := range l.searchDirs(m.dir) {
+		cand := filepath.Join(dir, name)
 		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
 			if target := l.loadDisk(cand); target != nil {
 				return target, parts, true
@@ -354,14 +378,113 @@ func (l *loader) resolveUse(m *module, d *ast.UseDecl) (*module, []string, bool)
 			return nil, nil, false
 		}
 	}
+	// A directory package: `use util;` loads every `.zx` file in `util/` (or
+	// its `mod.zx` facade if present). This is the "many files, one import"
+	// part of a convention-only project.
+	for _, dir := range l.searchDirs(m.dir) {
+		pkgDir := filepath.Join(dir, filepath.Join(parts...))
+		st, err := os.Stat(pkgDir)
+		if err != nil || !st.IsDir() {
+			continue
+		}
+		if modFile := filepath.Join(pkgDir, "mod.zx"); fileExists(modFile) {
+			target := l.loadDisk(modFile)
+			return target, parts, target != nil
+		}
+		if pkg := l.loadPackage(pkgDir); pkg != nil {
+			return pkg, parts, true
+		}
+		return nil, nil, false
+	}
 	if module, ok := stdModule(parts); ok {
 		if target := l.loadStdFile(module); target != nil {
 			return target, parts, true
 		}
 		return nil, nil, false
 	}
-	l.em.Report(diag.New("E9022", "cannot find a library named `%s` (looked for %s next to the importing file, in its lib/ folder, and in the standard library)", strings.Join(parts, "::"), name).WithSpan(d.Sp))
+	l.em.Report(diag.New("E9022", "cannot find a library named `%s` (looked for %s next to the importing file, in its lib/ folder, at the project root, and in the standard library)", strings.Join(parts, "::"), name).WithSpan(d.Sp))
 	return nil, nil, false
+}
+
+// searchDirs returns the directories a named module is looked up in, most
+// specific first: the importing file's directory, its `lib/` folder, the
+// project root, and the root's `lib/` folder. Duplicates are collapsed, which
+// matters in the common flat layout where the importer is the root.
+func (l *loader) searchDirs(importerDir string) []string {
+	var dirs []string
+	add := func(d string) {
+		if d == "" {
+			return
+		}
+		for _, x := range dirs {
+			if x == d {
+				return
+			}
+		}
+		dirs = append(dirs, d)
+	}
+	add(importerDir)
+	add(filepath.Join(importerDir, "lib"))
+	if l.root != "" && l.root != importerDir {
+		add(l.root)
+		add(filepath.Join(l.root, "lib"))
+	}
+	return dirs
+}
+
+// loadPackage loads every `.zx` file in a directory as one aggregate module:
+// the files each keep their own imports and are merged into the program, while
+// qualified access through the package qualifier is checked against the union
+// of their exports. `main.zx` and `_`-prefixed files are skipped, so a package
+// cannot pull in a second entry point or private scratch source.
+func (l *loader) loadPackage(dir string) *module {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		abs = filepath.Clean(dir)
+	}
+	key := "pkg:" + abs
+	if m, ok := l.mods[key]; ok {
+		return m
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		l.em.Report(diag.New("E9022", "cannot read package directory %s: %v", dir, err))
+		return nil
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if !strings.HasSuffix(n, ".zx") || n == "main.zx" || strings.HasPrefix(n, "_") {
+			continue
+		}
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		l.em.Report(diag.New("E9022", "package directory %s has no .zx files", dir))
+		return nil
+	}
+	pkg := &module{key: key, dir: dir, exports: map[string]bool{}}
+	l.mods[key] = pkg // register before loading members, so cycles terminate
+	for _, n := range names {
+		member := l.loadDisk(filepath.Join(dir, n))
+		if member == nil {
+			continue
+		}
+		for name, pub := range member.exports {
+			pkg.exports[name] = pkg.exports[name] || pub
+		}
+	}
+	return pkg
+}
+
+// fileExists reports whether path is an existing regular file.
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
 }
 
 // bind records one import binding, skipping exact duplicates and reporting a

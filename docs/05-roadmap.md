@@ -6,7 +6,10 @@
 > first M1 usability foundations are also live: file `use`/`import`, dotted
 > standard-library facades (`import http.server;`), `mod` source layouts,
 > per-module `as` aliases, and path-qualified lookup with `pub` enforcement are
-> resolved by the driver before checking. The merged program is still one flat
+> resolved by the driver before checking. Project builds are convention-only:
+> pass a directory (`zexic run .`), the loader finds `main.zx` or `src/main.zx`,
+> searches the project root for named imports, and can load a whole folder for
+> one `use pkg;`. The merged program is still one flat
 > namespace (unqualified names stay visible and ignore `pub`); true per-module
 > isolation remains M1 work.
 > Implemented language surface: functions and recursion; `let`/`const`;
@@ -120,10 +123,11 @@ seam.
 ## 5.3 M1 — usability (the "worth using" set)
 
 - **Modules & packages:** finish the shipped loader into scoped packages.
-  Qualified lookup, `as` aliases, and `pub` checks are live; what remains is
-  real per-module isolation (so unqualified cross-module names respect `pub`
-  and same-named items coexist), directory packages, re-exports/glob imports,
-  and a prelude.
+  Qualified lookup, `as` aliases, `pub` checks, directory entry points, and
+  whole-folder packages are live; what remains is real per-module isolation (so
+  unqualified cross-module names respect `pub` and same-named items coexist),
+  re-exports/glob imports, and a prelude. Manifests/package metadata are not
+  planned for the convention-only project model.
 - **Generics + traits:** monomorphized user generics, operator traits,
   `Iterator`, `Clone`/`Copy`/`Drop`, `From`/`Into`, `dyn Trait` (M1 late).
 - **Real ownership checker:** NLL, lifetime elision + explicit lifetimes,
