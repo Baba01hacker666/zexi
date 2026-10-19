@@ -386,6 +386,10 @@ The embedded standard library (sources in `internal/driver/std/`) includes:
   `sci_notation`, `percent_str`), human units (`byte_size`, `duration_ms`),
   ordinals (`ordinal`), and alignment (`align_left`/`align_right`/
   `align_center`). It has no C shim, so it costs nothing to import.
+- `codec`: pure-Zexi encoders and checksums — hex (`hex_encode`,
+  `hex_encode_upper`, `hex_decode`), base64 (`base64_encode`,
+  `base64_encode_url`, `base64_decode`), and CRC-32/Adler-32/FNV-1a/djb2 with
+  fixed-width `*_hex` forms.
 - `io`, `fs`, `sys`, and `random`: console I/O (`input(prompt = "")` and
   `read_line`); capped binary-safe file reads plus
   `write_bytes(path, &String)` (reads, writes, and copies cap at 32 MiB);

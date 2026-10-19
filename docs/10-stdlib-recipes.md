@@ -299,3 +299,37 @@ for NaN, `inf` for infinities, and falls back to the built-in float formatting
 for values too large to scale exactly. `radix_str` clamps its base to 2..36 and
 `fixed_point`/`sci_notation` clamp their digit count (0..18). See
 [`tests/formatting.zx`](../tests/formatting.zx) for every function.
+
+## 10.8 Encoders and checksums
+
+`use codec;` is a pure-Zexi (no C shim) module for the conversions around the
+network edge: hex and base64 for tokens, Basic auth, and data URIs, plus the
+checksums used for ETags and integrity checks.
+
+```zx
+use codec;
+
+fn main() -> i32 {
+    println(codec::hex_encode("hi"));          // 6869
+    println(codec::hex_decode("68656c6c6f"));  // hello
+    println(codec::base64_encode("hello"));    // aGVsbG8=
+    println(codec::base64_encode_url("a?b"));  // YT9i
+    println(codec::base64_decode("aGVsbG8=")); // hello
+    println(codec::crc32_hex("123456789"));    // cbf43926
+    println(codec::fnv1a64_hex("hello"));      // a430d84680aabd0b
+    0
+}
+```
+
+| Group | APIs |
+| --- | --- |
+| Hex | `hex_encode`, `hex_encode_upper`, `hex_decode` |
+| Base64 | `base64_encode`, `base64_encode_url`, `base64_decode` |
+| Checksums | `crc32`, `crc32_hex`, `adler32`, `adler32_hex`, `fnv1a32`, `fnv1a32_hex`, `fnv1a64`, `fnv1a64_hex`, `djb2`, `djb2_hex` |
+
+`crc32` is the zlib/IEEE 802.3 CRC-32; `adler32` matches zlib; `fnv1a32`/`fnv1a64`
+are 32-/64-bit FNV-1a; `djb2` is Bernstein's hash. The numeric forms return an
+`i64` (`u64` for the 64-bit hashes) and the `*_hex` forms return a zero-padded
+lowercase digest. `hex_decode` and `base64_decode` return an empty string on
+malformed input rather than guessing. See
+[`tests/encoding.zx`](../tests/encoding.zx) for the standard test vectors.

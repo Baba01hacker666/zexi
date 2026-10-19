@@ -57,11 +57,12 @@ This repository contains the **initial design and specification** of Zexi: the v
 > `new_app()`, and `listen_n(addr, count)` cover explicit and bounded servers;
 > `Client`, `get`, `do`, `fetch`, and `request` cover the client side (see
 > [`docs/08-networking.md`](docs/08-networking.md)). Embedded `math`, `text`,
-> `io`, `fs`, `os`, `regex`, `fmt`, and `thread` also provide dependency-free
+> `io`, `fs`, `os`, `regex`, `fmt`, `codec`, and `thread` also provide dependency-free
 > arithmetic, roots/logs/trigonometry/geometry, number theory, familiar string
 > helpers, `input(prompt)`, capped binary-safe file helpers, local process/path
 > conveniences, POSIX-ERE matching, number/value formatting (bases, grouping,
-> fixed decimals, human units, alignment), and real OS **concurrency**: fork–join
+> fixed decimals, human units, alignment), hex/base64 encoding and checksums
+> (CRC-32, FNV, Adler-32), and real OS **concurrency**: fork–join
 > threads, blocking `i64` channels, and lock-free `i64` atomics
 > (`Thread::spawn`, `Chan::new`, `Atomic::new`; see
 > [`docs/11-concurrency.md`](docs/11-concurrency.md)).
@@ -113,6 +114,7 @@ go run ./cmd/zexic run tests/keywords.zx  # until/elif/defer, or+range patterns,
 go run ./cmd/zexic run tests/modules.zx   # scoped imports: aliases, mod::item, pub checks
 go run ./cmd/zexic run tests/threads.zx   # threads, channels, and atomics
 go run ./cmd/zexic run tests/formatting.zx # bases, grouping, units, alignment
+go run ./cmd/zexic run tests/encoding.zx   # hex, base64, and checksums
 go run ./cmd/zexic run tests/easy.zx      # the easy way: no semicolons, f-strings, defaults, libraries
 go run ./cmd/zexic run examples/easy.zx   # same ideas, as a small standalone demo
 go run ./cmd/zexic run tests/sugar.zx     # break-with-value, Type::new(..), print/format sugar

@@ -1,0 +1,35 @@
+// tests/encoding.zx
+// The codec module: hex, base64 (standard and URL-safe), and the common
+// checksums (CRC-32, Adler-32, FNV-1a, djb2), checked against known vectors.
+
+use codec;
+
+fn main() -> i32 {
+    // Hex.
+    println(codec::hex_encode("hello"));
+    println(codec::hex_encode_upper("hello"));
+    println(codec::hex_decode("68656c6c6f"));
+    println("[" + codec::hex_decode("6g") + "]");   // invalid -> empty
+    println("[" + codec::hex_decode("6") + "]");    // odd length -> empty
+
+    // Base64.
+    println(codec::base64_encode("hello"));
+    println(codec::base64_encode(""));
+    println(codec::base64_encode_url("The quick brown fox jumps over the lazy dog"));
+    println(codec::base64_decode("aGVsbG8="));
+    println(codec::base64_decode("aGVsbG8"));       // padding optional on decode
+    println(codec::base64_decode("MTIzNDU2Nzg5"));  // round-trips "123456789"
+
+    // Checksums (standard published vectors).
+    println(codec::crc32_hex(""));
+    println(codec::crc32_hex("123456789"));
+    println(codec::crc32_hex("The quick brown fox jumps over the lazy dog"));
+    println(codec::adler32_hex(""));
+    println(codec::adler32_hex("123456789"));
+    println(codec::fnv1a32_hex("hello"));
+    println(codec::fnv1a64_hex("hello"));
+    println(codec::fnv1a64_hex("123456789"));
+    println(codec::djb2_hex("hello"));
+
+    0
+}

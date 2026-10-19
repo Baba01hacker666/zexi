@@ -101,6 +101,7 @@ Embedded in the compiler under `internal/driver/std/`:
 | fs     | `fs.zx` | capped binary-safe file read/write/copy helpers |
 | math   | `math.zx` | integer/bit helpers, roots/logs/trig, geometry/smoothing, primes/combinatorics |
 | fmt    | `fmt.zx` | number/value formatting: bases, grouping, fixed/sci decimals, human units, alignment |
+| codec  | `codec.zx` | hex/base64 encode+decode and CRC-32/Adler-32/FNV-1a/djb2 checksums |
 | text   | `text.zx` | string helpers |
 | random | `random.zx` | RNG |
 | regex  | `regex.zx` | POSIX-ERE search/full-match/find/replace (C shim `zxregex_c.txt`) |
