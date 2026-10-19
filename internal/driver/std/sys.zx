@@ -1,16 +1,28 @@
-// sys — operating-system helpers: environment, clocks, sleeping, pid.
+// sys — practical local-system helpers: environment, paths, clocks, and pid.
 // Import with `use sys;`, `use std::sys;`, `import os;`, or `import time;`.
 //
-// A small C shim (`zxs_*`) is linked in only when this module is used.
+// A small POSIX C shim (`zxs_*`) is linked only when this module is used.
+// Path-returning helpers use a 4096-byte buffer; failures return an empty
+// String and filesystem operations return 0 on success or -1 on failure.
 
 extern "C" fn zxs_env_get(name: str, buf: &mut [u8; 4096], cap: i32) -> i32;
+extern "C" fn zxs_env_has(name: str) -> i32;
+extern "C" fn zxs_env_set(name: str, value: str, overwrite: i32) -> i32;
+extern "C" fn zxs_env_unset(name: str) -> i32;
 extern "C" fn zxs_time_ms() -> i64;
 extern "C" fn zxs_mono_ms() -> i64;
 extern "C" fn zxs_sleep_ms(ms: i64);
 extern "C" fn zxs_pid() -> i32;
+extern "C" fn zxs_cwd(buf: &mut [u8; 4096], cap: i32) -> i32;
+extern "C" fn zxs_hostname(buf: &mut [u8; 4096], cap: i32) -> i32;
+extern "C" fn zxs_chdir(path: str) -> i32;
+extern "C" fn zxs_mkdir(path: str) -> i32;
+extern "C" fn zxs_remove_path(path: str) -> i32;
+extern "C" fn zxs_rename_path(from: str, to: str) -> i32;
+extern "C" fn zxs_cpu_count() -> i32;
 
 // env_get returns the value of an environment variable ("" when unset or
-// empty).
+// empty). Use env_has to distinguish those two cases.
 pub fn env_get(name: str) -> String {
     let mut buf: [u8; 4096] = [0; 4096];
     let n = zxs_env_get(name, &mut buf, 4096);
@@ -23,6 +35,31 @@ pub fn env_get(name: str) -> String {
         }
     }
     return out;
+}
+
+// env_has reports whether a variable is set, including when its value is "".
+pub fn env_has(name: str) -> bool {
+    return zxs_env_has(name) == 1;
+}
+
+// env_or returns an environment value when it is set, otherwise fallback.
+pub fn env_or(name: str, fallback: str) -> String {
+    if env_has(name) {
+        return env_get(name);
+    }
+    return String::from(fallback);
+}
+
+// env_set sets a process-local environment variable. overwrite defaults to
+// true; pass false to leave an already-set variable untouched. Returns 0/-1.
+pub fn env_set(name: str, value: str, overwrite: bool = true) -> i32 {
+    let mode = if overwrite { 1 } else { 0 };
+    return zxs_env_set(name, value, mode);
+}
+
+// env_unset removes a process-local environment variable. Returns 0/-1.
+pub fn env_unset(name: str) -> i32 {
+    return zxs_env_unset(name);
 }
 
 // time_ms is wall-clock time in milliseconds since the Unix epoch.
@@ -55,4 +92,79 @@ pub fn pid() -> i32 {
 // measured with the monotonic clock.
 pub fn millis_since(start: i64) -> i64 {
     return zxs_mono_ms() - start;
+}
+
+// cwd returns the current working directory, or "" when it cannot be read.
+pub fn cwd() -> String {
+    let mut buf: [u8; 4096] = [0; 4096];
+    let n = zxs_cwd(&mut buf, 4096);
+    let mut out = String::new();
+    if n > 0 {
+        let mut i: usize = 0;
+        while i < (n as usize) {
+            out.push_byte(buf[i]);
+            i += 1;
+        }
+    }
+    return out;
+}
+
+// hostname returns the local host name, or "" when it cannot be read.
+pub fn hostname() -> String {
+    let mut buf: [u8; 4096] = [0; 4096];
+    let n = zxs_hostname(&mut buf, 4096);
+    let mut out = String::new();
+    if n > 0 {
+        let mut i: usize = 0;
+        while i < (n as usize) {
+            out.push_byte(buf[i]);
+            i += 1;
+        }
+    }
+    return out;
+}
+
+// home_dir returns HOME, then USERPROFILE, or "" when neither is set.
+pub fn home_dir() -> String {
+    if env_has("HOME") {
+        return env_get("HOME");
+    }
+    if env_has("USERPROFILE") {
+        return env_get("USERPROFILE");
+    }
+    return String::new();
+}
+
+// temp_dir returns TMPDIR when set, otherwise the conventional POSIX /tmp.
+pub fn temp_dir() -> String {
+    if env_has("TMPDIR") {
+        return env_get("TMPDIR");
+    }
+    return String::from("/tmp");
+}
+
+// chdir changes the process working directory. Returns 0/-1.
+pub fn chdir(path: str) -> i32 {
+    return zxs_chdir(path);
+}
+
+// mkdir creates one directory level. It succeeds when path already names a
+// directory; it does not create missing parents. Returns 0/-1.
+pub fn mkdir(path: str) -> i32 {
+    return zxs_mkdir(path);
+}
+
+// remove_path removes a regular file or an empty directory. It never recurses.
+pub fn remove_path(path: str) -> i32 {
+    return zxs_remove_path(path);
+}
+
+// rename_path renames or moves a file/directory within the local filesystem.
+pub fn rename_path(from: str, to: str) -> i32 {
+    return zxs_rename_path(from, to);
+}
+
+// cpu_count returns the online CPU count, or 1 when the OS cannot report it.
+pub fn cpu_count() -> i32 {
+    return zxs_cpu_count();
 }

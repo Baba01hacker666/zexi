@@ -28,6 +28,8 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../examples/args.zx",
 		"../../examples/http_app.zx",
 		"../../examples/static_server.zx",
+		"../../examples/regex.zx",
+		"../../examples/local_tools.zx",
 		"../../tests/tour.zx",
 		"../../tests/structs.zx",
 		"../../tests/enums.zx",
@@ -580,7 +582,7 @@ fn form_handler(req: &Request) -> Response {
 }
 
 fn main() -> i32 {
-    let mut srv = listen("127.0.0.1", 18088);
+    let mut srv = listen_local(18088);
     if !srv.ok() {
         println("bind failed");
         return 1;
@@ -593,7 +595,7 @@ fn main() -> i32 {
     router.post("/form", form_handler);
 
     let mut served: i32 = 0;
-    while served < 6 {
+    while served < 8 {
         let mut c = srv.accept();
         if !c.ok() {
             continue;
@@ -647,6 +649,12 @@ fn main() -> i32 {
     print(g.status);
     print(" ");
     println(g.body);
+
+    println(get_status("http://127.0.0.1:18088/hello"));
+    let h = post_form_url("http://127.0.0.1:18088/form", "name=quick");
+    print(h.status);
+    print(" ");
+    println(h.body);
     0
 }
 `
@@ -693,7 +701,9 @@ fn main() -> i32 {
 		"200 hi there:body text\n" +
 		"0 https is not supported (this client is plaintext HTTP only)\n" +
 		"200 abc\n" +
-		"200 zexi lang\n"
+		"200 zexi lang\n" +
+		"200\n" +
+		"200 quick\n"
 	if string(out) != want {
 		t.Fatalf("client output mismatch\n got: %q\nwant: %q", string(out), want)
 	}
@@ -703,9 +713,9 @@ fn main() -> i32 {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("server did not exit after serving six requests")
+		t.Fatal("server did not exit after serving eight requests")
 	}
-	if wantLog := "/hello\n/old\n/hello\n/api/echo\n/cookie\n/form\n"; srvOut.String() != wantLog {
+	if wantLog := "/hello\n/old\n/hello\n/api/echo\n/cookie\n/form\n/hello\n/form\n"; srvOut.String() != wantLog {
 		t.Fatalf("server log mismatch\n got: %q\nwant: %q", srvOut.String(), wantLog)
 	}
 }
@@ -1064,6 +1074,7 @@ func TestImportFacadesAndModLayout(t *testing.T) {
 `,
 		"main.zx": `import math.basic;
 import text.ascii;
+import text.regex;
 import io.fs;
 import os;
 import random;
@@ -1077,7 +1088,7 @@ fn main() -> i32 {
     println(triple(14), seven(), add(2, 3));
     println(abs(sin(PI / 2.0) - 1.0) < 0.00001);
     println(to_upper("zexi"));
-    println(upper("hi"), lower("BYE"), strip("  zexi  "), contains("zexi", "ex"), is_blank(" \t"));
+    println(upper("hi"), lower("BYE"), strip("  zexi  "), contains("zexi", "ex"), is_blank(" \t"), is_match("[0-9]+", "v42"));
     0
 }
 `,
@@ -1098,7 +1109,7 @@ fn main() -> i32 {
 	if err != nil {
 		t.Fatalf("running import/module program: %v", err)
 	}
-	if want := "42 7 5\ntrue\nZEXI\nHI bye zexi true true\n"; string(raw) != want {
+	if want := "42 7 5\ntrue\nZEXI\nHI bye zexi true true true\n"; string(raw) != want {
 		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
 	}
 }
@@ -1157,9 +1168,9 @@ fn main() -> i32 {
 	}
 }
 
-// TestHighLevelHTTPServeN validates the compact `import http.server` surface.
-// A readiness TCP probe is deliberately sent before the two HTTP requests; it
-// must not consume serve_n's request budget.
+// TestHighLevelHTTPServeN validates the compact loopback-only
+// `import http.server` surface. A readiness TCP probe is deliberately sent
+// before the two HTTP requests; it must not consume serve_local_n's budget.
 func TestHighLevelHTTPServeN(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping end-to-end network test in short mode")
@@ -1188,7 +1199,7 @@ fn main() -> i32 {
     let port = arg_at(1).parse_i64() as i32;
     let mut app = Router::new();
     app.get("/", hello);
-    serve_n(&app, 2, port)
+    serve_local_n(&app, 2, port)
 }
 `
 	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
@@ -1302,8 +1313,8 @@ func TestMissingModIsDiagnostic(t *testing.T) {
 	}
 }
 
-// TestHighLevelStaticServeDirN covers the high-level static-server loop rather
-// than only its lower-level serve_static building block.
+// TestHighLevelStaticServeDirN covers the high-level loopback static-server
+// loop rather than only its lower-level serve_static building block.
 func TestHighLevelStaticServeDirN(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping end-to-end network test in short mode")
@@ -1337,7 +1348,7 @@ func TestHighLevelStaticServeDirN(t *testing.T) {
 fn main() -> i32 {
     let root = arg_at(1);
     let port = arg_at(2).parse_i64() as i32;
-    serve_dir_n(root.as_str(), 2, port)
+    serve_dir_local_n(root.as_str(), 2, port)
 }
 `
 	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
@@ -1413,5 +1424,106 @@ fn main() -> i32 { 0 }
 	em.Render(&buf, em.FirstFileID())
 	if !strings.Contains(buf.String(), "E9024") {
 		t.Fatalf("expected E9024 for aliased import, got:\n%s", buf.String())
+	}
+}
+
+// TestStdRegexHelpers exercises the opt-in POSIX ERE facade, including its
+// compatible span ABI, invalid-pattern behavior, and string replacement.
+func TestStdRegexHelpers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end regex test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	src := `import text.regex;
+
+fn main() -> i32 {
+    println(is_valid("[A-Z]+-[0-9]+"));
+    println(is_match("[0-9]+", "item=42"), is_match("[0-9]+", "none"));
+    println(full_match("[0-9]+", "42"), full_match("[0-9]+", "x42"));
+    let span = match_span("beta[0-9]+", "alpha beta42 gamma");
+    println(span.start, span.end);
+    println(find("beta[0-9]+", "alpha beta42 gamma"));
+    println(find_index("beta[0-9]+", "alpha beta42 gamma"));
+    println(replace_first("beta[0-9]+", "alpha beta42 gamma", "ID"));
+    println(is_valid("["), find_index("[", "text"));
+    println(replace_first("^", "x", ">"));
+    0
+}
+`
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build regex program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running regex program: %v", err)
+	}
+	if want := "true\ntrue false\ntrue false\n6 12\nbeta42\n6\nalpha ID gamma\nfalse -1\n>x\n"; string(raw) != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
+	}
+}
+
+// TestStdSysLocalHelpers covers local process state and deliberately
+// non-recursive filesystem operations through the friendly os facade.
+func TestStdSysLocalHelpers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end local-system test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	src := `import os;
+import io.fs;
+
+fn main() -> i32 {
+    let work = arg_at(1);
+    let from = arg_at(2);
+    let to = arg_at(3);
+    println(cwd().len() > 0, hostname().len() > 0, cpu_count() > 0);
+    println(env_has("ZEXI_ARENA_MISSING_VALUE"), env_or("ZEXI_ARENA_MISSING_VALUE", "fallback"));
+    println(env_set("ZEXI_ARENA_LOCAL_TEST", "set"));
+    println(env_get("ZEXI_ARENA_LOCAL_TEST"));
+    println(env_unset("ZEXI_ARENA_LOCAL_TEST"));
+    println(env_has("ZEXI_ARENA_LOCAL_TEST"));
+    println(mkdir(work.as_str()), mkdir(work.as_str()));
+    println(chdir(work.as_str()));
+    println(cwd().len() > 0);
+    println(write_text(from.as_str(), "local"));
+    println(rename_path(from.as_str(), to.as_str()));
+    println(path_exists(to.as_str()));
+    println(remove_path(to.as_str()));
+    println(path_exists(to.as_str()));
+    0
+}
+`
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build local-system program")
+	}
+	work := filepath.Join(dir, "workspace")
+	from := filepath.Join(dir, "from.txt")
+	to := filepath.Join(dir, "to.txt")
+	raw, err := exec.Command(out, work, from, to).Output()
+	if err != nil {
+		t.Fatalf("running local-system program: %v", err)
+	}
+	if want := "true true true\nfalse fallback\n0\nset\n0\nfalse\n0 0\n0\ntrue\n5\n0\ntrue\n0\nfalse\n"; string(raw) != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
 	}
 }

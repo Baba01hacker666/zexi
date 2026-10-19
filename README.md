@@ -49,8 +49,9 @@ This repository contains the **initial design and specification** of Zexi: the v
 > and `serve_dir(root, 8000)` remove the socket/accept boilerplate; `Client`,
 > `fetch`, and `request` cover the client side (see
 > [`docs/08-networking.md`](docs/08-networking.md)). Embedded `math`, `text`,
-> `io`, and `fs` also provide dependency-free arithmetic/trig/primes, familiar
-> string helpers, `input(prompt)`, and capped binary-safe file helpers.
+> `io`, `fs`, `os`, and `regex` also provide dependency-free arithmetic/trig/
+> primes, familiar string helpers, `input(prompt)`, capped binary-safe file
+> helpers, local process/path conveniences, and POSIX-ERE matching.
 >
 > Not yet implemented: generics, traits/`impl Trait`, **scoped** modules and
 > visibility enforcement (the current `use`/`import`/`mod` loader is flat;
@@ -82,6 +83,8 @@ go run ./cmd/zexic run tests/sugar.zx     # break-with-value, Type::new(..), pri
 go run ./cmd/zexic run tests/pi.zx        # 30 digits of π: big-int + Machin's formula
 go run ./cmd/zexic run examples/http_app.zx                  # high-level Router + serve
 go run ./cmd/zexic run examples/static_server.zx -- .         # one-call static server
+go run ./cmd/zexic run examples/local_tools.zx -- release-42  # local os + regex helpers
+go run ./cmd/zexic run examples/regex.zx                      # POSIX-ERE matching
 # The low-level, explicit FFI example remains available too:
 go run ./cmd/zexic run examples/http_server.zx lib/http.zx
 go run ./cmd/zexic run examples/http_client.zx lib/http.zx   # an HTTP client (needs the server)
@@ -116,8 +119,10 @@ for why, its real costs, and the plan to replace it with a native backend.
 - [`docs/05-roadmap.md`](docs/05-roadmap.md) — M0/M1/M2 milestones and the minimal viable feature set.
 - [`docs/06-backend-strategy.md`](docs/06-backend-strategy.md) — the C backend, its costs, and the road to a native backend.
 - [`docs/07-cheatsheet.md`](docs/07-cheatsheet.md) — a one-page tour of the language as it exists today.
-- [`docs/08-networking.md`](docs/08-networking.md) — FFI via `extern "C"`, and the HTTP library in `lib/http.zx`.
-- [`examples/`](examples/) — illustrative Zexi programs (aspirational; only the M0-alpha subset compiles today).
+- [`docs/08-networking.md`](docs/08-networking.md) — the embedded HTTP client/server and networking helpers.
+- [`docs/09-c-bridge.md`](docs/09-c-bridge.md) — calling C libraries through `extern "C"` and bindgen.
+- [`docs/10-stdlib-recipes.md`](docs/10-stdlib-recipes.md) — local networking, OS, filesystem, and regex recipes.
+- [`examples/`](examples/) — ready-to-run Zexi programs plus focused feature examples.
 - [`tests/tour.zx`](tests/tour.zx) — the end-to-end program the test suite compiles and runs.
 - [`tests/syntax.zx`](tests/syntax.zx) — a runnable syntax tour; [`tests/pi.zx`](tests/pi.zx) — 30 digits of π.
 

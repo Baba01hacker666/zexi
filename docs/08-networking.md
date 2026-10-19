@@ -180,9 +180,9 @@ fn main() {
 
 | API | Purpose |
 | --- | --- |
-| `fetch(url)` / `get_url(url)` | one-call GET with redirects |
+| `fetch(url)` / `get_url(url)` / `get_status(url)` | one-call GET or status-only request |
 | `request(method, url, body = "", content_type = "")` | one-call configurable request |
-| `post_url`, `post_json`, `put_url`, `delete_url`, `download` | high-level URL helpers |
+| `post_url`, `post_json`, `post_form_url`, `put_url`, `delete_url`, `download` | high-level URL helpers |
 | `Client::new()` / `Client.get/post/put/delete/send` | configurable reusable client |
 | `Client.post_form`, `Client.download` | form posts, and fetch-to-file |
 | `Client.timeout_ms`, `Client.follow_redirects`, `Client.max_redirects`, `Client.user_agent`, `Client.set_header` | client settings |
@@ -206,14 +206,16 @@ fn hello(req: &Request) -> Response {
 fn main() -> i32 {
     let mut app = Router::new();
     app.get("/", hello);
-    serve(&app, 8080)  // host defaults to 0.0.0.0; runs until stopped
+    serve_local(&app, 8080)  // loopback only; runs until stopped
 }
 ```
 
-For a controlled service or a test, `serve_n(&app, 10, 8080)` exits after ten
-valid requests. [`examples/http_app.zx`](../examples/http_app.zx) has a larger
-ready-to-run app. If you want the explicit accept loop, `listen`,
-`read_request`, and `send_response` remain public too.
+Use `serve(&app, port)` when intentionally exposing a service on all IPv4
+interfaces, or pass an explicit host as its third argument. For a controlled
+service or a test, `serve_n(&app, 10, 8080)` exits after ten valid requests;
+`serve_local_n` is the loopback-only counterpart. [`examples/http_app.zx`](../examples/http_app.zx)
+has a larger ready-to-run app. If you want the explicit accept loop, `listen`,
+`listen_local`, `read_request`, and `send_response` remain public too.
 
 | API | Purpose |
 | --- | --- |
@@ -224,7 +226,9 @@ ready-to-run app. If you want the explicit accept loop, `listen`,
 | `Response.keep_alive` | advertise a persistent connection |
 | `Router::new()`, `.get/.post/.put/.delete/.set_fallback`, `.dispatch/.serve` | Go-style handler table |
 | `serve(&router, port)`, `serve_n(...)` | high-level accept loop (forever or request-bounded) |
+| `serve_local(&router, port)`, `serve_local_n(...)` | loopback-only server helpers for local development/tests |
 | `serve_static(root, path)`, `serve_dir(root, port)`, `serve_file(path)` | static files with MIME detection and traversal checks |
+| `serve_dir_local(root, port)`, `serve_dir_local_n(...)` | loopback-only static-site helpers |
 | `read_file`, `write_file_bytes`, `file_size` | binary-safe file helpers (also used by downloads) |
 
 Handlers are ordinary functions (`fn(&Request) -> Response`) stored and invoked
@@ -262,12 +266,13 @@ import http.server;
 
 fn main() -> i32 {
     let root = arg_at(1);
-    serve_dir(root.as_str(), 8000)
+    serve_dir_local(root.as_str(), 8000)
 }
 ```
 
-Use `serve_static(root, req.path_only().as_str())` when it is one route in a
-larger app. `serve_static` maps `/` to `index.html`, rejects decoded `..`, backslashes and
+Use `serve_dir` when LAN exposure is intentional, or `serve_dir_local_n` for a
+request-bounded local tool. Use `serve_static(root, req.path_only().as_str())`
+when it is one route in a larger app. `serve_static` maps `/` to `index.html`, rejects decoded `..`, backslashes and
 NUL with `403`, returns `404` for missing files and `413` above 32 MiB. MIME
 types follow the extension. Bodies are copied byte-for-byte: `send_response`
 writes the head and body separately, so images and other binary files survive

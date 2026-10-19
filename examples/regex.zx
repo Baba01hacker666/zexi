@@ -1,0 +1,17 @@
+// Small POSIX-ERE regex example.
+//
+// Run:
+//   zexic run examples/regex.zx
+//
+// `import text.regex;` is an opt-in, dependency-free-at-source facade over
+// the platform's POSIX regular-expression engine.
+
+import text.regex;
+
+fn main() -> i32 {
+    let label = "build-42";
+    println(is_match("^[a-z]+-[0-9]+$", label));
+    println(find("[0-9]+", label));
+    println(replace_first("[0-9]+", label, "XX"));
+    0
+}

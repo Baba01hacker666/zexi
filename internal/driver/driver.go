@@ -134,6 +134,9 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 	if l.usesSys {
 		art.CExtra = append(art.CExtra, string(sysCSource))
 	}
+	if l.usesRegex {
+		art.CExtra = append(art.CExtra, string(regexCSource))
+	}
 	return art, true
 }
 
@@ -181,20 +184,26 @@ var stdFS embed.FS
 //go:embed zxnet_c.txt
 var netCSource []byte
 
-// sysCSource is the C shim for the `sys` module (env, clocks, sleep, pid),
-// embedded like the networking runtime.
+// sysCSource is the C shim for the `sys` module (environment, local paths,
+// clocks, and process helpers), embedded like the networking runtime.
 //
 //go:embed zxsys_c.txt
 var sysCSource []byte
 
+// regexCSource is the opt-in POSIX ERE bridge for the `regex` module.
+//
+//go:embed zxregex_c.txt
+var regexCSource []byte
+
 // loader reads source files (entry points plus everything they use/import/mod),
 // parses them, and merges their items into one program.
 type loader struct {
-	em      *diag.Emitter
-	merged  *ast.File
-	loaded  map[string]bool // canonical file keys already loaded
-	usesNet bool            // program imports net/http/fs (needs the shared C runtime)
-	usesSys bool            // program imports sys (needs the C shim)
+	em        *diag.Emitter
+	merged    *ast.File
+	loaded    map[string]bool // canonical file keys already loaded
+	usesNet   bool            // program imports net/http/fs (needs the shared C runtime)
+	usesSys   bool            // program imports sys (needs the C shim)
+	usesRegex bool            // program imports regex (needs the POSIX ERE shim)
 }
 
 // loadDiskFile loads one file from disk and everything it imports.
@@ -244,11 +253,13 @@ var stdModuleAliases = map[string]string{
 	"os":           "sys",
 	"random":       "random",
 	"random::rng":  "random",
+	"regex":        "regex",
 	"sys":          "sys",
 	"sys::env":     "sys",
 	"sys::time":    "sys",
 	"text":         "text",
 	"text::ascii":  "text",
+	"text::regex":  "regex",
 	"time":         "sys",
 }
 
@@ -283,6 +294,8 @@ func (l *loader) loadStdFile(name string) int {
 		l.usesNet = true
 	case "sys":
 		l.usesSys = true
+	case "regex":
+		l.usesRegex = true
 	}
 	display := "std/" + name + ".zx"
 	src, err := fs.ReadFile(stdFS, display)
@@ -364,15 +377,17 @@ func (l *loader) loadUse(d *ast.UseDecl, dir string) {
 		return
 	}
 
-	// Preserve the historical convenience for local modules named net/http/sys:
-	// their ABI calls can use the embedded runtime too. Embedded modules also
-	// mark themselves in loadStdFile, which covers facade paths like
-	// `import http.server;` whose last segment is not `http`.
+	// Preserve the historical convenience for local modules named net/http/sys
+	// (and regex): their ABI calls can use the embedded runtime too. Embedded
+	// modules also mark themselves in loadStdFile, which covers facade paths
+	// like `import http.server;` whose last segment is not `http`.
 	switch d.Path[len(d.Path)-1] {
 	case "net", "http", "fs":
 		l.usesNet = true
 	case "sys":
 		l.usesSys = true
+	case "regex":
+		l.usesRegex = true
 	}
 
 	parts := d.Path

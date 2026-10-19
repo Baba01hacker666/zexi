@@ -1,0 +1,74 @@
+// regex — small POSIX regular-expression helpers for Zexi.
+// Import with `use regex;`, `use std::regex;`, or `import text.regex;`.
+//
+// Patterns use POSIX extended regular expressions (ERE), not PCRE/Python
+// syntax: use `[[:digit:]]` or `[0-9]` rather than `\d`. The C ABI accepts
+// text strings, so embedded NUL bytes are not supported. Invalid patterns act
+// like no match; call is_valid when that distinction matters.
+
+// RegexSpan describes the first matching byte range. A failed search has
+// start == -1 and end == -1. Offsets are byte offsets, matching String.len().
+pub struct RegexSpan {
+    pub start: i64,
+    pub end: i64,
+}
+
+// The C shim's span struct has the same two i64 fields and is only passed by
+// pointer, so its ABI matches RegexSpan without exposing C details to callers.
+extern "C" fn zxr_is_valid(pattern: str) -> i32;
+extern "C" fn zxr_search_span(pattern: str, text: str, span: &mut RegexSpan) -> i32;
+extern "C" fn zxr_full_match(pattern: str, text: str) -> i32;
+
+// is_valid reports whether pattern can be compiled as a POSIX ERE.
+pub fn is_valid(pattern: str) -> bool {
+    return zxr_is_valid(pattern) == 1;
+}
+
+// match_span finds the first match anywhere in text. Its start/end are -1
+// when the pattern is invalid or no match exists.
+pub fn match_span(pattern: str, text: str) -> RegexSpan {
+    let mut span = RegexSpan { start: -1, end: -1 };
+    zxr_search_span(pattern, text, &mut span);
+    return span;
+}
+
+// is_match is a search-style predicate: it is true when any substring matches.
+// Use full_match when the entire text must satisfy the pattern.
+pub fn is_match(pattern: str, text: str) -> bool {
+    return match_span(pattern, text).start >= 0;
+}
+
+// full_match reports whether the complete text matches pattern.
+pub fn full_match(pattern: str, text: str) -> bool {
+    return zxr_full_match(pattern, text) == 1;
+}
+
+// find_index returns the first matching byte index, or -1 when absent/invalid.
+pub fn find_index(pattern: str, text: str) -> i64 {
+    return match_span(pattern, text).start;
+}
+
+// find returns the first matching substring, or "" when absent/invalid.
+pub fn find(pattern: str, text: str) -> String {
+    let span = match_span(pattern, text);
+    if span.start < 0 {
+        return String::new();
+    }
+    let value = String::from(text);
+    return value.substr(span.start as usize, (span.end - span.start) as usize);
+}
+
+// replace_first replaces only the first matching substring. A missing or
+// invalid pattern leaves text unchanged. Empty matches are supported.
+pub fn replace_first(pattern: str, text: str, replacement: str) -> String {
+    let span = match_span(pattern, text);
+    if span.start < 0 {
+        return String::from(text);
+    }
+    let value = String::from(text);
+    let mut out = value.substr(0, span.start as usize);
+    out.push_str(replacement);
+    let tail = value.substr(span.end as usize, value.len() - (span.end as usize));
+    out.push_str(tail.as_str());
+    return out;
+}

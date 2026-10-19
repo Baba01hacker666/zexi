@@ -836,6 +836,17 @@ pub fn post_json(url: str, body: str) -> Response {
     return request("POST", url, body, "application/json");
 }
 
+// post_form_url is the simple URL-encoded form counterpart to post_json.
+pub fn post_form_url(url: str, form: str) -> Response {
+    return request("POST", url, form, "application/x-www-form-urlencoded");
+}
+
+// get_status is handy when only a health/status code is needed.
+pub fn get_status(url: str) -> i32 {
+    let response = fetch(url);
+    return response.status;
+}
+
 pub fn put_url(url: str, body: str) -> Response {
     return request("PUT", url, body, "text/plain; charset=utf-8");
 }
@@ -1132,6 +1143,12 @@ pub fn serve(router: &Router, port: i32 = 8000, host: str = "0.0.0.0") -> i32 {
     }
 }
 
+// serve_local is the safer local-development form of serve: it listens only on
+// 127.0.0.1 instead of every IPv4 interface.
+pub fn serve_local(router: &Router, port: i32 = 8000) -> i32 {
+    return serve(router, port, "127.0.0.1");
+}
+
 // serve_n is serve with a request budget, useful for tests, command-line tools,
 // and graceful single-purpose services. Empty TCP probes do not count because
 // Router.serve returns false for them.
@@ -1153,6 +1170,12 @@ pub fn serve_n(router: &Router, max_requests: i32, port: i32 = 8000, host: str =
     }
     listener.close();
     return 0;
+}
+
+// serve_local_n is serve_n constrained to loopback for deterministic local
+// tools and tests.
+pub fn serve_local_n(router: &Router, max_requests: i32, port: i32 = 8000) -> i32 {
+    return serve_n(router, max_requests, port, "127.0.0.1");
 }
 
 // path_matches supports exact routes and a trailing "/*" prefix; the bare
@@ -1326,6 +1349,17 @@ pub fn serve_dir_n(root: str, max_requests: i32, port: i32 = 8000, host: str = "
     }
     listener.close();
     return 0;
+}
+
+// serve_dir_local serves a directory only on loopback, ideal for previews and
+// local development without exposing the directory to the LAN.
+pub fn serve_dir_local(root: str, port: i32 = 8000) -> i32 {
+    return serve_dir(root, port, "127.0.0.1");
+}
+
+// serve_dir_local_n is the bounded loopback static-server form.
+pub fn serve_dir_local_n(root: str, max_requests: i32, port: i32 = 8000) -> i32 {
+    return serve_dir_n(root, max_requests, port, "127.0.0.1");
 }
 
 // content_type_for guesses a Content-Type from a filename extension.

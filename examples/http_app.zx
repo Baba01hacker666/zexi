@@ -36,5 +36,5 @@ fn main() -> i32 {
     app.get("/health", health);
 
     println("listening on http://127.0.0.1:8000");
-    serve(&app, 8000, "127.0.0.1")
+    serve_local(&app, 8000)
 }

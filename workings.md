@@ -61,7 +61,7 @@ handles strings, printing, arrays, and the standard library's C shims.
 - Writes generated C to temp files.
 - Invokes `cc` with `-std=gnu11`, optimization, `-fwrapv` (defined signed
   integer wrapping), `-ffunction-sections`, `-fdata-sections`, and include dirs.
-- Links extra C sources (`--csrc`), embedded runtimes (net/sys), and libs.
+- Links extra C sources (`--csrc`), embedded runtimes (net/sys/regex), and libs.
 - `--gc-sections` / `-dead_strip` prunes unused functions (tree-shaking).
 
 ---
@@ -92,22 +92,24 @@ Embedded in the compiler under `internal/driver/std/`:
 | math   | `math.zx` | arithmetic, roots/trig/interpolation, primes/combinatorics |
 | text   | `text.zx` | string helpers |
 | random | `random.zx` | RNG |
-| sys    | `sys.zx` | env, clocks, sleep, pid (C shim `zxsys_c.txt`) |
+| regex  | `regex.zx` | POSIX-ERE search/full-match/find/replace (C shim `zxregex_c.txt`) |
+| sys    | `sys.zx` | env, local paths/filesystem ops, clocks, pid (C shim `zxsys_c.txt`) |
 | net    | `net.zx` | TCP sockets and shared file ABI (C shim `zxnet_c.txt`) |
 | http   | `http.zx` | HTTP client/server, Router + serve/serve_dir helpers |
 
 Import with `use io;`, `use std::net;`, `use http;`, or Python-shaped
-`import http.server;` / `import io.fs;`. The linker prunes anything not called,
-so importing costs nothing unless used.
+`import http.server;`, `import io.fs;`, `import os;`, and `import text.regex;`.
+The linker prunes anything not called, so importing costs nothing unless used.
 
-Each module may pull in a C shim (`zxnet_c.txt`, `zxsys_c.txt`) which is
-appended to the build only when the module is used.
+Each module may pull in a C shim (`zxnet_c.txt`, `zxsys_c.txt`,
+`zxregex_c.txt`) which is appended to the build only when the module is used.
 
 ---
 
 ## 5. Networking & HTTP
 
-- `net.zx` wraps POSIX sockets via `extern "C"` functions (`zxn_*`).
+- `net.zx` wraps POSIX sockets via `extern "C"` functions (`zxn_*`), including
+  `connect_local` / `listen_local` loopback conveniences.
 - `Conn` and `Server` own file descriptors; `close` invalidates the fd.
 - `http.zx` implements:
   - URL parsing, redirects (with header stripping on cross-origin)
@@ -160,7 +162,7 @@ Key flags: `--jobs N` (parallel units), `--opt-level`, `--include`, `--csrc`,
 | Codegen | `internal/codegen/c/` |
 | Driver / build | `internal/driver/driver.go` |
 | Stdlib | `internal/driver/std/` |
-| C shims | `internal/driver/zxnet_c.txt`, `zxsys_c.txt` |
+| C shims | `internal/driver/zxnet_c.txt`, `zxsys_c.txt`, `zxregex_c.txt` |
 | CLI | `cmd/zexic/main.go` |
 | Docs | `docs/` |
 | Examples | `examples/` |

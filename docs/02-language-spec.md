@@ -422,5 +422,11 @@ Deliberately tiny — a "core" that is largely in-language:
 - `os`/`sys` (opt-in): file, socket, process, time — thin libc or syscall
   wrappers, only linked when used.
 
+The shipped M1-preview helpers are embedded source modules: `io`, `fs`, `math`,
+`text`, `regex`, `random`, `sys`/`os`, `net`, and `http`. For example,
+`import text.regex;` selects the small POSIX-ERE facade and `import os;` selects
+local environment/path/process helpers. Their C shims are linked only if that
+module is selected.
+
 No `std` is linked by default; `#![no_std]` is the default rather than an
 opt-in, which is a key part of hitting the binary-size target.

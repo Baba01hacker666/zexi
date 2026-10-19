@@ -53,6 +53,12 @@ pub fn connect(host: str, port: i32, timeout_ms: i32 = 30000) -> Conn {
     return Conn { fd: fd };
 }
 
+// connect_local is the convenient loopback form of connect, useful for local
+// tools and tests. It never reaches the network beyond this machine.
+pub fn connect_local(port: i32, timeout_ms: i32 = 30000) -> Conn {
+    return connect("127.0.0.1", port, timeout_ms);
+}
+
 // listen binds a TCP listener on host:port. Server.fd is negative on error.
 pub fn listen(host: str, port: i32) -> Server {
     let fd = zxn_socket(AF_INET, SOCK_STREAM, 0);
@@ -69,6 +75,12 @@ pub fn listen(host: str, port: i32) -> Server {
         return Server { fd: -1 };
     }
     return Server { fd: fd };
+}
+
+// listen_local binds only the loopback interface. Prefer it for development
+// servers that should not be reachable from another machine.
+pub fn listen_local(port: i32) -> Server {
+    return listen("127.0.0.1", port);
 }
 
 impl Conn {
