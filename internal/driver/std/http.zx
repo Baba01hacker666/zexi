@@ -1124,6 +1124,13 @@ impl Router {
     }
 }
 
+// accept_retryable reports whether the listener's last accept failure was
+// transient. A persistent failure (such as running out of file descriptors)
+// must stop the server instead of spinning on a hot loop.
+fn accept_retryable() -> bool {
+    return zxn_accept_retryable() == 1;
+}
+
 // serve is the high-level server entry point: register handlers on a Router,
 // then call `serve(&router, 8000)`. It listens on all IPv4 interfaces by
 // default and runs until the process is stopped. A non-zero return means the
@@ -1136,7 +1143,11 @@ pub fn serve(router: &Router, port: i32 = 8000, host: str = "0.0.0.0") -> i32 {
     loop {
         let mut conn = listener.accept();
         if !conn.ok() {
-            continue;
+            if accept_retryable() {
+                continue;
+            }
+            listener.close();
+            return 1;
         }
         router.serve(&conn);
         conn.close();
@@ -1161,7 +1172,11 @@ pub fn serve_n(router: &Router, max_requests: i32, port: i32 = 8000, host: str =
     while served < max_requests {
         let mut conn = listener.accept();
         if !conn.ok() {
-            continue;
+            if accept_retryable() {
+                continue;
+            }
+            listener.close();
+            return 1;
         }
         if router.serve(&conn) {
             served += 1;
@@ -1286,7 +1301,54 @@ pub fn serve_static(root: str, url_path: str) -> Response {
         full.push_byte(47); // '/'
     }
     full.push_str(rel.as_str());
-    return serve_file(full.as_str());
+
+    // Resolve symlinks before opening, so a link inside the tree cannot expose
+    // a file outside the served root. A path that cannot be resolved is a
+    // missing file (404); a resolved path outside root is refused (403).
+    let real_root = resolve_real_path(root_s.as_str());
+    if real_root.len() == 0 {
+        return Response::empty(404);
+    }
+    let real_full = resolve_real_path(full.as_str());
+    if real_full.len() == 0 {
+        return Response::empty(404);
+    }
+    if !path_within_root(&real_root, &real_full) {
+        return Response::empty(403);
+    }
+    return serve_file(real_full.as_str());
+}
+
+// resolve_real_path returns the canonical absolute path for `path` (following
+// symlinks), or an empty String when it cannot be resolved.
+fn resolve_real_path(path: str) -> String {
+    let mut buf: [u8; 4096] = [0; 4096];
+    let n = zxn_realpath(path, &mut buf, 4096);
+    let mut out = String::new();
+    if n > 0 {
+        let mut i: usize = 0;
+        while i < (n as usize) {
+            out.push_byte(buf[i]);
+            i += 1;
+        }
+    }
+    return out;
+}
+
+// path_within_root reports whether resolved path `full` is `root` itself or a
+// descendant of it. The separator check keeps "/srv/www-evil" from passing as
+// a child of "/srv/www".
+fn path_within_root(root: &String, full: &String) -> bool {
+    if root.len() == 0 || full.len() < root.len() {
+        return false;
+    }
+    if !full.starts_with(root.as_str()) {
+        return false;
+    }
+    if full.len() == root.len() {
+        return true;
+    }
+    return full.byte_at(root.len()) == 47; // '/'
 }
 
 // serve_dir_connection handles one static-file request. It intentionally uses
@@ -1323,7 +1385,11 @@ pub fn serve_dir(root: str, port: i32 = 8000, host: str = "0.0.0.0") -> i32 {
     loop {
         let mut conn = listener.accept();
         if !conn.ok() {
-            continue;
+            if accept_retryable() {
+                continue;
+            }
+            listener.close();
+            return 1;
         }
         serve_dir_connection(&conn, root);
         conn.close();
@@ -1340,7 +1406,11 @@ pub fn serve_dir_n(root: str, max_requests: i32, port: i32 = 8000, host: str = "
     while served < max_requests {
         let mut conn = listener.accept();
         if !conn.ok() {
-            continue;
+            if accept_retryable() {
+                continue;
+            }
+            listener.close();
+            return 1;
         }
         if serve_dir_connection(&conn, root) {
             served += 1;

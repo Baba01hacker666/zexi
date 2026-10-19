@@ -751,6 +751,11 @@ func TestStdHTTPStaticFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("secret"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// A symlink inside the served tree must not expose the file it points to
+	// outside the tree.
+	if err := os.Symlink(filepath.Join(dir, "secret.txt"), filepath.Join(web, "link.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
 
 	serverSrc := `use http;
 
@@ -762,7 +767,7 @@ fn main() -> i32 {
         return 1;
     }
     let mut served: i32 = 0;
-    while served < 4 {
+    while served < 5 {
         let mut c = srv.accept();
         if !c.ok() {
             continue;
@@ -831,13 +836,16 @@ fn main() -> i32 {
 	if status, _, _ := get("/%2e%2e/secret.txt"); status != 403 {
 		t.Fatalf("traversal: status=%d, want 403", status)
 	}
+	if status, _, body := get("/link.txt"); status != 403 {
+		t.Fatalf("symlink escape: status=%d body=%q, want 403", status, body)
+	}
 
 	done := make(chan struct{})
 	go func() { server.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("server did not exit after serving four requests")
+		t.Fatal("server did not exit after serving five requests")
 	}
 }
 
@@ -1275,7 +1283,7 @@ fn main() -> i32 {
     println(approx_eq(exp(1.0), E, 0.000000000001), approx_eq(log(E), 1.0, 0.000000000001), approx_eq(log2(8.0), 3.0, 0.000000000001), approx_eq(log10(1000.0), 3.0, 0.000000000001), approx_eq(log_base(81.0, 3.0), 4.0, 0.000000000001), approx_eq(exp(ln(0.5)), 0.5, 0.000000000001));
     println(approx_eq(powf(9.0, 0.5), 3.0, 0.000000000001), approx_eq(powf(-2.0, 3.0), -8.0, 0.000000000001), powf(-2.0, 0.5) == 0.0, powf(MAX_F64, 0.0) == 1.0);
     println(approx_eq(atan(1.0), FRAC_PI_4, 0.000000000001), approx_eq(atan2(1.0, 1.0), FRAC_PI_4, 0.000000000001), approx_eq(atan2(-1.0, -1.0), 0.0 - 3.0 * FRAC_PI_4, 0.000000000001), approx_eq(asin(1.0), FRAC_PI_2, 0.000000000001), approx_eq(asin(0.5), PI / 6.0, 0.000000000001), approx_eq(acos(-1.0), PI, 0.000000000001));
-    println(approx_eq(radians(180.0), PI, 0.000000000001), approx_eq(degrees(PI), 180.0, 0.000000000001), approx_eq(sinh(0.0), 0.0, 0.000000000001), approx_eq(cosh(0.0), 1.0, 0.000000000001), approx_eq(tanh(1.0), 0.7615941559557649, 0.000000000001));
+    println(approx_eq(radians(180.0), PI, 0.000000000001), approx_eq(degrees(PI), 180.0, 0.000000000001), approx_eq(sinh(0.0), 0.0, 0.000000000001), approx_eq(cosh(0.0), 1.0, 0.000000000001), approx_eq(tanh(1.0), 0.7615941559557649, 0.000000000001), sinh(0.0 - 1000.0) == 0.0 - sinh(1000.0), cosh(0.0 - 1000.0) == cosh(1000.0));
     println(approx_eq(cbrt(-125.0), -5.0, 0.000000000001), approx_eq(root(81.0, 4), 3.0, 0.000000000001), smoothstep(0.0, 10.0, 5.0) == 0.5, smootherstep(0.0, 10.0, 5.0) == 0.5);
     println(approx_eq(distance(0.0, 0.0, 3.0, 4.0), 5.0, 0.000000000001), distance_sq(0.0, 0.0, 3.0, 4.0) == 25.0, fract(-2.75) == -0.75, copysign(2.0, -1.0) == -2.0, sign(-0.5) == -1.0, saturate(3.0) == 1.0);
     let inf = MAX_F64 * 2.0;
@@ -1300,7 +1308,7 @@ fn main() -> i32 {
 	if err != nil {
 		t.Fatalf("running high-level math program: %v", err)
 	}
-	if want := "true\ntrue\ntrue\ntrue\ntrue true true true true true\ntrue true true true\ntrue true true true true true\ntrue true true true true\ntrue true true true\ntrue true true true true true\nfalse true true false\n0 0 0 0 0\ntrue\ntrue\n3628800 120 true 101 0\n"; string(raw) != want {
+	if want := "true\ntrue\ntrue\ntrue\ntrue true true true true true\ntrue true true true\ntrue true true true true true\ntrue true true true true true true\ntrue true true true\ntrue true true true true true\nfalse true true false\n0 0 0 0 0\ntrue\ntrue\n3628800 120 true 101 0\n"; string(raw) != want {
 		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
 	}
 }

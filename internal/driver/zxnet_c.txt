@@ -120,6 +120,27 @@ int zxn_accept(int fd) {
     }
 }
 
+/* zxn_accept_retryable classifies the errno left by a failed zxn_accept.
+ * Returns 1 for transient failures that are safe to retry, 0 otherwise. */
+int zxn_accept_retryable(void) {
+    switch (errno) {
+    case EINTR:
+    case EAGAIN:
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+    case EWOULDBLOCK:
+#endif
+#ifdef ECONNABORTED
+    case ECONNABORTED:
+#endif
+#ifdef EPROTO
+    case EPROTO:
+#endif
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 int zxn_setsockopt_reuseaddr(int fd) {
     int one = 1;
     return setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
@@ -192,6 +213,20 @@ long zxn_file_size(const char *path) {
     struct stat st;
     if (!path || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
     return (long)st.st_size;
+}
+
+/* zxn_realpath resolves symlinks and returns the canonical absolute path in
+ * buf (NUL-terminated), or -1 when path cannot be resolved. */
+int zxn_realpath(const char *path, char *buf, int cap) {
+    if (!path || cap <= 0) return -1;
+    char *resolved = realpath(path, NULL);
+    if (!resolved) return -1;
+    size_t n = strlen(resolved);
+    if (n >= (size_t)cap) { free(resolved); return -1; }
+    memcpy(buf, resolved, n);
+    buf[n] = '\0';
+    free(resolved);
+    return (int)n;
 }
 
 int zxn_write_file(const char *path, const char *buf, int n) {

@@ -10,6 +10,10 @@ extern "C" fn zxn_connect(fd: i32, host: str, port: i32, timeout_ms: i32) -> i32
 extern "C" fn zxn_bind(fd: i32, host: str, port: i32) -> i32;
 extern "C" fn zxn_listen(fd: i32, backlog: i32) -> i32;
 extern "C" fn zxn_accept(fd: i32) -> i32;
+// zxn_accept_retryable classifies the errno left by a failed zxn_accept: 1 for
+// transient failures worth retrying, 0 for persistent ones (for example,
+// EMFILE/ENFILE when the process is out of file descriptors).
+extern "C" fn zxn_accept_retryable() -> i32;
 extern "C" fn zxn_setsockopt_reuseaddr(fd: i32) -> i32;
 extern "C" fn zxn_set_timeout(fd: i32, ms: i32) -> i32;
 extern "C" fn zxn_send_all(fd: i32, buf: str, n: i32) -> i32;
@@ -24,6 +28,9 @@ extern "C" fn zxn_file_read(handle: i64, buf: &mut [u8; 8192], cap: i32) -> i32;
 extern "C" fn zxn_file_close(handle: i64) -> i32;
 extern "C" fn zxn_file_size(path: str) -> i64;
 extern "C" fn zxn_write_file(path: str, buf: str, n: i32) -> i32;
+// zxn_realpath resolves symlinks and returns the canonical absolute path in
+// buf (NUL-terminated), or -1 when path cannot be resolved.
+extern "C" fn zxn_realpath(path: str, buf: &mut [u8; 4096], cap: i32) -> i32;
 
 const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;

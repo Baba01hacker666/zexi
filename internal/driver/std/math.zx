@@ -811,13 +811,14 @@ pub fn acos(x: f64) -> f64 {
 // sinh, cosh, and tanh are the usual hyperbolic functions. exp's documented
 // saturation behavior also bounds extreme inputs to these helpers.
 pub fn sinh(x: f64) -> f64 {
-    let ex = exp(x);
-    return (ex - 1.0 / ex) / 2.0;
+    // exp(0.0 - x) keeps both terms bounded by exp's documented saturation,
+    // so sinh is odd and symmetric instead of producing infinity for large
+    // negative inputs (where 1.0 / exp(x) would divide by 0.0).
+    return (exp(x) - exp(0.0 - x)) / 2.0;
 }
 
 pub fn cosh(x: f64) -> f64 {
-    let ex = exp(x);
-    return (ex + 1.0 / ex) / 2.0;
+    return (exp(x) + exp(0.0 - x)) / 2.0;
 }
 
 pub fn tanh(x: f64) -> f64 {

@@ -273,7 +273,8 @@ fn main() -> i32 {
 Use `serve_dir` when LAN exposure is intentional, or `serve_dir_local_n` for a
 request-bounded local tool. Use `serve_static(root, req.path_only().as_str())`
 when it is one route in a larger app. `serve_static` maps `/` to `index.html`, rejects decoded `..`, backslashes and
-NUL with `403`, returns `404` for missing files and `413` above 32 MiB. MIME
+NUL with `403`, resolves symlinks and refuses any target that escapes the
+served root with `403`, returns `404` for missing files and `413` above 32 MiB. MIME
 types follow the extension. Bodies are copied byte-for-byte: `send_response`
 writes the head and body separately, so images and other binary files survive
 (plain `render_response` is for text only). `Client.download(url, path)` is the

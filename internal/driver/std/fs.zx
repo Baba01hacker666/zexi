@@ -88,6 +88,14 @@ pub fn copy_file(from: str, to: str) -> i32 {
     if size < 0 || size > FS_MAX_BYTES as i64 {
         return -1;
     }
+    // A zero-byte file and an unreadable file both report length 0, but only
+    // the former should copy. Confirm the source actually opens before
+    // touching the destination so an unreadable source reports -1.
+    let probe = zxn_file_open(from);
+    if probe < 0 {
+        return -1;
+    }
+    zxn_file_close(probe);
     let data = read_bytes(from);
     // Detect a concurrent truncation/read failure instead of silently copying a
     // partial file. (The size is bounded above, so this cast is safe here.)
