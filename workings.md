@@ -106,13 +106,15 @@ Embedded in the compiler under `internal/driver/std/`:
 | sys    | `sys.zx` | env, local paths/filesystem ops, clocks, pid (C shim `zxsys_c.txt`) |
 | net    | `net.zx` | TCP sockets and shared file ABI (C shim `zxnet_c.txt`) |
 | http   | `http.zx` | HTTP client/server, Router + serve/serve_dir helpers |
+| thread | `thread.zx` | OS threads, `i64` channels, `i64` atomics (C shim `zxthread_c.txt`, links `-pthread`) |
 
 Import with `use io;`, `use std::net;`, `use http;`, or Python-shaped
 `import http.server;`, `import io.fs;`, `import os;`, and `import text.regex;`.
 The linker prunes anything not called, so importing costs nothing unless used.
 
 Each module may pull in a C shim (`zxnet_c.txt`, `zxsys_c.txt`,
-`zxregex_c.txt`) which is appended to the build only when the module is used.
+`zxregex_c.txt`, `zxthread_c.txt`) which is appended to the build only when the
+module is used.
 
 ---
 
@@ -172,7 +174,7 @@ Key flags: `--jobs N` (parallel units), `--opt-level`, `--include`, `--csrc`,
 | Codegen | `internal/codegen/c/` |
 | Driver / build | `internal/driver/driver.go` |
 | Stdlib | `internal/driver/std/` |
-| C shims | `internal/driver/zxnet_c.txt`, `zxsys_c.txt`, `zxregex_c.txt` |
+| C shims | `internal/driver/zxnet_c.txt`, `zxsys_c.txt`, `zxregex_c.txt`, `zxthread_c.txt` |
 | CLI | `cmd/zexic/main.go` |
 | Docs | `docs/` |
 | Examples | `examples/` |

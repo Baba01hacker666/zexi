@@ -221,3 +221,42 @@ platform-libm semantics, bind the required C function explicitly as described
 in [`09-c-bridge.md`](09-c-bridge.md).
 
 Run [`examples/math_tools.zx`](../examples/math_tools.zx) for a compact tour.
+
+## 10.6 Concurrency: threads, channels, and atomics
+
+`use thread;` adds real OS threads with fork–join, blocking `i64` channels, and
+lock-free `i64` atomics. It is the one stdlib module that links a thread shim
+(and `-pthread`), and only when imported:
+
+```zx
+use thread;
+
+fn worker(ch: i64) -> i64 {
+    let mut i: i64 = 1;
+    while i <= 5 {
+        chan_send(ch, i * i);
+        i += 1;
+    }
+    chan_close(ch);
+    return 0;
+}
+
+fn main() -> i32 {
+    let ch = Chan::new(4);
+    let t = Thread::spawn(worker, ch.id());
+    let mut sum: i64 = 0;
+    let mut v: i64 = 0;
+    while ch.recv(&mut v) {
+        sum += v;
+    }
+    t.join();
+    println(sum);        // 55
+    0
+}
+```
+
+Only `i64` values cross a thread boundary, which keeps the subset data-race-free.
+The full guide — `spawn`/`spawn2`/`spawn_void`, the free-function forms a worker
+uses, atomics, limits, and the `Send`/`Sync` roadmap — is in
+[`11-concurrency.md`](11-concurrency.md), and
+[`tests/threads.zx`](../tests/threads.zx) is a runnable tour.

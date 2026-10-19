@@ -49,6 +49,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/keywords.zx",
 		"../../tests/easy.zx",
 		"../../tests/modules.zx",
+		"../../tests/threads.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -215,6 +216,16 @@ func TestRunPrograms(t *testing.T) {
 			want: strings.Join([]string{
 				"14 10 9 42",
 				"25",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/threads.zx",
+			want: strings.Join([]string{
+				"square: 81",
+				"sum: 19900",
+				"total: 15",
+				"counter: 4000",
 				"",
 			}, "\n"),
 		},
@@ -868,7 +879,7 @@ func TestParallelCUnitsMatchSingleFile(t *testing.T) {
 		t.Skip("no C compiler available")
 	}
 
-	for _, file := range []string{"../../tests/pi.zx", "../../tests/strings.zx"} {
+	for _, file := range []string{"../../tests/pi.zx", "../../tests/strings.zx", "../../tests/threads.zx"} {
 		t.Run(filepath.Base(file), func(t *testing.T) {
 			dir := t.TempDir()
 			outputs := make([][]byte, 2)
@@ -1369,6 +1380,63 @@ fn main() -> i32 {
 	want := "200 42 zexi\n200 home\n"
 	if string(clientOut) != want {
 		t.Fatalf("client output mismatch:\n got %q\nwant %q", clientOut, want)
+	}
+}
+
+// TestThreadEdgeCases pins the deterministic corners of the concurrency
+// primitives: non-blocking receive, close waking a blocked receiver, and
+// stale/invalid handles failing cleanly.
+func TestThreadEdgeCases(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "edge.zx")
+	src := `use thread;
+
+fn waiter(ch: i64) -> i64 {
+    let mut v: i64 = 0;
+    if chan_recv(ch, &mut v) {
+        return v;
+    }
+    return -1;
+}
+
+fn main() -> i32 {
+    let ch = Chan::new(1);
+    let mut v: i64 = 7;
+    println(chan_try_recv(ch.id(), &mut v), v);
+    chan_send(ch.id(), 99);
+    println(chan_try_recv(ch.id(), &mut v), v);
+    println(chan_len(ch.id()));
+
+    let t = Thread::spawn(waiter, ch.id());
+    chan_close(ch.id());
+    println(t.join());
+
+    println(atomic_get(0), join(0));
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "edge")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build concurrency edge-case program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running edge-case program: %v", err)
+	}
+	want := "false 7\ntrue 99\n0\n-1\n0 0\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
 	}
 }
 

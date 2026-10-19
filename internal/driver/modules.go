@@ -56,6 +56,9 @@ var stdModuleAliases = map[string]string{
 	"text":         "text",
 	"text::ascii":  "text",
 	"text::regex":  "regex",
+	"thread":       "thread",
+	"thread::sync": "thread",
+	"thread::task": "thread",
 	"time":         "sys",
 }
 
@@ -112,9 +115,10 @@ type loader struct {
 
 	firstID int
 
-	usesNet   bool // program imports net/http/fs (needs the shared C runtime)
-	usesSys   bool // program imports sys (needs the C shim)
-	usesRegex bool // program imports regex (needs the POSIX ERE shim)
+	usesNet    bool // program imports net/http/fs (needs the shared C runtime)
+	usesSys    bool // program imports sys (needs the C shim)
+	usesRegex  bool // program imports regex (needs the POSIX ERE shim)
+	usesThread bool // program imports thread (needs the pthread shim and -pthread)
 }
 
 func newLoader(em *diag.Emitter) *loader {
@@ -171,6 +175,8 @@ func (l *loader) loadStdFile(name string) *module {
 		l.usesSys = true
 	case "regex":
 		l.usesRegex = true
+	case "thread":
+		l.usesThread = true
 	}
 	display := "std/" + name + ".zx"
 	src, err := fs.ReadFile(stdFS, display)
@@ -325,6 +331,8 @@ func (l *loader) bindUse(m *module, d *ast.UseDecl) {
 		l.usesSys = true
 	case "regex":
 		l.usesRegex = true
+	case "thread":
+		l.usesThread = true
 	}
 
 	target, parts, ok := l.resolveUse(m, d)

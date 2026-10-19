@@ -48,6 +48,9 @@ type Options struct {
 	// Jobs is how many translation units to compile in parallel (0 picks
 	// automatically; 1 forces the single-file path).
 	Jobs int
+	// Pthreads adds -pthread to the C compiler command line. The driver sets
+	// it automatically when the program imports `thread`.
+	Pthreads bool
 }
 
 // Artifacts is the result of a successful front end + codegen run.
@@ -64,6 +67,9 @@ type Artifacts struct {
 	// parallel; when empty, CSrc is the whole program.
 	CHeader string
 	CUnits  []string
+	// NeedsPthread is set when the program uses the `thread` module, so the
+	// C compiler is invoked with -pthread.
+	NeedsPthread bool
 }
 
 // FrontEnd runs lexing, parsing, type checking, and C generation. It returns
@@ -145,6 +151,10 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 	if l.usesRegex {
 		art.CExtra = append(art.CExtra, string(regexCSource))
 	}
+	if l.usesThread {
+		art.CExtra = append(art.CExtra, string(threadCSource))
+		art.NeedsPthread = true
+	}
 	return art, true
 }
 
@@ -203,6 +213,13 @@ var sysCSource []byte
 //go:embed zxregex_c.txt
 var regexCSource []byte
 
+// threadCSource is the opt-in pthread bridge for the `thread` module (threads,
+// i64 channels, and i64 atomics). Programs that import `thread` also link with
+// -pthread.
+//
+//go:embed zxthread_c.txt
+var threadCSource []byte
+
 // Tokens returns the token stream for a file, for the `tokenize` command.
 func Tokens(path string, em *diag.Emitter) ([]token.Token, int, bool) {
 	src, err := os.ReadFile(path)
@@ -252,6 +269,9 @@ func BuildFiles(paths []string, outPath string, opts Options, em *diag.Emitter) 
 	if outPath == "" {
 		outPath = DefaultOutput(paths[0])
 	}
+	if art.NeedsPthread {
+		opts.Pthreads = true
+	}
 	if len(art.CUnits) > 1 {
 		if err := CompileUnits(art.CHeader, art.CUnits, outPath, opts); err != nil {
 			em.Report(diag.New("E9002", "%v", err))
@@ -293,6 +313,9 @@ func CompileC(csrc, outPath string, opts Options) error {
 	// Tree-shaking: each function/data gets its own section so the linker
 	// can drop what the program never calls (only include what is used).
 	args = append(args, "-ffunction-sections", "-fdata-sections")
+	if opts.Pthreads {
+		args = append(args, "-pthread")
+	}
 	for _, dir := range opts.IncludeDirs {
 		args = append(args, "-I"+dir)
 	}
@@ -348,6 +371,9 @@ func CompileUnits(header string, units []string, outPath string, opts Options) e
 	}
 
 	base := []string{"-std=gnu11", optFlag(opts.OptLevel), "-fwrapv", "-ffunction-sections", "-fdata-sections", "-I" + dir}
+	if opts.Pthreads {
+		base = append(base, "-pthread")
+	}
 	objs := make([]string, len(units))
 	errs := make([]string, len(units))
 	var wg sync.WaitGroup
@@ -379,6 +405,9 @@ func CompileUnits(header string, units []string, outPath string, opts Options) e
 	// Extra C bridge sources are compiled during this final link invocation, so
 	// carry the same signed-overflow semantics as generated translation units.
 	args := []string{"-std=gnu11", optFlag(opts.OptLevel), "-fwrapv", "-ffunction-sections", "-fdata-sections"}
+	if opts.Pthreads {
+		args = append(args, "-pthread")
+	}
 	for _, inc := range opts.IncludeDirs {
 		args = append(args, "-I"+inc)
 	}

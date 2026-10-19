@@ -447,9 +447,11 @@ Deliberately tiny — a "core" that is largely in-language:
   wrappers, only linked when used.
 
 The shipped M1-preview helpers are embedded source modules: `io`, `fs`, `math`,
-`text`, `regex`, `random`, `sys`/`os`, `net`, and `http`. For example,
-`import text.regex;` selects the small POSIX-ERE facade and `import os;` selects
-local environment/path/process helpers. Their C shims are linked only if that
+`text`, `regex`, `random`, `sys`/`os`, `net`, `http`, and `thread`. For example,
+`import text.regex;` selects the small POSIX-ERE facade, `import os;` selects
+local environment/path/process helpers, and `use thread;` selects the pthread
+concurrency preview (threads, `i64` channels, `i64` atomics; see
+[`11-concurrency.md`](11-concurrency.md)). Their C shims are linked only if that
 module is selected.
 
 No `std` is linked by default; `#![no_std]` is the default rather than an

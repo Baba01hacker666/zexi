@@ -57,15 +57,20 @@ This repository contains the **initial design and specification** of Zexi: the v
 > `new_app()`, and `listen_n(addr, count)` cover explicit and bounded servers;
 > `Client`, `get`, `do`, `fetch`, and `request` cover the client side (see
 > [`docs/08-networking.md`](docs/08-networking.md)). Embedded `math`, `text`,
-> `io`, `fs`, `os`, and `regex` also provide dependency-free arithmetic,
-> roots/logs/trigonometry/geometry, number theory, familiar string helpers,
-> `input(prompt)`, capped binary-safe file helpers, local process/path
-> conveniences, and POSIX-ERE matching.
+> `io`, `fs`, `os`, `regex`, and `thread` also provide dependency-free
+> arithmetic, roots/logs/trigonometry/geometry, number theory, familiar string
+> helpers, `input(prompt)`, capped binary-safe file helpers, local process/path
+> conveniences, POSIX-ERE matching, and real OS **concurrency**: fork–join
+> threads, blocking `i64` channels, and lock-free `i64` atomics
+> (`Thread::spawn`, `Chan::new`, `Atomic::new`; see
+> [`docs/11-concurrency.md`](docs/11-concurrency.md)).
 >
 > Not yet implemented: generics, traits/`impl Trait`, full module
 > **isolation** (qualified access, `as` aliases, and `pub` checks work, but the
 > merged program is still one flat namespace, so unqualified cross-module names
 > remain visible and ignore `pub`), `Box`/`Vec`,
+> `Send`/`Sync` value passing across threads (today only `i64` handles, arguments,
+> and return values cross a thread boundary),
 > user-defined `Drop`, borrow-lifetime analysis (bound `&`/`*` aliases are not yet
 > tracked), and `Result`/`?`. Enum variants cannot carry
 > owning payloads yet. See `docs/05-roadmap.md`.
@@ -105,6 +110,7 @@ go run ./cmd/zexic run tests/drop.zx      # deterministic destruction across con
 go run ./cmd/zexic run tests/syntax.zx    # a runnable tour of the whole syntax
 go run ./cmd/zexic run tests/keywords.zx  # until/elif/defer, or+range patterns, if let, type aliases
 go run ./cmd/zexic run tests/modules.zx   # scoped imports: aliases, mod::item, pub checks
+go run ./cmd/zexic run tests/threads.zx   # threads, channels, and atomics
 go run ./cmd/zexic run tests/easy.zx      # the easy way: no semicolons, f-strings, defaults, libraries
 go run ./cmd/zexic run examples/easy.zx   # same ideas, as a small standalone demo
 go run ./cmd/zexic run tests/sugar.zx     # break-with-value, Type::new(..), print/format sugar
@@ -151,6 +157,7 @@ for why, its real costs, and the plan to replace it with a native backend.
 - [`docs/08-networking.md`](docs/08-networking.md) — the embedded HTTP client/server and networking helpers.
 - [`docs/09-c-bridge.md`](docs/09-c-bridge.md) — calling C libraries through `extern "C"` and bindgen.
 - [`docs/10-stdlib-recipes.md`](docs/10-stdlib-recipes.md) — local networking, OS, filesystem, and regex recipes.
+- [`docs/11-concurrency.md`](docs/11-concurrency.md) — threads, `i64` channels, and atomics.
 - [`examples/`](examples/) — ready-to-run Zexi programs plus focused feature examples.
 - [`tests/tour.zx`](tests/tour.zx) — the end-to-end program the test suite compiles and runs.
 - [`tests/syntax.zx`](tests/syntax.zx) — a runnable syntax tour; [`tests/pi.zx`](tests/pi.zx) — 30 digits of π.

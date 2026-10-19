@@ -140,6 +140,11 @@ seam.
   reflection) arrives with generics.
 - **Attributes:** `#[repr(C)]`, `#[inline]`, `#[no_mangle]`, `#[export]`.
 - **FFI:** `extern "C"` functions and structs, for libc and C libraries.
+- **Concurrency (preview):** `thread` gives OS threads, `i64` channels, and
+  `i64` atomics over a pthread shim, linked only when imported. Only `i64`
+  values cross a thread boundary, which keeps the subset data-race-free; full
+  `Send`/`Sync` value passing is the M2 item below. See
+  [`11-concurrency.md`](11-concurrency.md).
 - **Incremental + parallel builds**; LSP/`zexi fmt` usable.
 
 ## 5.4 M2 — the performance/size endgame
@@ -152,8 +157,9 @@ seam.
   niche optimization for `Option<&T>`/`Option<Box<T>>`, PGO.
 - **Freestanding target:** `no_std` + direct syscalls, no libc; sub-20 KB
   stripped binaries for computational programs.
-- **Concurrency:** `Send`/`Sync`, threads, `Mutex`/`Channel`, data-race freedom
-  checked by the borrow checker.
+- **Concurrency:** extend today's `i64`-only preview with `Send`/`Sync`, owning
+  values and shared references crossing threads, `Mutex`/typed `Channel`, and
+  data-race freedom checked by the borrow checker.
 - **Self-hosting (stretch):** rewrite `zexic` in Zexi once `String`/`Vec`/`Map`/IO
   are mature.
 

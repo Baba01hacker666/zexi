@@ -391,6 +391,10 @@ The embedded standard library (sources in `internal/driver/std/`) includes:
   default mux with `{name}` route parameters, `serve_local`, `serve_n`,
   `serve_dir`, and static-file helpers are documented in
   [`08-networking.md`](08-networking.md).
+- `thread`: OS threads (`Thread::spawn`/`spawn2`/`spawn_void`, `join`), blocking
+  `i64` channels (`Chan`, `chan_send`/`chan_recv`/`chan_close`), and lock-free
+  `i64` atomics (`Atomic`, `atomic_add`/`get`/`set`). Only `i64` values cross a
+  thread boundary; see [`11-concurrency.md`](11-concurrency.md).
 
 See [`10-stdlib-recipes.md`](10-stdlib-recipes.md) for runnable local HTTP,
 filesystem, OS, and regex patterns.

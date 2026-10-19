@@ -1,0 +1,237 @@
+// thread — OS threads, i64 channels, and i64 atomics for Zexi.
+//
+// Zexi has no closures yet, so a spawned function takes its inputs as
+// arguments and returns its result by joining:
+//
+//     use thread;
+//
+//     fn square(x: i64) -> i64 { return x * x; }
+//
+//     fn main() -> i32 {
+//         let t = Thread::spawn(square, 21);
+//         println(t.join());          // 441
+//         0
+//     }
+//
+// Channels connect threads. A channel carries i64 values and blocks when it is
+// full (send) or empty (recv); close unblocks every waiter, and buffered values
+// stay readable until drained. Because a worker cannot capture a `Chan` value,
+// the free-function form takes the raw i64 handle that `Chan.id()` exposes:
+//
+//     fn producer(ch: i64) -> i64 {
+//         let mut i: i64 = 0;
+//         while i < 5 {
+//             chan_send(ch, i);
+//             i += 1;
+//         }
+//         chan_close(ch);
+//         return 0;
+//     }
+//
+//     fn main() -> i32 {
+//         let ch = Chan::new(4);
+//         let t = Thread::spawn(producer, ch.id());
+//         let mut v: i64 = 0;
+//         while ch.recv(&mut v) {
+//             println(v);
+//         }
+//         t.join();
+//         0
+//     }
+//
+// Atomics are lock-free i64 cells for counters shared without a channel. All
+// three primitives are handle-based; a handle is a small integer, and a stale
+// handle fails cleanly rather than aliasing a reused slot.
+//
+// Limits: 256 live threads, 256 channels, and 256 atomics per process; channel
+// capacity is clamped to 1..65536. There is no `Send`/`Sync` checking yet, but
+// no Zexi value (String, struct, reference) can cross a thread boundary — only
+// i64 handles and i64 arguments/return values do — so the primitives here are
+// data-race-free for the types they accept.
+
+// --- threads ---------------------------------------------------------------
+
+extern "C" fn zxt_spawn(entry: fn(i64) -> i64, arg: i64) -> i64;
+extern "C" fn zxt_spawn2(entry: fn(i64, i64) -> i64, a: i64, b: i64) -> i64;
+extern "C" fn zxt_spawn_void(entry: fn()) -> i64;
+extern "C" fn zxt_join(handle: i64) -> i64;
+
+// spawn runs `f(arg)` on a new OS thread and returns its handle.
+pub fn spawn(f: fn(i64) -> i64, arg: i64) -> i64 {
+    return zxt_spawn(f, arg);
+}
+
+// spawn2 runs `f(a, b)` on a new OS thread.
+pub fn spawn2(f: fn(i64, i64) -> i64, a: i64, b: i64) -> i64 {
+    return zxt_spawn2(f, a, b);
+}
+
+// spawn_void runs `f()` on a new OS thread.
+pub fn spawn_void(f: fn()) -> i64 {
+    return zxt_spawn_void(f);
+}
+
+// join waits for the thread and returns its result (0 for spawn_void). Joining
+// an unknown or already-joined handle returns 0 instead of misbehaving.
+pub fn join(handle: i64) -> i64 {
+    return zxt_join(handle);
+}
+
+// Thread is the owning wrapper around a spawned thread. `join` consumes it.
+pub struct Thread { id: i64 }
+
+impl Thread {
+    pub fn spawn(f: fn(i64) -> i64, arg: i64) -> Thread {
+        return Thread { id: zxt_spawn(f, arg) };
+    }
+
+    pub fn spawn2(f: fn(i64, i64) -> i64, a: i64, b: i64) -> Thread {
+        return Thread { id: zxt_spawn2(f, a, b) };
+    }
+
+    pub fn spawn_void(f: fn()) -> Thread {
+        return Thread { id: zxt_spawn_void(f) };
+    }
+
+    pub fn id(&self) -> i64 {
+        return self.id;
+    }
+
+    pub fn join(self) -> i64 {
+        return zxt_join(self.id);
+    }
+}
+
+// --- channels (i64) --------------------------------------------------------
+
+extern "C" fn zxt_chan_new(cap: i64) -> i64;
+extern "C" fn zxt_chan_send(handle: i64, value: i64) -> i32;
+extern "C" fn zxt_chan_recv(handle: i64, out: &mut i64) -> i32;
+extern "C" fn zxt_chan_try_recv(handle: i64, out: &mut i64) -> i32;
+extern "C" fn zxt_chan_close(handle: i64) -> i32;
+extern "C" fn zxt_chan_len(handle: i64) -> i64;
+extern "C" fn zxt_chan_closed(handle: i64) -> i32;
+
+// chan_new creates a bounded channel; cap is clamped to 1..65536.
+pub fn chan_new(cap: i32) -> i64 {
+    return zxt_chan_new(cap as i64);
+}
+
+// chan_send blocks until there is room, returning false if closed.
+pub fn chan_send(handle: i64, value: i64) -> bool {
+    return zxt_chan_send(handle, value) == 1;
+}
+
+// chan_recv blocks until a value arrives, writing it to out. It returns false
+// when the channel is closed and drained.
+pub fn chan_recv(handle: i64, out: &mut i64) -> bool {
+    return zxt_chan_recv(handle, out) == 1;
+}
+
+// chan_try_recv is the non-blocking form of chan_recv.
+pub fn chan_try_recv(handle: i64, out: &mut i64) -> bool {
+    return zxt_chan_try_recv(handle, out) == 1;
+}
+
+// chan_close marks the channel closed and wakes every blocked sender/receiver.
+pub fn chan_close(handle: i64) {
+    zxt_chan_close(handle);
+}
+
+// chan_len is the number of buffered values.
+pub fn chan_len(handle: i64) -> i64 {
+    return zxt_chan_len(handle);
+}
+
+// chan_closed reports whether the channel was closed.
+pub fn chan_closed(handle: i64) -> bool {
+    return zxt_chan_closed(handle) == 1;
+}
+
+// Chan is the owning wrapper with method syntax; `id()` exposes the raw handle
+// to a spawned function, which uses the free functions above.
+pub struct Chan { id: i64 }
+
+impl Chan {
+    pub fn new(cap: i32) -> Chan {
+        return Chan { id: zxt_chan_new(cap as i64) };
+    }
+
+    pub fn id(&self) -> i64 {
+        return self.id;
+    }
+
+    pub fn send(&self, value: i64) -> bool {
+        return zxt_chan_send(self.id, value) == 1;
+    }
+
+    pub fn recv(&self, out: &mut i64) -> bool {
+        return zxt_chan_recv(self.id, out) == 1;
+    }
+
+    pub fn try_recv(&self, out: &mut i64) -> bool {
+        return zxt_chan_try_recv(self.id, out) == 1;
+    }
+
+    pub fn close(&self) {
+        zxt_chan_close(self.id);
+    }
+
+    pub fn len(&self) -> i64 {
+        return zxt_chan_len(self.id);
+    }
+
+    pub fn closed(&self) -> bool {
+        return zxt_chan_closed(self.id) == 1;
+    }
+}
+
+// --- atomics (i64) ---------------------------------------------------------
+
+extern "C" fn zxt_atomic_new(value: i64) -> i64;
+extern "C" fn zxt_atomic_add(handle: i64, delta: i64) -> i64;
+extern "C" fn zxt_atomic_get(handle: i64) -> i64;
+extern "C" fn zxt_atomic_set(handle: i64, value: i64);
+
+// atomic_new creates an i64 cell shared across threads.
+pub fn atomic_new(value: i64) -> i64 {
+    return zxt_atomic_new(value);
+}
+
+// atomic_add adds delta and returns the new value.
+pub fn atomic_add(handle: i64, delta: i64) -> i64 {
+    return zxt_atomic_add(handle, delta);
+}
+
+pub fn atomic_get(handle: i64) -> i64 {
+    return zxt_atomic_get(handle);
+}
+
+pub fn atomic_set(handle: i64, value: i64) {
+    zxt_atomic_set(handle, value);
+}
+
+// Atomic is the owning wrapper with method syntax.
+pub struct Atomic { id: i64 }
+
+impl Atomic {
+    pub fn new(value: i64) -> Atomic {
+        return Atomic { id: zxt_atomic_new(value) };
+    }
+
+    pub fn id(&self) -> i64 {
+        return self.id;
+    }
+
+    pub fn add(&self, delta: i64) -> i64 {
+        return zxt_atomic_add(self.id, delta);
+    }
+
+    pub fn get(&self) -> i64 {
+        return zxt_atomic_get(self.id);
+    }
+
+    pub fn set(&self, value: i64) {
+        zxt_atomic_set(self.id, value);
+    }
+}

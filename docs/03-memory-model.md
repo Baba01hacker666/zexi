@@ -93,8 +93,17 @@ automatically. Lifetimes are erased before codegen.
 
 ## 3.7 Concurrency safety
 
-The same aliasing rules give **data-race freedom for free**, provided
-`Sync`/`Send` (M2) gate sharing across threads:
+**Today (preview).** The `thread` module ships real OS threads, `i64` channels,
+and lock-free `i64` atomics (see [`11-concurrency.md`](11-concurrency.md)). Only
+`i64` values cross a thread boundary — arguments, return values, channel
+payloads, atomic cells, and the integer handles to the primitives themselves. No
+`String`, struct, enum, or reference can be sent to or shared with another
+thread, so there is no shared Zexi memory to race on; the only shared state is
+the C-side table of channels/atomics, which is mutex- or atomic-guarded. That
+makes this subset data-race-free without a `Send`/`Sync` checker.
+
+**Target (M2).** The full model lets owned values and shared references cross
+threads, gated by the same aliasing rules:
 
 - A value can be sent to another thread only if it is `Send`.
 - A value can be shared by `&T` across threads only if `T: Sync`.
