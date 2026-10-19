@@ -34,16 +34,22 @@ handles strings, printing, arrays, and the standard library's C shims.
 
 ### 2.3 Loader / driver (`internal/driver`)
 - `FrontEndFiles` (in `driver.go`) loads one or more source files.
+- `modules.go` turns every parsed file (and inline `mod { ... }` block) into a
+  module with an export table, records what each `use`/`import`/`mod` binds, and
+  resolves qualified paths (`alias::item`, `pkg::Type::new`,
+  `mod::Enum::Variant`) before checking — enforcing `pub` for qualified access
+  (E0603 private, E0412 missing, E0433 module-as-value).
 - Resolves source-layout declarations:
   - `use "helpers.zx";` / `import "helpers.zx";` → relative file
   - `use math;`, `use std::math;`, `import http.server;`, and
     `import io.fs;` → embedded standard-library modules
     (`internal/driver/std/*.zx`)
   - `mod name;` → `name.zx` or `name/mod.zx` beside the declaring file
-- Merges all imported/module items into one namespace for this M1-preview
-  stage; scoped names and visibility enforcement come later. `as` aliases are
-  parsed for forward compatibility but explicitly report E9024 until real
-  namespaces can make them meaningful.
+- Imports create qualifiers: `as alias`, else the full path and its last
+  segment; `mod` creates a qualifier too.
+- Items are then flattened into one program namespace for this M1-preview
+  stage (unqualified names stay visible and ignore `pub`), so scoped isolation
+  and visibility enforcement for *unqualified* names remain M1 work.
 
 ### 2.4 Semantic analysis (`internal/sema`)
 - Type checking, name resolution.

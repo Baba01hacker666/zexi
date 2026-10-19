@@ -5,9 +5,11 @@ common *script and service* tasks that otherwise make a language feel harder
 than it needs to be. No package installation is required: import the facade,
 then call its declarations directly.
 
-> The current M1-preview loader is deliberately flat. For example,
-> `import http.server;` makes `Router`, `Response`, and `serve_local` available
-> directly; it does **not** create an `http.server.*` namespace yet.
+> The M1-preview loader exposes imports both unqualified and through a
+> qualifier. `import http.server;` makes `Router`, `Response`, and `serve_local`
+> available directly *and* as `server::Router` / `server::serve_local`; the full
+> path `http::server::Router` works too. Qualified lookups enforce `pub`;
+> unqualified access is still backed by the flat merged namespace.
 
 ## 10.1 A local-only HTTP service
 

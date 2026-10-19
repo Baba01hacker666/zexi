@@ -4,8 +4,11 @@
 > resolution, bidirectional type inference, constant folding, a flow-sensitive
 > move checker, and a C backend that produces a runnable native binary. The
 > first M1 usability foundations are also live: file `use`/`import`, dotted
-> standard-library facades (`import http.server;`), and `mod` source layouts
-> are resolved by the driver before checking.
+> standard-library facades (`import http.server;`), `mod` source layouts,
+> per-module `as` aliases, and path-qualified lookup with `pub` enforcement are
+> resolved by the driver before checking. The merged program is still one flat
+> namespace (unqualified names stay visible and ignore `pub`); true per-module
+> isolation remains M1 work.
 > Implemented language surface: functions and recursion; `let`/`const`;
 > integer/float/bool/char/`str`; arithmetic, bitwise, comparison, and logical
 > operators; `as` casts; `if`/`else`; `while`/`loop`/`for i in a..b` and
@@ -28,9 +31,10 @@
 > declarations bind C functions (libc), and several `.zx` files compile together
 > into one program; on top of that, `lib/http.zx` is a working HTTP/1.x client
 > and server (see docs/08).
-> Not yet implemented: generics, traits, **scoped** modules/path-qualified item
-> lookup and visibility enforcement (the current loader deliberately flattens
-> imports and rejects `as` aliases until namespaces exist), `Vec`/`Box`,
+> Not yet implemented: generics, traits, full per-module **isolation**
+> (scoped qualified paths, `as` aliases, and `pub` checks are live, but the
+> loader still merges every module into one flat namespace, so unqualified
+> cross-module names remain visible and ignore `pub`), `Vec`/`Box`,
 > user-defined `Drop`, borrow-lifetime analysis (so bound
 > `&`/`*` aliases are not tracked), and `Result`/`?`. Enum variants may not carry
 > resource-owning payloads yet (a `match` binding would alias an owned value; see
@@ -60,9 +64,10 @@ M1/M2 are additive.
 - Full lexer (done) and recursive-descent parser for the grammar in docs/02.
 - A small practical extension is already shipped: `use`/`import` load files and
   embedded stdlib modules, and `mod name;` loads `name.zx` or `name/mod.zx`.
-  These currently flatten declarations into one namespace; `as` aliases are
-  explicitly rejected rather than ignored, and scoped paths and `pub`
-  enforcement remain M1 work.
+  Imports create qualifiers (`import math as m;` → `m::sqrt(2.0)`,
+  `mod util;` → `util::f`) and qualified lookup enforces `pub` (E0603/E0412/
+  E0433). The merged program is still flat, so unqualified names remain visible
+  and full isolation remains M1 work.
 
 **Types (M0)**
 - Primitives: `bool i8 i16 i32 i64 u8 u16 u32 u64 isize usize f32 f64 char`.
@@ -114,9 +119,11 @@ seam.
 
 ## 5.3 M1 — usability (the "worth using" set)
 
-- **Modules & packages:** turn the shipped flat `mod`/`use`/`import` loader
-  into scoped packages: path-qualified item lookup, real `pub` boundaries,
-  directory packages, and a prelude.
+- **Modules & packages:** finish the shipped loader into scoped packages.
+  Qualified lookup, `as` aliases, and `pub` checks are live; what remains is
+  real per-module isolation (so unqualified cross-module names respect `pub`
+  and same-named items coexist), directory packages, re-exports/glob imports,
+  and a prelude.
 - **Generics + traits:** monomorphized user generics, operator traits,
   `Iterator`, `Clone`/`Copy`/`Drop`, `From`/`Into`, `dyn Trait` (M1 late).
 - **Real ownership checker:** NLL, lifetime elision + explicit lifetimes,

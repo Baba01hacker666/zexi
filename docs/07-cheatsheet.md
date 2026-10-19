@@ -314,30 +314,37 @@ fn greet() { println("hi") }   // no return type needed when returning ()
   borrowed, never moved, and must be printable (numbers, `bool`, `char`,
   `str`, `String`).
 
-Libraries: `use` and `import` load whole files into your program — loaded
-declarations are currently available unqualified because visibility is not yet
-enforced. `import` accepts Python-shaped dots as a friendly alternative to
-`use` paths with `::`.
+Libraries: `use` and `import` load whole files into your program. Loaded
+declarations are available unqualified (the preview keeps a flat namespace), and
+each import also creates a qualifier so you can write path-qualified lookups.
+`import` accepts Python-shaped dots as a friendly alternative to `use` paths
+with `::`.
 
 ```zx
-use "helpers.zx";      // a file next to yours (path relative to your file)
-import "helpers.zx";   // same operation, alternate spelling
-use math;               // standard library: local files win, then embedded std
+use "helpers.zx";           // a file next to yours (path relative to your file)
+import "helpers.zx" as h;   // bind the module to a qualifier: h::triple(2)
+use math;                   // standard library: local files win, then embedded std
+use math as m;              // qualifier alias: m::maxi(1, 2)
 use std::text;
-import http.server;     // package-shaped facade; call serve(&router, port), Router, ...
-import io.fs;           // filesystem facade
-import os;              // environment, local paths, clocks, process helpers
-import text.regex;      // POSIX ERE matching helpers
+import http.server;         // package-shaped facade; server::Router, server::serve(&r, p)
+import http.server as srv;  // or srv::Router
+import io.fs;               // filesystem facade: fs::read_text("f")
+import os;                  // environment, local paths, clocks, process helpers
+import text.regex;          // POSIX ERE helpers: regex::is_match(pat, s)
 ```
 
-`mod name;` is an M1-preview layout helper: it loads `name.zx` or
-`name/mod.zx`; `mod name { ... }` works too. Every file is loaded at most once
-and cycles are harmless. Imports/modules are intentionally **flat for now**:
-there is no `http.server.serve()` lookup or visibility enforcement yet, so the
-names loaded by `import http.server;` are called directly. `as` is parsed for
-the future scoped model, but is rejected today with E9024 instead of silently
-being ignored. Passing extra `.zx` files on the command line (`zexic run
-main.zx lib.zx`) still works too.
+`mod name;` loads `name.zx` or `name/mod.zx`; `mod name { ... }` works too.
+Both create a `name::` qualifier, so `util::double(21)` and
+`helper::add(1, 2)` resolve against that module's public declarations. Qualified
+access checks `pub`: a private item is E0603, a missing one E0412, and using a
+module as a value/type is E0433. Every file is loaded at most once and cycles
+are harmless.
+
+Under the hood the merged program is still **flat**: unqualified names from a
+plain import keep working, and `pub` is enforced only for *qualified* paths, so
+the preview does not yet isolate same-named items from two modules. Passing
+extra `.zx` files on the command line (`zexic run main.zx lib.zx`) still works
+too.
 
 The embedded standard library (sources in `internal/driver/std/`) includes:
 
@@ -371,10 +378,12 @@ program that ties it all together, see `examples/guess.zx`.
 
 ## 7.14 Not implemented yet (roadmap M1+)
 
-Generics, traits, scoped modules/path-qualified item lookup and visibility
-checking (the current `mod`/`use`/`import` loader is intentionally flat),
-`Vec`/`Box`, user-defined `Drop`, tuple values (tuple *structs* exist; `(a, b)`
-values and destructuring do not yet), borrow-lifetime (NLL) analysis,
-`Result`/`?`, bindings inside or-patterns, nested patterns, and enum variants
-that own resources. See
+Generics, traits, `Vec`/`Box`, user-defined `Drop`, tuple values (tuple
+*structs* exist; `(a, b)` values and destructuring do not yet), borrow-lifetime
+(NLL) analysis, `Result`/`?`, bindings inside or-patterns, nested patterns, and
+enum variants that own resources. Scoped modules have landed for *qualified*
+access (imports, `as` aliases, `mod::item`, `pub` checks), but the merged
+program is still one flat namespace: unqualified cross-module names remain
+visible and ignore `pub`, so full isolation and package metadata are still M1
+work. See
 [`05-roadmap.md`](05-roadmap.md) for the plan.

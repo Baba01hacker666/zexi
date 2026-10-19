@@ -21,8 +21,13 @@ This repository contains the **initial design and specification** of Zexi: the v
 > `use` or Python-shaped `import`: `use "helpers.zx";` / `import "helpers.zx";`
 > import a neighbouring file, while `use math;`, `import http.server;`, and
 > `use io::fs;` select embedded standard-library helpers — see
-> `internal/driver/std/`. `mod name;` also loads `name.zx` or `name/mod.zx`
-> today (a deliberately flat, M1-preview module surface). Everything still
+> `internal/driver/std/`. Imports create qualifiers: `use math as m;` gives
+> `m::maxi(1, 2)`, `import http.server;` gives `server::Router` (and the full
+> `http::server::Router`), and `mod name;` / `mod name { ... }` give
+> `name::item`. Qualified lookups are real — they resolve against the module's
+> declarations and enforce `pub` (E0603 private, E0412 missing, E0433 module as
+> a value) — while the merged program underneath is still flat, so unqualified
+> names from a plain import keep working. Everything still
 > compiles to a small, fast native binary through C.
 >
 > Implemented: functions and recursion; `let`/`const`; `type` aliases; integer/
@@ -54,9 +59,10 @@ This repository contains the **initial design and specification** of Zexi: the v
 > `input(prompt)`, capped binary-safe file helpers, local process/path
 > conveniences, and POSIX-ERE matching.
 >
-> Not yet implemented: generics, traits/`impl Trait`, **scoped** modules and
-> visibility enforcement (the current `use`/`import`/`mod` loader is flat;
-> `import ... as name` is explicitly rejected until namespaces exist), `Box`/`Vec`,
+> Not yet implemented: generics, traits/`impl Trait`, full module
+> **isolation** (qualified access, `as` aliases, and `pub` checks work, but the
+> merged program is still one flat namespace, so unqualified cross-module names
+> remain visible and ignore `pub`), `Box`/`Vec`,
 > user-defined `Drop`, borrow-lifetime analysis (bound `&`/`*` aliases are not yet
 > tracked), and `Result`/`?`. Enum variants cannot carry
 > owning payloads yet. See `docs/05-roadmap.md`.
@@ -78,6 +84,7 @@ go run ./cmd/zexic run tests/strings.zx   # owning heap String + methods
 go run ./cmd/zexic run tests/drop.zx      # deterministic destruction across control flow
 go run ./cmd/zexic run tests/syntax.zx    # a runnable tour of the whole syntax
 go run ./cmd/zexic run tests/keywords.zx  # until/elif/defer, or+range patterns, if let, type aliases
+go run ./cmd/zexic run tests/modules.zx   # scoped imports: aliases, mod::item, pub checks
 go run ./cmd/zexic run tests/easy.zx      # the easy way: no semicolons, f-strings, defaults, libraries
 go run ./cmd/zexic run examples/easy.zx   # same ideas, as a small standalone demo
 go run ./cmd/zexic run tests/sugar.zx     # break-with-value, Type::new(..), print/format sugar

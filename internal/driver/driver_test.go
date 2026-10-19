@@ -48,6 +48,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/function_values.zx",
 		"../../tests/keywords.zx",
 		"../../tests/easy.zx",
+		"../../tests/modules.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -207,6 +208,14 @@ func TestRunPrograms(t *testing.T) {
 				"10", "6", "1024", "ababab", "00042",
 				"world #3 {ok}", "pi~3.5 ok=true grade=A",
 				"42", "6", "3", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/modules.zx",
+			want: strings.Join([]string{
+				"14 10 9 42",
+				"25",
+				"",
 			}, "\n"),
 		},
 	}
@@ -1425,24 +1434,114 @@ fn main() -> i32 {
 	}
 }
 
-// TestImportAliasIsDiagnostic prevents a parsed `as` clause from being silently
-// ignored while imports are intentionally flattened for the M1 preview.
-func TestImportAliasIsDiagnostic(t *testing.T) {
+// TestModuleQualifiedAccess exercises scoped modules end to end: an aliased
+// file import, qualified functions/constants/types/associated functions/enum
+// variants, a `mod name;` qualifier, and an inline `mod { ... }` qualifier.
+func TestModuleQualifiedAccess(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
 	dir := t.TempDir()
+	files := map[string]string{
+		"lib.zx": `pub fn triple(n: i32) -> i32 { n * 3 }
+pub const BASE: i32 = 10;
+pub struct Point { pub x: i32, pub y: i32 }
+pub enum Mode { Idle, Busy(i32) }
+impl Point {
+    pub fn new(x: i32, y: i32) -> Point { Point { x: x, y: y } }
+    pub fn sum(self) -> i32 { self.x + self.y }
+}
+`,
+		"tool.zx": `pub fn double(n: i32) -> i32 { n * 2 }
+`,
+		"main.zx": `use "lib.zx" as lib;
+use math as m;
+mod tool;
+mod inline { pub fn add(a: i32, b: i32) -> i32 { a + b } }
+
+fn main() -> i32 {
+    let p: lib::Point = lib::Point::new(2, 3);
+    println(lib::triple(7), p.sum(), lib::BASE, m::maxi(1, 5), tool::double(21), inline::add(2, 3));
+    let mode = lib::Mode::Busy(9);
+    match mode {
+        lib::Mode::Busy(n) => { println(n); }
+        lib::Mode::Idle => {}
+    }
+    0
+}
+`,
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	mainPath := filepath.Join(dir, "main.zx")
-	if err := os.WriteFile(mainPath, []byte(`import math as m;
-fn main() -> i32 { 0 }
-`), 0o644); err != nil {
-		t.Fatal(err)
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build qualified-module program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running qualified-module program: %v", err)
+	}
+	if want := "21 5 10 5 42 5\n9\n"; string(raw) != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
+	}
+}
+
+// TestModulePrivacy checks that qualified access to a non-`pub` item is a
+// diagnostic rather than silently working through the flattened namespace.
+func TestModulePrivacy(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"lib.zx":  "fn secret() -> i32 { 1 }\npub fn open() -> i32 { secret() }\n",
+		"main.zx": "use \"lib.zx\" as lib;\nfn main() -> i32 { lib::secret() }\n",
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	em := diag.NewEmitter()
-	if _, ok := driver.FrontEnd(mainPath, driver.Options{}, em); ok {
-		t.Fatal("expected aliased import to be rejected until namespaces exist")
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "main.zx"), driver.Options{}, em); ok {
+		t.Fatal("expected private qualified access to be rejected")
 	}
 	var buf bytes.Buffer
 	em.Render(&buf, em.FirstFileID())
-	if !strings.Contains(buf.String(), "E9024") {
-		t.Fatalf("expected E9024 for aliased import, got:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "E0603") {
+		t.Fatalf("expected E0603 for private item, got:\n%s", buf.String())
+	}
+}
+
+// TestModuleUnknownItem and TestModuleUsedAsValue cover the two other
+// qualified-path mistakes: a missing export and treating a module as a value.
+func TestModuleQualifiedDiagnostics(t *testing.T) {
+	cases := []struct {
+		name, src, code string
+	}{
+		{"unknown", "use math as m;\nfn main() -> i32 { m::nope() }\n", "E0412"},
+		{"module-as-type", "use math as m;\nfn main() -> i32 { let x: m = 0; 0 }\n", "E0433"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mainPath := filepath.Join(dir, "main.zx")
+			if err := os.WriteFile(mainPath, []byte(tc.src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			em := diag.NewEmitter()
+			if _, ok := driver.FrontEnd(mainPath, driver.Options{}, em); ok {
+				t.Fatalf("expected %s for:\n%s", tc.code, tc.src)
+			}
+			var buf bytes.Buffer
+			em.Render(&buf, em.FirstFileID())
+			if !strings.Contains(buf.String(), tc.code) {
+				t.Fatalf("expected %s, got:\n%s", tc.code, buf.String())
+			}
+		})
 	}
 }
 
