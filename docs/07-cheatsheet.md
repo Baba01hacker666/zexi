@@ -380,6 +380,12 @@ The embedded standard library (sources in `internal/driver/std/`) includes:
   for small scripts.
 - `regex`: opt-in POSIX-ERE validation/search/full-match/find/replace helpers
   via `import text.regex;`. It is intentionally not a PCRE engine.
+- `fmt`: pure-Zexi formatting of numbers and values. Bases (`hex_lower`,
+  `hex_upper`, `hex_pad`, `bin_str`, `oct_str`, `radix_str`), decimal grouping
+  (`thousands`, `thousands_sep`), decimals and exponents (`fixed_point`,
+  `sci_notation`, `percent_str`), human units (`byte_size`, `duration_ms`),
+  ordinals (`ordinal`), and alignment (`align_left`/`align_right`/
+  `align_center`). It has no C shim, so it costs nothing to import.
 - `io`, `fs`, `sys`, and `random`: console I/O (`input(prompt = "")` and
   `read_line`); capped binary-safe file reads plus
   `write_bytes(path, &String)` (reads, writes, and copies cap at 32 MiB);

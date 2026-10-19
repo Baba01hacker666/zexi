@@ -31,6 +31,7 @@ import (
 // names make imports read naturally: `import http.server;`, `use io::fs;`, and
 // `use std::http::client;` all select their backing module.
 var stdModuleAliases = map[string]string{
+	"fmt":          "fmt",
 	"fs":           "fs",
 	"http":         "http",
 	"http::client": "http",

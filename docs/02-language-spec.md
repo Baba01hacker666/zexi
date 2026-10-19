@@ -446,11 +446,12 @@ Deliberately tiny — a "core" that is largely in-language:
 - `os`/`sys` (opt-in): file, socket, process, time — thin libc or syscall
   wrappers, only linked when used.
 
-The shipped M1-preview helpers are embedded source modules: `io`, `fs`, `math`,
-`text`, `regex`, `random`, `sys`/`os`, `net`, `http`, and `thread`. For example,
-`import text.regex;` selects the small POSIX-ERE facade, `import os;` selects
-local environment/path/process helpers, and `use thread;` selects the pthread
-concurrency preview (threads, `i64` channels, `i64` atomics; see
+The shipped M1-preview helpers are embedded source modules: `io`, `fs`, `fmt`,
+`math`, `text`, `regex`, `random`, `sys`/`os`, `net`, `http`, and `thread`. For
+example, `import text.regex;` selects the small POSIX-ERE facade, `import os;`
+selects local environment/path/process helpers, `use fmt;` selects pure-Zexi
+number/value formatting, and `use thread;` selects the pthread concurrency
+preview (threads, `i64` channels, `i64` atomics; see
 [`11-concurrency.md`](11-concurrency.md)). Their C shims are linked only if that
 module is selected.
 

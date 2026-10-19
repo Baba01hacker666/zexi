@@ -100,6 +100,7 @@ Embedded in the compiler under `internal/driver/std/`:
 | io     | `io.zx` | stdin/stdout, input/read_line/read_all |
 | fs     | `fs.zx` | capped binary-safe file read/write/copy helpers |
 | math   | `math.zx` | integer/bit helpers, roots/logs/trig, geometry/smoothing, primes/combinatorics |
+| fmt    | `fmt.zx` | number/value formatting: bases, grouping, fixed/sci decimals, human units, alignment |
 | text   | `text.zx` | string helpers |
 | random | `random.zx` | RNG |
 | regex  | `regex.zx` | POSIX-ERE search/full-match/find/replace (C shim `zxregex_c.txt`) |

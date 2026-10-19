@@ -260,3 +260,42 @@ The full guide — `spawn`/`spawn2`/`spawn_void`, the free-function forms a work
 uses, atomics, limits, and the `Send`/`Sync` roadmap — is in
 [`11-concurrency.md`](11-concurrency.md), and
 [`tests/threads.zx`](../tests/threads.zx) is a runnable tour.
+
+## 10.7 Formatting numbers and units
+
+`use fmt;` is a pure-Zexi (no C shim) toolbox for the shapes a program prints:
+bases, grouping, fixed decimals, human units, ordinals, and alignment.
+
+```zx
+use fmt;
+
+fn main() -> i32 {
+    println(fmt::hex_lower(255));          // ff
+    println(fmt::hex_pad(255, 4));         // 00ff
+    println(fmt::thousands(1234567));      // 1,234,567
+    println(fmt::fixed_point(3.14159, 2)); // 3.14
+    println(fmt::sci_notation(12345.0, 2));// 1.23e4
+    println(fmt::percent_str(0.256, 1));   // 25.6%
+    println(fmt::byte_size(1536));         // 1.5 KB
+    println(fmt::duration_ms(3661000));    // 1h 1m 1s
+    println(fmt::ordinal(21));             // 21st
+    println("[" + fmt::align_right("42", 6) + "]");  // [    42]
+    0
+}
+```
+
+| Group | APIs |
+| --- | --- |
+| Bases | `hex_lower`, `hex_upper`, `hex_pad`, `bin_str`, `oct_str`, `radix_str` (2..36) |
+| Decimal grouping | `thousands`, `thousands_sep` |
+| Decimals and exponents | `fixed_point`, `sci_notation`, `percent_str` |
+| Human units | `byte_size`, `duration_ms` |
+| Ordinals | `ordinal` |
+| Alignment | `align_left`, `align_right`, `align_center` |
+
+Negative integers keep a leading `-` in front of the digits (`-ff`, not a
+two's-complement form). `fixed_point` rounds half away from zero, prints `NaN`
+for NaN, `inf` for infinities, and falls back to the built-in float formatting
+for values too large to scale exactly. `radix_str` clamps its base to 2..36 and
+`fixed_point`/`sci_notation` clamp their digit count (0..18). See
+[`tests/formatting.zx`](../tests/formatting.zx) for every function.

@@ -1,0 +1,447 @@
+// fmt — number and value formatting for terminals, reports, and CLIs.
+//
+// Zexi's `println`/`+` already turn a single value into text. This module adds
+// the pieces a program reaches for when it needs a *shape*: bases, grouping,
+// fixed decimals, human units, and alignment.
+//
+//     use fmt;
+//
+//     println(fmt::hex_lower(255));          // ff
+//     println(fmt::hex_upper(255));          // FF
+//     println(fmt::bin_str(10));             // 1010
+//     println(fmt::thousands(1234567));      // 1,234,567
+//     println(fmt::fixed_point(3.14159, 2)); // 3.14
+//     println(fmt::percent_str(0.256, 1));   // 25.6%
+//     println(fmt::byte_size(1536));         // 1.5 KB
+//     println(fmt::duration_ms(3661000));    // 1h 1m 1s
+//     println(fmt::align_right("42", 6));    // "    42"
+//
+// Everything is pure Zexi over the built-in `String`, so importing it costs no
+// C shim and no linker flags. Bases 2..36 are supported; negative integers keep
+// a leading `-` attached to the digits (the sign is not part of the radix
+// representation, matching how `-ff` is read as `-(ff)`).
+
+// fmt_clampi clamps v into [lo, hi].
+fn fmt_clampi(v: i32, lo: i32, hi: i32) -> i32 {
+    if v < lo {
+        return lo;
+    }
+    if v > hi {
+        return hi;
+    }
+    return v;
+}
+
+// fmt_mag is the unsigned magnitude of n. It is exact even for i64::MIN, whose
+// magnitude does not fit in a signed 64-bit value.
+fn fmt_mag(n: i64) -> u64 {
+    if n < 0 {
+        return (0 as u64) - (n as u64);
+    }
+    return n as u64;
+}
+
+// fmt_digit maps 0..35 to its lowercase ASCII digit byte.
+fn fmt_digit(d: u64) -> u8 {
+    if d < 10 {
+        return (48 as u8) + (d as u8); // '0'
+    }
+    return (87 as u8) + (d as u8); // 'a' - 10
+}
+
+// fmt_radix_mag renders an unsigned magnitude in `base` (2..36), lowercase.
+fn fmt_radix_mag(mag: u64, base: u64) -> String {
+    let mut buf: [u8; 64] = [0; 64];
+    let mut n: usize = 0;
+    let mut m = mag;
+    if m == 0 {
+        buf[0] = 48;
+        n = 1;
+    }
+    while m > 0 {
+        buf[n] = fmt_digit(m % base);
+        n += 1;
+        m = m / base;
+    }
+    let mut out = String::from("");
+    while n > 0 {
+        n -= 1;
+        out.push_byte(buf[n]);
+    }
+    return out;
+}
+
+// fmt_radix renders a signed integer in `base`, with a leading `-` when
+// negative.
+fn fmt_radix(n: i64, base: u64) -> String {
+    let mut out = String::from("");
+    if n < 0 {
+        out.push('-');
+    }
+    out += fmt_radix_mag(fmt_mag(n), base).as_str();
+    return out;
+}
+
+// fmt_i64 renders a signed integer in base 10.
+fn fmt_i64(n: i64) -> String {
+    return fmt_radix(n, 10);
+}
+
+// fmt_zero_pad renders a non-negative integer left-padded with zeros to at
+// least `width` digits.
+fn fmt_zero_pad(v: i64, width: i32) -> String {
+    let mut out = String::from("");
+    let digits = fmt_radix_mag(v as u64, 10);
+    let mut pad: i64 = (width as i64) - (digits.len() as i64);
+    while pad > 0 {
+        out.push('0');
+        pad -= 1;
+    }
+    out += digits.as_str();
+    return out;
+}
+
+// --- integer bases ---------------------------------------------------------
+
+// radix_str formats n in the given base; base is clamped to 2..36.
+pub fn radix_str(n: i64, base: i32) -> String {
+    return fmt_radix(n, fmt_clampi(base, 2, 36) as u64);
+}
+
+// hex_lower formats n in base 16, lowercase.
+pub fn hex_lower(n: i64) -> String {
+    return fmt_radix(n, 16);
+}
+
+// hex_upper formats n in base 16, uppercase.
+pub fn hex_upper(n: i64) -> String {
+    let lower = fmt_radix(n, 16);
+    let mut out = String::from("");
+    let mut i: usize = 0;
+    while i < lower.len() {
+        let b = lower.byte_at(i);
+        if b >= 97 && b <= 122 {
+            out.push_byte((b - 32) as u8);
+        } else {
+            out.push_byte(b as u8);
+        }
+        i += 1;
+    }
+    return out;
+}
+
+// hex_pad formats n in base 16 with the magnitude zero-padded to `width`
+// digits, keeping a leading `-` in front of the padding (e.g. hex_pad(-255, 4)
+// is "-00ff").
+pub fn hex_pad(n: i64, width: i32) -> String {
+    let digits = fmt_radix_mag(fmt_mag(n), 16);
+    let mut out = String::from("");
+    if n < 0 {
+        out.push('-');
+    }
+    let mut pad: i64 = (width as i64) - (digits.len() as i64);
+    while pad > 0 {
+        out.push('0');
+        pad -= 1;
+    }
+    out += digits.as_str();
+    return out;
+}
+
+// bin_str formats n in base 2.
+pub fn bin_str(n: i64) -> String {
+    return fmt_radix(n, 2);
+}
+
+// oct_str formats n in base 8.
+pub fn oct_str(n: i64) -> String {
+    return fmt_radix(n, 8);
+}
+
+// --- decimal grouping and floats -------------------------------------------
+
+// thousands_sep groups the decimal digits of n in threes with `sep`, e.g.
+// thousands_sep(1234567, ',') is "1,234,567".
+pub fn thousands_sep(n: i64, sep: char) -> String {
+    let mut buf: [u8; 20] = [0; 20];
+    let mut m = fmt_mag(n);
+    let mut count: usize = 0;
+    if m == 0 {
+        buf[0] = 48;
+        count = 1;
+    }
+    while m > 0 {
+        buf[count] = fmt_digit(m % 10);
+        count += 1;
+        m = m / 10;
+    }
+    let mut out = String::from("");
+    if n < 0 {
+        out.push('-');
+    }
+    let total = count;
+    let mut i: usize = 0;
+    while i < total {
+        // A separator goes before this digit when a multiple of three digits
+        // still sit to its right (and it is not the leading digit).
+        if i > 0 && (total - i) % 3 == 0 {
+            out.push(sep);
+        }
+        out.push_byte(buf[total - 1 - i]);
+        i += 1;
+    }
+    return out;
+}
+
+// thousands groups the decimal digits of n with commas.
+pub fn thousands(n: i64) -> String {
+    return thousands_sep(n, ',');
+}
+
+// fixed_point renders x with exactly `digits` digits after the decimal point,
+// rounding half away from zero (e.g. fixed_point(3.14159, 2) is "3.14",
+// fixed_point(2.5, 0) is "3"). `digits` is clamped to 0..18. NaN prints as
+// "NaN" and infinities as "inf". Values too large to scale exactly fall back to
+// the runtime's own float formatting.
+pub fn fixed_point(x: f64, digits: i32) -> String {
+    let d = fmt_clampi(digits, 0, 18);
+    if x != x {
+        return String::from("NaN");
+    }
+    let mut ax = x;
+    if x < 0.0 {
+        ax = 0.0 - x;
+    }
+    if ax != 0.0 && ax * 0.5 == ax {
+        return String::from("inf");
+    }
+    let mut scale: i64 = 1;
+    let mut k: i32 = 0;
+    while k < d {
+        scale = scale * 10;
+        k += 1;
+    }
+    let scaled_f = ax * (scale as f64);
+    if scaled_f >= 9.0e18 {
+        return "" + x;
+    }
+    let scaled = (scaled_f + 0.5) as i64;
+    let ip = scaled / scale;
+    let fp = scaled % scale;
+
+    let mut out = String::from("");
+    if x < 0.0 && scaled != 0 {
+        out.push('-');
+    }
+    out += fmt_radix_mag(ip as u64, 10).as_str();
+    if d > 0 {
+        out.push('.');
+        out += fmt_zero_pad(fp, d).as_str();
+    }
+    return out;
+}
+
+// sci_notation renders x in scientific form with `digits` digits after the
+// decimal point (e.g. sci_notation(12345.0, 2) is "1.23e4").
+pub fn sci_notation(x: f64, digits: i32) -> String {
+    let d = fmt_clampi(digits, 0, 17);
+    if x != x {
+        return String::from("NaN");
+    }
+    let neg = x < 0.0;
+    let mut ax = x;
+    if neg {
+        ax = 0.0 - x;
+    }
+    if ax != 0.0 && ax * 0.5 == ax {
+        return String::from("inf");
+    }
+    if ax == 0.0 {
+        let mut z = String::from("0");
+        if d > 0 {
+            z.push('.');
+            z += fmt_zero_pad(0, d).as_str();
+        }
+        z += "e0";
+        return z;
+    }
+    let mut exp: i32 = 0;
+    while ax >= 10.0 {
+        ax = ax / 10.0;
+        exp += 1;
+    }
+    while ax < 1.0 {
+        ax = ax * 10.0;
+        exp -= 1;
+    }
+    let mut scale: i64 = 1;
+    let mut k: i32 = 0;
+    while k < d {
+        scale = scale * 10;
+        k += 1;
+    }
+    let mut m = (ax * (scale as f64) + 0.5) as i64;
+    if m >= scale * 10 {
+        m = m / 10;
+        exp += 1;
+    }
+    let mut out = String::from("");
+    if neg {
+        out.push('-');
+    }
+    out += fmt_radix_mag((m / scale) as u64, 10).as_str();
+    if d > 0 {
+        out.push('.');
+        out += fmt_zero_pad(m % scale, d).as_str();
+    }
+    out.push('e');
+    out += exp;
+    return out;
+}
+
+// percent_str renders a fraction as a percentage, e.g. percent_str(0.256, 1) is
+// "25.6%".
+pub fn percent_str(frac: f64, digits: i32) -> String {
+    let mut out = fixed_point(frac * 100.0, digits);
+    out.push('%');
+    return out;
+}
+
+// --- human units -----------------------------------------------------------
+
+// byte_size renders a byte count with a decimal unit (B, KB, MB, GB, TB) and
+// one decimal place above 1 KB, e.g. byte_size(1536) is "1.5 KB".
+pub fn byte_size(n: i64) -> String {
+    if fmt_mag(n) < 1000 {
+        return fmt_i64(n) + " B";
+    }
+    let neg = n < 0;
+    let mut v: f64 = fmt_mag(n) as f64;
+    let mut u: usize = 0;
+    while v >= 1000.0 && u < 4 {
+        v = v / 1000.0;
+        u += 1;
+    }
+    let units: [str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut out = String::from("");
+    if neg {
+        out.push('-');
+    }
+    out += fixed_point(v, 1).as_str();
+    out.push(' ');
+    out += units[u];
+    return out;
+}
+
+// duration_ms renders a millisecond count as a compact duration, e.g.
+// duration_ms(3661000) is "1h 1m 1s" and duration_ms(250) is "250ms". Negative
+// input is passed through as "<n>ms".
+pub fn duration_ms(ms: i64) -> String {
+    if ms < 1000 {
+        return fmt_i64(ms) + "ms";
+    }
+    let hours = ms / 3600000;
+    let mins = (ms % 3600000) / 60000;
+    let secs = (ms % 60000) / 1000;
+    let millis = ms % 1000;
+    let mut out = String::from("");
+    if hours > 0 {
+        out += hours;
+        out.push('h');
+    }
+    if mins > 0 {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out += mins;
+        out.push('m');
+    }
+    if secs > 0 {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out += secs;
+        out.push('s');
+    }
+    if out.is_empty() {
+        out += ms;
+        out += "ms";
+    } else if millis > 0 {
+        out.push(' ');
+        out += millis;
+        out += "ms";
+    }
+    return out;
+}
+
+// ordinal renders n with its English ordinal suffix, e.g. ordinal(21) is
+// "21st". Negative values keep their sign ("-3rd").
+pub fn ordinal(n: i64) -> String {
+    let mut out = String::from("");
+    if n < 0 {
+        out.push('-');
+    }
+    out += fmt_mag(n);
+    let last2 = fmt_mag(n) % 100;
+    let last1 = fmt_mag(n) % 10;
+    if last2 >= 11 && last2 <= 13 {
+        out += "th";
+    } else if last1 == 1 {
+        out += "st";
+    } else if last1 == 2 {
+        out += "nd";
+    } else if last1 == 3 {
+        out += "rd";
+    } else {
+        out += "th";
+    }
+    return out;
+}
+
+// --- alignment -------------------------------------------------------------
+
+// align_left pads s on the right with spaces to `width` columns.
+pub fn align_left(s: str, width: i32) -> String {
+    let mut out = String::from(s);
+    let mut pad: i64 = (width as i64) - (s.len() as i64);
+    while pad > 0 {
+        out.push(' ');
+        pad -= 1;
+    }
+    return out;
+}
+
+// align_right pads s on the left with spaces to `width` columns.
+pub fn align_right(s: str, width: i32) -> String {
+    let mut out = String::from("");
+    let mut pad: i64 = (width as i64) - (s.len() as i64);
+    while pad > 0 {
+        out.push(' ');
+        pad -= 1;
+    }
+    out += s;
+    return out;
+}
+
+// align_center pads s on both sides with spaces to `width` columns, giving the
+// extra space on the right for odd padding.
+pub fn align_center(s: str, width: i32) -> String {
+    let extra: i64 = (width as i64) - (s.len() as i64);
+    if extra <= 0 {
+        return String::from(s);
+    }
+    let left: i64 = extra / 2;
+    let mut out = String::from("");
+    let mut i: i64 = 0;
+    while i < left {
+        out.push(' ');
+        i += 1;
+    }
+    out += s;
+    let mut j: i64 = left;
+    while j < extra {
+        out.push(' ');
+        j += 1;
+    }
+    return out;
+}
