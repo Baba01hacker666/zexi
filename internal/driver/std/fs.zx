@@ -22,10 +22,10 @@ pub fn file_len(path: str) -> i64 {
     return zxn_file_size(path);
 }
 
-// read_bytes returns a whole file as an owning byte String. Missing files and
-// files above FS_MAX_BYTES yield an empty String; call path_exists/file_len
-// first when an empty file must be distinguished from an error.
-pub fn read_bytes(path: str) -> String {
+// read_bytes_with_status reads a whole file and records, in `opened`, whether
+// the source actually opened. Callers that must distinguish "empty file" from
+// "unreadable file" use this instead of comparing the byte count to the size.
+fn read_bytes_with_status(path: str, opened: &mut bool) -> String {
     let size = zxn_file_size(path);
     if size < 0 || size > FS_MAX_BYTES as i64 {
         return String::new();
@@ -33,6 +33,7 @@ pub fn read_bytes(path: str) -> String {
     let mut out = String::with_capacity(size as usize);
     let handle = zxn_file_open(path);
     if handle >= 0 {
+        *opened = true;
         let mut buf: [u8; 8192] = [0; 8192];
         let mut done = false;
         while !done && out.len() < FS_MAX_BYTES {
@@ -52,6 +53,14 @@ pub fn read_bytes(path: str) -> String {
         zxn_file_close(handle);
     }
     return out;
+}
+
+// read_bytes returns a whole file as an owning byte String. Missing files and
+// files above FS_MAX_BYTES yield an empty String; call path_exists/file_len
+// first when an empty file must be distinguished from an error.
+pub fn read_bytes(path: str) -> String {
+    let mut opened = false;
+    return read_bytes_with_status(path, &mut opened);
 }
 
 // read_text is an alias for read_bytes. Zexi does not transcode file data:
@@ -89,14 +98,13 @@ pub fn copy_file(from: str, to: str) -> i32 {
         return -1;
     }
     // A zero-byte file and an unreadable file both report length 0, but only
-    // the former should copy. Confirm the source actually opens before
-    // touching the destination so an unreadable source reports -1.
-    let probe = zxn_file_open(from);
-    if probe < 0 {
+    // the former should copy. Track the source-open status directly so an
+    // unreadable source reports -1 without writing to the destination.
+    let mut opened = false;
+    let data = read_bytes_with_status(from, &mut opened);
+    if !opened {
         return -1;
     }
-    zxn_file_close(probe);
-    let data = read_bytes(from);
     // Detect a concurrent truncation/read failure instead of silently copying a
     // partial file. (The size is bounded above, so this cast is safe here.)
     if data.len() != size as usize {
