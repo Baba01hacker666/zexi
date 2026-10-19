@@ -43,6 +43,14 @@ func (p *parser) cur() token.Token { return p.toks[p.pos] }
 
 func (p *parser) at(k token.Kind) bool { return p.cur().Kind == k }
 
+// peekKind returns the kind of the token after the current one (or EOF).
+func (p *parser) peekKind() token.Kind {
+	if p.pos+1 < len(p.toks) {
+		return p.toks[p.pos+1].Kind
+	}
+	return token.KindEOF
+}
+
 func (p *parser) prevEnd() token.Pos {
 	if p.pos == 0 {
 		return 0
@@ -186,11 +194,8 @@ func (p *parser) parseFn(vis ast.Visibility, start token.Pos) ast.Item {
 	if !ok {
 		return nil
 	}
-	if p.at(token.KindLt) {
-		p.errf(p.cur(), "E0900", "generics are not supported yet (design milestone M1)")
-		p.skipGenericArgs()
-	}
 	fn := &ast.FnDecl{Vis: vis, Name: name, Sp: p.spanFrom(start)}
+	fn.Generics = p.parseGenerics()
 	fn.Params = p.parseParams()
 	if p.accept(token.KindArrow) {
 		fn.Ret = p.parseType()
@@ -282,11 +287,8 @@ func (p *parser) parseStruct(vis ast.Visibility, attrs []string, start token.Pos
 	if !ok {
 		return nil
 	}
-	if p.at(token.KindLt) {
-		p.errf(p.cur(), "E0900", "generics are not supported yet (design milestone M1)")
-		p.skipGenericArgs()
-	}
 	d := &ast.StructDecl{Vis: vis, Attrs: attrs, Name: name}
+	d.Generics = p.parseGenerics()
 	switch {
 	case p.accept(token.KindSemicolon):
 	case p.at(token.KindLBrace):
@@ -332,11 +334,8 @@ func (p *parser) parseEnum(vis ast.Visibility, attrs []string, start token.Pos) 
 	if !ok {
 		return nil
 	}
-	if p.at(token.KindLt) {
-		p.errf(p.cur(), "E0900", "generics are not supported yet (design milestone M1)")
-		p.skipGenericArgs()
-	}
 	d := &ast.EnumDecl{Vis: vis, Attrs: attrs, Name: name}
+	d.Generics = p.parseGenerics()
 	if _, ok := p.expect(token.KindLBrace, " to begin enum body"); !ok {
 		return d
 	}
@@ -413,10 +412,7 @@ func (p *parser) parseTypeAlias(vis ast.Visibility, start token.Pos) ast.Item {
 		return nil
 	}
 	d := &ast.TypeAlias{Vis: vis, Name: name}
-	if p.at(token.KindLt) {
-		p.errf(p.cur(), "E0900", "generics are not supported yet (design milestone M1)")
-		p.skipGenericArgs()
-	}
+	d.Generics = p.parseGenerics()
 	p.expect(token.KindEq, " in type alias")
 	d.Ty = p.parseType()
 	p.expectSemicolon()
@@ -426,11 +422,8 @@ func (p *parser) parseTypeAlias(vis ast.Visibility, start token.Pos) ast.Item {
 
 func (p *parser) parseImpl(start token.Pos) ast.Item {
 	p.bump() // impl
-	if p.at(token.KindLt) {
-		p.errf(p.cur(), "E0900", "generics are not supported yet (design milestone M1)")
-		p.skipGenericArgs()
-	}
 	d := &ast.ImplBlock{}
+	d.Generics = p.parseGenerics()
 	d.SelfTy = p.parseType()
 	if p.accept(token.KindFor) {
 		// `impl Trait for Type`: what we parsed as SelfTy is actually the trait.
@@ -620,8 +613,8 @@ func (p *parser) tokAt(n int) token.Token {
 }
 
 // parseStructLit parses `Path { field: value, .. }` or `Path { field, .. }`.
-func (p *parser) parseStructLit(path []string, start token.Pos) ast.Expr {
-	lit := &ast.StructLitExpr{Path: path}
+func (p *parser) parseStructLit(path []string, typeArgs []ast.Type, start token.Pos) ast.Expr {
+	lit := &ast.StructLitExpr{Path: path, TypeArgs: typeArgs}
 	p.bump() // {
 	for !p.at(token.KindRBrace) && !p.at(token.KindEOF) {
 		fstart := p.cur().Pos.Offset
@@ -1165,17 +1158,22 @@ func (p *parser) parsePrimary() ast.Expr {
 
 	case token.KindIdentifier:
 		p.bump()
+		var typeArgs []ast.Type
+		if p.at(token.KindColonColon) && p.peekKind() == token.KindLt {
+			p.bump() // ::
+			typeArgs = p.parseGenericArgs()
+		}
 		path := []string{t.Lit}
 		for p.accept(token.KindColonColon) {
 			path = append(path, p.expectIdentPath("path segment"))
 		}
 		if p.at(token.KindLBrace) && p.noStructLit == 0 {
-			return p.parseStructLit(path, start)
+			return p.parseStructLit(path, typeArgs, start)
 		}
 		if len(path) == 1 {
-			return &ast.IdentExpr{Name: path[0], Sp: p.spanFrom(start)}
+			return &ast.IdentExpr{Name: path[0], TypeArgs: typeArgs, Sp: p.spanFrom(start)}
 		}
-		return &ast.PathExpr{Segments: path, Sp: p.spanFrom(start)}
+		return &ast.PathExpr{Segments: path, TypeArgs: typeArgs, Sp: p.spanFrom(start)}
 
 	case token.KindLParen:
 		p.bump()
@@ -1470,10 +1468,7 @@ func (p *parser) parseType() ast.Type {
 			path = append(path, p.expectIdentPath("type path segment"))
 		}
 		pt := &ast.PathType{Segments: path}
-		if p.at(token.KindLt) {
-			p.errf(p.cur(), "E0900", "generics are not supported yet (design milestone M1)")
-			p.skipGenericArgs()
-		}
+		pt.Args = p.parseGenericArgs()
 		pt.Sp = p.spanFrom(start)
 		return pt
 	case token.KindUnderscore:
@@ -1521,25 +1516,70 @@ func (p *parser) skipTo(stop ...token.Kind) {
 	}
 }
 
-// skipGenericArgs consumes a balanced `<...>` after a generics error.
-func (p *parser) skipGenericArgs() {
+// parseGenerics parses a `<T, U: Bound>` type-parameter list. Bounds are parsed
+// for fidelity but rejected by the checker, since traits are not implemented.
+func (p *parser) parseGenerics() []ast.GenericParam {
 	if !p.at(token.KindLt) {
-		return
+		return nil
 	}
-	depth := 0
-	for !p.at(token.KindEOF) {
-		switch p.cur().Kind {
-		case token.KindLt:
-			depth++
-		case token.KindGt:
-			depth--
-			if depth == 0 {
-				p.bump()
-				return
+	p.bump() // <
+	var params []ast.GenericParam
+	for !p.at(token.KindGt) && !p.at(token.KindShr) && !p.at(token.KindEOF) {
+		start := p.cur().Pos.Offset
+		name, ok := p.expectIdent("type parameter name")
+		if !ok {
+			p.skipTo(token.KindComma, token.KindGt, token.KindShr)
+		} else {
+			gp := ast.GenericParam{Name: name}
+			if p.accept(token.KindColon) {
+				gp.Bounds = append(gp.Bounds, p.parseType())
+				for p.accept(token.KindPlus) {
+					gp.Bounds = append(gp.Bounds, p.parseType())
+				}
 			}
-		case token.KindSemicolon, token.KindLBrace:
-			return
+			gp.Sp = p.spanFrom(start)
+			params = append(params, gp)
 		}
-		p.bump()
+		if !p.accept(token.KindComma) {
+			break
+		}
 	}
+	p.expectGt(" to close type parameter list")
+	return params
+}
+
+// parseGenericArgs parses `<A, B>` in a type or turbofish position.
+func (p *parser) parseGenericArgs() []ast.Type {
+	if !p.at(token.KindLt) {
+		return nil
+	}
+	p.bump() // <
+	var args []ast.Type
+	for !p.at(token.KindGt) && !p.at(token.KindShr) && !p.at(token.KindEOF) {
+		args = append(args, p.parseType())
+		if !p.accept(token.KindComma) {
+			break
+		}
+	}
+	p.expectGt(" to close generic arguments")
+	return args
+}
+
+// expectGt consumes one closing `>`. The lexer produces `>>` as a single token,
+// so a `>>` satisfies one closer and is rewritten in place as a single `>` for
+// the next one (as in `Vec<Vec<i64>>`).
+func (p *parser) expectGt(context string) bool {
+	if p.at(token.KindGt) {
+		p.bump()
+		return true
+	}
+	if p.at(token.KindShr) {
+		t := p.cur()
+		pos := t.Pos
+		pos.Offset++
+		p.toks[p.pos] = token.Token{Kind: token.KindGt, Pos: pos, End: t.End, Lit: ">"}
+		return true
+	}
+	p.expect(token.KindGt, context)
+	return false
 }

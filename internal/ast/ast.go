@@ -74,12 +74,13 @@ type GenericParam struct {
 
 // StructDecl is a struct definition.
 type StructDecl struct {
-	Vis    Visibility
-	Attrs  []string
-	Name   string
-	Fields []Field
-	Tuple  bool // true for `struct S(T, U);`
-	Sp     token.Span
+	Vis      Visibility
+	Attrs    []string
+	Name     string
+	Generics []GenericParam
+	Fields   []Field
+	Tuple    bool // true for `struct S(T, U);`
+	Sp       token.Span
 }
 
 func (*StructDecl) itemNode()          {}
@@ -98,6 +99,7 @@ type EnumDecl struct {
 	Vis      Visibility
 	Attrs    []string
 	Name     string
+	Generics []GenericParam
 	Variants []Variant
 	Sp       token.Span
 }
@@ -127,10 +129,11 @@ func (d *ConstDecl) Span() token.Span { return d.Sp }
 
 // TypeAlias is `type Name = Ty;`.
 type TypeAlias struct {
-	Vis  Visibility
-	Name string
-	Ty   Type
-	Sp   token.Span
+	Vis      Visibility
+	Name     string
+	Generics []GenericParam
+	Ty       Type
+	Sp       token.Span
 }
 
 func (*TypeAlias) itemNode()          {}
@@ -167,10 +170,11 @@ func (d *UseDecl) Span() token.Span { return d.Sp }
 
 // ImplBlock is `impl Type { .. }` or `impl Trait for Type { .. }`.
 type ImplBlock struct {
-	SelfTy Type
-	Trait  Type // nil for inherent impls
-	Fns    []*FnDecl
-	Sp     token.Span
+	Generics []GenericParam
+	SelfTy   Type
+	Trait    Type // nil for inherent impls
+	Fns      []*FnDecl
+	Sp       token.Span
 }
 
 func (*ImplBlock) itemNode()          {}
@@ -312,18 +316,22 @@ type Block struct {
 func (*Block) exprNode()          {}
 func (b *Block) Span() token.Span { return b.Sp }
 
-// IdentExpr is a bare name.
+// IdentExpr is a bare name, optionally with explicit type arguments
+// (`foo::<i64>`).
 type IdentExpr struct {
-	Name string
-	Sp   token.Span
+	Name     string
+	TypeArgs []Type
+	Sp       token.Span
 }
 
 func (*IdentExpr) exprNode()          {}
 func (e *IdentExpr) Span() token.Span { return e.Sp }
 
-// PathExpr is `a::b::c`.
+// PathExpr is `a::b::c`. TypeArgs, when present, apply to the first segment
+// (a type path), as in `Vec::<i64>::new()`.
 type PathExpr struct {
 	Segments []string
+	TypeArgs []Type
 	Sp       token.Span
 }
 
@@ -543,11 +551,13 @@ type JumpExpr struct {
 func (*JumpExpr) exprNode()          {}
 func (e *JumpExpr) Span() token.Span { return e.Sp }
 
-// StructLitExpr is `Path { field: value, .. }`.
+// StructLitExpr is `Path { field: value, .. }`. TypeArgs, when present, apply
+// to the first path segment, as in `Pair::<i64, str> { .. }`.
 type StructLitExpr struct {
-	Path   []string
-	Fields []FieldInit
-	Sp     token.Span
+	Path     []string
+	TypeArgs []Type
+	Fields   []FieldInit
+	Sp       token.Span
 }
 
 func (*StructLitExpr) exprNode()          {}

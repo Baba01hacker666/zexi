@@ -264,3 +264,106 @@ mod external;`
 		t.Fatalf("unexpected external module: %#v", file.Items[4])
 	}
 }
+
+// TestParsesGenericSyntax covers generics on every item, type arguments on
+// types, expression turbofish, and the `>>` splitting needed by nested
+// instantiations.
+func TestParsesGenericSyntax(t *testing.T) {
+	src := `struct Pair<A, B> { first: A, second: B }
+enum Option<T> { Some(T), None }
+type PairI64<B> = Pair<i64, B>;
+impl<A, B> Pair<A, B> {
+    fn swap(self) -> Pair<B, A> { Pair { first: self.second, second: self.first } }
+}
+fn id<T>(x: T) -> T { x }
+fn nested(x: Vec<Vec<i64>>) -> i64 { 0 }
+fn main() -> i32 {
+    let a = id::<i64>(1);
+    let b = Pair::<i64, i64> { first: 1, second: 2 };
+    let c = Vec::<i64>::new();
+    0
+}`
+	file, n := parse(t, src)
+	if n != 0 {
+		t.Fatalf("unexpected diagnostics: %d", n)
+	}
+	if len(file.Items) != 7 {
+		t.Fatalf("expected 7 items, got %d", len(file.Items))
+	}
+	st, ok := file.Items[0].(*ast.StructDecl)
+	if !ok || len(st.Generics) != 2 || st.Generics[0].Name != "A" || st.Generics[1].Name != "B" {
+		t.Fatalf("unexpected struct generics: %#v", file.Items[0])
+	}
+	en, ok := file.Items[1].(*ast.EnumDecl)
+	if !ok || len(en.Generics) != 1 || en.Generics[0].Name != "T" {
+		t.Fatalf("unexpected enum generics: %#v", file.Items[1])
+	}
+	al, ok := file.Items[2].(*ast.TypeAlias)
+	if !ok || len(al.Generics) != 1 {
+		t.Fatalf("unexpected alias generics: %#v", file.Items[2])
+	}
+	pt, ok := al.Ty.(*ast.PathType)
+	if !ok || len(pt.Args) != 2 {
+		t.Fatalf("unexpected alias target: %#v", al.Ty)
+	}
+	im, ok := file.Items[3].(*ast.ImplBlock)
+	if !ok || len(im.Generics) != 2 {
+		t.Fatalf("unexpected impl generics: %#v", file.Items[3])
+	}
+	fn, ok := file.Items[4].(*ast.FnDecl)
+	if !ok || len(fn.Generics) != 1 || fn.Generics[0].Name != "T" {
+		t.Fatalf("unexpected fn generics: %#v", file.Items[4])
+	}
+	nested, ok := file.Items[5].(*ast.FnDecl)
+	if !ok || len(nested.Params) != 1 {
+		t.Fatalf("unexpected nested generic fn: %#v", file.Items[5])
+	}
+	outer, ok := nested.Params[0].Ty.(*ast.PathType)
+	if !ok || len(outer.Args) != 1 {
+		t.Fatalf("expected Vec<Vec<i64>>, got %#v", nested.Params[0].Ty)
+	}
+	inner, ok := outer.Args[0].(*ast.PathType)
+	if !ok || len(inner.Args) != 1 {
+		t.Fatalf("expected inner Vec<i64>, got %#v", outer.Args[0])
+	}
+
+	main, ok := file.Items[6].(*ast.FnDecl)
+	if !ok || len(main.Body.Stmts) != 3 {
+		t.Fatalf("unexpected main: %#v", file.Items[6])
+	}
+	// `id::<i64>(1)`: turbofish on a bare name.
+	firstLit, ok := main.Body.Stmts[0].(*ast.LetStmt)
+	if !ok {
+		t.Fatalf("unexpected stmt: %#v", main.Body.Stmts[0])
+	}
+	call, ok := firstLit.Val.(*ast.CallExpr)
+	if !ok {
+		t.Fatalf("unexpected call: %#v", firstLit.Val)
+	}
+	idExpr, ok := call.Callee.(*ast.IdentExpr)
+	if !ok || idExpr.Name != "id" || len(idExpr.TypeArgs) != 1 {
+		t.Fatalf("unexpected turbofish callee: %#v", call.Callee)
+	}
+	// `Pair::<i64, i64> { .. }`: turbofish on a struct literal.
+	secondLit, ok := main.Body.Stmts[1].(*ast.LetStmt)
+	if !ok {
+		t.Fatalf("unexpected stmt: %#v", main.Body.Stmts[1])
+	}
+	lit, ok := secondLit.Val.(*ast.StructLitExpr)
+	if !ok || len(lit.TypeArgs) != 2 || len(lit.Fields) != 2 {
+		t.Fatalf("unexpected struct literal: %#v", secondLit.Val)
+	}
+	// `Vec::<i64>::new()`: turbofish on a type-qualified call.
+	thirdLit, ok := main.Body.Stmts[2].(*ast.LetStmt)
+	if !ok {
+		t.Fatalf("unexpected stmt: %#v", main.Body.Stmts[2])
+	}
+	ctor, ok := thirdLit.Val.(*ast.CallExpr)
+	if !ok {
+		t.Fatalf("unexpected call: %#v", thirdLit.Val)
+	}
+	path, ok := ctor.Callee.(*ast.PathExpr)
+	if !ok || len(path.Segments) != 2 || path.Segments[1] != "new" || len(path.TypeArgs) != 1 {
+		t.Fatalf("unexpected qualified ctor: %#v", ctor.Callee)
+	}
+}
