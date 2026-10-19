@@ -30,6 +30,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../examples/static_server.zx",
 		"../../examples/regex.zx",
 		"../../examples/local_tools.zx",
+		"../../examples/math_tools.zx",
 		"../../tests/tour.zx",
 		"../../tests/structs.zx",
 		"../../tests/enums.zx",
@@ -1252,8 +1253,9 @@ fn main() -> i32 {
 	}
 }
 
-// TestStdMathConvenience exercises the high-level dependency-free helpers,
-// including the conventional names that make small programs read naturally.
+// TestStdMathConvenience exercises the high-level dependency-free numerical
+// surface: conventional aliases, transcendental helpers, geometry, domain
+// fallbacks, and floating-point classification.
 func TestStdMathConvenience(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping end-to-end math test in short mode")
@@ -1270,6 +1272,15 @@ fn main() -> i32 {
     println(approx_eq(hypot(3.0, 4.0), 5.0, 0.0000001));
     println(pow(2.0, 10) == 1024.0);
     println(approx_eq(sin(PI / 2.0), 1.0, 0.0000001));
+    println(approx_eq(exp(1.0), E, 0.000000000001), approx_eq(log(E), 1.0, 0.000000000001), approx_eq(log2(8.0), 3.0, 0.000000000001), approx_eq(log10(1000.0), 3.0, 0.000000000001), approx_eq(log_base(81.0, 3.0), 4.0, 0.000000000001), approx_eq(exp(ln(0.5)), 0.5, 0.000000000001));
+    println(approx_eq(powf(9.0, 0.5), 3.0, 0.000000000001), approx_eq(powf(-2.0, 3.0), -8.0, 0.000000000001), powf(-2.0, 0.5) == 0.0, powf(MAX_F64, 0.0) == 1.0);
+    println(approx_eq(atan(1.0), FRAC_PI_4, 0.000000000001), approx_eq(atan2(1.0, 1.0), FRAC_PI_4, 0.000000000001), approx_eq(atan2(-1.0, -1.0), 0.0 - 3.0 * FRAC_PI_4, 0.000000000001), approx_eq(asin(1.0), FRAC_PI_2, 0.000000000001), approx_eq(asin(0.5), PI / 6.0, 0.000000000001), approx_eq(acos(-1.0), PI, 0.000000000001));
+    println(approx_eq(radians(180.0), PI, 0.000000000001), approx_eq(degrees(PI), 180.0, 0.000000000001), approx_eq(sinh(0.0), 0.0, 0.000000000001), approx_eq(cosh(0.0), 1.0, 0.000000000001), approx_eq(tanh(1.0), 0.7615941559557649, 0.000000000001));
+    println(approx_eq(cbrt(-125.0), -5.0, 0.000000000001), approx_eq(root(81.0, 4), 3.0, 0.000000000001), smoothstep(0.0, 10.0, 5.0) == 0.5, smootherstep(0.0, 10.0, 5.0) == 0.5);
+    println(approx_eq(distance(0.0, 0.0, 3.0, 4.0), 5.0, 0.000000000001), distance_sq(0.0, 0.0, 3.0, 4.0) == 25.0, fract(-2.75) == -0.75, copysign(2.0, -1.0) == -2.0, sign(-0.5) == -1.0, saturate(3.0) == 1.0);
+    let inf = MAX_F64 * 2.0;
+    println(is_nan(1.0), is_finite(MAX_F64), is_infinite(inf), is_finite(inf));
+    println(div_floor(1, 0), mod_floor(1, 0), div_ceil(1, 0), powi(2, -1), pow_mod(2, -1, 7));
     println(floor(9223372036854775808.0) == 9223372036854775808.0);
     println(trunc(0.0 - 9223372036854775808.0) == 0.0 - 9223372036854775808.0);
     println(factorial(10), choose(10, 3), is_prime(97), next_prime(100), next_prime(9223372036854775807));
@@ -1289,7 +1300,7 @@ fn main() -> i32 {
 	if err != nil {
 		t.Fatalf("running high-level math program: %v", err)
 	}
-	if want := "true\ntrue\ntrue\ntrue\ntrue\ntrue\n3628800 120 true 101 0\n"; string(raw) != want {
+	if want := "true\ntrue\ntrue\ntrue\ntrue true true true true true\ntrue true true true\ntrue true true true true true\ntrue true true true true\ntrue true true true\ntrue true true true true true\nfalse true true false\n0 0 0 0 0\ntrue\ntrue\n3628800 120 true 101 0\n"; string(raw) != want {
 		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
 	}
 }

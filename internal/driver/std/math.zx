@@ -36,6 +36,11 @@ pub fn is_odd(x: i64) -> bool {
 
 // div_floor rounds division toward negative infinity (C truncates toward 0).
 pub fn div_floor(a: i64, b: i64) -> i64 {
+    // Keep a convenience helper from turning a bad command-line/config value
+    // into a process-level divide-by-zero trap.
+    if b == 0 {
+        return 0;
+    }
     let q = a / b;
     if a % b != 0 && ((a < 0) != (b < 0)) {
         return q - 1;
@@ -43,8 +48,13 @@ pub fn div_floor(a: i64, b: i64) -> i64 {
     return q;
 }
 
-// mod_floor is the Euclidean-style non-negative remainder.
+// mod_floor is the remainder paired with div_floor (it has b's sign when
+// non-zero). It returns 0 when b is 0 rather than evaluating an undefined C
+// remainder operation.
 pub fn mod_floor(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        return 0;
+    }
     let r = a % b;
     if r != 0 && ((a < 0) != (b < 0)) {
         return r + b;
@@ -52,8 +62,11 @@ pub fn mod_floor(a: i64, b: i64) -> i64 {
     return r;
 }
 
-// div_ceil rounds division toward positive infinity.
+// div_ceil rounds division toward positive infinity (and returns 0 for b=0).
 pub fn div_ceil(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        return 0;
+    }
     let q = a / b;
     if a % b != 0 && ((a > 0) == (b > 0)) {
         return q + 1;
@@ -80,7 +93,12 @@ pub fn lcmi(a: i64, b: i64) -> i64 {
     return absi(a / gcdi(a, b) * b);
 }
 
+// powi raises an integer base to a non-negative exponent. A negative exponent
+// would require a fractional result, so it returns 0 instead of silently 1.
 pub fn powi(base: i64, exp: i32) -> i64 {
+    if exp < 0 {
+        return 0;
+    }
     let mut r: i64 = 1;
     let mut i = 0;
     while i < exp {
@@ -112,7 +130,7 @@ pub fn isqrt(n: i64) -> i64 {
 // 64-bit arithmetic. Results are exact only when m <= 4294967296, since
 // b*b and result*b can overflow u64 for larger moduli.
 pub fn pow_mod(base: i64, exp: i64, m: i64) -> i64 {
-    if m <= 1 {
+    if m <= 1 || exp < 0 {
         return 0;
     }
     let mut result: u64 = 1;
@@ -193,10 +211,16 @@ pub fn log2_floor(x: u64) -> i32 {
 const MATH_F64_I64_LIMIT: f64 = 9223372036854775808.0;
 
 pub fn minf(a: f64, b: f64) -> f64 {
+    // Preserve exceptional values instead of quietly discarding a NaN because
+    // every ordered comparison with it is false.
+    if a != a { return a; }
+    if b != b { return b; }
     if a < b { a } else { b }
 }
 
 pub fn maxf(a: f64, b: f64) -> f64 {
+    if a != a { return a; }
+    if b != b { return b; }
     if a > b { a } else { b }
 }
 
@@ -259,6 +283,16 @@ pub fn trunc_f(x: f64) -> f64 {
 pub const PI: f64 = 3.14159265358979323846264338327950288;
 pub const TAU: f64 = 6.28318530717958647692528676655900576;
 pub const E: f64 = 2.71828182845904523536028747135266250;
+pub const FRAC_PI_2: f64 = 1.57079632679489661923132169163975144;
+pub const FRAC_PI_4: f64 = 0.78539816339744830961566084581987572;
+pub const SQRT_2: f64 = 1.41421356237309504880168872420969808;
+pub const LN_2: f64 = 0.69314718055994530941723212145817657;
+pub const LN_10: f64 = 2.30258509299404568401799145468436421;
+pub const LOG2_E: f64 = 1.44269504088896340735992468100189214;
+pub const LOG10_E: f64 = 0.43429448190325182765112891891660508;
+// MAX_F64 is the largest finite IEEE-754 f64 value. It is useful with the
+// classification helpers and makes saturation behavior explicit.
+pub const MAX_F64: f64 = 1.7976931348623157e308;
 
 pub fn min(a: f64, b: f64) -> f64 { minf(a, b) }
 pub fn max(a: f64, b: f64) -> f64 { maxf(a, b) }
@@ -321,6 +355,12 @@ pub fn sqrt(x: f64) -> f64 {
 pub fn hypot(x: f64, y: f64) -> f64 {
     let ax = absf(x);
     let ay = absf(y);
+    // Match the useful IEEE convention: an infinite side dominates a NaN
+    // side, while a NaN is otherwise preserved.
+    if is_infinite(ax) { return ax; }
+    if is_infinite(ay) { return ay; }
+    if is_nan(ax) { return ax; }
+    if is_nan(ay) { return ay; }
     let hi = maxf(ax, ay);
     let lo = minf(ax, ay);
     if hi == 0.0 {
@@ -506,4 +546,349 @@ pub fn next_prime(n: i64) -> i64 {
         }
         candidate += 2;
     }
+}
+
+// --- extended float helpers ------------------------------------------------
+//
+// These stay in Zexi rather than binding libm, so a small program can use the
+// familiar APIs below without adding a platform-specific linker dependency.
+// They target ordinary application/numerical work; for correctly-rounded
+// scientific edge cases an explicit C/libm binding remains available.
+
+// is_nan reports whether x is an IEEE NaN.
+pub fn is_nan(x: f64) -> bool { return x != x; }
+
+// is_finite reports whether x is neither NaN nor positive/negative infinity.
+pub fn is_finite(x: f64) -> bool {
+    return x == x && x <= MAX_F64 && x >= 0.0 - MAX_F64;
+}
+
+// is_infinite reports positive or negative infinity.
+pub fn is_infinite(x: f64) -> bool {
+    return !is_nan(x) && !is_finite(x);
+}
+
+// sign returns -1.0, 0.0, or 1.0. NaN has no ordering, so it returns 0.0.
+pub fn sign(x: f64) -> f64 {
+    if x < 0.0 {
+        return -1.0;
+    }
+    if x > 0.0 {
+        return 1.0;
+    }
+    return 0.0;
+}
+
+// copysign applies sign_source's sign to magnitude. A NaN sign source is
+// treated as non-negative; signed zero is intentionally normalized to +0.
+pub fn copysign(magnitude: f64, sign_source: f64) -> f64 {
+    let mag = absf(magnitude);
+    if sign_source < 0.0 {
+        return 0.0 - mag;
+    }
+    return mag;
+}
+
+// fract returns the fractional part after truncation toward zero.
+pub fn fract(x: f64) -> f64 { return x - trunc_f(x); }
+
+// radians and degrees convert between the two common angle units.
+pub fn radians(value: f64) -> f64 { return value * PI / 180.0; }
+pub fn degrees(value: f64) -> f64 { return value * 180.0 / PI; }
+
+// midpoint avoids overflow better than `(a + b) / 2.0` for large same-sign
+// values. It is the two-value counterpart to mean2.
+pub fn midpoint(a: f64, b: f64) -> f64 { return a / 2.0 + b / 2.0; }
+
+// saturate clamps a value into the useful unit interval [0, 1].
+pub fn saturate(x: f64) -> f64 { return clampf(x, 0.0, 1.0); }
+
+// scale_pow2 multiplies a value by 2^exponent without needing libm. The
+// extended helpers only call it with the bounded f64 exponent range.
+fn scale_pow2(value: f64, exponent: i32) -> f64 {
+    let mut out = value;
+    let mut e = exponent;
+    while e > 0 {
+        out *= 2.0;
+        e -= 1;
+    }
+    while e < 0 {
+        out *= 0.5;
+        e += 1;
+    }
+    return out;
+}
+
+// exp computes e^x using ln(2) range reduction and a Taylor series. Large
+// positive inputs saturate at MAX_F64; sufficiently negative inputs underflow
+// to 0.0 instead of requiring an infinity-producing runtime operation.
+pub fn exp(x: f64) -> f64 {
+    if x != x {
+        return x;
+    }
+    if x >= 709.782712893384 {
+        return MAX_F64;
+    }
+    if x <= -745.1332191019411 {
+        return 0.0;
+    }
+    let exponent = floor_f(x / LN_2) as i32;
+    let reduced = x - (exponent as f64) * LN_2;
+    let mut term = 1.0;
+    let mut out = 1.0;
+    let mut i: i32 = 1;
+    while i <= 18 {
+        term = term * reduced / (i as f64);
+        out += term;
+        i += 1;
+    }
+    return scale_pow2(out, exponent);
+}
+
+// exp2 computes 2^x. It is useful for scalings, signal processing, and binary
+// sizes when an integer-only pow is too restrictive.
+pub fn exp2(x: f64) -> f64 { return exp(x * LN_2); }
+
+// ln computes the natural logarithm of a positive x. It returns 0.0 for x <=
+// 0 because this compact stdlib has no Result/NaN-construction API for a
+// domain error. NaN is propagated and +infinity remains +infinity.
+pub fn ln(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x != x {
+        return x;
+    }
+    let mut y = x;
+    let mut exponent: i32 = 0;
+    while y >= 2.0 && exponent < 1024 {
+        y *= 0.5;
+        exponent += 1;
+    }
+    while y < 1.0 && exponent > -1074 {
+        y *= 2.0;
+        exponent -= 1;
+    }
+    // This is reached by +infinity after the bounded range-reduction loop.
+    if y >= 2.0 || y < 1.0 {
+        return y;
+    }
+    // atanh-style series: ln(y) = 2 * (z + z^3/3 + ...), where y is in
+    // [1, 2), so |z| <= 1/3 and 20 terms are comfortably accurate.
+    let z = (y - 1.0) / (y + 1.0);
+    let z2 = z * z;
+    let mut term = z;
+    let mut out = z;
+    let mut divisor: i32 = 3;
+    while divisor <= 39 {
+        term *= z2;
+        out += term / (divisor as f64);
+        divisor += 2;
+    }
+    return 2.0 * out + (exponent as f64) * LN_2;
+}
+
+// log is the conventional short name for the natural logarithm.
+pub fn log(x: f64) -> f64 { return ln(x); }
+pub fn log2(x: f64) -> f64 { return ln(x) / LN_2; }
+pub fn log10(x: f64) -> f64 { return ln(x) / LN_10; }
+
+// log_base computes log base `base` of x. Inputs outside x > 0, base > 0, and
+// base != 1 return 0.0, following ln's compact domain-error convention.
+pub fn log_base(x: f64, base: f64) -> f64 {
+    if x <= 0.0 || base <= 0.0 || base == 1.0 {
+        return 0.0;
+    }
+    return ln(x) / ln(base);
+}
+
+const MATH_F64_I32_LIMIT: f64 = 2147483648.0;
+
+// powf raises a real base to a real exponent. Positive bases support any finite
+// exponent; negative bases work for whole i32 exponents. Other real powers of
+// a negative number have no real result here and return 0.0.
+pub fn powf(base: f64, exponent: f64) -> f64 {
+    // This also gives the conventional 0^0 and (+infinity)^0 result.
+    if exponent == 0.0 {
+        return 1.0;
+    }
+    if base == 0.0 {
+        if exponent > 0.0 {
+            return 0.0;
+        }
+        return 0.0;
+    }
+    if base > 0.0 {
+        return exp(ln(base) * exponent);
+    }
+    let whole = trunc_f(exponent);
+    if exponent != whole || whole < 0.0 - MATH_F64_I32_LIMIT || whole >= MATH_F64_I32_LIMIT {
+        return 0.0;
+    }
+    return pow(base, whole as i32);
+}
+
+// atan_series assumes |x| <= sqrt(2)-1 and uses the alternating arctangent
+// series. Range reduction in atan keeps it in that fast-converging interval.
+fn atan_series(x: f64) -> f64 {
+    let x2 = x * x;
+    let mut term = x;
+    let mut out = x;
+    let mut k: i32 = 1;
+    while k < 20 {
+        term *= x2;
+        let part = term / ((2 * k + 1) as f64);
+        if k % 2 == 1 {
+            out -= part;
+        } else {
+            out += part;
+        }
+        k += 1;
+    }
+    return out;
+}
+
+// atan returns the angle whose tangent is x, in radians.
+pub fn atan(x: f64) -> f64 {
+    if x != x {
+        return x;
+    }
+    if x < 0.0 {
+        return 0.0 - atan(0.0 - x);
+    }
+    if x > 1.0 {
+        return FRAC_PI_2 - atan(1.0 / x);
+    }
+    if x > SQRT_2 - 1.0 {
+        return FRAC_PI_4 + atan((x - 1.0) / (x + 1.0));
+    }
+    return atan_series(x);
+}
+
+// atan2 returns the signed angle from the positive x-axis to (x, y). The
+// origin has no direction and returns 0.0.
+pub fn atan2(y: f64, x: f64) -> f64 {
+    if y != y {
+        return y;
+    }
+    if x != x {
+        return x;
+    }
+    if x > 0.0 {
+        return atan(y / x);
+    }
+    if x < 0.0 {
+        if y >= 0.0 {
+            return atan(y / x) + PI;
+        }
+        return atan(y / x) - PI;
+    }
+    if y > 0.0 {
+        return FRAC_PI_2;
+    }
+    if y < 0.0 {
+        return 0.0 - FRAC_PI_2;
+    }
+    return 0.0;
+}
+
+// asin and acos return principal-value angles in radians. Inputs outside
+// [-1, 1] have no real result and return 0.0.
+pub fn asin(x: f64) -> f64 {
+    if x < -1.0 || x > 1.0 {
+        return 0.0;
+    }
+    return atan2(x, sqrt(1.0 - x * x));
+}
+
+pub fn acos(x: f64) -> f64 {
+    if x < -1.0 || x > 1.0 {
+        return 0.0;
+    }
+    return FRAC_PI_2 - asin(x);
+}
+
+// sinh, cosh, and tanh are the usual hyperbolic functions. exp's documented
+// saturation behavior also bounds extreme inputs to these helpers.
+pub fn sinh(x: f64) -> f64 {
+    let ex = exp(x);
+    return (ex - 1.0 / ex) / 2.0;
+}
+
+pub fn cosh(x: f64) -> f64 {
+    let ex = exp(x);
+    return (ex + 1.0 / ex) / 2.0;
+}
+
+pub fn tanh(x: f64) -> f64 {
+    if x > 20.0 {
+        return 1.0;
+    }
+    if x < -20.0 {
+        return -1.0;
+    }
+    let ex = exp(2.0 * x);
+    return (ex - 1.0) / (ex + 1.0);
+}
+
+// cbrt returns the real cube root, including for negative inputs.
+pub fn cbrt(x: f64) -> f64 {
+    if x == 0.0 || is_infinite(x) {
+        return x;
+    }
+    if x < 0.0 {
+        return 0.0 - exp(ln(0.0 - x) / 3.0);
+    }
+    return exp(ln(x) / 3.0);
+}
+
+// root returns the real nth root for a positive n. Negative radicands are
+// supported for odd n; even roots of a negative value and n <= 0 return 0.0.
+pub fn root(x: f64, n: i32) -> f64 {
+    if n <= 0 {
+        return 0.0;
+    }
+    if x == 0.0 || is_infinite(x) {
+        if x < 0.0 && n % 2 == 0 {
+            return 0.0;
+        }
+        return x;
+    }
+    if x < 0.0 {
+        if n % 2 == 0 {
+            return 0.0;
+        }
+        return 0.0 - exp(ln(0.0 - x) / (n as f64));
+    }
+    return exp(ln(x) / (n as f64));
+}
+
+// smoothstep and smootherstep make a clamped, smooth transition from 0 to 1
+// across [edge0, edge1]. Equal edges return 0.0 through inverse_lerp.
+pub fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
+    let t = saturate(inverse_lerp(edge0, edge1, x));
+    return t * t * (3.0 - 2.0 * t);
+}
+
+pub fn smootherstep(edge0: f64, edge1: f64, x: f64) -> f64 {
+    let t = saturate(inverse_lerp(edge0, edge1, x));
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+// remap_clamped is remap with the source ratio constrained to [0, 1].
+pub fn remap_clamped(in_lo: f64, in_hi: f64, out_lo: f64, out_hi: f64, x: f64) -> f64 {
+    let t = saturate(inverse_lerp(in_lo, in_hi, x));
+    return lerp(out_lo, out_hi, t);
+}
+
+// distance_sq and distance are 2D Cartesian helpers. distance uses hypot to
+// avoid an intermediate overflow for ordinary finite coordinate differences.
+pub fn distance_sq(x0: f64, y0: f64, x1: f64, y1: f64) -> f64 {
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    return dx * dx + dy * dy;
+}
+
+pub fn distance(x0: f64, y0: f64, x1: f64, y1: f64) -> f64 {
+    return hypot(x1 - x0, y1 - y0);
 }

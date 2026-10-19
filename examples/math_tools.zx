@@ -1,0 +1,21 @@
+// Common dependency-free math helpers: angles, logs, roots, smoothing, and
+// simple 2D geometry.
+//
+// Run:
+//   zexic run examples/math_tools.zx
+
+import math;
+
+fn main() -> i32 {
+    let heading = atan2(4.0, 3.0);
+    println("heading in degrees:", degrees(heading));
+    println("sin(30 degrees):", sin(radians(30.0)));
+
+    println("e^1:", exp(1.0), "ln(e):", ln(E));
+    println("9^0.5:", powf(9.0, 0.5), "cube root of -125:", cbrt(-125.0));
+
+    println("smooth halfway:", smoothstep(0.0, 100.0, 50.0));
+    println("2D distance:", distance(0.0, 0.0, 3.0, 4.0));
+    println("next prime after 100:", next_prime(100));
+    0
+}

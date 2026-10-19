@@ -164,5 +164,53 @@ result types land.
 
 Ready-to-run examples: [`examples/http_app.zx`](../examples/http_app.zx),
 [`examples/static_server.zx`](../examples/static_server.zx),
-[`examples/local_tools.zx`](../examples/local_tools.zx), and
-[`examples/regex.zx`](../examples/regex.zx).
+[`examples/local_tools.zx`](../examples/local_tools.zx),
+[`examples/regex.zx`](../examples/regex.zx), and
+[`examples/math_tools.zx`](../examples/math_tools.zx).
+
+## 10.5 Everyday numerical work
+
+`import math;` is a dependency-free, pure-Zexi toolbox for the common numeric
+jobs that should not require an external package or a `-lm` linker flag:
+
+```zx
+import math;
+
+fn main() -> i32 {
+    let angle = atan2(4.0, 3.0);       // atan2(y, x), in radians
+    println(degrees(angle));
+    println(sin(radians(30.0)));
+
+    println(exp(1.0), ln(E));
+    println(powf(9.0, 0.5), cbrt(-125.0));
+    println(smoothstep(0.0, 100.0, 50.0));
+    println(distance(0.0, 0.0, 3.0, 4.0));
+    0
+}
+```
+
+| Group | APIs |
+| --- | --- |
+| Constants and conversion | `PI`, `TAU`, `E`, `FRAC_PI_2`, `FRAC_PI_4`, `SQRT_2`, `LN_2`, `LN_10`, `radians`, `degrees` |
+| Basic float work | `min`, `max`, `clamp`, `abs`, `sign`, `copysign`, `floor`, `ceil`, `round`, `trunc`, `fract`, `saturate`, `midpoint` |
+| Exponentials and logs | `exp`, `exp2`, `ln`/`log`, `log2`, `log10`, `log_base`, `powf` |
+| Trigonometry | `sin`, `cos`, `tan`, `atan`, `atan2`, `asin`, `acos`, `sinh`, `cosh`, `tanh` |
+| Roots and geometry | `sqrt`, `cbrt`, `root`, `hypot`, `distance`, `distance_sq` |
+| Ranges and animation | `lerp`, `inverse_lerp`, `remap`, `remap_clamped`, `smoothstep`, `smootherstep`, `approx_eq` |
+| Integers and number theory | `gcd`, `lcm`, `isqrt`, `powi`, `pow_mod`, bit helpers, `factorial`, `choose`, `is_prime`, `next_prime` |
+
+`pow(base, exponent)` retains its efficient **integer** exponent API; use
+`powf(base, exponent)` for real exponents. `powf` accepts any real exponent for
+a positive base and also accepts whole `i32` exponents for a negative base;
+other negative-base real powers return `0.0` because they have no real result.
+
+The approximation-based transcendental functions are designed for normal app,
+visualization, game, and scripting calculations—not correctly rounded,
+scientific-edge-case work. `exp` saturates positive overflow at `MAX_F64` and
+underflows extreme negative input to `0.0`; `ln`, logarithms, and real roots
+with no real value return `0.0`. `is_nan`, `is_finite`, and `is_infinite` let a
+caller explicitly inspect exceptional floating-point values. For stricter
+platform-libm semantics, bind the required C function explicitly as described
+in [`09-c-bridge.md`](09-c-bridge.md).
+
+Run [`examples/math_tools.zx`](../examples/math_tools.zx) for a compact tour.

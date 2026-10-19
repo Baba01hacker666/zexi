@@ -341,9 +341,11 @@ main.zx lib.zx`) still works too.
 
 The embedded standard library (sources in `internal/driver/std/`) includes:
 
-- `math`: integer helpers plus `PI`, `sqrt`, `hypot`, `sin`, `cos`, `pow`,
-  `lerp`, `factorial`, `choose`, `is_prime`, and conventional `min`/`max`/
-  `abs` aliases.
+- `math`: integer/bit/prime helpers plus `PI`, angle conversion, roots,
+  exponentials/logarithms, `sin`/`cos`/inverse and hyperbolic trig, `pow`/
+  `powf`, geometry, interpolation/smoothing, and conventional `min`/`max`/
+  `abs` aliases. See [`10-stdlib-recipes.md`](10-stdlib-recipes.md) for
+  domain and approximation behavior.
 - `text`: ASCII casing, trim/pad/replace/search, comparisons, and simple
   formatting helpers; familiar `upper`, `lower`, `strip`, `contains`,
   `starts_with`, `ends_with`, `replace`, and `is_blank` aliases are included

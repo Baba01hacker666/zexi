@@ -49,9 +49,10 @@ This repository contains the **initial design and specification** of Zexi: the v
 > and `serve_dir(root, 8000)` remove the socket/accept boilerplate; `Client`,
 > `fetch`, and `request` cover the client side (see
 > [`docs/08-networking.md`](docs/08-networking.md)). Embedded `math`, `text`,
-> `io`, `fs`, `os`, and `regex` also provide dependency-free arithmetic/trig/
-> primes, familiar string helpers, `input(prompt)`, capped binary-safe file
-> helpers, local process/path conveniences, and POSIX-ERE matching.
+> `io`, `fs`, `os`, and `regex` also provide dependency-free arithmetic,
+> roots/logs/trigonometry/geometry, number theory, familiar string helpers,
+> `input(prompt)`, capped binary-safe file helpers, local process/path
+> conveniences, and POSIX-ERE matching.
 >
 > Not yet implemented: generics, traits/`impl Trait`, **scoped** modules and
 > visibility enforcement (the current `use`/`import`/`mod` loader is flat;
@@ -84,6 +85,7 @@ go run ./cmd/zexic run tests/pi.zx        # 30 digits of π: big-int + Machin's 
 go run ./cmd/zexic run examples/http_app.zx                  # high-level Router + serve
 go run ./cmd/zexic run examples/static_server.zx -- .         # one-call static server
 go run ./cmd/zexic run examples/local_tools.zx -- release-42  # local os + regex helpers
+go run ./cmd/zexic run examples/math_tools.zx                 # roots, logs, angles, and geometry
 go run ./cmd/zexic run examples/regex.zx                      # POSIX-ERE matching
 # The low-level, explicit FFI example remains available too:
 go run ./cmd/zexic run examples/http_server.zx lib/http.zx
