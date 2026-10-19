@@ -2,7 +2,8 @@
 
 This is the *normative-shaped* spec for the M0 language. Features tagged
 **M1/M2** are designed here; the lightweight source loader described in §2.8
-is an intentionally flat M1 preview, not yet full scoped modules.
+supports qualified, `pub`-checked module paths on top of a still-flat merged
+program namespace.
 
 ## 2.1 Lexical structure
 
@@ -380,12 +381,12 @@ No exceptions. Two mechanisms:
 
 ## 2.8 Modules & packages
 
-The current loader is a useful **M1 preview** rather than the final scoped
-module system:
+The loader supports **scoped, path-qualified access** on top of the flat M1
+preview:
 
 - A **file** can be loaded as a module. `mod foo;` finds `foo.zx` or
   `foo/mod.zx` relative to its declaring file. `mod foo { ... }` is accepted
-  for inline organization.
+  for inline organization. Both create a `foo::` qualifier.
 - `use` imports a whole library file at compile time. `use "path.zx";` loads a
   relative file; `use a::b;` loads `a/b.zx`, searched next to the importing
   file, then in a `lib/` folder beside it, then in the embedded standard
@@ -393,17 +394,40 @@ module system:
 - `import` is an equivalent Python-shaped spelling. It additionally accepts
   dots: `import http.server;` selects the high-level HTTP module and
   `import io.fs;` selects the file helpers. `::` is accepted there too.
+- **`as` binds the module to a qualifier**: `import math as m;` makes
+  `m::sqrt(2.0)` valid. Without `as`, the last path segment is the qualifier
+  (`import http.server;` → `server::Router`), and the full path is accepted too
+  (`http::server::Router`).
+- **Qualified paths are real lookups**: `alias::fn(..)`,
+  `mod::Type { .. }`, `pkg::Type::new(..)`, `mod::Enum::Variant`, and
+  `mod::Type` in type position all resolve against the target module's
+  declarations, and `pub` is enforced (**E0603** for a private item, **E0412**
+  for a missing one, **E0433** for using a module as a value).
 - Imports are transitive, every file is loaded once, and cycles are harmless.
-  For now, loaded declarations are flattened into one program namespace:
-  `import http.server;` lets code call `serve(...)`, not
-  `http.server.serve(...)`. `pub` is parsed but is not yet enforced across
-  module boundaries. The grammar retains `as alias` for forward compatibility,
-  but the flat loader deliberately rejects it with **E9024** rather than
-  silently pretending that a namespace exists. Name collisions remain errors,
-  and an unresolvable import/module is E9022/E9023.
 
-Files may also be passed directly on the command line, as before. Full path
-resolution, visibility enforcement, and package metadata remain M1 work.
+**Projects (convention only, no manifest).** The compiler accepts a directory as
+well as a file. For a directory, `main.zx` is tried first, then `src/main.zx`;
+the **project root** is that directory (for `zexic run src/main.zx`, the root is
+the directory above `src`). Named imports (`use foo;`, `use a::b;`, `mod foo;`)
+are searched in this order: the importing file's directory, its `lib/` folder,
+the project root, the root's `lib/` folder, then the embedded standard library.
+If a lookup names a **directory** instead of a file, the whole folder is loaded
+as one package: every `.zx` file in it (except `main.zx` and `_`-prefixed files)
+is compiled in, and its public names are reachable through the package
+qualifier. So a project can be `main.zx` plus a handful of files, or a tree of
+folders, and `zexic run .` compiles the entry and everything it links to.
+`--root=<dir>` overrides the discovered root.
+
+The preview remains **flat underneath**: items are still merged into one
+program namespace, so plain imports continue to expose their names unqualified
+(this keeps existing code working and means `pub` is not yet enforced for
+*unqualified* access). Name collisions between two loaded modules are still
+errors, and there are no re-exports, glob imports, or package metadata yet.
+Full isolation — per-module namespaces that make unqualified cross-module
+access respect `pub` — is the remaining M1 work. An unresolvable
+import/module is E9022/E9023.
+
+Files may also be passed directly on the command line, as before.
 
 ## 2.9 Attributes (M1/M2)
 
@@ -422,11 +446,14 @@ Deliberately tiny — a "core" that is largely in-language:
 - `os`/`sys` (opt-in): file, socket, process, time — thin libc or syscall
   wrappers, only linked when used.
 
-The shipped M1-preview helpers are embedded source modules: `io`, `fs`, `math`,
-`text`, `regex`, `random`, `sys`/`os`, `net`, and `http`. For example,
-`import text.regex;` selects the small POSIX-ERE facade and `import os;` selects
-local environment/path/process helpers. Their C shims are linked only if that
-module is selected.
+The shipped M1-preview helpers are embedded source modules: `io`, `fs`, `fmt`,
+`codec`, `math`, `text`, `regex`, `random`, `sys`/`os`, `net`, `http`, and
+`thread`. For example, `import text.regex;` selects the small POSIX-ERE facade,
+`import os;` selects local environment/path/process helpers, `use fmt;` selects
+pure-Zexi number/value formatting, `use codec;` selects hex/base64 and
+checksums, and `use thread;` selects the pthread concurrency preview (threads,
+`i64` channels, `i64` atomics; see [`11-concurrency.md`](11-concurrency.md)).
+Their C shims are linked only if that module is selected.
 
 No `std` is linked by default; `#![no_std]` is the default rather than an
 opt-in, which is a key part of hitting the binary-size target.

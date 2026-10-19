@@ -5,9 +5,11 @@ common *script and service* tasks that otherwise make a language feel harder
 than it needs to be. No package installation is required: import the facade,
 then call its declarations directly.
 
-> The current M1-preview loader is deliberately flat. For example,
-> `import http.server;` makes `Router`, `Response`, and `serve_local` available
-> directly; it does **not** create an `http.server.*` namespace yet.
+> The M1-preview loader exposes imports both unqualified and through a
+> qualifier. `import http.server;` makes `Router`, `Response`, and `serve_local`
+> available directly *and* as `server::Router` / `server::serve_local`; the full
+> path `http::server::Router` works too. Qualified lookups enforce `pub`;
+> unqualified access is still backed by the flat merged namespace.
 
 ## 10.1 A local-only HTTP service
 
@@ -23,14 +25,19 @@ fn hello(req: &Request) -> Response {
 }
 
 fn main() -> i32 {
-    let mut app = Router::new();
-    app.get("/health", hello);
-    serve_local(&app, 8000)
+    handle_get("/health", hello);
+    listen("127.0.0.1:8000")
 }
 ```
 
-For a deterministic tool or test, use `serve_local_n(&app, count, port)`. It
-exits after `count` valid HTTP requests; empty TCP readiness probes do not count.
+The top-level form registers on the default mux and `listen` takes an address
+string, so it reads like Go's `http.HandleFunc` + `http.ListenAndServe`. For an
+explicit router, `let mut app = new_app(); app.get("/health", hello);` then
+`serve_local(&app, 8000)` behaves as before.
+
+For a deterministic tool or test, use `serve_local_n(&app, count, port)` (or
+`listen_n(addr, count)`) to exit after `count` valid HTTP requests; empty TCP
+readiness probes do not count.
 
 To serve a local directory without writing an accept loop:
 
@@ -214,3 +221,115 @@ platform-libm semantics, bind the required C function explicitly as described
 in [`09-c-bridge.md`](09-c-bridge.md).
 
 Run [`examples/math_tools.zx`](../examples/math_tools.zx) for a compact tour.
+
+## 10.6 Concurrency: threads, channels, and atomics
+
+`use thread;` adds real OS threads with fork–join, blocking `i64` channels, and
+lock-free `i64` atomics. It is the one stdlib module that links a thread shim
+(and `-pthread`), and only when imported:
+
+```zx
+use thread;
+
+fn worker(ch: i64) -> i64 {
+    let mut i: i64 = 1;
+    while i <= 5 {
+        chan_send(ch, i * i);
+        i += 1;
+    }
+    chan_close(ch);
+    return 0;
+}
+
+fn main() -> i32 {
+    let ch = Chan::new(4);
+    let t = Thread::spawn(worker, ch.id());
+    let mut sum: i64 = 0;
+    let mut v: i64 = 0;
+    while ch.recv(&mut v) {
+        sum += v;
+    }
+    t.join();
+    println(sum);        // 55
+    0
+}
+```
+
+Only `i64` values cross a thread boundary, which keeps the subset data-race-free.
+The full guide — `spawn`/`spawn2`/`spawn_void`, the free-function forms a worker
+uses, atomics, limits, and the `Send`/`Sync` roadmap — is in
+[`11-concurrency.md`](11-concurrency.md), and
+[`tests/threads.zx`](../tests/threads.zx) is a runnable tour.
+
+## 10.7 Formatting numbers and units
+
+`use fmt;` is a pure-Zexi (no C shim) toolbox for the shapes a program prints:
+bases, grouping, fixed decimals, human units, ordinals, and alignment.
+
+```zx
+use fmt;
+
+fn main() -> i32 {
+    println(fmt::hex_lower(255));          // ff
+    println(fmt::hex_pad(255, 4));         // 00ff
+    println(fmt::thousands(1234567));      // 1,234,567
+    println(fmt::fixed_point(3.14159, 2)); // 3.14
+    println(fmt::sci_notation(12345.0, 2));// 1.23e4
+    println(fmt::percent_str(0.256, 1));   // 25.6%
+    println(fmt::byte_size(1536));         // 1.5 KB
+    println(fmt::duration_ms(3661000));    // 1h 1m 1s
+    println(fmt::ordinal(21));             // 21st
+    println("[" + fmt::align_right("42", 6) + "]");  // [    42]
+    0
+}
+```
+
+| Group | APIs |
+| --- | --- |
+| Bases | `hex_lower`, `hex_upper`, `hex_pad`, `bin_str`, `oct_str`, `radix_str` (2..36) |
+| Decimal grouping | `thousands`, `thousands_sep` |
+| Decimals and exponents | `fixed_point`, `sci_notation`, `percent_str` |
+| Human units | `byte_size`, `duration_ms` |
+| Ordinals | `ordinal` |
+| Alignment | `align_left`, `align_right`, `align_center` |
+
+Negative integers keep a leading `-` in front of the digits (`-ff`, not a
+two's-complement form). `fixed_point` rounds half away from zero, prints `NaN`
+for NaN, `inf` for infinities, and falls back to the built-in float formatting
+for values too large to scale exactly. `radix_str` clamps its base to 2..36 and
+`fixed_point`/`sci_notation` clamp their digit count (0..18). See
+[`tests/formatting.zx`](../tests/formatting.zx) for every function.
+
+## 10.8 Encoders and checksums
+
+`use codec;` is a pure-Zexi (no C shim) module for the conversions around the
+network edge: hex and base64 for tokens, Basic auth, and data URIs, plus the
+checksums used for ETags and integrity checks.
+
+```zx
+use codec;
+
+fn main() -> i32 {
+    println(codec::hex_encode("hi"));          // 6869
+    println(codec::hex_decode("68656c6c6f"));  // hello
+    println(codec::base64_encode("hello"));    // aGVsbG8=
+    println(codec::base64_encode_url("a?b"));  // YT9i
+    println(codec::base64_decode("aGVsbG8=")); // hello
+    println(codec::crc32_hex("123456789"));    // cbf43926
+    println(codec::fnv1a64_hex("hello"));      // a430d84680aabd0b
+    0
+}
+```
+
+| Group | APIs |
+| --- | --- |
+| Hex | `hex_encode`, `hex_encode_upper`, `hex_decode` |
+| Base64 | `base64_encode`, `base64_encode_url`, `base64_decode` |
+| Checksums | `crc32`, `crc32_hex`, `adler32`, `adler32_hex`, `fnv1a32`, `fnv1a32_hex`, `fnv1a64`, `fnv1a64_hex`, `djb2`, `djb2_hex` |
+
+`crc32` is the zlib/IEEE 802.3 CRC-32; `adler32` matches zlib; `fnv1a32`/`fnv1a64`
+are 32-/64-bit FNV-1a; `djb2` is Bernstein's hash. The numeric forms return an
+`i64` (`u64` for the 64-bit hashes) and the `*_hex` forms return a zero-padded
+lowercase digest. `hex_decode` and `base64_decode` return an empty string on
+malformed input rather than guessing. See
+[`tests/encoding.zx`](../tests/encoding.zx) for the standard test vectors.

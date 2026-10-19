@@ -48,6 +48,10 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/function_values.zx",
 		"../../tests/keywords.zx",
 		"../../tests/easy.zx",
+		"../../tests/modules.zx",
+		"../../tests/threads.zx",
+		"../../tests/formatting.zx",
+		"../../tests/encoding.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -209,6 +213,89 @@ func TestRunPrograms(t *testing.T) {
 				"42", "6", "3", "",
 			}, "\n"),
 		},
+		{
+			file: "../../tests/modules.zx",
+			want: strings.Join([]string{
+				"14 10 9 42",
+				"25",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/threads.zx",
+			want: strings.Join([]string{
+				"square: 81",
+				"sum: 19900",
+				"total: 15",
+				"counter: 4000",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/formatting.zx",
+			want: strings.Join([]string{
+				"ff",
+				"FF",
+				"00ff",
+				"-00ff",
+				"1010",
+				"100",
+				"qglj",
+				"11111111",
+				"-8000000000000000",
+				"1,234,567",
+				"-1,000,000",
+				"0",
+				"1 234 567",
+				"3.14",
+				"3",
+				"0.00",
+				"0.000",
+				"1.23e4",
+				"4.200e-4",
+				"1.0e1",
+				"25.6%",
+				"999 B",
+				"1.5 KB",
+				"123.5 MB",
+				"250ms",
+				"1m 30s",
+				"1s 500ms",
+				"1h 1m 1s",
+				"1st 2nd 3rd 11th 21st 0th",
+				"[ab   ]",
+				"[   ab]",
+				"[ ab  ]",
+				"[abcd]",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/encoding.zx",
+			want: strings.Join([]string{
+				"68656c6c6f",
+				"68656C6C6F",
+				"hello",
+				"[]",
+				"[]",
+				"aGVsbG8=",
+				"",
+				"VGhlIHF1aWNrIGJyb3duIGZveCBqdW1wcyBvdmVyIHRoZSBsYXp5IGRvZw",
+				"hello",
+				"hello",
+				"123456789",
+				"00000000",
+				"cbf43926",
+				"414fa339",
+				"00000001",
+				"091e01de",
+				"4f9f2cab",
+				"a430d84680aabd0b",
+				"06d5573923c6cdfc",
+				"000000310f923099",
+				"",
+			}, "\n"),
+		},
 	}
 
 	for _, tc := range cases {
@@ -324,7 +411,7 @@ func TestStdNetHTTPRoundTrip(t *testing.T) {
 	serverSrc := `use http;
 
 fn main() -> i32 {
-    let mut srv = listen("127.0.0.1", 18082);
+    let mut srv = listen_tcp("127.0.0.1", 18082);
     if srv.fd < 0 {
         println("bind failed");
         return 1;
@@ -358,7 +445,7 @@ fn main() -> i32 {
 	clientSrc := `use std::http;
 
 fn main() -> i32 {
-    let a = get("127.0.0.1", 18082, "/");
+    let a = get_raw("127.0.0.1", 18082, "/");
     let ra = parse_response(&a);
     print(ra.status);
     print(" ");
@@ -366,13 +453,13 @@ fn main() -> i32 {
     print(" ");
     println(ra.header("content-length"));
 
-    let b = get("127.0.0.1", 18082, "/pi");
+    let b = get_raw("127.0.0.1", 18082, "/pi");
     let rb = parse_response(&b);
     print(rb.status);
     print(" ");
     println(rb.body.trim());
 
-    let p = post("127.0.0.1", 18082, "/echo", "hello body");
+    let p = post_raw("127.0.0.1", 18082, "/echo", "hello body");
     let rp = parse_response(&p);
     print(rp.status);
     print(" ");
@@ -493,14 +580,14 @@ func TestStdHTTPClientReadsBodies(t *testing.T) {
 
 fn main() -> i32 {
     let port = String::from(arg_at(1)).parse_i64() as i32;
-    let a = get("127.0.0.1", port, "/");
+    let a = get_raw("127.0.0.1", port, "/");
     let ra = parse_response(&a);
     print(ra.status);
     print(" [");
     print(ra.body);
     println("]");
 
-    let b = get("127.0.0.1", port, "/");
+    let b = get_raw("127.0.0.1", port, "/");
     let rb = parse_response(&b);
     print(rb.status);
     print(" [");
@@ -761,7 +848,7 @@ func TestStdHTTPStaticFiles(t *testing.T) {
 
 fn main() -> i32 {
     let root = String::from(arg_at(1));
-    let mut srv = listen("127.0.0.1", 18089);
+    let mut srv = listen_tcp("127.0.0.1", 18089);
     if !srv.ok() {
         println("bind failed");
         return 1;
@@ -859,7 +946,7 @@ func TestParallelCUnitsMatchSingleFile(t *testing.T) {
 		t.Skip("no C compiler available")
 	}
 
-	for _, file := range []string{"../../tests/pi.zx", "../../tests/strings.zx"} {
+	for _, file := range []string{"../../tests/pi.zx", "../../tests/strings.zx", "../../tests/threads.zx"} {
 		t.Run(filepath.Base(file), func(t *testing.T) {
 			dir := t.TempDir()
 			outputs := make([][]byte, 2)
@@ -1261,6 +1348,165 @@ fn main() -> i32 {
 	}
 }
 
+// TestDefaultMuxAndGoClient exercises the Go-flavoured surface: top-level
+// handle_get/listen on a process-global mux, `{name}` route parameters, after
+// middleware, and the one-call client (`get`, `do`).
+func TestDefaultMuxAndGoClient(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end network test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	reserve, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := reserve.Addr().(*net.TCPAddr).Port
+	if err := reserve.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	serverSrc := `use http;
+
+fn home(req: &Request) -> Response {
+    return Response::text(200, "home");
+}
+
+fn user(req: &Request) -> Response {
+    return Response::text(200, req.param("id").as_str());
+}
+
+fn cors(req: &Request, res: &mut Response) {
+    res.set_header("X-Mux", "zexi");
+}
+
+fn main() -> i32 {
+    let mut addr = String::from("127.0.0.1:");
+    addr.push_str(arg_at(1).as_str());
+    http::handle_get("/", home);
+    http::handle_get("/users/{id}", user);
+    http::use_after(cors);
+    http::listen_n(addr.as_str(), 2)
+}
+`
+	clientSrc := `use http;
+
+fn main() -> i32 {
+    let mut base = String::from("http://127.0.0.1:");
+    base.push_str(arg_at(1).as_str());
+    let mut one = base.clone();
+    one.push_str("/users/42");
+    let a = http::get(one.as_str());
+    println(a.status, a.body.as_str(), a.header("X-Mux").as_str());
+    let mut two = base.clone();
+    two.push_str("/");
+    let b = http::do("GET", two.as_str());
+    println(b.status, b.body.as_str());
+    0
+}
+`
+	serverPath := filepath.Join(dir, "server.zx")
+	clientPath := filepath.Join(dir, "client.zx")
+	if err := os.WriteFile(serverPath, []byte(serverSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(clientPath, []byte(clientSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	serverBin := filepath.Join(dir, "server")
+	clientBin := filepath.Join(dir, "client")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(serverPath, serverBin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build default-mux server")
+	}
+	em = diag.NewEmitter()
+	if _, ok := driver.Build(clientPath, clientBin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build Zexi HTTP client")
+	}
+
+	server := exec.Command(serverBin, strconv.Itoa(port))
+	var serverOut bytes.Buffer
+	server.Stdout = &serverOut
+	server.Stderr = &serverOut
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Process.Kill()
+	if !waitPort("127.0.0.1:"+strconv.Itoa(port), 5*time.Second) {
+		t.Fatalf("server never started listening; output:\n%s", serverOut.String())
+	}
+
+	clientOut, err := exec.Command(clientBin, strconv.Itoa(port)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("client failed: %v\n%s", err, clientOut)
+	}
+	want := "200 42 zexi\n200 home\n"
+	if string(clientOut) != want {
+		t.Fatalf("client output mismatch:\n got %q\nwant %q", clientOut, want)
+	}
+}
+
+// TestThreadEdgeCases pins the deterministic corners of the concurrency
+// primitives: non-blocking receive, close waking a blocked receiver, and
+// stale/invalid handles failing cleanly.
+func TestThreadEdgeCases(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "edge.zx")
+	src := `use thread;
+
+fn waiter(ch: i64) -> i64 {
+    let mut v: i64 = 0;
+    if chan_recv(ch, &mut v) {
+        return v;
+    }
+    return -1;
+}
+
+fn main() -> i32 {
+    let ch = Chan::new(1);
+    let mut v: i64 = 7;
+    println(chan_try_recv(ch.id(), &mut v), v);
+    chan_send(ch.id(), 99);
+    println(chan_try_recv(ch.id(), &mut v), v);
+    println(chan_len(ch.id()));
+
+    let t = Thread::spawn(waiter, ch.id());
+    chan_close(ch.id());
+    println(t.join());
+
+    println(atomic_get(0), join(0));
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "edge")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build concurrency edge-case program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running edge-case program: %v", err)
+	}
+	want := "false 7\ntrue 99\n0\n-1\n0 0\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
 // TestStdMathConvenience exercises the high-level dependency-free numerical
 // surface: conventional aliases, transcendental helpers, geometry, domain
 // fallbacks, and floating-point classification.
@@ -1425,24 +1671,257 @@ fn main() -> i32 {
 	}
 }
 
-// TestImportAliasIsDiagnostic prevents a parsed `as` clause from being silently
-// ignored while imports are intentionally flattened for the M1 preview.
-func TestImportAliasIsDiagnostic(t *testing.T) {
+// TestProjectDirectoryEntry covers convention-only project builds: a directory
+// entry (`main.zx` or `src/main.zx`), a project root derived from it, and named
+// imports that reach modules at the root from a file in `src/`.
+func TestProjectDirectoryEntry(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
 	dir := t.TempDir()
-	mainPath := filepath.Join(dir, "main.zx")
-	if err := os.WriteFile(mainPath, []byte(`import math as m;
-fn main() -> i32 { 0 }
-`), 0o644); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "src"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	files := map[string]string{
+		"util.zx":     "pub fn double(n: i32) -> i32 { n * 2 }\n",
+		"src/main.zx": "use util;\nfn main() -> i32 { println(util::double(21)); 0 }\n",
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entry, root, err := driver.ResolveEntry(dir)
+	if err != nil {
+		t.Fatalf("ResolveEntry(%s): %v", dir, err)
+	}
+	if want := filepath.Join(dir, "src", "main.zx"); entry != want {
+		t.Fatalf("entry = %q, want %q", entry, want)
+	}
+	if root != dir {
+		t.Fatalf("root = %q, want %q", root, dir)
+	}
+
+	// The same root is derived whether the directory, the entry file, or a
+	// file inside `src` is named on the command line.
+	for _, in := range []string{dir, entry, filepath.Join(dir, "src")} {
+		_, r, err := driver.ResolveEntry(in)
+		if err != nil {
+			t.Fatalf("ResolveEntry(%s): %v", in, err)
+		}
+		if r != dir {
+			t.Fatalf("ResolveEntry(%s) root = %q, want %q", in, r, dir)
+		}
+	}
+
+	out := filepath.Join(dir, "prog")
 	em := diag.NewEmitter()
-	if _, ok := driver.FrontEnd(mainPath, driver.Options{}, em); ok {
-		t.Fatal("expected aliased import to be rejected until namespaces exist")
+	if _, ok := driver.Build(entry, out, driver.Options{Root: root}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("project build failed")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running project program: %v", err)
+	}
+	if got := string(raw); got != "42\n" {
+		t.Fatalf("output mismatch: got %q want %q", got, "42\n")
+	}
+}
+
+// TestDirectoryPackage loads a whole folder for one import: `use util;` pulls
+// every .zx file in util/, whose public names are reachable through the
+// package qualifier while private ones are not.
+func TestDirectoryPackage(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "util"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"util/a.zx":  "pub fn a() -> i32 { 1 }\n",
+		"util/b.zx":  "pub fn b() -> i32 { 2 }\nfn hidden() -> i32 { 9 }\n",
+		"main.zx":    "use util;\nfn main() -> i32 { println(util::a(), util::b()); 0 }\n",
+		"badmain.zx": "use util;\nfn main() -> i32 { util::hidden() }\n",
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	em := diag.NewEmitter()
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "main.zx"), driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("directory package failed to type-check")
+	}
+
+	em = diag.NewEmitter()
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "badmain.zx"), driver.Options{}, em); ok {
+		t.Fatal("expected a private package item to be rejected")
 	}
 	var buf bytes.Buffer
 	em.Render(&buf, em.FirstFileID())
-	if !strings.Contains(buf.String(), "E9024") {
-		t.Fatalf("expected E9024 for aliased import, got:\n%s", buf.String())
+	if !strings.Contains(buf.String(), "E0603") {
+		t.Fatalf("expected E0603 for package-private item, got:\n%s", buf.String())
+	}
+}
+
+// TestProjectRootReachability checks that a module in a subdirectory can import
+// a module at the project root by name.
+func TestProjectRootReachability(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"util.zx":          "pub fn base() -> i32 { 40 }\n",
+		"nested/helper.zx": "use util;\npub fn seven() -> i32 { util::base() + 7 }\n",
+		"main.zx":          "use nested::helper;\nfn main() -> i32 { println(helper::seven()); 0 }\n",
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entry, root, err := driver.ResolveEntry(filepath.Join(dir, "main.zx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(entry, out, driver.Options{Root: root}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("project-root build failed")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running project program: %v", err)
+	}
+	if got := string(raw); got != "47\n" {
+		t.Fatalf("output mismatch: got %q want %q", got, "47\n")
+	}
+}
+
+// TestProjectNoEntry checks the diagnostic for a directory that has no entry
+// point.
+func TestProjectNoEntry(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := driver.ResolveEntry(dir); err == nil {
+		t.Fatal("expected an error for a directory with no main.zx")
+	}
+}
+
+// TestModuleQualifiedAccess exercises scoped modules end to end: an aliased
+// file import, qualified functions/constants/types/associated functions/enum
+// variants, a `mod name;` qualifier, and an inline `mod { ... }` qualifier.
+func TestModuleQualifiedAccess(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	files := map[string]string{
+		"lib.zx": `pub fn triple(n: i32) -> i32 { n * 3 }
+pub const BASE: i32 = 10;
+pub struct Point { pub x: i32, pub y: i32 }
+pub enum Mode { Idle, Busy(i32) }
+impl Point {
+    pub fn new(x: i32, y: i32) -> Point { Point { x: x, y: y } }
+    pub fn sum(self) -> i32 { self.x + self.y }
+}
+`,
+		"tool.zx": `pub fn double(n: i32) -> i32 { n * 2 }
+`,
+		"main.zx": `use "lib.zx" as lib;
+use math as m;
+mod tool;
+mod inline { pub fn add(a: i32, b: i32) -> i32 { a + b } }
+
+fn main() -> i32 {
+    let p: lib::Point = lib::Point::new(2, 3);
+    println(lib::triple(7), p.sum(), lib::BASE, m::maxi(1, 5), tool::double(21), inline::add(2, 3));
+    let mode = lib::Mode::Busy(9);
+    match mode {
+        lib::Mode::Busy(n) => { println(n); }
+        lib::Mode::Idle => {}
+    }
+    0
+}
+`,
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mainPath := filepath.Join(dir, "main.zx")
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build qualified-module program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running qualified-module program: %v", err)
+	}
+	if want := "21 5 10 5 42 5\n9\n"; string(raw) != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
+	}
+}
+
+// TestModulePrivacy checks that qualified access to a non-`pub` item is a
+// diagnostic rather than silently working through the flattened namespace.
+func TestModulePrivacy(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"lib.zx":  "fn secret() -> i32 { 1 }\npub fn open() -> i32 { secret() }\n",
+		"main.zx": "use \"lib.zx\" as lib;\nfn main() -> i32 { lib::secret() }\n",
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	em := diag.NewEmitter()
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "main.zx"), driver.Options{}, em); ok {
+		t.Fatal("expected private qualified access to be rejected")
+	}
+	var buf bytes.Buffer
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E0603") {
+		t.Fatalf("expected E0603 for private item, got:\n%s", buf.String())
+	}
+}
+
+// TestModuleUnknownItem and TestModuleUsedAsValue cover the two other
+// qualified-path mistakes: a missing export and treating a module as a value.
+func TestModuleQualifiedDiagnostics(t *testing.T) {
+	cases := []struct {
+		name, src, code string
+	}{
+		{"unknown", "use math as m;\nfn main() -> i32 { m::nope() }\n", "E0412"},
+		{"module-as-type", "use math as m;\nfn main() -> i32 { let x: m = 0; 0 }\n", "E0433"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			mainPath := filepath.Join(dir, "main.zx")
+			if err := os.WriteFile(mainPath, []byte(tc.src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			em := diag.NewEmitter()
+			if _, ok := driver.FrontEnd(mainPath, driver.Options{}, em); ok {
+				t.Fatalf("expected %s for:\n%s", tc.code, tc.src)
+			}
+			var buf bytes.Buffer
+			em.Render(&buf, em.FirstFileID())
+			if !strings.Contains(buf.String(), tc.code) {
+				t.Fatalf("expected %s, got:\n%s", tc.code, buf.String())
+			}
+		})
 	}
 }
 

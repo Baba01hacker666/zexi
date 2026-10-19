@@ -21,8 +21,13 @@ This repository contains the **initial design and specification** of Zexi: the v
 > `use` or Python-shaped `import`: `use "helpers.zx";` / `import "helpers.zx";`
 > import a neighbouring file, while `use math;`, `import http.server;`, and
 > `use io::fs;` select embedded standard-library helpers — see
-> `internal/driver/std/`. `mod name;` also loads `name.zx` or `name/mod.zx`
-> today (a deliberately flat, M1-preview module surface). Everything still
+> `internal/driver/std/`. Imports create qualifiers: `use math as m;` gives
+> `m::maxi(1, 2)`, `import http.server;` gives `server::Router` (and the full
+> `http::server::Router`), and `mod name;` / `mod name { ... }` give
+> `name::item`. Qualified lookups are real — they resolve against the module's
+> declarations and enforce `pub` (E0603 private, E0412 missing, E0433 module as
+> a value) — while the merged program underneath is still flat, so unqualified
+> names from a plain import keep working. Everything still
 > compiles to a small, fast native binary through C.
 >
 > Implemented: functions and recursion; `let`/`const`; `type` aliases; integer/
@@ -45,18 +50,29 @@ This repository contains the **initial design and specification** of Zexi: the v
 > `net`/`http` modules (`import http.server;`) with URL parsing, redirects,
 > headers, query/form decoding, chunked bodies, timeouts, response builders,
 > cookies, static-file serving with MIME detection, downloads, and a
-> fixed-capacity router built on function values. High-level `serve(&app, 8000)`
-> and `serve_dir(root, 8000)` remove the socket/accept boilerplate; `Client`,
-> `fetch`, and `request` cover the client side (see
+> fixed-capacity router built on function values. Go-style servers are a few
+> lines: `handle_get("/users/{id}", user); listen(":8080")` registers on a
+> default mux with `{name}` route parameters and `use_before`/`use_after`
+> middleware. High-level `serve(&app, 8000)`, `serve_dir(root, 8000)`,
+> `new_app()`, and `listen_n(addr, count)` cover explicit and bounded servers;
+> `Client`, `get`, `do`, `fetch`, and `request` cover the client side (see
 > [`docs/08-networking.md`](docs/08-networking.md)). Embedded `math`, `text`,
-> `io`, `fs`, `os`, and `regex` also provide dependency-free arithmetic,
-> roots/logs/trigonometry/geometry, number theory, familiar string helpers,
-> `input(prompt)`, capped binary-safe file helpers, local process/path
-> conveniences, and POSIX-ERE matching.
+> `io`, `fs`, `os`, `regex`, `fmt`, `codec`, and `thread` also provide dependency-free
+> arithmetic, roots/logs/trigonometry/geometry, number theory, familiar string
+> helpers, `input(prompt)`, capped binary-safe file helpers, local process/path
+> conveniences, POSIX-ERE matching, number/value formatting (bases, grouping,
+> fixed decimals, human units, alignment), hex/base64 encoding and checksums
+> (CRC-32, FNV, Adler-32), and real OS **concurrency**: fork–join
+> threads, blocking `i64` channels, and lock-free `i64` atomics
+> (`Thread::spawn`, `Chan::new`, `Atomic::new`; see
+> [`docs/11-concurrency.md`](docs/11-concurrency.md)).
 >
-> Not yet implemented: generics, traits/`impl Trait`, **scoped** modules and
-> visibility enforcement (the current `use`/`import`/`mod` loader is flat;
-> `import ... as name` is explicitly rejected until namespaces exist), `Box`/`Vec`,
+> Not yet implemented: generics, traits/`impl Trait`, full module
+> **isolation** (qualified access, `as` aliases, and `pub` checks work, but the
+> merged program is still one flat namespace, so unqualified cross-module names
+> remain visible and ignore `pub`), `Box`/`Vec`,
+> `Send`/`Sync` value passing across threads (today only `i64` handles, arguments,
+> and return values cross a thread boundary),
 > user-defined `Drop`, borrow-lifetime analysis (bound `&`/`*` aliases are not yet
 > tracked), and `Result`/`?`. Enum variants cannot carry
 > owning payloads yet. See `docs/05-roadmap.md`.
@@ -65,6 +81,23 @@ This repository contains the **initial design and specification** of Zexi: the v
 
 See [`workings.md`](workings.md) for a walkthrough of the compiler pipeline and
 runtime.
+
+## Projects
+
+A program can be one file or a whole folder. Point `zexic` at a project
+directory and it finds `main.zx` (or `src/main.zx`), then pulls in everything
+the entry links to — no manifest and no file list:
+
+```sh
+zexic run .                 # entry discovered, every import compiled in
+zexic run src/main.zx       # the root above src/ is searched for modules
+zexic build . -o app
+```
+
+Named imports are searched next to the importing file, in its `lib/`, at the
+project root, and in the root's `lib/`, before the embedded standard library.
+`use util;` where `util/` is a directory loads the **whole folder** (every `.zx`
+inside it) as one package; `--root=dir` pins the root explicitly.
 
 ## Try it
 
@@ -78,11 +111,15 @@ go run ./cmd/zexic run tests/strings.zx   # owning heap String + methods
 go run ./cmd/zexic run tests/drop.zx      # deterministic destruction across control flow
 go run ./cmd/zexic run tests/syntax.zx    # a runnable tour of the whole syntax
 go run ./cmd/zexic run tests/keywords.zx  # until/elif/defer, or+range patterns, if let, type aliases
+go run ./cmd/zexic run tests/modules.zx   # scoped imports: aliases, mod::item, pub checks
+go run ./cmd/zexic run tests/threads.zx   # threads, channels, and atomics
+go run ./cmd/zexic run tests/formatting.zx # bases, grouping, units, alignment
+go run ./cmd/zexic run tests/encoding.zx   # hex, base64, and checksums
 go run ./cmd/zexic run tests/easy.zx      # the easy way: no semicolons, f-strings, defaults, libraries
 go run ./cmd/zexic run examples/easy.zx   # same ideas, as a small standalone demo
 go run ./cmd/zexic run tests/sugar.zx     # break-with-value, Type::new(..), print/format sugar
 go run ./cmd/zexic run tests/pi.zx        # 30 digits of π: big-int + Machin's formula
-go run ./cmd/zexic run examples/http_app.zx                  # high-level Router + serve
+go run ./cmd/zexic run examples/http_app.zx                  # Go-style default mux: handle_get + listen
 go run ./cmd/zexic run examples/static_server.zx -- .         # one-call static server
 go run ./cmd/zexic run examples/local_tools.zx -- release-42  # local os + regex helpers
 go run ./cmd/zexic run examples/math_tools.zx                 # roots, logs, angles, and geometry
@@ -124,6 +161,7 @@ for why, its real costs, and the plan to replace it with a native backend.
 - [`docs/08-networking.md`](docs/08-networking.md) — the embedded HTTP client/server and networking helpers.
 - [`docs/09-c-bridge.md`](docs/09-c-bridge.md) — calling C libraries through `extern "C"` and bindgen.
 - [`docs/10-stdlib-recipes.md`](docs/10-stdlib-recipes.md) — local networking, OS, filesystem, and regex recipes.
+- [`docs/11-concurrency.md`](docs/11-concurrency.md) — threads, `i64` channels, and atomics.
 - [`examples/`](examples/) — ready-to-run Zexi programs plus focused feature examples.
 - [`tests/tour.zx`](tests/tour.zx) — the end-to-end program the test suite compiles and runs.
 - [`tests/syntax.zx`](tests/syntax.zx) — a runnable syntax tour; [`tests/pi.zx`](tests/pi.zx) — 30 digits of π.

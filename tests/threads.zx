@@ -1,0 +1,85 @@
+// threads.zx — OS threads, channels, and atomics.
+//
+// Run:
+//   zexic run tests/threads.zx
+//
+// The output is deterministic: each section joins or drains before printing,
+// so concurrent order never reaches the test's expected output.
+
+use thread;
+
+fn square(x: i64) -> i64 {
+    return x * x;
+}
+
+// range_sum adds lo..hi-1, used to split a sum across two threads.
+fn range_sum(lo: i64, hi: i64) -> i64 {
+    let mut s: i64 = 0;
+    let mut i: i64 = lo;
+    while i < hi {
+        s += i;
+        i += 1;
+    }
+    return s;
+}
+
+// feed pushes 1..5 then closes the channel. A worker receives the raw i64
+// handle because it cannot capture the Chan value.
+fn feed(ch: i64) -> i64 {
+    let mut i: i64 = 1;
+    while i <= 5 {
+        chan_send(ch, i);
+        i += 1;
+    }
+    chan_close(ch);
+    return 0;
+}
+
+// bump increments a shared counter 1000 times.
+fn bump(counter: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < 1000 {
+        atomic_add(counter, 1);
+        i += 1;
+    }
+    return i;
+}
+
+fn main() -> i32 {
+    // Fork–join: a thread computes and join returns its result.
+    let t = Thread::spawn(square, 9);
+    println("square:", t.join());
+
+    // Two halves of 0..200 summed in parallel (spawn2 passes two arguments).
+    let a = Thread::spawn2(range_sum, 0, 100);
+    let b = Thread::spawn2(range_sum, 100, 200);
+    println("sum:", a.join() + b.join());
+
+    // Channel: producer thread, consumer loop until close.
+    let ch = Chan::new(3);
+    let p = Thread::spawn(feed, ch.id());
+    let mut total: i64 = 0;
+    let mut v: i64 = 0;
+    while ch.recv(&mut v) {
+        total += v;
+    }
+    p.join();
+    println("total:", total);
+
+    // Atomics: four threads share one lock-free counter.
+    let counter = Atomic::new(0);
+    let mut handles: [i64; 4] = [0; 4];
+    let mut k: usize = 0;
+    while k < 4 {
+        handles[k] = spawn(bump, counter.id());
+        k += 1;
+    }
+    k = 0;
+    while k < 4 {
+        join(handles[k]);
+        k += 1;
+    }
+    println("counter:", counter.get());
+
+    0
+}

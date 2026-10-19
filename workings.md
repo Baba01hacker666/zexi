@@ -34,16 +34,26 @@ handles strings, printing, arrays, and the standard library's C shims.
 
 ### 2.3 Loader / driver (`internal/driver`)
 - `FrontEndFiles` (in `driver.go`) loads one or more source files.
+- `modules.go` turns every parsed file (and inline `mod { ... }` block) into a
+  module with an export table, records what each `use`/`import`/`mod` binds, and
+  resolves qualified paths (`alias::item`, `pkg::Type::new`,
+  `mod::Enum::Variant`) before checking — enforcing `pub` for qualified access
+  (E0603 private, E0412 missing, E0433 module-as-value).
 - Resolves source-layout declarations:
   - `use "helpers.zx";` / `import "helpers.zx";` → relative file
   - `use math;`, `use std::math;`, `import http.server;`, and
     `import io.fs;` → embedded standard-library modules
     (`internal/driver/std/*.zx`)
   - `mod name;` → `name.zx` or `name/mod.zx` beside the declaring file
-- Merges all imported/module items into one namespace for this M1-preview
-  stage; scoped names and visibility enforcement come later. `as` aliases are
-  parsed for forward compatibility but explicitly report E9024 until real
-  namespaces can make them meaningful.
+- Project mode (`project.go`): a directory argument finds `main.zx` or
+  `src/main.zx`; the project root is searched alongside the importing file for
+  named imports and `mod`. A directory named by an import (`use util;` with
+  `util/`) loads every `.zx` file in that folder as one aggregate package.
+- Imports create qualifiers: `as alias`, else the full path and its last
+  segment; `mod` creates a qualifier too.
+- Items are then flattened into one program namespace for this M1-preview
+  stage (unqualified names stay visible and ignore `pub`), so scoped isolation
+  and visibility enforcement for *unqualified* names remain M1 work.
 
 ### 2.4 Semantic analysis (`internal/sema`)
 - Type checking, name resolution.
@@ -90,19 +100,23 @@ Embedded in the compiler under `internal/driver/std/`:
 | io     | `io.zx` | stdin/stdout, input/read_line/read_all |
 | fs     | `fs.zx` | capped binary-safe file read/write/copy helpers |
 | math   | `math.zx` | integer/bit helpers, roots/logs/trig, geometry/smoothing, primes/combinatorics |
+| fmt    | `fmt.zx` | number/value formatting: bases, grouping, fixed/sci decimals, human units, alignment |
+| codec  | `codec.zx` | hex/base64 encode+decode and CRC-32/Adler-32/FNV-1a/djb2 checksums |
 | text   | `text.zx` | string helpers |
 | random | `random.zx` | RNG |
 | regex  | `regex.zx` | POSIX-ERE search/full-match/find/replace (C shim `zxregex_c.txt`) |
 | sys    | `sys.zx` | env, local paths/filesystem ops, clocks, pid (C shim `zxsys_c.txt`) |
 | net    | `net.zx` | TCP sockets and shared file ABI (C shim `zxnet_c.txt`) |
 | http   | `http.zx` | HTTP client/server, Router + serve/serve_dir helpers |
+| thread | `thread.zx` | OS threads, `i64` channels, `i64` atomics (C shim `zxthread_c.txt`, links `-pthread`) |
 
 Import with `use io;`, `use std::net;`, `use http;`, or Python-shaped
 `import http.server;`, `import io.fs;`, `import os;`, and `import text.regex;`.
 The linker prunes anything not called, so importing costs nothing unless used.
 
 Each module may pull in a C shim (`zxnet_c.txt`, `zxsys_c.txt`,
-`zxregex_c.txt`) which is appended to the build only when the module is used.
+`zxregex_c.txt`, `zxthread_c.txt`) which is appended to the build only when the
+module is used.
 
 ---
 
@@ -162,7 +176,7 @@ Key flags: `--jobs N` (parallel units), `--opt-level`, `--include`, `--csrc`,
 | Codegen | `internal/codegen/c/` |
 | Driver / build | `internal/driver/driver.go` |
 | Stdlib | `internal/driver/std/` |
-| C shims | `internal/driver/zxnet_c.txt`, `zxsys_c.txt`, `zxregex_c.txt` |
+| C shims | `internal/driver/zxnet_c.txt`, `zxsys_c.txt`, `zxregex_c.txt`, `zxthread_c.txt` |
 | CLI | `cmd/zexic/main.go` |
 | Docs | `docs/` |
 | Examples | `examples/` |

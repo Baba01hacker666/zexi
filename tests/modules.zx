@@ -1,0 +1,26 @@
+# modules.zx — scoped imports: an alias, a standard-library alias, an inline
+# module, qualified types/associated functions/enum variants, and `pub`.
+#
+# Run with `zexic run tests/modules.zx`; the library beside it is loaded by
+# `use "modules_lib.zx" as lib;`.
+
+use "modules_lib.zx" as lib;
+use math as m;
+
+mod inline {
+    pub fn twice(n: i32) -> i32 {
+        n * 2
+    }
+}
+
+fn main() -> i32 {
+    let p: lib::Point = lib::Point::new(3, 4);
+    println(lib::scale(p.total(), 2), lib::LIB_BASE, m::maxi(2, 9), inline::twice(21));
+
+    let s = lib::Shape::Circle(5);
+    match s {
+        lib::Shape::Circle(r) => { println(r * r); }
+        lib::Shape::Dot => { println(0); }
+    }
+    0
+}

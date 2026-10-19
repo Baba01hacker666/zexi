@@ -1,0 +1,53 @@
+// tests/fmt.zx
+// The number/value formatting module: bases, grouping, fixed decimals,
+// scientific notation, human units, ordinals, and alignment.
+
+use fmt;
+
+fn main() -> i32 {
+    // Integer bases (including the sign convention and 64-bit extremes).
+    println(fmt::hex_lower(255));
+    println(fmt::hex_upper(255));
+    println(fmt::hex_pad(255, 4));
+    println(fmt::hex_pad(-255, 4));
+    println(fmt::bin_str(10));
+    println(fmt::oct_str(64));
+    println(fmt::radix_str(1234567, 36));
+    println(fmt::radix_str(255, 1));       // base clamped up to 2
+    let min = -9223372036854775807 - 1;
+    println(fmt::hex_lower(min));
+
+    // Decimal grouping.
+    println(fmt::thousands(1234567));
+    println(fmt::thousands(-1000000));
+    println(fmt::thousands(0));
+    println(fmt::thousands_sep(1234567, ' '));
+
+    // Fixed decimals and scientific notation.
+    println(fmt::fixed_point(3.14159, 2));
+    println(fmt::fixed_point(2.5, 0));
+    println(fmt::fixed_point(-0.001, 2));  // rounds to zero, no sign
+    println(fmt::fixed_point(0.0, 3));
+    println(fmt::sci_notation(12345.0, 2));
+    println(fmt::sci_notation(0.00042, 3));
+    println(fmt::sci_notation(9.99, 1));   // rounds up into a new exponent
+    println(fmt::percent_str(0.256, 1));
+
+    // Human units.
+    println(fmt::byte_size(999));
+    println(fmt::byte_size(1536));
+    println(fmt::byte_size(123456789));
+    println(fmt::duration_ms(250));
+    println(fmt::duration_ms(90000));
+    println(fmt::duration_ms(1500));
+    println(fmt::duration_ms(3661000));
+    println(fmt::ordinal(1), fmt::ordinal(2), fmt::ordinal(3), fmt::ordinal(11), fmt::ordinal(21), fmt::ordinal(0));
+
+    // Alignment (bracketed so the padding is visible).
+    println("[" + fmt::align_left("ab", 5) + "]");
+    println("[" + fmt::align_right("ab", 5) + "]");
+    println("[" + fmt::align_center("ab", 5) + "]");
+    println("[" + fmt::align_center("abcd", 2) + "]");
+
+    0
+}

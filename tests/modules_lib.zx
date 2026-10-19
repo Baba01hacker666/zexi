@@ -1,0 +1,33 @@
+# modules_lib — imported by tests/modules.zx.
+#
+# Only `pub` declarations are reachable through a qualified path such as
+# `lib::scale(..)` or `lib::Point::new(..)`; `helper_secret` stays private.
+
+pub const LIB_BASE: i32 = 10;
+
+pub struct Point {
+    pub x: i32,
+    pub y: i32,
+}
+
+pub enum Shape {
+    Dot,
+    Circle(i32),
+}
+
+impl Point {
+    pub fn new(x: i32, y: i32) -> Point {
+        Point { x: x, y: y }
+    }
+    pub fn total(&self) -> i32 {
+        self.x + self.y
+    }
+}
+
+pub fn scale(n: i32, k: i32) -> i32 {
+    n * k
+}
+
+fn helper_secret() -> i32 {
+    -1
+}

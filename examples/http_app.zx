@@ -4,11 +4,14 @@
 //   zexic run examples/http_app.zx
 // Then visit:
 //   curl 'http://127.0.0.1:8000/?name=Ada'
+//   curl http://127.0.0.1:8000/hello/Grace
 //   curl -X POST --data 'hello' http://127.0.0.1:8000/echo
 //
 // `import http.server;` is a friendly alias for the embedded `http` module.
-// Imported declarations are currently available directly, so handlers use
-// Router, Request, Response, and serve without a namespace prefix.
+// Handlers register on the process-wide default mux (like Go's http.HandleFunc)
+// and `listen` takes an address string. Imported declarations are currently
+// available directly, so handlers use Request, Response, and the helpers
+// without a namespace prefix.
 
 import http.server;
 
@@ -40,9 +43,17 @@ fn escape_html(s: &String) -> String {
 fn home(req: &Request) -> Response {
     let name = req.query("name");
     if name.len() == 0 {
-        return Response::html(200, "<h1>Hello from Zexi</h1><p>Try ?name=Ada</p>");
+        return Response::html(200, "<h1>Hello from Zexi</h1><p>Try ?name=Ada or /hello/Grace</p>");
     }
     let safe = escape_html(&name);
+    let body = f"<h1>Hello, {safe}!</h1>";
+    return Response::html(200, body.as_str());
+}
+
+// user shows a named path parameter: `{name}` captures one segment.
+fn user(req: &Request) -> Response {
+    let raw = req.param("name");
+    let safe = escape_html(&raw);
     let body = f"<h1>Hello, {safe}!</h1>";
     return Response::html(200, body.as_str());
 }
@@ -56,11 +67,11 @@ fn health(req: &Request) -> Response {
 }
 
 fn main() -> i32 {
-    let mut app = Router::new();
-    app.get("/", home);
-    app.post("/echo", echo);
-    app.get("/health", health);
+    handle_get("/", home);
+    handle_post("/echo", echo);
+    handle_get("/health", health);
+    handle_get("/hello/{name}", user);
 
     println("listening on http://127.0.0.1:8000");
-    serve_local(&app, 8000)
+    listen("127.0.0.1:8000")
 }

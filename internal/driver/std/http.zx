@@ -18,15 +18,19 @@
 // verbs. URLs are parsed with `parse_url`; query/form values are decoded for
 // you. Connections are plaintext HTTP only — `https://` reports an error.
 //
-// Server (Router + serve-flavoured):
+// Server (Go-style default mux, or an explicit Router):
 //
 //     import http.server;
 //     fn hello(req: &Request) -> Response { Response::html(200, "<h1>hi</h1>") }
 //     fn main() -> i32 {
-//         let mut app = Router::new();
-//         app.get("/", hello);
-//         serve(&app, 8080)
+//         handle_get("/", hello);
+//         listen(":8080")
 //     }
+//
+// `{name}` path segments are captured (`req.param("name")`), and
+// `use_before`/`use_after` attach middleware. An explicit Router
+// (`new_app()`, `app.get`, `app.listen`) is available when a program holds
+// several servers.
 //
 // Bodies are framed by Content-Length or chunked encoding (responses) and
 // Content-Length (requests); reads are bounded and client I/O has a timeout.
@@ -288,6 +292,9 @@ pub struct Request {
     // headers is the raw head block after the request line.
     pub headers: String,
     pub body: String,
+    // params holds values captured by `{name}` route segments. It is encoded
+    // as `\x1fname\x1fvalue` pairs and is filled in by Router.dispatch.
+    params: String,
 }
 
 pub struct Response {
@@ -384,18 +391,56 @@ impl Request {
         return String::new();
     }
 
-    // param looks in the query string first, then in an
-    // application/x-www-form-urlencoded body.
+    // param looks in the query string, then at a `{name}` route segment, then
+    // in an application/x-www-form-urlencoded body.
     pub fn param(&self, name: str) -> String {
         let q = self.raw_query();
         let v = query_value(&q, name);
         if v.len() > 0 {
             return v;
         }
+        let rv = self.route_param(name);
+        if rv.len() > 0 {
+            return rv;
+        }
         let ct = self.header("Content-Type");
         let ct_l = http_lower(&ct);
         if ct_l.contains("application/x-www-form-urlencoded") {
             return query_value(&self.body, name);
+        }
+        return String::new();
+    }
+
+    // route_param returns a value captured by a `{name}` segment in the route
+    // pattern that matched this request ("" when the route has no such name).
+    // Route parameters are also available through `param`.
+    pub fn route_param(&self, name: str) -> String {
+        let want = String::from(name);
+        let mut pos: usize = 0;
+        while pos < self.params.len() {
+            let rest = self.params.substr(pos, 4294967295);
+            let lead = rest.find("\x1f");
+            if lead < 0 {
+                break;
+            }
+            pos = pos + (lead as usize) + 1;
+            let rest2 = self.params.substr(pos, 4294967295);
+            let mid = rest2.find("\x1f");
+            if mid < 0 {
+                break;
+            }
+            let key = rest2.substr(0, mid as usize);
+            pos = pos + (mid as usize) + 1;
+            let rest3 = self.params.substr(pos, 4294967295);
+            let next = rest3.find("\x1f");
+            let val = if next < 0 { rest3 } else { rest3.substr(0, next as usize) };
+            if key.as_str() == want.as_str() {
+                return val;
+            }
+            if next < 0 {
+                break;
+            }
+            pos = pos + (next as usize);
         }
         return String::new();
     }
@@ -621,7 +666,7 @@ pub fn parse_request(raw: &String) -> Request {
     if end < 0 {
         return Request {
             method: String::new(), path: String::new(), version: String::new(),
-            headers: String::new(), body: String::new(),
+            headers: String::new(), body: String::new(), params: String::new(),
         };
     }
     let line = raw.substr(0, end as usize);
@@ -635,7 +680,7 @@ pub fn parse_request(raw: &String) -> Request {
     let headers = header_block(raw);
     let he = head_end(raw);
     let body = if he < 0 { String::new() } else { raw.substr(he as usize, 4294967295) };
-    return Request { method: method, path: path, version: version, headers: headers, body: body };
+    return Request { method: method, path: path, version: version, headers: headers, body: body, params: String::new() };
 }
 
 // read_request reads a request head and then its body, using Content-Length
@@ -824,6 +869,13 @@ pub fn request(method: str, url: str, body: str = "", content_type: str = "") ->
     return c.send(method, url, body, content_type);
 }
 
+// do is the one-call form for any method: `do("GET", url)` is fetch(url),
+// `do("POST", url, body)` posts text. It returns a Response even on failure
+// (status 0, error set).
+pub fn do(method: str, url: str, body: str = "", content_type: str = "") -> Response {
+    return request(method, url, body, content_type);
+}
+
 // These URL-shaped helpers avoid the older low-level get/post names below,
 // whose host/port/path arguments are kept for backwards compatibility.
 pub fn get_url(url: str) -> Response { fetch(url) }
@@ -859,14 +911,25 @@ pub fn download(url: str, dest: str) -> Response {
     return c.download(url, dest);
 }
 
-// get performs a low-level GET against host:port and returns the raw response
-// text ("" on error). Kept for callers that build requests by hand.
-pub fn get(host: str, port: i32, path: str) -> String {
+// get performs a one-call GET and returns a Response (`fetch` with Go's name).
+// It follows redirects; on a transport failure status is 0 and error is set.
+pub fn get(url: str) -> Response {
+    return fetch(url);
+}
+
+// post sends a text body to url and returns a Response.
+pub fn post(url: str, body: str) -> Response {
+    return request("POST", url, body, "text/plain; charset=utf-8");
+}
+
+// get_raw performs a low-level GET against host:port and returns the raw
+// response text ("" on error). Kept for callers that build requests by hand.
+pub fn get_raw(host: str, port: i32, path: str) -> String {
     return send_request("GET", host, port, path, "", "");
 }
 
-// post performs a low-level POST and returns the raw response text.
-pub fn post(host: str, port: i32, path: str, body: str) -> String {
+// post_raw performs a low-level POST and returns the raw response text.
+pub fn post_raw(host: str, port: i32, path: str, body: str) -> String {
     return send_request("POST", host, port, path, body, "text/plain; charset=utf-8");
 }
 
@@ -908,9 +971,9 @@ fn send_request(method: str, host: str, port: i32, path: str, body: str, content
     return raw;
 }
 
-// read_response is get plus parsing, for low-level callers.
+// read_response is get_raw plus parsing, for low-level callers.
 pub fn read_response(host: str, port: i32, path: str) -> Response {
-    let raw = get(host, port, path);
+    let raw = get_raw(host, port, path);
     return parse_response(&raw);
 }
 
@@ -1023,19 +1086,56 @@ fn dir_prefix(path: &String) -> String {
 // language has no dynamic arrays yet).
 const MAX_ROUTES: i32 = 32;
 
+// MAX_MIDDLEWARE is the number of before/after hooks a Router can hold.
+const MAX_MIDDLEWARE: i32 = 8;
+
 // not_found_handler is the default fallback.
 fn not_found_handler(req: &Request) -> Response {
     return Response::empty(404);
 }
 
-// Router maps (method, exact path) pairs to handlers. Register routes once,
+// pass_through is the neutral before-hook: an invalid response means "keep
+// going". A middleware that returns a valid response short-circuits routing.
+fn pass_through(req: &Request) -> Response {
+    return Response::empty(0);
+}
+
+// noop_after is the neutral after-hook.
+fn noop_after(req: &Request, res: &mut Response) {
+}
+
+// The default mux is a process-global Router for the top-level handlers:
+//
+//     handle_get("/users/{id}", user);
+//     listen(":8080");
+//
+// The storage lives in the networking C shim (which http already links), since
+// the language has no mutable globals yet; it is initialized once, on first
+// use, from Zexi.
+extern "C" fn zxh_default_mux() -> *Router;
+extern "C" fn zxh_default_mux_ready() -> i32;
+
+fn default_router() -> *Router {
+    let p = zxh_default_mux();
+    if zxh_default_mux_ready() == 1 {
+        *p = Router::new();
+    }
+    return p;
+}
+
+// Router maps (method, path) pairs to handlers. Register routes once,
 // then call dispatch(req) or serve(conn). Paths are `str` values, so pass
-// literals; use Request.query for parameters rather than path patterns.
+// literals; `{name}` segments are captured and can be read with
+// `req.param("name")` or `req.route_param("name")`.
 pub struct Router {
     methods: [str; 32],
     paths: [str; 32],
     handlers: [fn(&Request) -> Response; 32],
     fallback: fn(&Request) -> Response,
+    before: [fn(&Request) -> Response; 8],
+    after: [fn(&Request, &mut Response); 8],
+    before_count: i32,
+    after_count: i32,
     count: i32,
 }
 
@@ -1046,6 +1146,10 @@ impl Router {
             paths: [""; 32],
             handlers: [not_found_handler; 32],
             fallback: not_found_handler,
+            before: [pass_through; 8],
+            after: [noop_after; 8],
+            before_count: 0,
+            after_count: 0,
             count: 0,
         };
     }
@@ -1071,6 +1175,53 @@ impl Router {
         self.fallback = handler;
     }
 
+    // use_before registers a middleware that runs before routing. It may
+    // return a valid response to short-circuit the request (auth, rate limits,
+    // redirects); returning Response::empty(0) means "continue".
+    pub fn use_before(&mut self, mw: fn(&Request) -> Response) {
+        if self.before_count >= MAX_MIDDLEWARE {
+            return;
+        }
+        self.before[self.before_count as usize] = mw;
+        self.before_count = self.before_count + 1;
+    }
+
+    // use_after registers a middleware that runs after the handler and may
+    // add headers (CORS, server timing, cookies) to the response.
+    pub fn use_after(&mut self, mw: fn(&Request, &mut Response)) {
+        if self.after_count >= MAX_MIDDLEWARE {
+            return;
+        }
+        self.after[self.after_count as usize] = mw;
+        self.after_count = self.after_count + 1;
+    }
+
+    // listen serves on an address string: ":8080", "8080", "127.0.0.1:8080",
+    // or "http://127.0.0.1:8080". It runs until the process stops; a non-zero
+    // return means the address was invalid or the listener could not open.
+    pub fn listen(&self, addr: str = "0.0.0.0:8000") -> i32 {
+        let a = parse_addr(addr);
+        if !a.ok {
+            return 2;
+        }
+        return serve(self, a.port, a.host.as_str());
+    }
+
+    // listen_and_serve is the Go-flavoured name for listen.
+    pub fn listen_and_serve(&self, addr: str = "0.0.0.0:8000") -> i32 {
+        return self.listen(addr);
+    }
+
+    // listen_n serves at most max_requests requests (useful for tests and
+    // one-shot tools) on an address string.
+    pub fn listen_n(&self, addr: str, max_requests: i32) -> i32 {
+        let a = parse_addr(addr);
+        if !a.ok {
+            return 2;
+        }
+        return serve_n(self, max_requests, a.port, a.host.as_str());
+    }
+
     pub fn add(&mut self, method: str, path: str, handler: fn(&Request) -> Response) {
         if self.count >= MAX_ROUTES {
             return;
@@ -1082,29 +1233,61 @@ impl Router {
         self.count = self.count + 1;
     }
 
-    // dispatch routes one parsed request.
-    pub fn dispatch(&self, req: &Request) -> Response {
+    // dispatch routes one parsed request through the before hooks, the
+    // matching handler (or fallback), and the after hooks. Captured `{name}`
+    // values are stored on the request for `param`/`route_param`.
+    pub fn dispatch(&self, req: &mut Request) -> Response {
         if !req.valid() {
             return Response::empty(400);
         }
         let path = req.path_only();
+        req.params = String::new();
+
+        let mut b: usize = 0;
+        while b < (self.before_count as usize) {
+            let mw = self.before[b];
+            let early = mw(req);
+            if early.valid() {
+                return early;
+            }
+            b += 1;
+        }
+
+        let mut res = Response::empty(404);
+        let mut matched = false;
         let mut i: usize = 0;
         while i < (self.count as usize) {
-            if self.methods[i] == req.method.as_str() && path_matches(self.paths[i], &path) {
-                let handler = self.handlers[i];
-                return handler(req);
+            if self.methods[i] == req.method.as_str() {
+                let mut captured = String::new();
+                if route_match(self.paths[i], &path, &mut captured) {
+                    req.params = captured;
+                    let handler = self.handlers[i];
+                    res = handler(req);
+                    matched = true;
+                    break;
+                }
             }
             i += 1;
         }
-        let fallback = self.fallback;
-        return fallback(req);
+        if !matched {
+            let fallback = self.fallback;
+            res = fallback(req);
+        }
+
+        let mut a: usize = 0;
+        while a < (self.after_count as usize) {
+            let mw = self.after[a];
+            mw(req, &mut res);
+            a += 1;
+        }
+        return res;
     }
 
     // serve reads one request from c, dispatches it, and writes the response.
     // It returns false when the peer sent nothing usable (a probe or EOF).
     pub fn serve(&self, c: &Conn) -> bool {
         c.set_timeout(DEFAULT_TIMEOUT_MS);
-        let req = read_request(c);
+        let mut req = read_request(c);
         if !req.valid() {
             return false;
         }
@@ -1118,10 +1301,76 @@ impl Router {
             send_response(c, &bad);
             return true;
         }
-        let res = self.dispatch(&req);
+        let res = self.dispatch(&mut req);
         send_response(c, &res);
         return true;
     }
+}
+
+// new_app is the short constructor for a Router: `let mut app = new_app();`.
+pub fn new_app() -> Router {
+    return Router::new();
+}
+
+// handle registers a method/path pair on the process-wide default mux. The
+// matching `Router` is also available explicitly through new_app().
+pub fn handle(method: str, path: str, handler: fn(&Request) -> Response) {
+    let mux = default_router();
+    mux.add(method, path, handler);
+}
+
+// handle_get/handle_post/handle_put/handle_delete are Go-style conveniences
+// that register on the default mux.
+pub fn handle_get(path: str, handler: fn(&Request) -> Response) {
+    let mux = default_router();
+    mux.get(path, handler);
+}
+
+pub fn handle_post(path: str, handler: fn(&Request) -> Response) {
+    let mux = default_router();
+    mux.post(path, handler);
+}
+
+pub fn handle_put(path: str, handler: fn(&Request) -> Response) {
+    let mux = default_router();
+    mux.put(path, handler);
+}
+
+pub fn handle_delete(path: str, handler: fn(&Request) -> Response) {
+    let mux = default_router();
+    mux.delete(path, handler);
+}
+
+// use_before/use_after attach middleware to the default mux, mirroring the
+// Router methods of the same name.
+pub fn use_before(mw: fn(&Request) -> Response) {
+    let mux = default_router();
+    mux.use_before(mw);
+}
+
+pub fn use_after(mw: fn(&Request, &mut Response)) {
+    let mux = default_router();
+    mux.use_after(mw);
+}
+
+// listen serves the default mux on an address string: ":8080", "8080",
+// "127.0.0.1:8080", or "http://127.0.0.1:8080". It runs until the process
+// stops; a non-zero return means the address was invalid or bind failed.
+pub fn listen(addr: str = "0.0.0.0:8000") -> i32 {
+    let mux = default_router();
+    return mux.listen(addr);
+}
+
+// listen_and_serve is the Go-flavoured alias for listen.
+pub fn listen_and_serve(addr: str = "0.0.0.0:8000") -> i32 {
+    return listen(addr);
+}
+
+// listen_n is listen with a request budget, useful for tests and one-shot
+// services.
+pub fn listen_n(addr: str, max_requests: i32) -> i32 {
+    let mux = default_router();
+    return mux.listen_n(addr, max_requests);
 }
 
 // accept_retryable reports whether the listener's last accept failure was
@@ -1136,7 +1385,7 @@ fn accept_retryable() -> bool {
 // default and runs until the process is stopped. A non-zero return means the
 // listener could not be opened.
 pub fn serve(router: &Router, port: i32 = 8000, host: str = "0.0.0.0") -> i32 {
-    let mut listener = listen(host, port);
+    let mut listener = listen_tcp(host, port);
     if !listener.ok() {
         return 1;
     }
@@ -1164,7 +1413,7 @@ pub fn serve_local(router: &Router, port: i32 = 8000) -> i32 {
 // and graceful single-purpose services. Empty TCP probes do not count because
 // Router.serve returns false for them.
 pub fn serve_n(router: &Router, max_requests: i32, port: i32 = 8000, host: str = "0.0.0.0") -> i32 {
-    let mut listener = listen(host, port);
+    let mut listener = listen_tcp(host, port);
     if !listener.ok() {
         return 1;
     }
@@ -1205,6 +1454,143 @@ fn path_matches(pattern: str, path: &String) -> bool {
         return path.starts_with(prefix.as_str());
     }
     return path.as_str() == p.as_str();
+}
+
+// take_segment returns the next "/"-separated segment of s and advances pos
+// past it. An empty segment (for example between "//") is returned as "".
+fn take_segment(s: &String, pos: &mut usize) -> String {
+    if *pos >= s.len() {
+        return String::new();
+    }
+    if s.substr(*pos, 1).as_str() == "/" {
+        *pos = *pos + 1;
+    }
+    if *pos >= s.len() {
+        return String::new();
+    }
+    let rest = s.substr(*pos, 4294967295);
+    let slash = rest.find("/");
+    if slash < 0 {
+        *pos = s.len();
+        return rest.clone();
+    }
+    let seg = rest.substr(0, slash as usize);
+    *pos = *pos + (slash as usize) + 1;
+    return seg;
+}
+
+// route_match matches a route pattern against a request path, filling out with
+// `\x1fname\x1fvalue` pairs for every `{name}` segment. Patterns without braces
+// keep the exact / trailing-`/*` / `*` behaviour of path_matches. A `*` segment
+// after named segments matches the remaining path.
+fn route_match(pattern: str, path: &String, out: &mut String) -> bool {
+    let p = String::from(pattern).trim();
+    if p.find("{") < 0 {
+        return path_matches(p.as_str(), path);
+    }
+    let mut pat = p;
+    let mut actual = path.clone();
+    if pat.len() > 1 && pat.ends_with("/") {
+        pat = pat.substr(0, pat.len() - 1);
+    }
+    if actual.len() > 1 && actual.ends_with("/") {
+        actual = actual.substr(0, actual.len() - 1);
+    }
+    let mut pi: usize = 0;
+    let mut si: usize = 0;
+    loop {
+        let pdone = pi >= pat.len();
+        let sdone = si >= actual.len();
+        if pdone && sdone {
+            return true;
+        }
+        if pdone || sdone {
+            return false;
+        }
+        let ps = take_segment(&pat, &mut pi);
+        let ss = take_segment(&actual, &mut si);
+        if ps.len() >= 2 && ps.starts_with("{") && ps.ends_with("}") {
+            if ss.len() == 0 {
+                return false;
+            }
+            let inner = ps.substr(1, ps.len() - 2);
+            out.push_str("\x1f");
+            out.push_str(inner.as_str());
+            out.push_str("\x1f");
+            out.push_str(ss.as_str());
+        } else if ps.as_str() == "*" {
+            return true;
+        } else if ps.as_str() != ss.as_str() {
+            return false;
+        }
+    }
+}
+
+// Addr is a parsed listen address. ok is false when the text was not a valid
+// port (1..65535) or used https.
+pub struct Addr {
+    pub host: String,
+    pub port: i32,
+    pub ok: bool,
+}
+
+// last_colon returns the index of the final ':' in s, or -1.
+fn last_colon(s: &String) -> i64 {
+    let mut pos: usize = 0;
+    let mut last: i64 = -1;
+    while pos < s.len() {
+        let rest = s.substr(pos, 4294967295);
+        let idx = rest.find(":");
+        if idx < 0 {
+            break;
+        }
+        last = (pos + (idx as usize)) as i64;
+        pos = pos + (idx as usize) + 1;
+    }
+    return last;
+}
+
+// parse_addr accepts the forms ":8080", "8080", "127.0.0.1:8080",
+// "localhost:8080", and "http://host:8080/path". A bare port or an empty host
+// listens on all IPv4 interfaces; "localhost" is mapped to 127.0.0.1. The
+// stack is plaintext HTTP, so an https URL is rejected.
+pub fn parse_addr(raw: str) -> Addr {
+    let trimmed = String::from(raw).trim();
+    if trimmed.starts_with("https://") {
+        return Addr { host: String::new(), port: 0, ok: false };
+    }
+    let mut rest = trimmed;
+    if rest.starts_with("http://") {
+        let after_scheme = rest.substr(7, 4294967295);
+        rest = after_scheme;
+    }
+    let slash = rest.find("/");
+    if slash >= 0 {
+        let authority = rest.substr(0, slash as usize);
+        rest = authority;
+    }
+    let mut host = String::from("0.0.0.0");
+    let mut port_s = rest.clone();
+    let colon = last_colon(&rest);
+    if colon >= 0 {
+        let h = rest.substr(0, colon as usize);
+        if h.len() > 0 {
+            host = h;
+        }
+        port_s = rest.substr((colon + 1) as usize, 4294967295);
+    }
+    let p = parse_dec(&port_s);
+    let mut ok = true;
+    let mut port: i32 = 0;
+    if p <= 0 || p > 65535 {
+        ok = false;
+    } else {
+        port = p as i32;
+    }
+    if host.as_str() == "localhost" {
+        host = String::from("127.0.0.1");
+    }
+    return Addr { host: host, port: port, ok: ok };
 }
 
 // --- files and static serving ----------------------------------------------
@@ -1378,7 +1764,7 @@ fn serve_dir_connection(c: &Conn, root: str) -> bool {
 // serve_dir is the compact "python -m http.server" equivalent: serve a
 // directory with safe path handling, index.html support, and MIME types.
 pub fn serve_dir(root: str, port: i32 = 8000, host: str = "0.0.0.0") -> i32 {
-    let mut listener = listen(host, port);
+    let mut listener = listen_tcp(host, port);
     if !listener.ok() {
         return 1;
     }
@@ -1398,7 +1784,7 @@ pub fn serve_dir(root: str, port: i32 = 8000, host: str = "0.0.0.0") -> i32 {
 
 // serve_dir_n is the bounded static-server form for controlled services/tests.
 pub fn serve_dir_n(root: str, max_requests: i32, port: i32 = 8000, host: str = "0.0.0.0") -> i32 {
-    let mut listener = listen(host, port);
+    let mut listener = listen_tcp(host, port);
     if !listener.ok() {
         return 1;
     }
