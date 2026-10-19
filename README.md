@@ -50,9 +50,12 @@ This repository contains the **initial design and specification** of Zexi: the v
 > `net`/`http` modules (`import http.server;`) with URL parsing, redirects,
 > headers, query/form decoding, chunked bodies, timeouts, response builders,
 > cookies, static-file serving with MIME detection, downloads, and a
-> fixed-capacity router built on function values. High-level `serve(&app, 8000)`
-> and `serve_dir(root, 8000)` remove the socket/accept boilerplate; `Client`,
-> `fetch`, and `request` cover the client side (see
+> fixed-capacity router built on function values. Go-style servers are a few
+> lines: `handle_get("/users/{id}", user); listen(":8080")` registers on a
+> default mux with `{name}` route parameters and `use_before`/`use_after`
+> middleware. High-level `serve(&app, 8000)`, `serve_dir(root, 8000)`,
+> `new_app()`, and `listen_n(addr, count)` cover explicit and bounded servers;
+> `Client`, `get`, `do`, `fetch`, and `request` cover the client side (see
 > [`docs/08-networking.md`](docs/08-networking.md)). Embedded `math`, `text`,
 > `io`, `fs`, `os`, and `regex` also provide dependency-free arithmetic,
 > roots/logs/trigonometry/geometry, number theory, familiar string helpers,
@@ -106,7 +109,7 @@ go run ./cmd/zexic run tests/easy.zx      # the easy way: no semicolons, f-strin
 go run ./cmd/zexic run examples/easy.zx   # same ideas, as a small standalone demo
 go run ./cmd/zexic run tests/sugar.zx     # break-with-value, Type::new(..), print/format sugar
 go run ./cmd/zexic run tests/pi.zx        # 30 digits of π: big-int + Machin's formula
-go run ./cmd/zexic run examples/http_app.zx                  # high-level Router + serve
+go run ./cmd/zexic run examples/http_app.zx                  # Go-style default mux: handle_get + listen
 go run ./cmd/zexic run examples/static_server.zx -- .         # one-call static server
 go run ./cmd/zexic run examples/local_tools.zx -- release-42  # local os + regex helpers
 go run ./cmd/zexic run examples/math_tools.zx                 # roots, logs, angles, and geometry

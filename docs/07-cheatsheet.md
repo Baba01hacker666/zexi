@@ -385,9 +385,12 @@ The embedded standard library (sources in `internal/driver/std/`) includes:
   `write_bytes(path, &String)` (reads, writes, and copies cap at 32 MiB);
   environment, cwd/hostname, local non-recursive directory/file operations,
   clocks/sleep; and deterministic or libc-backed random numbers.
-- `net` and `http`: TCP and a high-level HTTP client/server. `Client`, `fetch`,
-  `request`, `post_form_url`, `Router`, `serve_local`, `serve_n`, `serve_dir`,
-  and static-file helpers are documented in [`08-networking.md`](08-networking.md).
+- `net` and `http`: TCP and a high-level HTTP client/server. `Client`, `get`,
+  `do`, `fetch`, `request`, `post_form_url`, `Router`, `new_app`, the Go-style
+  `handle_get`/`handle_post`/`use_before`/`use_after` + `listen(":8080")`
+  default mux with `{name}` route parameters, `serve_local`, `serve_n`,
+  `serve_dir`, and static-file helpers are documented in
+  [`08-networking.md`](08-networking.md).
 
 See [`10-stdlib-recipes.md`](10-stdlib-recipes.md) for runnable local HTTP,
 filesystem, OS, and regex patterns.

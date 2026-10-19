@@ -297,3 +297,20 @@ char *zxn_http_get(const char *host, int port, const char *path) {
     close(fd);
     return out;
 }
+
+/* zxh_default_mux backs std/http's top-level handler registry (the Go-style
+ * default mux). The shim cannot see the generated zx_Router layout, so the
+ * storage is an oversized, over-aligned buffer; the Router is copied into it
+ * once, on first use, by Zexi code. A process only ever has one. */
+_Alignas(64) static unsigned char zxh_mux_storage[16384];
+static int zxh_mux_ready = 0;
+
+void *zxh_default_mux(void) { return zxh_mux_storage; }
+
+int zxh_default_mux_ready(void) {
+    if (!zxh_mux_ready) {
+        zxh_mux_ready = 1;
+        return 1;
+    }
+    return 0;
+}

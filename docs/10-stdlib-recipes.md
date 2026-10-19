@@ -25,14 +25,19 @@ fn hello(req: &Request) -> Response {
 }
 
 fn main() -> i32 {
-    let mut app = Router::new();
-    app.get("/health", hello);
-    serve_local(&app, 8000)
+    handle_get("/health", hello);
+    listen("127.0.0.1:8000")
 }
 ```
 
-For a deterministic tool or test, use `serve_local_n(&app, count, port)`. It
-exits after `count` valid HTTP requests; empty TCP readiness probes do not count.
+The top-level form registers on the default mux and `listen` takes an address
+string, so it reads like Go's `http.HandleFunc` + `http.ListenAndServe`. For an
+explicit router, `let mut app = new_app(); app.get("/health", hello);` then
+`serve_local(&app, 8000)` behaves as before.
+
+For a deterministic tool or test, use `serve_local_n(&app, count, port)` (or
+`listen_n(addr, count)`) to exit after `count` valid HTTP requests; empty TCP
+readiness probes do not count.
 
 To serve a local directory without writing an accept loop:
 

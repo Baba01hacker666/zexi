@@ -33,7 +33,9 @@
 > moves transfer ownership and leave the source empty. `extern "C"`
 > declarations bind C functions (libc), and several `.zx` files compile together
 > into one program; on top of that, `lib/http.zx` is a working HTTP/1.x client
-> and server (see docs/08).
+> and server (see docs/08), now with a Go-style default mux: top-level
+> `handle_get("/users/{id}", user)` plus `listen(":8080")`, `{name}` route
+> parameters, and `use_before`/`use_after` middleware.
 > Not yet implemented: generics, traits, full per-module **isolation**
 > (scoped qualified paths, `as` aliases, and `pub` checks are live, but the
 > loader still merges every module into one flat namespace, so unqualified

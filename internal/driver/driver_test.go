@@ -333,7 +333,7 @@ func TestStdNetHTTPRoundTrip(t *testing.T) {
 	serverSrc := `use http;
 
 fn main() -> i32 {
-    let mut srv = listen("127.0.0.1", 18082);
+    let mut srv = listen_tcp("127.0.0.1", 18082);
     if srv.fd < 0 {
         println("bind failed");
         return 1;
@@ -367,7 +367,7 @@ fn main() -> i32 {
 	clientSrc := `use std::http;
 
 fn main() -> i32 {
-    let a = get("127.0.0.1", 18082, "/");
+    let a = get_raw("127.0.0.1", 18082, "/");
     let ra = parse_response(&a);
     print(ra.status);
     print(" ");
@@ -375,13 +375,13 @@ fn main() -> i32 {
     print(" ");
     println(ra.header("content-length"));
 
-    let b = get("127.0.0.1", 18082, "/pi");
+    let b = get_raw("127.0.0.1", 18082, "/pi");
     let rb = parse_response(&b);
     print(rb.status);
     print(" ");
     println(rb.body.trim());
 
-    let p = post("127.0.0.1", 18082, "/echo", "hello body");
+    let p = post_raw("127.0.0.1", 18082, "/echo", "hello body");
     let rp = parse_response(&p);
     print(rp.status);
     print(" ");
@@ -502,14 +502,14 @@ func TestStdHTTPClientReadsBodies(t *testing.T) {
 
 fn main() -> i32 {
     let port = String::from(arg_at(1)).parse_i64() as i32;
-    let a = get("127.0.0.1", port, "/");
+    let a = get_raw("127.0.0.1", port, "/");
     let ra = parse_response(&a);
     print(ra.status);
     print(" [");
     print(ra.body);
     println("]");
 
-    let b = get("127.0.0.1", port, "/");
+    let b = get_raw("127.0.0.1", port, "/");
     let rb = parse_response(&b);
     print(rb.status);
     print(" [");
@@ -770,7 +770,7 @@ func TestStdHTTPStaticFiles(t *testing.T) {
 
 fn main() -> i32 {
     let root = String::from(arg_at(1));
-    let mut srv = listen("127.0.0.1", 18089);
+    let mut srv = listen_tcp("127.0.0.1", 18089);
     if !srv.ok() {
         println("bind failed");
         return 1;
@@ -1267,6 +1267,108 @@ fn main() -> i32 {
 	}
 	if got := serverOut.String(); got != "" {
 		t.Fatalf("unexpected server output: %q", got)
+	}
+}
+
+// TestDefaultMuxAndGoClient exercises the Go-flavoured surface: top-level
+// handle_get/listen on a process-global mux, `{name}` route parameters, after
+// middleware, and the one-call client (`get`, `do`).
+func TestDefaultMuxAndGoClient(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end network test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	reserve, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := reserve.Addr().(*net.TCPAddr).Port
+	if err := reserve.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	serverSrc := `use http;
+
+fn home(req: &Request) -> Response {
+    return Response::text(200, "home");
+}
+
+fn user(req: &Request) -> Response {
+    return Response::text(200, req.param("id").as_str());
+}
+
+fn cors(req: &Request, res: &mut Response) {
+    res.set_header("X-Mux", "zexi");
+}
+
+fn main() -> i32 {
+    let mut addr = String::from("127.0.0.1:");
+    addr.push_str(arg_at(1).as_str());
+    http::handle_get("/", home);
+    http::handle_get("/users/{id}", user);
+    http::use_after(cors);
+    http::listen_n(addr.as_str(), 2)
+}
+`
+	clientSrc := `use http;
+
+fn main() -> i32 {
+    let mut base = String::from("http://127.0.0.1:");
+    base.push_str(arg_at(1).as_str());
+    let mut one = base.clone();
+    one.push_str("/users/42");
+    let a = http::get(one.as_str());
+    println(a.status, a.body.as_str(), a.header("X-Mux").as_str());
+    let mut two = base.clone();
+    two.push_str("/");
+    let b = http::do("GET", two.as_str());
+    println(b.status, b.body.as_str());
+    0
+}
+`
+	serverPath := filepath.Join(dir, "server.zx")
+	clientPath := filepath.Join(dir, "client.zx")
+	if err := os.WriteFile(serverPath, []byte(serverSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(clientPath, []byte(clientSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	serverBin := filepath.Join(dir, "server")
+	clientBin := filepath.Join(dir, "client")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(serverPath, serverBin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build default-mux server")
+	}
+	em = diag.NewEmitter()
+	if _, ok := driver.Build(clientPath, clientBin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build Zexi HTTP client")
+	}
+
+	server := exec.Command(serverBin, strconv.Itoa(port))
+	var serverOut bytes.Buffer
+	server.Stdout = &serverOut
+	server.Stderr = &serverOut
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Process.Kill()
+	if !waitPort("127.0.0.1:"+strconv.Itoa(port), 5*time.Second) {
+		t.Fatalf("server never started listening; output:\n%s", serverOut.String())
+	}
+
+	clientOut, err := exec.Command(clientBin, strconv.Itoa(port)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("client failed: %v\n%s", err, clientOut)
+	}
+	want := "200 42 zexi\n200 home\n"
+	if string(clientOut) != want {
+		t.Fatalf("client output mismatch:\n got %q\nwant %q", clientOut, want)
 	}
 }
 

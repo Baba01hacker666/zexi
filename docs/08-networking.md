@@ -180,9 +180,10 @@ fn main() {
 
 | API | Purpose |
 | --- | --- |
-| `fetch(url)` / `get_url(url)` / `get_status(url)` | one-call GET or status-only request |
-| `request(method, url, body = "", content_type = "")` | one-call configurable request |
-| `post_url`, `post_json`, `post_form_url`, `put_url`, `delete_url`, `download` | high-level URL helpers |
+| `fetch(url)` / `get(url)` / `get_url(url)` / `get_status(url)` | one-call GET or status-only request |
+| `request(method, url, body = "", content_type = "")` / `do(...)` | one-call configurable request |
+| `post(url, body)`, `post_url`, `post_json`, `post_form_url`, `put_url`, `delete_url`, `download` | high-level URL helpers |
+| `get_raw(host, port, path)`, `post_raw(host, port, path, body)` | raw-text request builders kept for hand-rolled calls |
 | `Client::new()` / `Client.get/post/put/delete/send` | configurable reusable client |
 | `Client.post_form`, `Client.download` | form posts, and fetch-to-file |
 | `Client.timeout_ms`, `Client.follow_redirects`, `Client.max_redirects`, `Client.user_agent`, `Client.set_header` | client settings |
@@ -194,7 +195,8 @@ Redirects are followed for 301/302/303 (switching to GET) and 307/308
 (preserving the method and body), up to `max_redirects`. `https://` URLs
 officially fail with `error` set, because the stack is plaintext HTTP only.
 
-A server can now be as small as a router plus `serve`:
+A server can be as small as a few top-level registrations plus `listen` — the
+same shape as Go's `http.HandleFunc` + `http.ListenAndServe`:
 
 ```zx
 import http.server;
@@ -204,60 +206,81 @@ fn hello(req: &Request) -> Response {
 }
 
 fn main() -> i32 {
-    let mut app = Router::new();
-    app.get("/", hello);
-    serve_local(&app, 8080)  // loopback only; runs until stopped
+    handle_get("/", hello);
+    listen(":8080")            // runs until stopped
+}
+```
+
+`handle_get/handle_post/handle_put/handle_delete` and `handle(method, path, fn)`
+register on a process-wide default mux; `listen(addr)`/`listen_n(addr, max)`
+take an address string (`":8080"`, `"8080"`, `"127.0.0.1:8080"`, or
+`"http://host:8080"`). `use_before(fn)`/`use_after(fn)` attach middleware to the
+default mux: a before hook may return a valid `Response` to short-circuit
+(auth, redirects), an after hook can add headers. Prefer an explicit
+`Router::new()`/`new_app()` when a program holds several independent servers.
+
+If you want the classic `Router` value and accept loop, everything is still
+there:
+
+```zx
+fn main() -> i32 {
+    let mut app = new_app();
+    app.get("/hello", hello);
+    app.set_fallback(my_404);
+    // ... per-connection: if app.serve(&c) { ... }
+    0
 }
 ```
 
 Use `serve(&app, port)` when intentionally exposing a service on all IPv4
 interfaces, or pass an explicit host as its third argument. For a controlled
 service or a test, `serve_n(&app, 10, 8080)` exits after ten valid requests;
-`serve_local_n` is the loopback-only counterpart. [`examples/http_app.zx`](../examples/http_app.zx)
-has a larger ready-to-run app. If you want the explicit accept loop, `listen`,
-`listen_local`, `read_request`, and `send_response` remain public too.
+`serve_local_n` is the loopback-only counterpart. If you want the explicit
+accept loop, the `net` helpers `listen_tcp`, `listen_local`, `read_request`,
+and `send_response` remain public.
 
 | API | Purpose |
 | --- | --- |
 | `read_request(&Conn) -> Request` | head plus Content-Length body |
-| `Request.query/param/cookie/path_only/raw_query/wants_keep_alive` | request access (`param` also reads form bodies) |
+| `Request.query/param/route_param/cookie/path_only/raw_query/wants_keep_alive` | request access (`param` reads query, route, then form) |
 | `Response::text/html/json/empty/redirect`, `Response.set_header/set_cookie` | response builders |
 | `send_response(&Conn, &Response) -> i64` | serialize and write a response |
 | `Response.keep_alive` | advertise a persistent connection |
-| `Router::new()`, `.get/.post/.put/.delete/.set_fallback`, `.dispatch/.serve` | Go-style handler table |
-| `serve(&router, port)`, `serve_n(...)` | high-level accept loop (forever or request-bounded) |
-| `serve_local(&router, port)`, `serve_local_n(...)` | loopback-only server helpers for local development/tests |
+| `handle*` / `use_before` / `use_after` / `listen` / `listen_n` | top-level default-mux registration and serving |
+| `new_app()`, `Router.get/.post/.put/.delete/.add`, `.use_before/.use_after`, `.set_fallback`, `.listen/.listen_n`, `.dispatch/.serve` | explicit router with the same features |
+| `serve(&router, port)`, `serve_n(...)`, `serve_local(...)`, `serve_local_n(...)` | low-level accept loops (forever or request-bounded) |
+| `parse_addr(str) -> Addr` | parse a listen address (`Addr.ok/host/port`) |
 | `serve_static(root, path)`, `serve_dir(root, port)`, `serve_file(path)` | static files with MIME detection and traversal checks |
 | `serve_dir_local(root, port)`, `serve_dir_local_n(...)` | loopback-only static-site helpers |
 | `read_file`, `write_file_bytes`, `file_size` | binary-safe file helpers (also used by downloads) |
 
 Handlers are ordinary functions (`fn(&Request) -> Response`) stored and invoked
-through function values, so routing looks like Go:
+through function values.
+
+Routers hold up to 32 (method, path) pairs and 8 before/after middleware hooks.
+A route segment written `{name}` matches exactly one path segment and its value
+is available as `req.param("name")` (which checks the query string first, then
+route parameters) or `req.route_param("name")`:
 
 ```zx
-fn hello(req: &Request) -> Response {
-    return Response::text(200, "hi");
-}
-
-fn my_404(req: &Request) -> Response {
-    return Response::empty(404);
+fn user(req: &Request) -> Response {
+    return Response::text(200, req.param("id").as_str());
 }
 
 fn main() -> i32 {
-    let mut router = Router::new();
-    router.get("/hello", hello);
-    router.set_fallback(my_404);
-    // ... accept loop:
-    //     if router.serve(&c) { served += 1; }
-    0
+    handle_get("/users/{id}", user);
+    listen(":8080")
 }
 ```
 
-Routers hold up to 32 (method, path) pairs. A trailing `/*` makes a prefix
-route (`/api/*` matches `/api/echo`) and `*` matches everything. Named path
-parameters and middleware chains are not supported yet; use
-`Request.query` for inputs. `Router.serve` also answers oversized bodies
-with `413` before calling a handler.
+`/users/42` then yields `req.param("id") == "42"`. A trailing `/*` still makes a
+prefix route (`/api/*` matches `/api/echo`), `*` matches everything, and a `*`
+segment after named segments matches the remaining path. `Router.serve` answers
+oversized bodies with `413` before calling a handler.
+
+The default mux is one per process (it is not a user-visible global; the storage
+lives behind the `http` shim). Programs that need isolated registries should use
+explicit routers.
 
 A directory can be served in one call, much like Python's built-in file server:
 
