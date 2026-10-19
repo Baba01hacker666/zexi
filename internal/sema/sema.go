@@ -25,7 +25,9 @@ import (
 type Fn struct {
 	Decl     *ast.FnDecl
 	Name     string
-	QualName string // "Point::len_sq" for methods, else Name
+	QualName string   // "Point::len_sq" for methods, else Name
+	Generics []string // declared type-parameter names
+	Generic  bool     // true for the un-instantiated template
 	Params   []*types.Type
 	// ParamNames and Defaults are aligned with Params (the receiver, when
 	// present, occupies slot 0 with an empty name and no default).
@@ -141,6 +143,7 @@ type checker struct {
 
 	scope     []map[string]*types.Type // local bindings, innermost last
 	mutScope  []map[string]bool        // mutability of tracked bindings (else permissive)
+	typeEnv   map[string]*types.Type   // in-scope type parameters (name -> type)
 	cur       *Fn
 	loopDepth int
 	breaks    []*breakInfo // one entry per enclosing loop, innermost last
@@ -163,6 +166,43 @@ func (c *checker) errf(sp token.Span, code, format string, args ...any) {
 
 func (c *checker) errAt(e ast.Expr, code, format string, args ...any) {
 	c.errf(e.Span(), code, format, args...)
+}
+
+// checkGenerics validates a type-parameter list and returns its names.
+// Duplicate names are rejected; written bounds are not supported yet.
+func (c *checker) checkGenerics(gps []ast.GenericParam) []string {
+	if len(gps) == 0 {
+		return nil
+	}
+	var names []string
+	seen := map[string]bool{}
+	for _, g := range gps {
+		if len(g.Bounds) > 0 {
+			c.errf(g.Sp, "E0900", "trait bounds are not supported yet (roadmap M1)")
+		}
+		if seen[g.Name] {
+			c.errf(g.Sp, "E0428", "the type parameter `%s` is declared more than once", g.Name)
+			continue
+		}
+		seen[g.Name] = true
+		names = append(names, g.Name)
+	}
+	return names
+}
+
+// withTypeParams runs fn with the named type parameters in scope, each bound to
+// an opaque parameter type. It restores the previous environment afterwards.
+func (c *checker) withTypeParams(names []string, fn func()) {
+	saved := c.typeEnv
+	if len(names) > 0 {
+		env := make(map[string]*types.Type, len(names))
+		for _, n := range names {
+			env[n] = &types.Type{Kind: types.ParamKind, ParamName: n}
+		}
+		c.typeEnv = env
+	}
+	fn()
+	c.typeEnv = saved
 }
 
 // --- collection pass ------------------------------------------------------
@@ -318,12 +358,12 @@ func (c *checker) checkTypeCycles() {
 			}
 		}
 	}
-	for _, st := range c.info.StructOrd {
+	for _, st := range c.info.Structs {
 		for _, f := range st.Fields {
 			addType(st.Name, f.Ty)
 		}
 	}
-	for _, en := range c.info.EnumOrd {
+	for _, en := range c.info.Enums {
 		for _, v := range en.Variants {
 			for _, f := range v.Fields {
 				addType(en.Name, f.Ty)
@@ -371,9 +411,12 @@ func (c *checker) registerEnum(d *ast.EnumDecl) {
 		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
 		return
 	}
-	en := &types.Enum{Name: d.Name, Copy: types.CopyAttr(d.Attrs)}
+	names := c.checkGenerics(d.Generics)
+	en := &types.Enum{Name: d.Name, Base: d.Name, Generics: names, Generic: len(names) > 0, Copy: types.CopyAttr(d.Attrs)}
 	c.info.Enums[d.Name] = en
-	c.info.EnumOrd = append(c.info.EnumOrd, en)
+	if !en.Generic {
+		c.info.EnumOrd = append(c.info.EnumOrd, en)
+	}
 }
 
 func (c *checker) collectEnumVariants(d *ast.EnumDecl) {
@@ -381,6 +424,12 @@ func (c *checker) collectEnumVariants(d *ast.EnumDecl) {
 	if !ok || len(en.Variants) > 0 {
 		return
 	}
+	c.withTypeParams(en.Generics, func() {
+		c.collectEnumVariantsInner(d, en)
+	})
+}
+
+func (c *checker) collectEnumVariantsInner(d *ast.EnumDecl, en *types.Enum) {
 	for i, v := range d.Variants {
 		if _, dup := en.Variant(v.Name); dup {
 			c.errf(v.Sp, "E0428", "the variant `%s` is defined multiple times", v.Name)
@@ -396,7 +445,7 @@ func (c *checker) collectEnumVariants(d *ast.EnumDecl) {
 			if ft == nil {
 				ft = &types.Type{Kind: types.Invalid}
 			}
-			if ft.NeedsDrop() {
+			if !en.Generic && ft.NeedsDrop() {
 				// Binding a payload in a `match` aliases the owned value, so a
 				// payload that owns heap memory could be freed twice. Until the
 				// borrow checker lands, keep enum payloads resource-free.
@@ -426,9 +475,12 @@ func (c *checker) registerStruct(d *ast.StructDecl) {
 		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
 		return
 	}
-	st := &types.Struct{Name: d.Name, Tuple: d.Tuple, Copy: types.CopyAttr(d.Attrs)}
+	names := c.checkGenerics(d.Generics)
+	st := &types.Struct{Name: d.Name, Base: d.Name, Generics: names, Generic: len(names) > 0, Tuple: d.Tuple, Copy: types.CopyAttr(d.Attrs)}
 	c.info.Structs[d.Name] = st
-	c.info.StructOrd = append(c.info.StructOrd, st)
+	if !st.Generic {
+		c.info.StructOrd = append(c.info.StructOrd, st)
+	}
 }
 
 func (c *checker) collectStructFields(d *ast.StructDecl) {
@@ -436,6 +488,12 @@ func (c *checker) collectStructFields(d *ast.StructDecl) {
 	if !ok || len(st.Fields) > 0 {
 		return // duplicate or already filled
 	}
+	c.withTypeParams(st.Generics, func() {
+		c.collectStructFieldsInner(d, st)
+	})
+}
+
+func (c *checker) collectStructFieldsInner(d *ast.StructDecl, st *types.Struct) {
 	for i, f := range d.Fields {
 		name := f.Name
 		if d.Tuple {
@@ -459,6 +517,10 @@ func (c *checker) collectStructFields(d *ast.StructDecl) {
 func (c *checker) collectImpl(d *ast.ImplBlock) {
 	if d.Trait != nil {
 		c.errf(d.Sp, "E0900", "trait impls are not supported by the compiler yet (roadmap M1)")
+		return
+	}
+	if len(d.Generics) > 0 {
+		c.errf(d.Sp, "E0900", "generic impls are not supported yet (roadmap M1)")
 		return
 	}
 	name := typePathName(d.SelfTy)
@@ -511,11 +573,25 @@ func (c *checker) collectFn(d *ast.FnDecl, extern bool, abi string) {
 		fn.ABI = abi
 	}
 	c.info.Fns[d.Name] = fn
-	c.info.FnOrder = append(c.info.FnOrder, fn)
+	if !fn.Generic {
+		c.info.FnOrder = append(c.info.FnOrder, fn)
+	}
 }
 
-// makeFn builds a checked function header, handling method receivers.
+// makeFn builds a checked function header, handling method receivers and
+// generic type parameters.
 func (c *checker) makeFn(d *ast.FnDecl, recv *types.Type) *Fn {
+	names := c.checkGenerics(d.Generics)
+	var fn *Fn
+	c.withTypeParams(names, func() {
+		fn = c.makeFnInner(d, recv)
+	})
+	fn.Generics = names
+	fn.Generic = len(names) > 0
+	return fn
+}
+
+func (c *checker) makeFnInner(d *ast.FnDecl, recv *types.Type) *Fn {
 	fn := &Fn{Decl: d, Name: d.Name, Recv: recv}
 	if recv != nil {
 		fn.QualName = nominalName(recv) + "::" + d.Name
@@ -2725,6 +2801,11 @@ func (c *checker) resolveType(t ast.Type) *types.Type {
 		if x.Segments[0] == "_" {
 			c.errf(x.Sp, "E0121", "the type placeholder `_` is not allowed here")
 			return nil
+		}
+		if len(x.Segments) == 1 {
+			if t, ok := c.typeEnv[x.Segments[0]]; ok {
+				return t
+			}
 		}
 		if len(x.Segments) > 1 {
 			c.errf(x.Sp, "E0900", "type paths are not supported by the compiler yet (roadmap M1)")

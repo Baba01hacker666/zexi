@@ -41,6 +41,7 @@ const (
 	StructKind // nominal product type
 	EnumKind   // nominal tagged union
 	StringKind // builtin owning heap string
+	ParamKind  // a generic type parameter (only while checking a template)
 )
 
 // Type is a semantic type. Only the fields relevant to Kind are set.
@@ -57,14 +58,22 @@ type Type struct {
 	St *Struct
 	// Enum
 	En *Enum
+	// ParamKind: the parameter's name, e.g. the `T` in `Option<T>`.
+	ParamName string
 }
 
-// Struct is a nominal product type.
+// Struct is a nominal product type. For a generic instantiation, Name is the
+// canonical instantiation key (e.g. `Pair$i64$str`), Base is the source name
+// (`Pair`), and Args are the type arguments.
 type Struct struct {
-	Name   string
-	Fields []Field
-	Tuple  bool
-	Copy   bool // opt-in via `#[copy]`
+	Name     string
+	Base     string
+	Args     []*Type
+	Generics []string // declared type-parameter names (template only)
+	Generic  bool     // true for the un-instantiated template
+	Fields   []Field
+	Tuple    bool
+	Copy     bool // opt-in via `#[copy]`
 }
 
 // Field is one struct field.
@@ -84,9 +93,14 @@ func (s *Struct) Field(name string) (*Field, bool) {
 	return nil, false
 }
 
-// Enum is a nominal tagged union.
+// Enum is a nominal tagged union. For a generic instantiation, the Name/Base/
+// Args convention matches Struct.
 type Enum struct {
 	Name     string
+	Base     string
+	Args     []*Type
+	Generics []string // declared type-parameter names (template only)
+	Generic  bool     // true for the un-instantiated template
 	Variants []Variant
 	Copy     bool // opt-in via `#[copy]`
 }
@@ -202,6 +216,9 @@ func Equal(a, b *Type) bool {
 	if a.Kind != b.Kind || a.Mut != b.Mut || a.Len != b.Len {
 		return false
 	}
+	if a.Kind == ParamKind {
+		return a.ParamName == b.ParamName
+	}
 	if a.Kind == StructKind {
 		return a.St != nil && b.St != nil && a.St.Name == b.St.Name
 	}
@@ -269,6 +286,11 @@ func (t *Type) IsCopy() bool {
 		return true
 	case StringKind:
 		return false
+	case ParamKind:
+		// A type parameter is treated as non-`Copy`: the move checker then
+		// moves it, which is the sound conservative choice for any concrete
+		// instantiation (a `Copy` instantiation can still be used freely).
+		return false
 	case Invalid:
 		return true
 	default:
@@ -328,6 +350,25 @@ func CopyAttr(attrs []string) bool {
 	return false
 }
 
+// stDisplay renders a nominal type for diagnostics: `Base<Args...>` for an
+// instantiation, else the plain name.
+func stDisplay(name, base string, args []*Type) string {
+	if len(args) == 0 {
+		return name
+	}
+	if base == "" {
+		base = name
+	}
+	s := base + "<"
+	for i, a := range args {
+		if i > 0 {
+			s += ", "
+		}
+		s += a.String()
+	}
+	return s + ">"
+}
+
 // String renders a type for diagnostics.
 func (t *Type) String() string {
 	if t == nil {
@@ -336,6 +377,11 @@ func (t *Type) String() string {
 	switch t.Kind {
 	case Invalid:
 		return "<invalid>"
+	case ParamKind:
+		if t.ParamName != "" {
+			return t.ParamName
+		}
+		return "<param>"
 	case Unit:
 		return "()"
 	case Bool:
@@ -350,12 +396,12 @@ func (t *Type) String() string {
 		return "never"
 	case StructKind:
 		if t.St != nil {
-			return t.St.Name
+			return stDisplay(t.St.Name, t.St.Base, t.St.Args)
 		}
 		return "<struct>"
 	case EnumKind:
 		if t.En != nil {
-			return t.En.Name
+			return stDisplay(t.En.Name, t.En.Base, t.En.Args)
 		}
 		return "<enum>"
 	case I8:

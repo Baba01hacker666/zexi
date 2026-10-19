@@ -6,6 +6,7 @@ import (
 	"zexi/internal/diag"
 	"zexi/internal/parser"
 	"zexi/internal/sema"
+	"zexi/internal/types"
 )
 
 // check parses and type-checks src, returning whether it is clean and the
@@ -1147,5 +1148,68 @@ func TestDidYouMeanStillErrors(t *testing.T) {
 	ok, codes = check(t, `fn main() -> i32 { let total = 1; println(totla); 0 }`)
 	if ok || !has(codes, "E0425") {
 		t.Fatalf("expected E0425, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+func TestGenericTemplatesAreDeclaredNotEmitted(t *testing.T) {
+	src := `struct Pair<A, B> { first: A, second: B }
+enum Opt<T> { Some(T), None }
+fn id<T>(x: T) -> T { x }
+fn main() -> i32 { 0 }`
+	file, pd := parser.Parse(0, []byte(src))
+	if len(pd) > 0 {
+		t.Fatalf("unexpected parse diagnostics: %v", codesOf(pd))
+	}
+	info, ds := sema.Check(file)
+	if len(ds) > 0 {
+		t.Fatalf("unexpected diagnostics: %v", codesOf(ds))
+	}
+	id := info.Fns["id"]
+	if id == nil || !id.Generic || len(id.Generics) != 1 || id.Generics[0] != "T" {
+		t.Fatalf("generic fn not registered as a template: %#v", id)
+	}
+	if id.Params[0].Kind != types.ParamKind || id.Ret.Kind != types.ParamKind {
+		t.Fatalf("template signature did not resolve to parameter types: %s", id.Sig())
+	}
+	st := info.Structs["Pair"]
+	if st == nil || !st.Generic || len(st.Generics) != 2 || st.Fields[0].Ty.Kind != types.ParamKind {
+		t.Fatalf("generic struct not registered as a template: %#v", st)
+	}
+	en := info.Enums["Opt"]
+	if en == nil || !en.Generic || len(en.Generics) != 1 || en.Variants[0].Fields[0].Ty.Kind != types.ParamKind {
+		t.Fatalf("generic enum not registered as a template: %#v", en)
+	}
+	if len(info.StructOrd) != 0 || len(info.EnumOrd) != 0 {
+		t.Fatalf("templates must not be queued for emission")
+	}
+	for _, fn := range info.FnOrder {
+		if fn == id {
+			t.Fatal("generic template must not be in FnOrder")
+		}
+	}
+}
+
+func TestGenericBoundsRejected(t *testing.T) {
+	_, codes := check(t, `fn max<T: Ord>(a: T, b: T) -> T { a }
+fn main() -> i32 { 0 }`)
+	if !has(codes, "E0900") {
+		t.Fatalf("expected E0900 for a bound, got %v", codes)
+	}
+}
+
+func TestDuplicateTypeParameterRejected(t *testing.T) {
+	_, codes := check(t, `fn f<T, T>(x: T) -> T { x }
+fn main() -> i32 { 0 }`)
+	if !has(codes, "E0428") {
+		t.Fatalf("expected E0428 for a duplicate parameter, got %v", codes)
+	}
+}
+
+func TestGenericImplRejectedForNow(t *testing.T) {
+	_, codes := check(t, `struct Pair<T> { v: T }
+impl<T> Pair<T> { fn get(&self) -> T { self.v } }
+fn main() -> i32 { 0 }`)
+	if !has(codes, "E0900") {
+		t.Fatalf("expected E0900 for a generic impl, got %v", codes)
 	}
 }
