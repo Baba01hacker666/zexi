@@ -52,6 +52,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/threads.zx",
 		"../../tests/formatting.zx",
 		"../../tests/encoding.zx",
+		"../../tests/generics.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -293,6 +294,21 @@ func TestRunPrograms(t *testing.T) {
 				"a430d84680aabd0b",
 				"06d5573923c6cdfc",
 				"000000310f923099",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/generics.zx",
+			want: strings.Join([]string{
+				"7",
+				"7",
+				"hey",
+				"21",
+				"1",
+				"b",
+				"42",
+				"9",
+				"7",
 				"",
 			}, "\n"),
 		},

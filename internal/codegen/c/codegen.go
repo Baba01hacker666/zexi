@@ -242,7 +242,9 @@ func usedFns(info *sema.Info) map[*sema.Fn]bool {
 				}
 			case *ast.IdentExpr:
 				// A name in value position (callback argument, binding).
-				if r := info.Fns[x.Name]; r != nil {
+				if r := info.FnValues[x]; r != nil {
+					add(r)
+				} else if r := info.Fns[x.Name]; r != nil {
 					add(r)
 				}
 			case *ast.PathExpr:
@@ -1234,6 +1236,9 @@ func (g *gen) value(e ast.Expr) string {
 		return g.literal(x)
 
 	case *ast.IdentExpr:
+		if fn := g.info.FnValues[x]; fn != nil {
+			return funcName(fn)
+		}
 		return g.identValue(x.Name, x.Sp)
 
 	case *ast.PathExpr:

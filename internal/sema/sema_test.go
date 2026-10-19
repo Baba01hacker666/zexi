@@ -1213,3 +1213,82 @@ fn main() -> i32 { 0 }`)
 		t.Fatalf("expected E0900 for a generic impl, got %v", codes)
 	}
 }
+
+func TestGenericFunctionInstantiation(t *testing.T) {
+	src := `fn id<T>(x: T) -> T { return x; }
+fn main() -> i32 {
+    let a: i64 = id(1);
+    let b = id::<i32>(2);
+    let c = id(a);
+    let d = id(b);
+    println(a);
+    println(b);
+    println(c);
+    println(d);
+    0
+}`
+	file, pd := parser.Parse(0, []byte(src))
+	if len(pd) > 0 {
+		t.Fatalf("unexpected parse diagnostics: %v", codesOf(pd))
+	}
+	info, ds := sema.Check(file)
+	if len(ds) > 0 {
+		t.Fatalf("unexpected diagnostics: %v", codesOf(ds))
+	}
+	insts := 0
+	for name, fn := range info.Fns {
+		if len(name) > 3 && name[:3] == "id$" {
+			insts++
+			if fn.Generic {
+				t.Fatalf("instantiation %s must not be a template", name)
+			}
+		}
+	}
+	// One for i64 (a and c share it) and one for i32 (b and d share it).
+	if insts != 2 {
+		t.Fatalf("expected 2 monomorphizations, got %d", insts)
+	}
+	if info.Fns["id"] == nil || !info.Fns["id"].Generic {
+		t.Fatal("the generic template must still be registered")
+	}
+}
+
+func TestGenericInferenceAndErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{
+			name: "uninferable",
+			src:  "fn make<T>() -> i64 { 0 }\nfn main() -> i32 { let x = make(); 0 }",
+			want: "E0282",
+		},
+		{
+			name: "too many type args",
+			src:  "fn id<T>(x: T) -> T { return x; }\nfn main() -> i32 { println(id::<i32, i64>(1)); 0 }",
+			want: "E0107",
+		},
+		{
+			name: "type args on non-generic",
+			src:  "fn f(x: i32) -> i32 { x }\nfn main() -> i32 { println(f::<i32>(1)); 0 }",
+			want: "E0107",
+		},
+		{
+			name: "argument type mismatch",
+			src:  "fn pair<T>(a: T, b: T) -> T { return a; }\nfn main() -> i32 { println(pair(1, \"x\")); 0 }",
+			want: "E0308",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			if ok {
+				t.Fatalf("expected an error, got none")
+			}
+			if !has(codes, tc.want) {
+				t.Fatalf("expected %s, got %v", tc.want, codes)
+			}
+		})
+	}
+}

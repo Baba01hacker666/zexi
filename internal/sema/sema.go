@@ -77,6 +77,7 @@ type Info struct {
 	EnumOrd    []*types.Enum
 	Methods    map[string]map[string]*Fn  // struct name -> method name -> fn
 	Resolved   map[ast.Expr]*Fn           // resolved call / method target
+	FnValues   map[ast.Expr]*Fn           // resolved function value (instantiated generic)
 	Indirect   map[ast.Expr]*types.Type   // calls through a function value
 	Ctors      map[ast.Expr]*Ctor         // resolved enum-variant construction
 	TupleCtors map[ast.Expr]*types.Struct // resolved tuple-struct construction
@@ -107,6 +108,7 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 			Enums:      map[string]*types.Enum{},
 			Methods:    map[string]map[string]*Fn{},
 			Resolved:   map[ast.Expr]*Fn{},
+			FnValues:   map[ast.Expr]*Fn{},
 			Indirect:   map[ast.Expr]*types.Type{},
 			Ctors:      map[ast.Expr]*Ctor{},
 			TupleCtors: map[ast.Expr]*types.Struct{},
@@ -130,7 +132,26 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 	} else if !c.info.Main.Ret.Kind.IsInt() && c.info.Main.Ret.Kind != types.Unit {
 		c.errf(c.info.Main.Decl.Sp, "E0601", "`main` must return an integer or `()`, found %s", c.info.Main.Ret)
 	}
-	return c.info, c.errs
+	return c.info, dedupeDiags(c.errs)
+}
+
+// dedupeDiags drops exact duplicates. Instantiation re-checks a body once per
+// concrete type, so a mistake can otherwise be reported several times.
+func dedupeDiags(ds []diag.Diagnostic) []diag.Diagnostic {
+	if len(ds) < 2 {
+		return ds
+	}
+	seen := make(map[string]bool, len(ds))
+	out := ds[:0]
+	for _, d := range ds {
+		k := fmt.Sprintf("%d:%d:%s:%s", d.Span.Start, d.Span.End, d.Code, d.Message)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, d)
+	}
+	return out
 }
 
 type checker struct {
@@ -737,7 +758,10 @@ func (c *checker) tryCollectConst(d *ast.ConstDecl) bool {
 // --- body checking --------------------------------------------------------
 
 func (c *checker) checkBodies() {
-	for _, fn := range c.info.FnOrder {
+	// A worklist: instantiating a generic call appends the concrete function to
+	// FnOrder, and it must be checked in turn (index-based, so growth is seen).
+	for i := 0; i < len(c.info.FnOrder); i++ {
+		fn := c.info.FnOrder[i]
 		if fn.Decl.Body == nil {
 			continue
 		}
@@ -1003,7 +1027,7 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		return c.inferLiteral(x, expected)
 
 	case *ast.IdentExpr:
-		return c.inferIdent(x.Name, x.Sp)
+		return c.inferIdentExpr(x, expected)
 
 	case *ast.PathExpr:
 		if len(x.Segments) == 1 {
@@ -1065,7 +1089,7 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		return dstT
 
 	case *ast.CallExpr:
-		return c.inferCall(x)
+		return c.inferCall(x, expected)
 
 	case *ast.IfExpr:
 		return c.inferIf(x, expected)
@@ -1249,6 +1273,51 @@ func suggestName(name string, candidates []string) string {
 	return fmt.Sprintf(" (did you mean `%s`?)", best)
 }
 
+// inferIdentExpr types a bare name used as a value. A generic function is
+// instantiated when explicit type arguments (`f::<i64>`) or an expected
+// function type determine its parameters.
+func (c *checker) inferIdentExpr(x *ast.IdentExpr, expected *types.Type) *types.Type {
+	// A local binding or constant shadows a function of the same name.
+	if c.lookupScope(x.Name) != nil {
+		return c.inferIdent(x.Name, x.Sp)
+	}
+	if _, ok := c.info.Consts[x.Name]; ok {
+		return c.inferIdent(x.Name, x.Sp)
+	}
+	fn, ok := c.info.Fns[x.Name]
+	if !ok {
+		return c.inferIdent(x.Name, x.Sp)
+	}
+	if !fn.Generic {
+		if len(x.TypeArgs) > 0 {
+			c.errf(x.Sp, "E0107", "`%s` is not generic", x.Name)
+		}
+		return c.inferIdent(x.Name, x.Sp)
+	}
+	bindings := map[string]*types.Type{}
+	if len(x.TypeArgs) > len(fn.Generics) {
+		c.errf(x.Sp, "E0107", "`%s` takes %d type argument(s) but %d were supplied", x.Name, len(fn.Generics), len(x.TypeArgs))
+	}
+	for i, name := range fn.Generics {
+		if i < len(x.TypeArgs) {
+			if t := c.resolveType(x.TypeArgs[i]); t != nil {
+				bindings[name] = t
+			}
+		}
+	}
+	if expected != nil && expected.Kind == types.Fn {
+		c.unify(&types.Type{Kind: types.Fn, Params: fn.Params, Ret: fn.Ret}, expected, bindings)
+	}
+	args := c.bindGenericArgs(x.Sp, fn, bindings)
+	if args == nil {
+		return &types.Type{Kind: types.Invalid}
+	}
+	inst := c.instantiateFn(fn, args)
+	c.info.FnValues[x] = inst
+	return &types.Type{Kind: types.Fn, Params: inst.Params, Ret: inst.Ret}
+}
+
+// inferIdent resolves a bare value name without generic instantiation.
 func (c *checker) inferIdent(name string, sp token.Span) *types.Type {
 	if name == "_" {
 		c.errf(sp, "E0425", "cannot use `_` as a value")
@@ -1480,7 +1549,7 @@ func (c *checker) isPlace(e ast.Expr) bool {
 	return false
 }
 
-func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
+func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 	// `Enum::Variant(args)` is a variant constructor, and `String::new()` /
 	// `String::from(..)` are builtin constructors.
 	if p, ok := x.Callee.(*ast.PathExpr); ok && len(p.Segments) == 2 {
@@ -1584,6 +1653,12 @@ func (c *checker) inferCall(x *ast.CallExpr) *types.Type {
 		}
 		return nil
 	}
+	if fn.Generic {
+		return c.checkGenericCall(x, fn, calleeTypeArgs(x.Callee), expected, fmt.Sprintf("function `%s`", name))
+	}
+	if len(calleeTypeArgs(x.Callee)) > 0 {
+		c.errAt(x.Callee, "E0107", "`%s` is not generic", name)
+	}
 	return c.checkCallArgs(x, fn, fmt.Sprintf("function `%s`", name))
 }
 
@@ -1615,7 +1690,7 @@ func (c *checker) resolveArgs(sp token.Span, args []ast.Expr, names []string, de
 					ok = false
 					break
 				}
-				filled[i] = defaults[i]
+				filled[i] = ast.Clone(defaults[i])
 			}
 			if ok {
 				return filled
@@ -1669,7 +1744,7 @@ func (c *checker) resolveArgs(sp token.Span, args []ast.Expr, names []string, de
 	}
 	for i := range out {
 		if out[i] == nil && defaults != nil && defaults[i] != nil {
-			out[i] = defaults[i]
+			out[i] = ast.Clone(defaults[i])
 			seen[i] = true
 		}
 	}
@@ -1701,6 +1776,254 @@ func (c *checker) checkCallArgs(x *ast.CallExpr, fn *Fn, label string) *types.Ty
 		}
 	}
 	return fn.Ret
+}
+
+// calleeTypeArgs returns the explicit turbofish arguments on a callee.
+func calleeTypeArgs(e ast.Expr) []ast.Type {
+	switch x := e.(type) {
+	case *ast.IdentExpr:
+		return x.TypeArgs
+	case *ast.PathExpr:
+		return x.TypeArgs
+	}
+	return nil
+}
+
+// checkGenericCall infers a generic function's type arguments (from explicit
+// turbofish, the expected result, and the argument types), instantiates it, and
+// checks the call against the concrete signature.
+func (c *checker) checkGenericCall(x *ast.CallExpr, tmpl *Fn, explicit []ast.Type, expected *types.Type, label string) *types.Type {
+	bindings := map[string]*types.Type{}
+	if len(explicit) > len(tmpl.Generics) {
+		c.errAt(x, "E0107", "`%s` takes %d type argument(s) but %d were supplied", tmpl.Name, len(tmpl.Generics), len(explicit))
+	}
+	for i, name := range tmpl.Generics {
+		if i < len(explicit) {
+			if t := c.resolveType(explicit[i]); t != nil {
+				bindings[name] = t
+			}
+		}
+	}
+	// A known result type can pin parameters that the arguments cannot.
+	if expected != nil {
+		c.unify(tmpl.Ret, expected, bindings)
+	}
+	x.Args = c.resolveArgs(x.Sp, x.Args, tmpl.ParamNames, tmpl.Defaults, label)
+	for i, a := range x.Args {
+		at := c.checkExpr(a, nil)
+		if i < len(tmpl.Params) {
+			c.unify(tmpl.Params[i], at, bindings)
+		}
+	}
+	args := c.bindGenericArgs(x.Callee.Span(), tmpl, bindings)
+	if args == nil {
+		return &types.Type{Kind: types.Invalid}
+	}
+	inst := c.instantiateFn(tmpl, args)
+	// Re-check the arguments against the concrete signature so that integer
+	// literals adopt the instantiated type (e.g. `id::<i64>(1)`).
+	return c.checkCallArgs(x, inst, label)
+}
+
+// bindGenericArgs materializes the concrete arguments for a generic function,
+// reporting E0282 for any parameter inference left unbound.
+func (c *checker) bindGenericArgs(sp token.Span, tmpl *Fn, bindings map[string]*types.Type) []*types.Type {
+	args := make([]*types.Type, len(tmpl.Generics))
+	ok := true
+	for i, name := range tmpl.Generics {
+		if t, found := bindings[name]; found && t != nil && t.Kind != types.Invalid {
+			args[i] = t
+			continue
+		}
+		c.errf(sp, "E0282", "type annotations needed: cannot infer type parameter `%s`", name)
+		args[i] = &types.Type{Kind: types.Invalid}
+		ok = false
+	}
+	if !ok {
+		return nil
+	}
+	return args
+}
+
+// unify structurally matches a (possibly generic) parameter type against a
+// concrete type, recording parameter bindings. It deliberately does not report
+// diagnostics: the caller checks assignability against the instantiated
+// signature, which produces the precise error.
+func (c *checker) unify(pat, got *types.Type, b map[string]*types.Type) bool {
+	if pat == nil || got == nil || got.Kind == types.Invalid || pat.Kind == types.Invalid {
+		return true
+	}
+	if pat.Kind == types.ParamKind {
+		if prev, ok := b[pat.ParamName]; ok {
+			return types.Equal(prev, got)
+		}
+		b[pat.ParamName] = got
+		return true
+	}
+	if pat.Kind != got.Kind {
+		return false
+	}
+	switch pat.Kind {
+	case types.Ref, types.Ptr, types.Slice:
+		return c.unify(pat.Elem, got.Elem, b)
+	case types.Array:
+		if pat.Len != got.Len {
+			return false
+		}
+		return c.unify(pat.Elem, got.Elem, b)
+	case types.Tuple:
+		if len(pat.Elems) != len(got.Elems) {
+			return false
+		}
+		ok := true
+		for i := range pat.Elems {
+			if !c.unify(pat.Elems[i], got.Elems[i], b) {
+				ok = false
+			}
+		}
+		return ok
+	case types.Fn:
+		if len(pat.Params) != len(got.Params) {
+			return false
+		}
+		ok := true
+		for i := range pat.Params {
+			if !c.unify(pat.Params[i], got.Params[i], b) {
+				ok = false
+			}
+		}
+		if !c.unify(pat.Ret, got.Ret, b) {
+			ok = false
+		}
+		return ok
+	}
+	return true
+}
+
+// withBindings runs fn with additional type-parameter bindings layered over the
+// current environment (used while re-checking an instantiated body).
+func (c *checker) withBindings(bind map[string]*types.Type, fn func()) {
+	saved := c.typeEnv
+	merged := make(map[string]*types.Type, len(saved)+len(bind))
+	for k, v := range saved {
+		merged[k] = v
+	}
+	for k, v := range bind {
+		merged[k] = v
+	}
+	c.typeEnv = merged
+	fn()
+	c.typeEnv = saved
+}
+
+// instantiateFn clones a generic function's body, re-checks its signature with
+// the concrete arguments, and registers it as an ordinary function. Its body is
+// checked by the checkBodies worklist.
+func (c *checker) instantiateFn(tmpl *Fn, args []*types.Type) *Fn {
+	key := instKey(tmpl.Name, args)
+	if fn, ok := c.info.Fns[key]; ok {
+		return fn
+	}
+	clone := ast.Clone(tmpl.Decl)
+	clone.Generics = nil
+	bind := make(map[string]*types.Type, len(tmpl.Generics))
+	for i, name := range tmpl.Generics {
+		if i < len(args) && args[i] != nil {
+			bind[name] = args[i]
+		}
+	}
+	var fn *Fn
+	c.withBindings(bind, func() {
+		fn = c.makeFnInner(clone, tmpl.Recv)
+	})
+	fn.Name = key
+	fn.QualName = key
+	fn.Generics = nil
+	fn.Generic = false
+	fn.Extern = tmpl.Extern
+	fn.ABI = tmpl.ABI
+	c.info.Fns[key] = fn
+	c.info.FnOrder = append(c.info.FnOrder, fn)
+	return fn
+}
+
+// instKey is the canonical, injective name of a generic instantiation:
+// `id$3:i64`. Length-prefixed components keep names containing `$` (nested
+// instantiations) unambiguous.
+func instKey(base string, args []*types.Type) string {
+	var b strings.Builder
+	b.WriteString(base)
+	for _, a := range args {
+		k := typeKey(a)
+		b.WriteString("$")
+		b.WriteString(strconv.Itoa(len(k)))
+		b.WriteString(":")
+		b.WriteString(k)
+	}
+	return b.String()
+}
+
+// typeKey is an injective textual key for a semantic type, used to name
+// instantiations. Compound constructors start with a `$` tag, which cannot
+// occur in a source identifier (and is escaped by codegen's safeIdent).
+func typeKey(t *types.Type) string {
+	if t == nil {
+		return "void"
+	}
+	switch t.Kind {
+	case types.ParamKind:
+		return compound("p", t.ParamName)
+	case types.StructKind:
+		if t.St != nil {
+			return t.St.Name
+		}
+		return "struct"
+	case types.EnumKind:
+		if t.En != nil {
+			return t.En.Name
+		}
+		return "enum"
+	case types.Ref:
+		m := "0"
+		if t.Mut {
+			m = "1"
+		}
+		return compound("r", m, typeKey(t.Elem))
+	case types.Ptr:
+		return compound("x", typeKey(t.Elem))
+	case types.Slice:
+		return compound("s", typeKey(t.Elem))
+	case types.Array:
+		return compound("a", strconv.FormatInt(t.Len, 10), typeKey(t.Elem))
+	case types.Tuple:
+		parts := make([]string, len(t.Elems))
+		for i, e := range t.Elems {
+			parts[i] = typeKey(e)
+		}
+		return compound("t", parts...)
+	case types.Fn:
+		parts := make([]string, 0, len(t.Params)+2)
+		parts = append(parts, strconv.Itoa(len(t.Params)))
+		for _, p := range t.Params {
+			parts = append(parts, typeKey(p))
+		}
+		parts = append(parts, typeKey(t.Ret))
+		return compound("f", parts...)
+	default:
+		return t.String()
+	}
+}
+
+func compound(tag string, parts ...string) string {
+	var b strings.Builder
+	b.WriteString("$")
+	b.WriteString(tag)
+	for _, p := range parts {
+		b.WriteString(strconv.Itoa(len(p)))
+		b.WriteString(":")
+		b.WriteString(p)
+	}
+	return b.String()
 }
 
 // stringCtorSig describes a builtin `String` constructor.

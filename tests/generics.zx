@@ -1,0 +1,36 @@
+// Generic functions are monomorphized: every distinct instantiation becomes a
+// separate function in the generated C. This covers inference, explicit
+// turbofish, nesting, and generic functions used as values.
+fn id<T>(x: T) -> T { return x; }
+
+fn twice<T>(x: T) -> T { return id(x); }
+
+fn pick<T>(a: T, b: T, first: bool) -> T {
+    if first { return a; }
+    return b;
+}
+
+fn apply<T>(f: fn(T) -> T, v: T) -> T { return f(v); }
+
+fn inc(x: i64) -> i64 { return x + 1; }
+
+struct Box2 { a: i64, b: i64 }
+
+fn sum(b: Box2) -> i64 { return b.a + b.b; }
+
+fn main() -> i32 {
+    println(id(7));                 // inferred: id<i32>
+    println(id::<i64>(7));          // explicit turbofish
+    let s: str = id("hey");
+    println(s);
+    println(twice(21));             // nested: id<i32> instantiated from twice<i32>
+    println(pick(1, 2, true));
+    println(pick::<str>("a", "b", false));
+    let f: fn(i64) -> i64 = inc;
+    println(apply::<i64>(f, 41));
+    let g: fn(i64) -> i64 = id::<i64>;
+    println(g(9));
+    let b = Box2 { a: 3, b: 4 };
+    println(sum(id(b)));
+    0
+}
