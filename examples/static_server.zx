@@ -1,0 +1,13 @@
+// Serve a directory in the style of `python -m http.server`.
+//
+// Run:
+//   zexic run examples/static_server.zx -- .
+// Visit http://127.0.0.1:8000/ afterwards.
+
+import http.server;
+
+fn main() -> i32 {
+    let root = arg_at(1);
+    println("serving ", root, " on http://127.0.0.1:8000");
+    serve_dir_local(root.as_str(), 8000)
+}

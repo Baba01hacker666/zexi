@@ -132,8 +132,8 @@ func FuzzLexer(f *testing.F) {
 }
 
 func TestNewKeywords(t *testing.T) {
-	eq(t, "until elif defer",
-		token.KindUntil, token.KindElif, token.KindDefer)
+	eq(t, "until elif defer import",
+		token.KindUntil, token.KindElif, token.KindDefer, token.KindImport)
 }
 
 func TestRawStringWithHashes(t *testing.T) {

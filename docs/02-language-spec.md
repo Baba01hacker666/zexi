@@ -1,7 +1,8 @@
 # 2. Language Specification (draft v0.1)
 
 This is the *normative-shaped* spec for the M0 language. Features tagged
-**M1/M2** are designed here but not implemented initially.
+**M1/M2** are designed here; the lightweight source loader described in §2.8
+is an intentionally flat M1 preview, not yet full scoped modules.
 
 ## 2.1 Lexical structure
 
@@ -41,7 +42,7 @@ also adopt a float context. There are no implicit numeric conversions (see 2.4).
 
 ```
 as      break   const   continue  defer   else    elif    enum    extern
-false   fn      for     if        impl    in      let     loop
+false   fn      for     if        impl    import  in      let     loop
 match   mod     mut     pub       return  struct  true    type
 unsafe  until   use     while   i8 i16 i32 i64 isize u8 u16 u32 u64 usize f32 f64
 bool    char    str     never
@@ -65,7 +66,7 @@ Precedence (tightest → loosest): unary (`- ! & *`) → `as` → `* / %` →
 program     = { item } ;
 
 item        = fn_item | struct_item | enum_item | const_item
-            | mod_item | use_item | impl_item | type_item ;
+            | mod_item | use_item | import_item | impl_item | type_item ;
 
 fn_item     = [ "pub" ] [ "unsafe" ] "fn" ident [ generics ]
               "(" [ params ] ")" [ "->" type ] ( block | ";" ) ;
@@ -84,7 +85,9 @@ variant     = ident [ "(" types ")" ] | ident "{" fields "}" ;
 const_item  = [ "pub" ] "const" ident [ ":" type ] "=" expr ";" ;
 type_item   = [ "pub" ] "type" ident [ generics ] "=" type ";" ;
 mod_item    = [ "pub" ] "mod" ident ( ";" | "{" { item } "}" ) ;
-use_item    = "use" path [ "as" ident ] ";" ;
+use_item    = "use" ( path | string ) [ "as" ident ] ";" ;
+import_item = "import" ( import_path | string ) [ "as" ident ] ";" ;
+import_path = ident { ( "." | "::" ) ident } ;
 impl_item   = "impl" [ generics ] type [ "for" type ] "{" { fn_item } "}" ;
 
 block       = "{" { stmt } [ expr ] "}" ;
@@ -377,19 +380,30 @@ No exceptions. Two mechanisms:
 
 ## 2.8 Modules & packages
 
-- A **file** is a module; a **directory** with `mod.zx` is a package root.
-- `mod foo;` declares a child module (file `foo.zx` or `foo/mod.zx`) —
-  still reserved for the roadmap.
-- **Implemented today:** `use` imports whole library files at compile
-  time. `use "path.zx";` loads a file relative to the importing file;
-  `use a::b;` loads `a/b.zx`, searched next to the importing file, then
-  in a `lib/` folder beside it, then in the standard library embedded in
-  the compiler (`use std::math;` also works). Imports are transitive,
-  each file is loaded at most once, and cycles are harmless. The imported
-  file's items join the program's single namespace (name collisions are
-  errors, as for any duplicate definition), and an unresolvable import is
-  E9022. Files may also be passed directly on the command line, as
-  before.
+The current loader is a useful **M1 preview** rather than the final scoped
+module system:
+
+- A **file** can be loaded as a module. `mod foo;` finds `foo.zx` or
+  `foo/mod.zx` relative to its declaring file. `mod foo { ... }` is accepted
+  for inline organization.
+- `use` imports a whole library file at compile time. `use "path.zx";` loads a
+  relative file; `use a::b;` loads `a/b.zx`, searched next to the importing
+  file, then in a `lib/` folder beside it, then in the embedded standard
+  library (`use std::math;` also works).
+- `import` is an equivalent Python-shaped spelling. It additionally accepts
+  dots: `import http.server;` selects the high-level HTTP module and
+  `import io.fs;` selects the file helpers. `::` is accepted there too.
+- Imports are transitive, every file is loaded once, and cycles are harmless.
+  For now, loaded declarations are flattened into one program namespace:
+  `import http.server;` lets code call `serve(...)`, not
+  `http.server.serve(...)`. `pub` is parsed but is not yet enforced across
+  module boundaries. The grammar retains `as alias` for forward compatibility,
+  but the flat loader deliberately rejects it with **E9024** rather than
+  silently pretending that a namespace exists. Name collisions remain errors,
+  and an unresolvable import/module is E9022/E9023.
+
+Files may also be passed directly on the command line, as before. Full path
+resolution, visibility enforcement, and package metadata remain M1 work.
 
 ## 2.9 Attributes (M1/M2)
 
@@ -407,6 +421,12 @@ Deliberately tiny — a "core" that is largely in-language:
 - `alloc` (opt-in): `Box`, `Vec`, `String`, arenas, `GlobalAlloc`.
 - `os`/`sys` (opt-in): file, socket, process, time — thin libc or syscall
   wrappers, only linked when used.
+
+The shipped M1-preview helpers are embedded source modules: `io`, `fs`, `math`,
+`text`, `regex`, `random`, `sys`/`os`, `net`, and `http`. For example,
+`import text.regex;` selects the small POSIX-ERE facade and `import os;` selects
+local environment/path/process helpers. Their C shims are linked only if that
+module is selected.
 
 No `std` is linked by default; `#![no_std]` is the default rather than an
 opt-in, which is a key part of hitting the binary-size target.

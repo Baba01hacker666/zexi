@@ -140,19 +140,23 @@ func (d *TypeAlias) Span() token.Span { return d.Sp }
 type ModDecl struct {
 	Vis   Visibility
 	Name  string
-	Items []Item // nil when the module is a separate file
-	Sp    token.Span
+	Items []Item
+	// Inline distinguishes `mod name { ... }` from `mod name;`. An empty
+	// inline module has no items, so its syntax cannot be inferred from Items.
+	Inline bool
+	Sp     token.Span
 }
 
 func (*ModDecl) itemNode()          {}
 func (d *ModDecl) Span() token.Span { return d.Sp }
 
-// UseDecl is `use path;` or `use "file.zx";`. The driver resolves it to
-// source files (a library import) before type checking.
+// UseDecl is `use path;` / `import path;` or a quoted file form. The driver
+// resolves it to source files (a library import) before type checking. `As` is
+// retained by the parser for the future scoped-module model.
 type UseDecl struct {
 	Path []string
-	// File is the literal path of `use "file.zx";`, resolved relative to
-	// the importing file. Empty for the `use a::b;` form.
+	// File is the literal path of `use "file.zx";` / `import "file.zx";`,
+	// resolved relative to the importing file. Empty for a named-library path.
 	File string
 	As   string
 	Sp   token.Span

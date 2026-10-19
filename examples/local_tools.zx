@@ -1,0 +1,20 @@
+// Inspect local process information without writing C glue.
+//
+// Run:
+//   zexic run examples/local_tools.zx -- "release-42"
+
+import os;
+import text.regex;
+
+fn main() -> i32 {
+    println("cwd:", cwd());
+    println("host:", hostname());
+    println("pid:", pid(), "cpus:", cpu_count());
+    println("home set:", env_has("HOME"), "temp:", temp_dir());
+
+    let value = arg_at(1);
+    if value.len() > 0 {
+        println("looks like a release label:", is_match("^[a-z]+-[0-9]+$", value.as_str()));
+    }
+    0
+}

@@ -1,5 +1,5 @@
 // random — random helpers, part of the Zexi standard library.
-// Import with `use random;` or `use std::random;`.
+// Import with `use random;`, `use std::random;`, or `import random;`.
 //
 // Two layers: a deterministic xorshift64 `Rng` you own (reproducible, no
 // global state — Go's `rand.New(rand.NewSource(seed))` style), and thin

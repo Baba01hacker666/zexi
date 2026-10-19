@@ -74,13 +74,14 @@ func FrontEnd(path string, opts Options, em *diag.Emitter) (*Artifacts, bool) {
 // FrontEndFiles is FrontEnd for a program split across several source files.
 // The files are parsed independently (each keeps its own identity for
 // diagnostics) and their items are combined into one module. On top of that,
-// `use` declarations import library files: `use "helpers.zx";` loads a file
-// relative to the importing file, and `use math;` / `use std::math;` load a
-// library by name — searched next to the importing file, in a `lib/` folder
-// beside it, and finally in the standard library embedded in the compiler.
-// Imports are transitive, every file is loaded at most once, and import
-// cycles are harmless (a file being loaded counts as loaded). The first
-// path is treated as the program.
+// `use` / `import` declarations import library files: `use "helpers.zx";`
+// or `import "helpers.zx";` loads a relative file, while `use math;`,
+// `import http.server;`, and `use std::math;` load a library by name — searched
+// next to the importing file, in a `lib/` folder beside it, and finally in the
+// standard library embedded in the compiler. `mod name;` loads `name.zx` or
+// `name/mod.zx`. Imports are transitive, every file is loaded at most once, and
+// cycles are harmless (a file being loaded counts as loaded). The first path is
+// treated as the program.
 func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, bool) {
 	if len(paths) == 0 {
 		em.Report(diag.New("E9021", "no input files"))
@@ -133,6 +134,9 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 	if l.usesSys {
 		art.CExtra = append(art.CExtra, string(sysCSource))
 	}
+	if l.usesRegex {
+		art.CExtra = append(art.CExtra, string(regexCSource))
+	}
 	return art, true
 }
 
@@ -167,33 +171,39 @@ func splitJobs(opts Options, fns int) int {
 }
 
 // stdFS holds the standard library: small Zexi source files embedded in
-// the compiler, importable from any program with `use math;`,
-// `use text;`, or `use std::math;` — no installation or paths needed.
+// the compiler, importable with `use math;`, `use std::math;`,
+// `import http.server;`, and the other facade paths — no installation needed.
 //
 //go:embed std/*.zx
 var stdFS embed.FS
 
-// netCSource is the C networking runtime compiled into programs that
-// `use net;` or `use http;`. Embedded so it needs no installation and
+// netCSource is the shared socket/file C runtime compiled into programs that
+// select embedded net/http/fs helpers. Embedded so it needs no installation and
 // stays in sync with the Zexi bindings.
 //
 //go:embed zxnet_c.txt
 var netCSource []byte
 
-// sysCSource is the C shim for the `sys` module (env, clocks, sleep, pid),
-// embedded like the networking runtime.
+// sysCSource is the C shim for the `sys` module (environment, local paths,
+// clocks, and process helpers), embedded like the networking runtime.
 //
 //go:embed zxsys_c.txt
 var sysCSource []byte
 
-// loader reads source files (entry points plus everything they `use`),
+// regexCSource is the opt-in POSIX ERE bridge for the `regex` module.
+//
+//go:embed zxregex_c.txt
+var regexCSource []byte
+
+// loader reads source files (entry points plus everything they use/import/mod),
 // parses them, and merges their items into one program.
 type loader struct {
-	em      *diag.Emitter
-	merged  *ast.File
-	loaded  map[string]bool // canonical file keys already loaded
-	usesNet bool            // program imports net/http (needs the C runtime)
-	usesSys bool            // program imports sys (needs the C shim)
+	em        *diag.Emitter
+	merged    *ast.File
+	loaded    map[string]bool // canonical file keys already loaded
+	usesNet   bool            // program imports net/http/fs (needs the shared C runtime)
+	usesSys   bool            // program imports sys (needs the C shim)
+	usesRegex bool            // program imports regex (needs the POSIX ERE shim)
 }
 
 // loadDiskFile loads one file from disk and everything it imports.
@@ -219,12 +229,73 @@ func (l *loader) loadDiskFile(path string) int {
 	return l.loadSource(key, path, src, filepath.Dir(abs))
 }
 
+// stdModuleAliases gives the flat, embedded library a small package-shaped
+// facade. The language currently merges imported declarations into one program
+// namespace, but these paths make imports read naturally while real scoped
+// module names are built out: `import http.server;`, `use io::fs;`, and
+// `use std::http::client;` all select their backing module.
+var stdModuleAliases = map[string]string{
+	"fs":           "fs",
+	"http":         "http",
+	"http::client": "http",
+	"http::files":  "http",
+	"http::server": "http",
+	"http::static": "http",
+	"io":           "io",
+	"io::console":  "io",
+	"io::file":     "fs",
+	"io::fs":       "fs",
+	"math":         "math",
+	"math::basic":  "math",
+	"math::stats":  "math",
+	"net":          "net",
+	"net::tcp":     "net",
+	"os":           "sys",
+	"random":       "random",
+	"random::rng":  "random",
+	"regex":        "regex",
+	"sys":          "sys",
+	"sys::env":     "sys",
+	"sys::time":    "sys",
+	"text":         "text",
+	"text::ascii":  "text",
+	"text::regex":  "regex",
+	"time":         "sys",
+}
+
+// stdModule resolves a public module path to an embedded source file. Keeping
+// this table in the driver means aliases cost no runtime code and normal
+// filesystem imports still take precedence over the standard-library facade.
+func stdModule(parts []string) (string, bool) {
+	if name, ok := stdModuleAliases[strings.Join(parts, "::")]; ok {
+		return name, true
+	}
+	if len(parts) == 1 {
+		name := parts[0]
+		if _, err := fs.Stat(stdFS, path.Join("std", name+".zx")); err == nil {
+			return name, true
+		}
+	}
+	return "", false
+}
+
 // loadStdFile loads one embedded standard-library file by base name
 // (for example "math" for std/math.zx).
 func (l *loader) loadStdFile(name string) int {
 	key := "std:" + name
 	if l.loaded[key] {
 		return 0
+	}
+	// The socket/file C shim is intentionally shared. `fs` only uses its file
+	// functions, but linking it is still opt-in and dead-code elimination keeps
+	// unused socket helpers out of the binary.
+	switch name {
+	case "net", "http", "fs":
+		l.usesNet = true
+	case "sys":
+		l.usesSys = true
+	case "regex":
+		l.usesRegex = true
 	}
 	display := "std/" + name + ".zx"
 	src, err := fs.ReadFile(stdFS, display)
@@ -235,10 +306,9 @@ func (l *loader) loadStdFile(name string) int {
 	return l.loadSource(key, display, src, "")
 }
 
-// loadSource parses one already-read file, records its items, and follows
-// its `use` declarations. dir is the directory relative imports resolve
-// against (empty for embedded files). It reports whether the program
-// uses the C networking runtime (`use net;` / `use http;`).
+// loadSource parses one already-read file, records ordinary declarations, and
+// follows import/module directives. dir is the directory relative imports
+// resolve against (empty for embedded files).
 func (l *loader) loadSource(key, display string, src []byte, dir string) int {
 	l.loaded[key] = true // mark first: import cycles load each file once
 	fileID := l.em.AddFile(display, src)
@@ -247,57 +317,107 @@ func (l *loader) loadSource(key, display string, src []byte, dir string) int {
 	if file == nil {
 		return fileID
 	}
-	for _, it := range file.Items {
-		if d, ok := it.(*ast.UseDecl); ok {
-			l.loadUse(d, dir)
-			if d.File == "" && len(d.Path) > 0 {
-				name := d.Path[len(d.Path)-1]
-				if name == "net" || name == "http" {
-					l.usesNet = true
-				}
-				if name == "sys" {
-					l.usesSys = true
-				}
-			}
-			continue // imports contribute their own items; never checked here
-		}
-		l.merged.Items = append(l.merged.Items, it)
-	}
+	l.mergeItems(file.Items, dir)
 	return fileID
 }
 
-// loadUse resolves and loads one `use` declaration.
+// mergeItems flattens the current M1-preview module surface into the program
+// fed to sema. This is intentionally the same one-namespace behavior as
+// `use`: file layout is useful today, while path-qualified item lookup and
+// visibility checking remain future module work.
+func (l *loader) mergeItems(items []ast.Item, dir string) {
+	for _, it := range items {
+		switch d := it.(type) {
+		case *ast.UseDecl:
+			l.loadUse(d, dir)
+		case *ast.ModDecl:
+			l.loadMod(d, dir)
+		default:
+			l.merged.Items = append(l.merged.Items, it)
+		}
+	}
+}
+
+// loadMod resolves `mod name;` using the conventional `name.zx` and
+// `name/mod.zx` layouts. Inline `mod name { ... }` blocks are flattened in the
+// same way, which makes them useful for organization before namespaces land.
+func (l *loader) loadMod(d *ast.ModDecl, dir string) {
+	if d.Inline {
+		l.mergeItems(d.Items, dir)
+		return
+	}
+	for _, cand := range []string{
+		filepath.Join(dir, d.Name+".zx"),
+		filepath.Join(dir, d.Name, "mod.zx"),
+	} {
+		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+			l.loadDiskFile(cand)
+			return
+		}
+	}
+	l.em.Report(diag.New("E9023", "cannot find module `%s` (looked for %s.zx and %s/mod.zx)", d.Name, d.Name, d.Name).WithSpan(d.Sp))
+}
+
+// loadUse resolves and loads one `use` / `import` declaration.
 func (l *loader) loadUse(d *ast.UseDecl, dir string) {
+	// Parsing aliases now keeps source forward-compatible, but aliases would
+	// promise a namespace that the deliberately flat M1-preview loader cannot
+	// provide. Reject them explicitly rather than silently ignoring `as name`.
+	if d.As != "" {
+		l.em.Report(diag.New("E9024", "import aliases are not supported by the current flat module loader; remove `as %s` and use imported items unqualified", d.As).WithSpan(d.Sp))
+		return
+	}
 	if d.File != "" {
-		// `use "helpers.zx";` — a path relative to the importing file.
+		// `use "helpers.zx";` / `import "helpers.zx";` — relative to the
+		// importing file.
 		l.loadDiskFile(filepath.Join(dir, filepath.FromSlash(d.File)))
 		return
 	}
 	if len(d.Path) == 0 {
 		return
 	}
-	if d.Path[0] == "std" {
-		if len(d.Path) < 2 {
+
+	// Preserve the historical convenience for local modules named net/http/sys
+	// (and regex): their ABI calls can use the embedded runtime too. Embedded
+	// modules also mark themselves in loadStdFile, which covers facade paths
+	// like `import http.server;` whose last segment is not `http`.
+	switch d.Path[len(d.Path)-1] {
+	case "net", "http", "fs":
+		l.usesNet = true
+	case "sys":
+		l.usesSys = true
+	case "regex":
+		l.usesRegex = true
+	}
+
+	parts := d.Path
+	if parts[0] == "std" {
+		if len(parts) < 2 {
 			l.em.Report(diag.New("E9022", "`use std;` needs a module name, such as `use std::math;`").WithSpan(d.Sp))
 			return
 		}
-		l.loadStdFile(d.Path[len(d.Path)-1])
+		if module, ok := stdModule(parts[1:]); ok {
+			l.loadStdFile(module)
+			return
+		}
+		l.em.Report(diag.New("E9022", "there is no standard library module named `%s`", strings.Join(parts[1:], "::")).WithSpan(d.Sp))
 		return
 	}
-	// `use a::b;` names the file a/b.zx: look beside the importing file,
-	// then in a lib/ folder beside it, then in the embedded stdlib.
-	name := filepath.Join(d.Path...) + ".zx"
+
+	// `use a::b;` / `import a.b;` names a/b.zx: local modules win over
+	// embedded ones so applications can provide their own package trees.
+	name := filepath.Join(parts...) + ".zx"
 	for _, cand := range []string{filepath.Join(dir, name), filepath.Join(dir, "lib", name)} {
 		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
 			l.loadDiskFile(cand)
 			return
 		}
 	}
-	if _, err := fs.Stat(stdFS, path.Join("std", filepath.ToSlash(name))); err == nil {
-		l.loadStdFile(d.Path[len(d.Path)-1])
+	if module, ok := stdModule(parts); ok {
+		l.loadStdFile(module)
 		return
 	}
-	l.em.Report(diag.New("E9022", "cannot find a library named `%s` (looked for %s next to the importing file, in its lib/ folder, and in the standard library)", strings.Join(d.Path, "::"), name).WithSpan(d.Sp))
+	l.em.Report(diag.New("E9022", "cannot find a library named `%s` (looked for %s next to the importing file, in its lib/ folder, and in the standard library)", strings.Join(parts, "::"), name).WithSpan(d.Sp))
 }
 
 // Tokens returns the token stream for a file, for the `tokenize` command.
@@ -386,7 +506,7 @@ func CompileC(csrc, outPath string, opts Options) error {
 		return fmt.Errorf("C compiler %q not found; install gcc or clang, or set CC", cc)
 	}
 
-	args := []string{"-std=gnu11", optFlag(opts.OptLevel)}
+	args := []string{"-std=gnu11", optFlag(opts.OptLevel), "-fwrapv"}
 	// Tree-shaking: each function/data gets its own section so the linker
 	// can drop what the program never calls (only include what is used).
 	args = append(args, "-ffunction-sections", "-fdata-sections")
@@ -444,7 +564,7 @@ func CompileUnits(header string, units []string, outPath string, opts Options) e
 		return fmt.Errorf("C compiler %q not found; install gcc or clang, or set CC", cc)
 	}
 
-	base := []string{"-std=gnu11", optFlag(opts.OptLevel), "-ffunction-sections", "-fdata-sections", "-I" + dir}
+	base := []string{"-std=gnu11", optFlag(opts.OptLevel), "-fwrapv", "-ffunction-sections", "-fdata-sections", "-I" + dir}
 	objs := make([]string, len(units))
 	errs := make([]string, len(units))
 	var wg sync.WaitGroup
@@ -473,7 +593,9 @@ func CompileUnits(header string, units []string, outPath string, opts Options) e
 		}
 	}
 
-	args := []string{"-std=gnu11", optFlag(opts.OptLevel), "-ffunction-sections", "-fdata-sections"}
+	// Extra C bridge sources are compiled during this final link invocation, so
+	// carry the same signed-overflow semantics as generated translation units.
+	args := []string{"-std=gnu11", optFlag(opts.OptLevel), "-fwrapv", "-ffunction-sections", "-fdata-sections"}
 	for _, inc := range opts.IncludeDirs {
 		args = append(args, "-I"+inc)
 	}

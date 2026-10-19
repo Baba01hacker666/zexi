@@ -26,6 +26,11 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../examples/cbridge.zx",
 		"../../examples/guess.zx",
 		"../../examples/args.zx",
+		"../../examples/http_app.zx",
+		"../../examples/static_server.zx",
+		"../../examples/regex.zx",
+		"../../examples/local_tools.zx",
+		"../../examples/math_tools.zx",
 		"../../tests/tour.zx",
 		"../../tests/structs.zx",
 		"../../tests/enums.zx",
@@ -578,7 +583,7 @@ fn form_handler(req: &Request) -> Response {
 }
 
 fn main() -> i32 {
-    let mut srv = listen("127.0.0.1", 18088);
+    let mut srv = listen_local(18088);
     if !srv.ok() {
         println("bind failed");
         return 1;
@@ -591,7 +596,7 @@ fn main() -> i32 {
     router.post("/form", form_handler);
 
     let mut served: i32 = 0;
-    while served < 6 {
+    while served < 8 {
         let mut c = srv.accept();
         if !c.ok() {
             continue;
@@ -645,6 +650,12 @@ fn main() -> i32 {
     print(g.status);
     print(" ");
     println(g.body);
+
+    println(get_status("http://127.0.0.1:18088/hello"));
+    let h = post_form_url("http://127.0.0.1:18088/form", "name=quick");
+    print(h.status);
+    print(" ");
+    println(h.body);
     0
 }
 `
@@ -691,7 +702,9 @@ fn main() -> i32 {
 		"200 hi there:body text\n" +
 		"0 https is not supported (this client is plaintext HTTP only)\n" +
 		"200 abc\n" +
-		"200 zexi lang\n"
+		"200 zexi lang\n" +
+		"200\n" +
+		"200 quick\n"
 	if string(out) != want {
 		t.Fatalf("client output mismatch\n got: %q\nwant: %q", string(out), want)
 	}
@@ -701,9 +714,9 @@ fn main() -> i32 {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("server did not exit after serving six requests")
+		t.Fatal("server did not exit after serving eight requests")
 	}
-	if wantLog := "/hello\n/old\n/hello\n/api/echo\n/cookie\n/form\n"; srvOut.String() != wantLog {
+	if wantLog := "/hello\n/old\n/hello\n/api/echo\n/cookie\n/form\n/hello\n/form\n"; srvOut.String() != wantLog {
 		t.Fatalf("server log mismatch\n got: %q\nwant: %q", srvOut.String(), wantLog)
 	}
 }
@@ -738,6 +751,11 @@ func TestStdHTTPStaticFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("secret"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// A symlink inside the served tree must not expose the file it points to
+	// outside the tree.
+	if err := os.Symlink(filepath.Join(dir, "secret.txt"), filepath.Join(web, "link.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
 
 	serverSrc := `use http;
 
@@ -749,7 +767,7 @@ fn main() -> i32 {
         return 1;
     }
     let mut served: i32 = 0;
-    while served < 4 {
+    while served < 5 {
         let mut c = srv.accept();
         if !c.ok() {
             continue;
@@ -818,13 +836,16 @@ fn main() -> i32 {
 	if status, _, _ := get("/%2e%2e/secret.txt"); status != 403 {
 		t.Fatalf("traversal: status=%d, want 403", status)
 	}
+	if status, _, body := get("/link.txt"); status != 403 {
+		t.Fatalf("symlink escape: status=%d body=%q, want 403", status, body)
+	}
 
 	done := make(chan struct{})
 	go func() { server.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("server did not exit after serving four requests")
+		t.Fatal("server did not exit after serving five requests")
 	}
 }
 
@@ -1019,7 +1040,7 @@ func TestReadLine(t *testing.T) {
 	mainPath := filepath.Join(dir, "main.zx")
 	src := `use io;
 fn main() -> i32 {
-    let line = read_line();
+    let line = input("prompt> ");
     println(f"got: {line} ({len(line)})");
     0
 }
@@ -1039,7 +1060,489 @@ fn main() -> i32 {
 	if err != nil {
 		t.Fatalf("running read_line program: %v", err)
 	}
-	if want := "got: hello zexi (10)\n"; string(raw) != want {
+	if want := "prompt> got: hello zexi (10)\n"; string(raw) != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
+	}
+}
+
+// TestImportFacadesAndModLayout exercises the M1-oriented source organization
+// layer: package-shaped imports, a local module file, a directory module, and
+// an inline module all flatten into the current program namespace.
+func TestImportFacadesAndModLayout(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"helper.zx": `fn triple(n: i32) -> i32 { n * 3 }
+`,
+		"nested/mod.zx": `fn seven() -> i32 { 7 }
+`,
+		"main.zx": `import math.basic;
+import text.ascii;
+import text.regex;
+import io.fs;
+import os;
+import random;
+import net.tcp;
+import http.client;
+mod helper;
+mod nested;
+mod inline { fn add(a: i32, b: i32) -> i32 { a + b } }
+
+fn main() -> i32 {
+    println(triple(14), seven(), add(2, 3));
+    println(abs(sin(PI / 2.0) - 1.0) < 0.00001);
+    println(to_upper("zexi"));
+    println(upper("hi"), lower("BYE"), strip("  zexi  "), contains("zexi", "ex"), is_blank(" \t"), is_match("[0-9]+", "v42"));
+    0
+}
+`,
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mainPath := filepath.Join(dir, "main.zx")
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build import/module program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running import/module program: %v", err)
+	}
+	if want := "42 7 5\ntrue\nZEXI\nHI bye zexi true true true\n"; string(raw) != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
+	}
+}
+
+// TestStdFSBinaryRoundTrip proves that the small filesystem layer brings in
+// the shared C shim automatically and preserves bytes after an embedded NUL.
+func TestStdFSBinaryRoundTrip(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end filesystem test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	src := `import io.fs;
+
+fn main() -> i32 {
+    let source = arg_at(1);
+    let target = arg_at(2);
+    let mut data = String::from("hi");
+    data.push_byte(0);
+    data.push_str("there");
+    println(write_bytes(source.as_str(), &data));
+    println(copy_file(source.as_str(), target.as_str()));
+    let got = read_bytes(target.as_str());
+    println(got.len(), got.byte_at(2), got.byte_at(7));
+    0
+}
+`
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build filesystem program")
+	}
+	source := filepath.Join(dir, "source.bin")
+	target := filepath.Join(dir, "target.bin")
+	raw, err := exec.Command(out, source, target).Output()
+	if err != nil {
+		t.Fatalf("running filesystem program: %v", err)
+	}
+	if want := "8\n8\n8 0 101\n"; string(raw) != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
+	}
+	wantBytes := []byte{'h', 'i', 0, 't', 'h', 'e', 'r', 'e'}
+	gotBytes, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotBytes, wantBytes) {
+		t.Fatalf("copied bytes mismatch\n got: %v\nwant: %v", gotBytes, wantBytes)
+	}
+}
+
+// TestHighLevelHTTPServeN validates the compact loopback-only
+// `import http.server` surface. A readiness TCP probe is deliberately sent
+// before the two HTTP requests; it must not consume serve_local_n's budget.
+func TestHighLevelHTTPServeN(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end network test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	reserve, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := reserve.Addr().(*net.TCPAddr).Port
+	if err := reserve.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "server.zx")
+	src := `import http.server;
+
+fn hello(req: &Request) -> Response {
+    return Response::text(200, "hello from serve_n");
+}
+
+fn main() -> i32 {
+    let port = arg_at(1).parse_i64() as i32;
+    let mut app = Router::new();
+    app.get("/", hello);
+    serve_local_n(&app, 2, port)
+}
+`
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	serverBin := filepath.Join(dir, "server")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, serverBin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build high-level server")
+	}
+
+	server := exec.Command(serverBin, strconv.Itoa(port))
+	var serverOut bytes.Buffer
+	server.Stdout = &serverOut
+	server.Stderr = &serverOut
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Process.Kill()
+	addr := "127.0.0.1:" + strconv.Itoa(port)
+	if !waitPort(addr, 5*time.Second) {
+		t.Fatalf("server never started listening; output:\n%s", serverOut.String())
+	}
+
+	for i := 0; i < 2; i++ {
+		resp, err := stdhttp.Get("http://" + addr + "/")
+		if err != nil {
+			t.Fatalf("GET %d: %v", i, err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("reading GET %d: %v", i, err)
+		}
+		if resp.StatusCode != stdhttp.StatusOK || string(body) != "hello from serve_n" {
+			t.Fatalf("GET %d: status=%d body=%q", i, resp.StatusCode, body)
+		}
+	}
+
+	done := make(chan struct{})
+	go func() { _ = server.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("serve_n did not exit after its request budget; output:\n%s", serverOut.String())
+	}
+	if got := serverOut.String(); got != "" {
+		t.Fatalf("unexpected server output: %q", got)
+	}
+}
+
+// TestStdMathConvenience exercises the high-level dependency-free numerical
+// surface: conventional aliases, transcendental helpers, geometry, domain
+// fallbacks, and floating-point classification.
+func TestStdMathConvenience(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end math test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	src := `import math;
+
+fn main() -> i32 {
+    println(sqrt(81.0) == 9.0);
+    println(approx_eq(hypot(3.0, 4.0), 5.0, 0.0000001));
+    println(pow(2.0, 10) == 1024.0);
+    println(approx_eq(sin(PI / 2.0), 1.0, 0.0000001));
+    println(approx_eq(exp(1.0), E, 0.000000000001), approx_eq(log(E), 1.0, 0.000000000001), approx_eq(log2(8.0), 3.0, 0.000000000001), approx_eq(log10(1000.0), 3.0, 0.000000000001), approx_eq(log_base(81.0, 3.0), 4.0, 0.000000000001), approx_eq(exp(ln(0.5)), 0.5, 0.000000000001));
+    println(approx_eq(powf(9.0, 0.5), 3.0, 0.000000000001), approx_eq(powf(-2.0, 3.0), -8.0, 0.000000000001), powf(-2.0, 0.5) == 0.0, powf(MAX_F64, 0.0) == 1.0);
+    println(approx_eq(atan(1.0), FRAC_PI_4, 0.000000000001), approx_eq(atan2(1.0, 1.0), FRAC_PI_4, 0.000000000001), approx_eq(atan2(-1.0, -1.0), 0.0 - 3.0 * FRAC_PI_4, 0.000000000001), approx_eq(asin(1.0), FRAC_PI_2, 0.000000000001), approx_eq(asin(0.5), PI / 6.0, 0.000000000001), approx_eq(acos(-1.0), PI, 0.000000000001));
+    println(approx_eq(radians(180.0), PI, 0.000000000001), approx_eq(degrees(PI), 180.0, 0.000000000001), approx_eq(sinh(0.0), 0.0, 0.000000000001), approx_eq(cosh(0.0), 1.0, 0.000000000001), approx_eq(tanh(1.0), 0.7615941559557649, 0.000000000001), sinh(0.0 - 1000.0) == 0.0 - sinh(1000.0), cosh(0.0 - 1000.0) == cosh(1000.0));
+    println(approx_eq(cbrt(-125.0), -5.0, 0.000000000001), approx_eq(root(81.0, 4), 3.0, 0.000000000001), smoothstep(0.0, 10.0, 5.0) == 0.5, smootherstep(0.0, 10.0, 5.0) == 0.5);
+    println(approx_eq(distance(0.0, 0.0, 3.0, 4.0), 5.0, 0.000000000001), distance_sq(0.0, 0.0, 3.0, 4.0) == 25.0, fract(-2.75) == -0.75, copysign(2.0, -1.0) == -2.0, sign(-0.5) == -1.0, saturate(3.0) == 1.0);
+    let inf = MAX_F64 * 2.0;
+    println(is_nan(1.0), is_finite(MAX_F64), is_infinite(inf), is_finite(inf));
+    println(div_floor(1, 0), mod_floor(1, 0), div_ceil(1, 0), powi(2, -1), pow_mod(2, -1, 7));
+    println(floor(9223372036854775808.0) == 9223372036854775808.0);
+    println(trunc(0.0 - 9223372036854775808.0) == 0.0 - 9223372036854775808.0);
+    println(factorial(10), choose(10, 3), is_prime(97), next_prime(100), next_prime(9223372036854775807));
+    0
+}
+`
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build high-level math program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running high-level math program: %v", err)
+	}
+	if want := "true\ntrue\ntrue\ntrue\ntrue true true true true true\ntrue true true true\ntrue true true true true true\ntrue true true true true true true\ntrue true true true\ntrue true true true true true\nfalse true true false\n0 0 0 0 0\ntrue\ntrue\n3628800 120 true 101 0\n"; string(raw) != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
+	}
+}
+
+// TestMissingModIsDiagnostic makes sure the M1-preview module loader reports a
+// useful error instead of passing an unresolved ModDecl to semantic analysis.
+func TestMissingModIsDiagnostic(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	if err := os.WriteFile(mainPath, []byte("mod missing;\nfn main() -> i32 { 0 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	em := diag.NewEmitter()
+	if _, ok := driver.FrontEnd(mainPath, driver.Options{}, em); ok {
+		t.Fatal("expected a diagnostic for a missing module")
+	}
+	var buf bytes.Buffer
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E9023") {
+		t.Fatalf("expected E9023, got:\n%s", buf.String())
+	}
+}
+
+// TestHighLevelStaticServeDirN covers the high-level loopback static-server
+// loop rather than only its lower-level serve_static building block.
+func TestHighLevelStaticServeDirN(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end network test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	reserve, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := reserve.Addr().(*net.TCPAddr).Port
+	if err := reserve.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	web := filepath.Join(dir, "web")
+	if err := os.Mkdir(web, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(web, "index.html"), []byte("index via serve_dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(web, "hello.txt"), []byte("hello static"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mainPath := filepath.Join(dir, "server.zx")
+	src := `import http.server;
+
+fn main() -> i32 {
+    let root = arg_at(1);
+    let port = arg_at(2).parse_i64() as i32;
+    serve_dir_local_n(root.as_str(), 2, port)
+}
+`
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	serverBin := filepath.Join(dir, "server")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, serverBin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build high-level static server")
+	}
+
+	server := exec.Command(serverBin, web, strconv.Itoa(port))
+	var serverOut bytes.Buffer
+	server.Stdout = &serverOut
+	server.Stderr = &serverOut
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Process.Kill()
+	addr := "127.0.0.1:" + strconv.Itoa(port)
+	if !waitPort(addr, 5*time.Second) {
+		t.Fatalf("server never started listening; output:\n%s", serverOut.String())
+	}
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{"/", "index via serve_dir"},
+		{"/hello.txt", "hello static"},
+	} {
+		resp, err := stdhttp.Get("http://" + addr + tc.path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", tc.path, err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("reading %s: %v", tc.path, err)
+		}
+		if resp.StatusCode != stdhttp.StatusOK || string(body) != tc.want {
+			t.Fatalf("GET %s: status=%d body=%q", tc.path, resp.StatusCode, body)
+		}
+	}
+
+	done := make(chan struct{})
+	go func() { _ = server.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("serve_dir_n did not exit after its request budget; output:\n%s", serverOut.String())
+	}
+	if got := serverOut.String(); got != "" {
+		t.Fatalf("unexpected server output: %q", got)
+	}
+}
+
+// TestImportAliasIsDiagnostic prevents a parsed `as` clause from being silently
+// ignored while imports are intentionally flattened for the M1 preview.
+func TestImportAliasIsDiagnostic(t *testing.T) {
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	if err := os.WriteFile(mainPath, []byte(`import math as m;
+fn main() -> i32 { 0 }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	em := diag.NewEmitter()
+	if _, ok := driver.FrontEnd(mainPath, driver.Options{}, em); ok {
+		t.Fatal("expected aliased import to be rejected until namespaces exist")
+	}
+	var buf bytes.Buffer
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E9024") {
+		t.Fatalf("expected E9024 for aliased import, got:\n%s", buf.String())
+	}
+}
+
+// TestStdRegexHelpers exercises the opt-in POSIX ERE facade, including its
+// compatible span ABI, invalid-pattern behavior, and string replacement.
+func TestStdRegexHelpers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end regex test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	src := `import text.regex;
+
+fn main() -> i32 {
+    println(is_valid("[A-Z]+-[0-9]+"));
+    println(is_match("[0-9]+", "item=42"), is_match("[0-9]+", "none"));
+    println(full_match("[0-9]+", "42"), full_match("[0-9]+", "x42"));
+    let span = match_span("beta[0-9]+", "alpha beta42 gamma");
+    println(span.start, span.end);
+    println(find("beta[0-9]+", "alpha beta42 gamma"));
+    println(find_index("beta[0-9]+", "alpha beta42 gamma"));
+    println(replace_first("beta[0-9]+", "alpha beta42 gamma", "ID"));
+    println(is_valid("["), find_index("[", "text"));
+    println(replace_first("^", "x", ">"));
+    0
+}
+`
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build regex program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running regex program: %v", err)
+	}
+	if want := "true\ntrue false\ntrue false\n6 12\nbeta42\n6\nalpha ID gamma\nfalse -1\n>x\n"; string(raw) != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
+	}
+}
+
+// TestStdSysLocalHelpers covers local process state and deliberately
+// non-recursive filesystem operations through the friendly os facade.
+func TestStdSysLocalHelpers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end local-system test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	src := `import os;
+import io.fs;
+
+fn main() -> i32 {
+    let work = arg_at(1);
+    let from = arg_at(2);
+    let to = arg_at(3);
+    println(cwd().len() > 0, hostname().len() > 0, cpu_count() > 0);
+    println(env_has("ZEXI_ARENA_MISSING_VALUE"), env_or("ZEXI_ARENA_MISSING_VALUE", "fallback"));
+    println(env_set("ZEXI_ARENA_LOCAL_TEST", "set"));
+    println(env_get("ZEXI_ARENA_LOCAL_TEST"));
+    println(env_unset("ZEXI_ARENA_LOCAL_TEST"));
+    println(env_has("ZEXI_ARENA_LOCAL_TEST"));
+    println(mkdir(work.as_str()), mkdir(work.as_str()));
+    println(chdir(work.as_str()));
+    println(cwd().len() > 0);
+    println(write_text(from.as_str(), "local"));
+    println(rename_path(from.as_str(), to.as_str()));
+    println(path_exists(to.as_str()));
+    println(remove_path(to.as_str()));
+    println(path_exists(to.as_str()));
+    0
+}
+`
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build local-system program")
+	}
+	work := filepath.Join(dir, "workspace")
+	from := filepath.Join(dir, "from.txt")
+	to := filepath.Join(dir, "to.txt")
+	raw, err := exec.Command(out, work, from, to).Output()
+	if err != nil {
+		t.Fatalf("running local-system program: %v", err)
+	}
+	if want := "true true true\nfalse fallback\n0\nset\n0\nfalse\n0 0\n0\ntrue\n5\n0\ntrue\n0\nfalse\n"; string(raw) != want {
 		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
 	}
 }

@@ -2,7 +2,7 @@
 //
 // Client (urllib/requests-flavoured):
 //
-//     use http;
+//     import http.client;
 //
 //     fn main() {
 //         let r = fetch("http://example.com/");
@@ -18,17 +18,14 @@
 // verbs. URLs are parsed with `parse_url`; query/form values are decoded for
 // you. Connections are plaintext HTTP only — `https://` reports an error.
 //
-// Server (microhttpd-flavoured):
+// Server (Router + serve-flavoured):
 //
-//     let srv = listen("127.0.0.1", 8080);
-//     loop {
-//         let c = srv.accept();
-//         let req = read_request(&c);
-//         if !req.valid() { c.close(); continue; }
-//         let mut res = Response::html(200, "<h1>hi</h1>");
-//         res.set_header("X-Route", req.path_only().as_str());
-//         send_response(&c, &res);
-//         c.close();
+//     import http.server;
+//     fn hello(req: &Request) -> Response { Response::html(200, "<h1>hi</h1>") }
+//     fn main() -> i32 {
+//         let mut app = Router::new();
+//         app.get("/", hello);
+//         serve(&app, 8080)
 //     }
 //
 // Bodies are framed by Content-Length or chunked encoding (responses) and
@@ -36,13 +33,7 @@
 
 use net;
 
-// File helpers live in the same C runtime as sockets. They are declared here
-// (rather than in `net`) so only programs that use HTTP pull them in.
-extern "C" fn zxn_file_open(path: str) -> i64;
-extern "C" fn zxn_file_read(handle: i64, buf: &mut [u8; 8192], cap: i32) -> i32;
-extern "C" fn zxn_file_close(handle: i64) -> i32;
-extern "C" fn zxn_file_size(path: str) -> i64;
-extern "C" fn zxn_write_file(path: str, buf: str, n: i32) -> i32;
+// File helpers are declared by `net`, which owns the shared opt-in C shim.
 
 // --- limits and defaults ---------------------------------------------------
 
@@ -112,7 +103,7 @@ pub fn parse_url(raw: str) -> Url {
         return empty_url("missing URL scheme (expected http://host/path)");
     }
     let scheme_raw = s.substr(0, sep as usize);
-    let scheme = lower(&scheme_raw);
+    let scheme = http_lower(&scheme_raw);
     if scheme.as_str() != "http" {
         if scheme.as_str() == "https" {
             return empty_url("https is not supported (this client is plaintext HTTP only)");
@@ -402,7 +393,7 @@ impl Request {
             return v;
         }
         let ct = self.header("Content-Type");
-        let ct_l = lower(&ct);
+        let ct_l = http_lower(&ct);
         if ct_l.contains("application/x-www-form-urlencoded") {
             return query_value(&self.body, name);
         }
@@ -412,7 +403,7 @@ impl Request {
     // wants_keep_alive reports whether the client asked to reuse the socket.
     pub fn wants_keep_alive(&self) -> bool {
         let cv = self.header("Connection");
-        let conn = lower(&cv);
+        let conn = http_lower(&cv);
         if conn.contains("close") {
             return false;
         }
@@ -825,6 +816,49 @@ pub fn fetch(url: str) -> Response {
     return c.get(url);
 }
 
+// request is the high-level one-call client entry point. It accepts the usual
+// HTTP method and absolute URL; body and content_type default to empty values,
+// so `request("GET", url)` is equivalent to fetch(url).
+pub fn request(method: str, url: str, body: str = "", content_type: str = "") -> Response {
+    let c = Client::new();
+    return c.send(method, url, body, content_type);
+}
+
+// These URL-shaped helpers avoid the older low-level get/post names below,
+// whose host/port/path arguments are kept for backwards compatibility.
+pub fn get_url(url: str) -> Response { fetch(url) }
+
+pub fn post_url(url: str, body: str) -> Response {
+    return request("POST", url, body, "text/plain; charset=utf-8");
+}
+
+pub fn post_json(url: str, body: str) -> Response {
+    return request("POST", url, body, "application/json");
+}
+
+// post_form_url is the simple URL-encoded form counterpart to post_json.
+pub fn post_form_url(url: str, form: str) -> Response {
+    return request("POST", url, form, "application/x-www-form-urlencoded");
+}
+
+// get_status is handy when only a health/status code is needed.
+pub fn get_status(url: str) -> i32 {
+    let response = fetch(url);
+    return response.status;
+}
+
+pub fn put_url(url: str, body: str) -> Response {
+    return request("PUT", url, body, "text/plain; charset=utf-8");
+}
+
+pub fn delete_url(url: str) -> Response { request("DELETE", url) }
+
+// download is the one-call counterpart to Client.download.
+pub fn download(url: str, dest: str) -> Response {
+    let c = Client::new();
+    return c.download(url, dest);
+}
+
 // get performs a low-level GET against host:port and returns the raw response
 // text ("" on error). Kept for callers that build requests by hand.
 pub fn get(host: str, port: i32, path: str) -> String {
@@ -914,7 +948,7 @@ fn read_raw(c: &Conn) -> String {
     if raw.len() > 0 {
         let headers = header_block(&head);
         let te_value = header_value(&headers, "Transfer-Encoding");
-        let te = lower(&te_value);
+        let te = http_lower(&te_value);
         if te.contains("chunked") {
             let body = read_chunked(c, MAX_BODY);
             raw.push_str(body);
@@ -1090,6 +1124,75 @@ impl Router {
     }
 }
 
+// accept_retryable reports whether the listener's last accept failure was
+// transient. A persistent failure (such as running out of file descriptors)
+// must stop the server instead of spinning on a hot loop.
+fn accept_retryable() -> bool {
+    return zxn_accept_retryable() == 1;
+}
+
+// serve is the high-level server entry point: register handlers on a Router,
+// then call `serve(&router, 8000)`. It listens on all IPv4 interfaces by
+// default and runs until the process is stopped. A non-zero return means the
+// listener could not be opened.
+pub fn serve(router: &Router, port: i32 = 8000, host: str = "0.0.0.0") -> i32 {
+    let mut listener = listen(host, port);
+    if !listener.ok() {
+        return 1;
+    }
+    loop {
+        let mut conn = listener.accept();
+        if !conn.ok() {
+            if accept_retryable() {
+                continue;
+            }
+            listener.close();
+            return 1;
+        }
+        router.serve(&conn);
+        conn.close();
+    }
+}
+
+// serve_local is the safer local-development form of serve: it listens only on
+// 127.0.0.1 instead of every IPv4 interface.
+pub fn serve_local(router: &Router, port: i32 = 8000) -> i32 {
+    return serve(router, port, "127.0.0.1");
+}
+
+// serve_n is serve with a request budget, useful for tests, command-line tools,
+// and graceful single-purpose services. Empty TCP probes do not count because
+// Router.serve returns false for them.
+pub fn serve_n(router: &Router, max_requests: i32, port: i32 = 8000, host: str = "0.0.0.0") -> i32 {
+    let mut listener = listen(host, port);
+    if !listener.ok() {
+        return 1;
+    }
+    let mut served: i32 = 0;
+    while served < max_requests {
+        let mut conn = listener.accept();
+        if !conn.ok() {
+            if accept_retryable() {
+                continue;
+            }
+            listener.close();
+            return 1;
+        }
+        if router.serve(&conn) {
+            served += 1;
+        }
+        conn.close();
+    }
+    listener.close();
+    return 0;
+}
+
+// serve_local_n is serve_n constrained to loopback for deterministic local
+// tools and tests.
+pub fn serve_local_n(router: &Router, max_requests: i32, port: i32 = 8000) -> i32 {
+    return serve_n(router, max_requests, port, "127.0.0.1");
+}
+
 // path_matches supports exact routes and a trailing "/*" prefix; the bare
 // pattern "*" matches everything.
 fn path_matches(pattern: str, path: &String) -> bool {
@@ -1132,9 +1235,23 @@ pub fn read_file(path: str) -> String {
     return out;
 }
 
-// write_file writes bytes to a file (binary-safe). Returns bytes written or -1.
+// write_file writes text to a file. For binary data (including embedded NUL
+// bytes), use write_file_bytes with an owning String below.
 pub fn write_file(path: str, data: str) -> i32 {
-    return zxn_write_file(path, data, len(data) as i32);
+    let n = len(data);
+    if n > 2147483647 {
+        return -1;
+    }
+    return zxn_write_file(path, data, n as i32);
+}
+
+// write_file_bytes writes every byte of an owning String, including NULs.
+pub fn write_file_bytes(path: str, data: &String) -> i32 {
+    let n = data.len();
+    if n > 2147483647 {
+        return -1;
+    }
+    return zxn_write_file(path, data.as_str(), n as i32);
 }
 
 // file_size returns the size of a regular file, or -1 when absent.
@@ -1184,7 +1301,135 @@ pub fn serve_static(root: str, url_path: str) -> Response {
         full.push_byte(47); // '/'
     }
     full.push_str(rel.as_str());
-    return serve_file(full.as_str());
+
+    // Resolve symlinks before opening, so a link inside the tree cannot expose
+    // a file outside the served root. A path that cannot be resolved is a
+    // missing file (404); a resolved path outside root is refused (403).
+    let real_root = resolve_real_path(root_s.as_str());
+    if real_root.len() == 0 {
+        return Response::empty(404);
+    }
+    let real_full = resolve_real_path(full.as_str());
+    if real_full.len() == 0 {
+        return Response::empty(404);
+    }
+    if !path_within_root(&real_root, &real_full) {
+        return Response::empty(403);
+    }
+    return serve_file(real_full.as_str());
+}
+
+// resolve_real_path returns the canonical absolute path for `path` (following
+// symlinks), or an empty String when it cannot be resolved.
+fn resolve_real_path(path: str) -> String {
+    let mut buf: [u8; 4096] = [0; 4096];
+    let n = zxn_realpath(path, &mut buf, 4096);
+    let mut out = String::new();
+    if n > 0 {
+        let mut i: usize = 0;
+        while i < (n as usize) {
+            out.push_byte(buf[i]);
+            i += 1;
+        }
+    }
+    return out;
+}
+
+// path_within_root reports whether resolved path `full` is `root` itself or a
+// descendant of it. The separator check keeps "/srv/www-evil" from passing as
+// a child of "/srv/www".
+fn path_within_root(root: &String, full: &String) -> bool {
+    if root.len() == 0 || full.len() < root.len() {
+        return false;
+    }
+    if !full.starts_with(root.as_str()) {
+        return false;
+    }
+    if full.len() == root.len() {
+        return true;
+    }
+    return full.byte_at(root.len()) == 47; // '/'
+}
+
+// serve_dir_connection handles one static-file request. It intentionally uses
+// the same request-size and malformed-request rules as Router.serve.
+fn serve_dir_connection(c: &Conn, root: str) -> bool {
+    c.set_timeout(DEFAULT_TIMEOUT_MS);
+    let req = read_request(c);
+    if !req.valid() {
+        return false;
+    }
+    if req.body_too_large() {
+        let too_large = Response::empty(413);
+        send_response(c, &too_large);
+        return true;
+    }
+    if !req.body_complete() {
+        let bad = Response::empty(400);
+        send_response(c, &bad);
+        return true;
+    }
+    let request_path = req.path_only();
+    let res = serve_static(root, request_path.as_str());
+    send_response(c, &res);
+    return true;
+}
+
+// serve_dir is the compact "python -m http.server" equivalent: serve a
+// directory with safe path handling, index.html support, and MIME types.
+pub fn serve_dir(root: str, port: i32 = 8000, host: str = "0.0.0.0") -> i32 {
+    let mut listener = listen(host, port);
+    if !listener.ok() {
+        return 1;
+    }
+    loop {
+        let mut conn = listener.accept();
+        if !conn.ok() {
+            if accept_retryable() {
+                continue;
+            }
+            listener.close();
+            return 1;
+        }
+        serve_dir_connection(&conn, root);
+        conn.close();
+    }
+}
+
+// serve_dir_n is the bounded static-server form for controlled services/tests.
+pub fn serve_dir_n(root: str, max_requests: i32, port: i32 = 8000, host: str = "0.0.0.0") -> i32 {
+    let mut listener = listen(host, port);
+    if !listener.ok() {
+        return 1;
+    }
+    let mut served: i32 = 0;
+    while served < max_requests {
+        let mut conn = listener.accept();
+        if !conn.ok() {
+            if accept_retryable() {
+                continue;
+            }
+            listener.close();
+            return 1;
+        }
+        if serve_dir_connection(&conn, root) {
+            served += 1;
+        }
+        conn.close();
+    }
+    listener.close();
+    return 0;
+}
+
+// serve_dir_local serves a directory only on loopback, ideal for previews and
+// local development without exposing the directory to the LAN.
+pub fn serve_dir_local(root: str, port: i32 = 8000) -> i32 {
+    return serve_dir(root, port, "127.0.0.1");
+}
+
+// serve_dir_local_n is the bounded loopback static-server form.
+pub fn serve_dir_local_n(root: str, max_requests: i32, port: i32 = 8000) -> i32 {
+    return serve_dir_n(root, max_requests, port, "127.0.0.1");
 }
 
 // content_type_for guesses a Content-Type from a filename extension.
@@ -1201,7 +1446,7 @@ fn content_type_for(path: &String) -> str {
         return "application/octet-stream";
     }
     let ext_raw = path.substr((dot + 1) as usize, 4294967295);
-    let ext = lower(&ext_raw);
+    let ext = http_lower(&ext_raw);
     if ext.as_str() == "html" || ext.as_str() == "htm" { return "text/html; charset=utf-8"; }
     if ext.as_str() == "css" { return "text/css; charset=utf-8"; }
     if ext.as_str() == "js" { return "text/javascript; charset=utf-8"; }
@@ -1309,8 +1554,9 @@ fn lower_byte(b: i64) -> i64 {
     return b;
 }
 
-// lower returns an ASCII-lowercased copy of s.
-fn lower(s: &String) -> String {
+// http_lower returns an ASCII-lowercased copy of s. Its private-style
+// prefix avoids colliding with text.lower while modules are still flat.
+fn http_lower(s: &String) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i: usize = 0;
     while i < s.len() {

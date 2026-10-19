@@ -1,8 +1,10 @@
 # 8. Networking & HTTP
 
-Zexi has no standard library to speak of yet — but it does have the **C ABI**,
-and that is enough to write a real HTTP client and server in ordinary Zexi code.
-Everything here is implemented in [`lib/http.zx`](../lib/http.zx) and runs today.
+Zexi has a compact, opt-in standard library as well as a real **C ABI**. That
+combination is enough to write a real HTTP client and server in ordinary Zexi
+code. [`lib/http.zx`](../lib/http.zx) remains the explicit FFI walkthrough;
+new applications should normally use the embedded `http` module described in
+§8.6.
 
 ## 8.1 How it works: FFI via `extern "C"`
 
@@ -112,10 +114,10 @@ fn main() -> i32 {
 }
 ```
 
-## 8.4 Compiling against a library
+## 8.4 Compiling against the low-level walkthrough library
 
-There is no `use`/`mod` yet, so a program is compiled **together with** the
-files it needs; the first file owns `main`, the rest are compiled into it:
+The explicit FFI walkthrough can still be compiled **together with** the files
+it needs; the first file owns `main`, and the rest are merged into it:
 
 ```sh
 zexic run examples/http_server.zx lib/http.zx
@@ -125,7 +127,9 @@ zexic run examples/http_client.zx lib/http.zx
 See [`examples/http_server.zx`](../examples/http_server.zx) and
 [`examples/http_client.zx`](../examples/http_client.zx). The test suite builds
 both and exercises the round trip over loopback
-(`TestHTTPServerAndClient` in `internal/driver/driver_test.go`).
+(`TestHTTPServerAndClient` in `internal/driver/driver_test.go`). The newer
+loader also supports `use`/`import` and `mod`; see §8.6 for the zero-extra-file
+high-level API.
 
 ## 8.5 Honest limitations (M0)
 
@@ -144,18 +148,20 @@ both and exercises the round trip over loopback
 These are deliberate cut lines for M0; none of them is blocked by the language,
 only deferred.
 
-## 8.6 High-level stdlib networking (`use http;`)
+## 8.6 High-level stdlib networking (`import http.server;`)
 
 The `net` and `http` modules embedded in the compiler are the higher-level
 surface: URLs, redirects, headers, query/form decoding, response builders and
 body framing are handled for you. `lib/http.zx` remains the worked example of
 building the same thing from raw FFI declarations; new code should prefer
-`use http;`.
+`use http;`, `import http.client;`, or `import http.server;`. These package-like
+facades load the same module and make its declarations available directly while
+full scoped module lookup is completed in M1.
 
 A client in the urllib/requests style:
 
 ```zx
-use http;
+import http.client;
 
 fn main() {
     let mut c = Client::new();
@@ -174,8 +180,10 @@ fn main() {
 
 | API | Purpose |
 | --- | --- |
-| `fetch(url) -> Response` | one-call GET with redirects |
-| `Client::new()` / `Client.get/post/put/delete/send` | configurable client |
+| `fetch(url)` / `get_url(url)` / `get_status(url)` | one-call GET or status-only request |
+| `request(method, url, body = "", content_type = "")` | one-call configurable request |
+| `post_url`, `post_json`, `post_form_url`, `put_url`, `delete_url`, `download` | high-level URL helpers |
+| `Client::new()` / `Client.get/post/put/delete/send` | configurable reusable client |
 | `Client.post_form`, `Client.download` | form posts, and fetch-to-file |
 | `Client.timeout_ms`, `Client.follow_redirects`, `Client.max_redirects`, `Client.user_agent`, `Client.set_header` | client settings |
 | `parse_url(str) -> Url` | scheme/host/port/path/query, with `Url.error` |
@@ -186,40 +194,28 @@ Redirects are followed for 301/302/303 (switching to GET) and 307/308
 (preserving the method and body), up to `max_redirects`. `https://` URLs
 officially fail with `error` set, because the stack is plaintext HTTP only.
 
-A server in the microhttpd style:
+A server can now be as small as a router plus `serve`:
 
 ```zx
-use http;
+import http.server;
+
+fn hello(req: &Request) -> Response {
+    return Response::json(200, "{\"hello\":true}");
+}
 
 fn main() -> i32 {
-    let srv = listen("127.0.0.1", 8080);
-    if !srv.ok() {
-        println("bind failed");
-        return 1;
-    }
-    loop {
-        let c = srv.accept();
-        let req = read_request(&c);
-        if !req.valid() {
-            c.close();
-            continue;
-        }
-        if req.path_only().as_str() == "/echo" {
-            let mut body = req.query("name");
-            body.push_str(":");
-            body.push_str(req.body.as_str());
-            let res = Response::text(200, body.as_str());
-            send_response(&c, &res);
-        } else {
-            let mut res = Response::json(404, "{\"error\":\"not found\"}");
-            res.set_header("X-Zexi", "1");
-            send_response(&c, &res);
-        }
-        c.close();
-    }
-    0
+    let mut app = Router::new();
+    app.get("/", hello);
+    serve_local(&app, 8080)  // loopback only; runs until stopped
 }
 ```
+
+Use `serve(&app, port)` when intentionally exposing a service on all IPv4
+interfaces, or pass an explicit host as its third argument. For a controlled
+service or a test, `serve_n(&app, 10, 8080)` exits after ten valid requests;
+`serve_local_n` is the loopback-only counterpart. [`examples/http_app.zx`](../examples/http_app.zx)
+has a larger ready-to-run app. If you want the explicit accept loop, `listen`,
+`listen_local`, `read_request`, and `send_response` remain public too.
 
 | API | Purpose |
 | --- | --- |
@@ -229,8 +225,11 @@ fn main() -> i32 {
 | `send_response(&Conn, &Response) -> i64` | serialize and write a response |
 | `Response.keep_alive` | advertise a persistent connection |
 | `Router::new()`, `.get/.post/.put/.delete/.set_fallback`, `.dispatch/.serve` | Go-style handler table |
-| `serve_static(root, path)`, `serve_file(path)` | static files with MIME detection and traversal checks |
-| `read_file`, `write_file`, `file_size` | binary-safe file helpers (also used by downloads) |
+| `serve(&router, port)`, `serve_n(...)` | high-level accept loop (forever or request-bounded) |
+| `serve_local(&router, port)`, `serve_local_n(...)` | loopback-only server helpers for local development/tests |
+| `serve_static(root, path)`, `serve_dir(root, port)`, `serve_file(path)` | static files with MIME detection and traversal checks |
+| `serve_dir_local(root, port)`, `serve_dir_local_n(...)` | loopback-only static-site helpers |
+| `read_file`, `write_file_bytes`, `file_size` | binary-safe file helpers (also used by downloads) |
 
 Handlers are ordinary functions (`fn(&Request) -> Response`) stored and invoked
 through function values, so routing looks like Go:
@@ -260,19 +259,26 @@ parameters and middleware chains are not supported yet; use
 `Request.query` for inputs. `Router.serve` also answers oversized bodies
 with `413` before calling a handler.
 
-A directory can be served in one line per request:
+A directory can be served in one call, much like Python's built-in file server:
 
 ```zx
-let res = serve_static("/var/www", req.path_only().as_str());
-send_response(&c, &res);
+import http.server;
+
+fn main() -> i32 {
+    let root = arg_at(1);
+    serve_dir_local(root.as_str(), 8000)
+}
 ```
 
-`serve_static` maps `/` to `index.html`, rejects decoded `..`, backslashes and
-NUL with `403`, returns `404` for missing files and `413` above 32 MiB. MIME
+Use `serve_dir` when LAN exposure is intentional, or `serve_dir_local_n` for a
+request-bounded local tool. Use `serve_static(root, req.path_only().as_str())`
+when it is one route in a larger app. `serve_static` maps `/` to `index.html`, rejects decoded `..`, backslashes and
+NUL with `403`, resolves symlinks and refuses any target that escapes the
+served root with `403`, returns `404` for missing files and `413` above 32 MiB. MIME
 types follow the extension. Bodies are copied byte-for-byte: `send_response`
 writes the head and body separately, so images and other binary files survive
 (plain `render_response` is for text only). `Client.download(url, path)` is the
-client-side counterpart; `read_file`/`write_file` are binary-safe.
+client-side counterpart; `read_file`/`write_file_bytes` are binary-safe.
 
 Client connections get a 30 s default timeout and every body read is capped
 (`MAX_BODY`, 16 MiB). Requests are framed by Content-Length; responses support

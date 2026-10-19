@@ -2,7 +2,10 @@
 
 > **Progress:** M0 is largely landed. Working today: lexer, parser, name
 > resolution, bidirectional type inference, constant folding, a flow-sensitive
-> move checker, and a C backend that produces a runnable native binary.
+> move checker, and a C backend that produces a runnable native binary. The
+> first M1 usability foundations are also live: file `use`/`import`, dotted
+> standard-library facades (`import http.server;`), and `mod` source layouts
+> are resolved by the driver before checking.
 > Implemented language surface: functions and recursion; `let`/`const`;
 > integer/float/bool/char/`str`; arithmetic, bitwise, comparison, and logical
 > operators; `as` casts; `if`/`else`; `while`/`loop`/`for i in a..b` and
@@ -25,10 +28,13 @@
 > declarations bind C functions (libc), and several `.zx` files compile together
 > into one program; on top of that, `lib/http.zx` is a working HTTP/1.x client
 > and server (see docs/08).
-> Not yet implemented: generics, traits, modules/`use`, `Vec`/`Box`, user-defined
-> `Drop`, borrow-lifetime analysis (so bound `&`/`*` aliases are not tracked), and
-> `Result`/`?`. Enum variants may not carry resource-owning payloads yet (a
-> `match` binding would alias an owned value; see §5.2).
+> Not yet implemented: generics, traits, **scoped** modules/path-qualified item
+> lookup and visibility enforcement (the current loader deliberately flattens
+> imports and rejects `as` aliases until namespaces exist), `Vec`/`Box`,
+> user-defined `Drop`, borrow-lifetime analysis (so bound
+> `&`/`*` aliases are not tracked), and `Result`/`?`. Enum variants may not carry
+> resource-owning payloads yet (a `match` binding would alias an owned value; see
+> §5.2).
 > See `docs/06-backend-strategy.md` for the backend status.
 
 The MVP is milestone **M0**: enough language to compile real, safe, small
@@ -43,7 +49,7 @@ M1/M2 are additive.
 | Types | primitives, tuples, arrays, slices, structs, enums | + generics, traits, `dyn`, `str`/`String` | + const eval, SIMD, niche opt |
 | Ownership | lexical scope, moves, explicit `drop` | full NLL borrow checker, lifetimes | escape analysis, drop elision |
 | Errors | `Result` + `?`, panic abort | + `Option` ergonomics, `?` in `main` | zero-cost error paths |
-| Modules | single file | packages (`mod`/`use`/`pub`) | incremental + parallel builds |
+| Modules | file imports + flat `mod`/`use`/`import` preview | scoped packages + `pub` enforcement | incremental + parallel builds |
 | Runtime | panic+exit only | opt-in `alloc`/`fmt` | freestanding `no_std` tuned |
 | Backend | C11 | C11 (+ PGO passthrough) | native x86-64 (or Cranelift) |
 | Std | `core` skeleton | `alloc`, `Vec`, `String`, `Iterator` | `os`/`sys`, collections |
@@ -52,16 +58,19 @@ M1/M2 are additive.
 
 **Lexical/parse**
 - Full lexer (done) and recursive-descent parser for the grammar in docs/02.
-- Single-file programs, no `use`/`mod` (those are M1), but the AST/parser already
-  model them so M1 is a lowering change, not a rewrite.
+- A small practical extension is already shipped: `use`/`import` load files and
+  embedded stdlib modules, and `mod name;` loads `name.zx` or `name/mod.zx`.
+  These currently flatten declarations into one namespace; `as` aliases are
+  explicitly rejected rather than ignored, and scoped paths and `pub`
+  enforcement remain M1 work.
 
 **Types (M0)**
 - Primitives: `bool i8 i16 i32 i64 u8 u16 u32 u64 isize usize f32 f64 char`.
 - `()`, tuples, `[T; N]`, `[T]` + `&[T]`, `&T`, `&mut T`, `*T` (unsafe), `str`.
 - `struct`, `enum` (tagged union) with `match`.
-- `Option<T>`, `Result<T,E>` as library enums.
-- No generics yet — but built-in `Option`/`Result`/slices are hard-coded in the
-  type checker so user programs are already useful.
+- No generic `Option<T>`/`Result<T,E>` yet — their syntax and `?` propagation
+  remain the principal M0/M1 error-handling gap. Concrete enums and `match`
+  cover many small-program cases today.
 
 **Declarations & statements**
 - `fn`, `struct`, `enum`, `const`, `type` aliases.
@@ -105,7 +114,9 @@ seam.
 
 ## 5.3 M1 — usability (the "worth using" set)
 
-- **Modules & packages:** `mod`, `use`, `pub`, directory packages, prelude.
+- **Modules & packages:** turn the shipped flat `mod`/`use`/`import` loader
+  into scoped packages: path-qualified item lookup, real `pub` boundaries,
+  directory packages, and a prelude.
 - **Generics + traits:** monomorphized user generics, operator traits,
   `Iterator`, `Clone`/`Copy`/`Drop`, `From`/`Into`, `dyn Trait` (M1 late).
 - **Real ownership checker:** NLL, lifetime elision + explicit lifetimes,
