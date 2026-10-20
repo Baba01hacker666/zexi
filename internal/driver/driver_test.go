@@ -57,6 +57,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/generics.zx",
 		"../../tests/option_result.zx",
 		"../../tests/vec.zx",
+		"../../tests/hashmap.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -127,6 +128,15 @@ func TestRunPrograms(t *testing.T) {
 				"10", "99", "30", "30 2", "10 1", "99 3 1 3", "100 4",
 				"2", "true", "0 true", "6", "3 3", "4",
 				"3 alpha gamma", "gamma 2", "alpha 1", "1 2 8", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/hashmap.zx",
+			want: strings.Join([]string{
+				"2 false", "one", "one", "2", "two", "1 false", "0",
+				"11 0", "3", "-1",
+				"true false", "true true", "true false", "true false",
+				"200", "200", "",
 			}, "\n"),
 		},
 		{

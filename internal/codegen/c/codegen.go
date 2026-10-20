@@ -49,6 +49,10 @@ type gen struct {
 	vecs       map[string]*types.Type // Vec handle struct name -> Vec type
 	vecSeen    map[string]bool
 	vecOrder   []string
+	maps       map[string]*types.Type // HashMap handle struct name -> map type
+	mapSeen    map[string]bool
+	mapOrder   []string
+	hashSeen   map[string]bool // key mangled names whose hash/eq helpers exist
 	dropFrames []*dropFrame
 	dropTypes  []*dropType
 	dropSeen   map[string]bool
@@ -189,7 +193,7 @@ func GenerateSplit(info *sema.Info, opts Options, n int) (string, []string, erro
 }
 
 func newGen(info *sema.Info, opts Options) *gen {
-	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}, arrays: map[string]*types.Type{}, arrSeen: map[string]bool{}, vecs: map[string]*types.Type{}, vecSeen: map[string]bool{}, dropSeen: map[string]bool{}, externNames: map[string]bool{}}
+	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}, arrays: map[string]*types.Type{}, arrSeen: map[string]bool{}, vecs: map[string]*types.Type{}, vecSeen: map[string]bool{}, maps: map[string]*types.Type{}, mapSeen: map[string]bool{}, hashSeen: map[string]bool{}, dropSeen: map[string]bool{}, externNames: map[string]bool{}}
 	g.used = usedFns(info)
 	for _, fn := range info.FnOrder {
 		if fn.Extern || fn.Name == "main" || fn.NoMangle {
@@ -205,14 +209,16 @@ func (g *gen) emitPrefix() {
 	g.preamble()
 	g.collectArrayTypes()
 	g.collectVecTypes()
+	g.collectMapTypes()
 	g.collectDropTypes()
 	g.runtime()
 	g.typeDefs()
 	g.dropFuncs()
-	// The Vec helpers call the destructors, so they come after dropFuncs has
-	// declared them.
+	// The Vec and HashMap helpers call the destructors, so they come after
+	// dropFuncs has declared them.
 	g.vecRuntimeProtos()
 	g.vecRuntime()
+	g.mapRuntime()
 	g.constants()
 	g.prototypes()
 }
@@ -386,7 +392,7 @@ func (g *gen) preamble() {
 // when the program actually uses the corresponding feature, so trivial programs
 // produce minimal C.
 func (g *gen) runtime() {
-	if len(g.arrayOrder) > 0 || len(g.vecOrder) > 0 {
+	if len(g.arrayOrder) > 0 || len(g.vecOrder) > 0 || len(g.mapOrder) > 0 {
 		g.hasPanic = true
 		g.boundsHelper()
 	}
@@ -535,7 +541,7 @@ func (g *gen) constants() { // Emit in source order for stable output.
 // order so that by-value fields refer to complete types. All names are
 // forward-declared first, which also permits self-referential pointers.
 func (g *gen) typeDefs() {
-	if len(g.info.StructOrd) == 0 && len(g.info.EnumOrd) == 0 && len(g.arrayOrder) == 0 && len(g.vecOrder) == 0 {
+	if len(g.info.StructOrd) == 0 && len(g.info.EnumOrd) == 0 && len(g.arrayOrder) == 0 && len(g.vecOrder) == 0 && len(g.mapOrder) == 0 {
 		return
 	}
 	for _, s := range g.info.StructOrd {
@@ -551,6 +557,8 @@ func (g *gen) typeDefs() {
 	// order-independent and can precede the structs that embed it by value.
 	g.vecForwardDecls()
 	g.vecDefs()
+	g.mapForwardDecls()
+	g.mapDefs()
 	g.w.line("")
 	for _, name := range g.typeOrder() {
 		switch {
@@ -670,6 +678,19 @@ func (g *gen) collectDropTypes() {
 			// The handle's own destructor is generated below; its element
 			// type still needs one when it owns resources.
 			walk(t.Elem)
+			name := typeMangle(t)
+			if g.dropSeen[name] {
+				return
+			}
+			g.dropSeen[name] = true
+			g.dropTypes = append(g.dropTypes, &dropType{name: name, t: t})
+			return
+		}
+		if t.Kind == types.MapKind {
+			// As with a Vec, the table's own destructor is generated below;
+			// both element types still need one when they own resources.
+			walk(t.Key)
+			walk(t.Val)
 			name := typeMangle(t)
 			if g.dropSeen[name] {
 				return
@@ -800,6 +821,29 @@ func (g *gen) emitDropFunc(d *dropType) {
 		}
 		g.w.line("free(v->ptr);")
 		g.w.line("v->ptr = NULL;")
+		g.w.indent--
+		g.w.line("}")
+		g.w.line("v->len = 0;")
+		g.w.line("v->cap = 0;")
+	case types.MapKind:
+		g.w.line("if (v->entries) {")
+		g.w.indent++
+		g.w.line("for (size_t i = 0; i < v->cap; i++) {")
+		g.w.indent++
+		g.w.line("if (v->entries[i].used) {")
+		g.w.indent++
+		if t.Key.NeedsDrop() {
+			g.w.line("zx_drop_%s(&v->entries[i].key);", typeMangle(t.Key))
+		}
+		if t.Val.NeedsDrop() {
+			g.w.line("zx_drop_%s(&v->entries[i].value);", typeMangle(t.Val))
+		}
+		g.w.indent--
+		g.w.line("}")
+		g.w.indent--
+		g.w.line("}")
+		g.w.line("free(v->entries);")
+		g.w.line("v->entries = NULL;")
 		g.w.indent--
 		g.w.line("}")
 		g.w.line("v->len = 0;")
@@ -987,6 +1031,8 @@ func typeMangle(t *types.Type) string {
 		return arrayTypeName(t)
 	case types.VecKind:
 		return vecTypeName(t)
+	case types.MapKind:
+		return mapTypeName(t)
 	case types.Ptr:
 		return "p_" + typeMangle(t.Elem)
 	case types.Ref:
@@ -1914,6 +1960,9 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 	if p, ok := x.Callee.(*ast.PathExpr); ok && len(p.Segments) == 2 && p.Segments[0] == "Vec" {
 		return g.vecCtorValue(x, p.Segments[1])
 	}
+	if p, ok := x.Callee.(*ast.PathExpr); ok && len(p.Segments) == 2 && p.Segments[0] == "HashMap" {
+		return g.mapCtorValue(x, p.Segments[1])
+	}
 	// Calling a function value (a local, parameter, or field) needs an
 	// explicit function-pointer cast: the value itself has C type `void *`.
 	if ft := g.info.Indirect[x]; ft != nil {
@@ -2102,6 +2151,9 @@ func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
 	}
 	if base := recvBase(g.info.TypeOf(x.Recv)); base != nil && base.Kind == types.VecKind {
 		return g.vecMethodCall(x)
+	}
+	if base := recvBase(g.info.TypeOf(x.Recv)); base != nil && base.Kind == types.MapKind {
+		return g.mapMethodCall(x)
 	}
 	// `arr.len()` / `s.len()` mirror the builtin `len`.
 	if x.Name == "len" && len(x.Args) == 0 {
@@ -3364,6 +3416,8 @@ func ctype(t *types.Type) string {
 		return "zx_String"
 	case types.VecKind:
 		return vecTypeName(t)
+	case types.MapKind:
+		return mapTypeName(t)
 	case types.I8:
 		return "int8_t"
 	case types.I16:
@@ -3425,6 +3479,8 @@ func zeroValue(t *types.Type) string {
 		return "((zx_String){ 0 })"
 	case t.Kind == types.VecKind:
 		return "((" + vecTypeName(t) + "){ 0 })"
+	case t.Kind == types.MapKind:
+		return "((" + mapTypeName(t) + "){ 0 })"
 	case t.Kind == types.StructKind && t.St != nil:
 		return "((" + typeName(t.St.Name) + "){ 0 })"
 	case t.Kind == types.EnumKind && t.En != nil:

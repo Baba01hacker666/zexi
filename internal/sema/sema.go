@@ -1952,6 +1952,9 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		if p.Segments[0] == "Vec" {
 			return c.inferVecCtor(x, p, p.Segments[1], expected)
 		}
+		if p.Segments[0] == "HashMap" {
+			return c.inferMapCtor(x, p, p.Segments[1], expected)
+		}
 		// `Type::name(args)` may also name an associated function: one declared
 		// in an `impl` block without a `self` parameter.
 		if m, ok := c.info.Methods[p.Segments[0]][p.Segments[1]]; ok {
@@ -3812,6 +3815,9 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 	if base != nil && base.Kind == types.VecKind {
 		return c.inferVecMethod(x, base)
 	}
+	if base != nil && base.Kind == types.MapKind {
+		return c.inferMapMethod(x, base)
+	}
 	// `len()` is also available directly on arrays and `str` values.
 	if x.Name == "len" && len(x.Args) == 0 && base != nil && (base.Kind == types.Array || base.Kind == types.Str) {
 		return types.UsizeT
@@ -4346,6 +4352,9 @@ func (c *checker) resolveType(t ast.Type) *types.Type {
 		name := x.Segments[0]
 		if name == "Vec" {
 			return c.resolveVecType(x.Sp, x.Args)
+		}
+		if name == "HashMap" {
+			return c.resolveMapType(x.Sp, x.Args)
 		}
 		if len(x.Args) > 0 {
 			args := make([]*types.Type, len(x.Args))

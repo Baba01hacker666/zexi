@@ -1624,3 +1624,29 @@ fn main() -> i32 { let x = 0; println(next(x)); let y: u32 = x; println(y); 0 }`
 		})
 	}
 }
+
+// TestHashMapKeyTypes checks the closed set of key types with a built-in hash:
+// a struct key is rejected, and the arity is enforced.
+func TestHashMapKeyTypes(t *testing.T) {
+	src := `struct Point { x: i32, y: i32 }
+fn main() -> i32 { let m: HashMap<Point, i32> = HashMap::new(); println(m.len()); 0 }`
+	ok, codes := check(t, src)
+	if ok || !has(codes, "E0308") {
+		t.Fatalf("struct key: expected E0308, got ok=%v codes=%v", ok, codes)
+	}
+
+	ok, codes = check(t, `fn main() -> i32 { let m: HashMap<i32> = HashMap::new(); println(m.len()); 0 }`)
+	if ok || !has(codes, "E0107") {
+		t.Fatalf("arity: expected E0107, got ok=%v codes=%v", ok, codes)
+	}
+
+	ok, codes = check(t, `fn main() -> i32 {
+    let mut m: HashMap<i32, String> = HashMap::new();
+    m.insert(1, String::from("x"));
+    println(m.len(), m.contains_key(1));
+    0
+}`)
+	if !ok {
+		t.Fatalf("hashable key: expected clean, got %v", codes)
+	}
+}

@@ -1,0 +1,94 @@
+// tests/hashmap.zx
+// Coverage for the builtin hash map `HashMap<K, V>`: construction, insertion
+// with replacement, lookup, removal, clearing, borrowed receivers, and the
+// built-in hashable key types.
+
+fn unwrap_or(o: Option<i64>, fallback: i64) -> i64 {
+    match o {
+        Some(v) => v,
+        None => fallback,
+    }
+}
+
+fn bump(m: &mut HashMap<i64, i64>, k: i64) -> i64 {
+    match m.insert(k, 0) {
+        Some(old) => {
+            m.insert(k, old + 1);
+            old + 1
+        }
+        None => 0,
+    }
+}
+
+fn main() -> i32 {
+    // String values: insert, lookup through `Option<&String>`, replacement,
+    // removal, and clear.
+    let mut m: HashMap<i64, String> = HashMap::new();
+    m.insert(1, String::from("one"));
+    m.insert(2, String::from("two"));
+    println(m.len(), m.is_empty());
+    match m.get(1) {
+        Some(v) => println(v.as_str()),
+        None => println("missing"),
+    }
+    match m.insert(1, String::from("ONE")) {
+        Some(old) => println(old),
+        None => println("new"),
+    }
+    println(m.len());
+    match m.remove(2) {
+        Some(v) => println(v),
+        None => println("missing"),
+    }
+    println(m.len(), m.contains_key(2));
+    m.clear();
+    println(m.len());
+
+    // Integer keys and a borrowed, mutating receiver.
+    let mut a: HashMap<i64, i64> = HashMap::new();
+    a.insert(1, 10);
+    a.insert(-5, 20);
+    println(bump(&mut a, 1), bump(&mut a, 2));
+    println(a.len());
+    println(unwrap_or(a.remove(100), -1));
+
+    // String keys.
+    let mut s: HashMap<String, i64> = HashMap::new();
+    s.insert(String::from("x"), 1);
+    s.insert(String::from("y"), 2);
+    println(s.contains_key(String::from("x")), s.contains_key(String::from("z")));
+
+    // bool, char, and str keys.
+    let mut b: HashMap<bool, i64> = HashMap::new();
+    b.insert(true, 1);
+    b.insert(false, 2);
+    println(b.contains_key(true), b.contains_key(false));
+
+    let mut c: HashMap<char, i64> = HashMap::new();
+    c.insert('x', 1);
+    println(c.contains_key('x'), c.contains_key('q'));
+
+    let mut strs: HashMap<str, i64> = HashMap::new();
+    strs.insert("hello", 1);
+    println(strs.contains_key("hello"), strs.contains_key("hellp"));
+
+    // Growth past the initial capacity, and every key still reachable.
+    let mut big: HashMap<i64, String> = HashMap::new();
+    let mut i: i64 = 0;
+    while i < 200 {
+        big.insert(i, String::from("v"));
+        i += 1;
+    }
+    println(big.len());
+    let mut found: i64 = 0;
+    let mut j: i64 = 0;
+    while j < 200 {
+        if big.contains_key(j) {
+            found += 1;
+        }
+        j += 1;
+    }
+    println(found);
+
+    0
+}

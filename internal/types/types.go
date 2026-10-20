@@ -46,6 +46,7 @@ const (
 	EnumKind   // nominal tagged union
 	StringKind // builtin owning heap string
 	VecKind    // builtin growable owning array, Vec<T>
+	MapKind    // builtin hash map, HashMap<K, V>
 	ParamKind  // a generic type parameter (only while checking a template)
 )
 
@@ -63,6 +64,9 @@ type Type struct {
 	St *Struct
 	// Enum
 	En *Enum
+	// MapKind: the key and value types of a `HashMap<K, V>`.
+	Key *Type
+	Val *Type
 	// ParamKind: the parameter's name, e.g. the `T` in `Option<T>`.
 	ParamName string
 }
@@ -247,6 +251,10 @@ func Equal(a, b *Type) bool {
 	if a.Kind == EnumKind {
 		return a.En != nil && b.En != nil && a.En.Name == b.En.Name
 	}
+	if a.Kind == MapKind {
+		return a.Key != nil && b.Key != nil && a.Val != nil && b.Val != nil &&
+			Equal(a.Key, b.Key) && Equal(a.Val, b.Val)
+	}
 	if !Equal(a.Elem, b.Elem) || !Equal(a.Ret, b.Ret) {
 		return false
 	}
@@ -302,6 +310,9 @@ func (t *Type) IsCopy() bool {
 	case VecKind:
 		// A Vec owns a heap buffer; copying the handle would double-free it.
 		return false
+	case MapKind:
+		// A HashMap owns a heap table; copying the handle would double-free it.
+		return false
 	case Tuple:
 		for _, e := range t.Elems {
 			if !e.IsCopy() {
@@ -355,6 +366,9 @@ func (t *Type) NeedsDrop() bool {
 		}
 	case VecKind:
 		// Always: the buffer itself is heap-allocated, whatever it holds.
+		return true
+	case MapKind:
+		// Always: the table itself is heap-allocated, whatever it holds.
 		return true
 	case Array:
 		return t.Elem.NeedsDrop()
@@ -469,6 +483,8 @@ func (t *Type) String() string {
 		return "String"
 	case VecKind:
 		return "Vec<" + t.Elem.String() + ">"
+	case MapKind:
+		return "HashMap<" + t.Key.String() + ", " + t.Val.String() + ">"
 	case Never:
 		return "never"
 	case StructKind:
