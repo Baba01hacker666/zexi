@@ -1591,3 +1591,36 @@ fn main() -> i32 { println(plain(1)); 0 }`
 		t.Fatalf("plain function: expected clean, got %v", codes)
 	}
 }
+
+// TestDefaultedIntegerLiteralNegatives checks the limits of literal
+// adoption: it never crosses into floats, never admits a literal that does
+// not fit, and first demand wins when two demands conflict.
+func TestDefaultedIntegerLiteralNegatives(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{
+			name: "float expected",
+			src: `fn want(x: f64) -> f64 { return x; }
+fn main() -> i32 { let x = 0; println(want(x)); 0 }`,
+		},
+		{
+			name: "does not fit",
+			src:  `fn main() -> i32 { let x = 300; let y: i8 = x; println(y); 0 }`,
+		},
+		{
+			name: "conflicting demands",
+			src: `fn next(i: i64) -> i64 { return i + 1; }
+fn main() -> i32 { let x = 0; println(next(x)); let y: u32 = x; println(y); 0 }`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			if ok || !has(codes, "E0308") {
+				t.Fatalf("expected E0308, got ok=%v codes=%v", ok, codes)
+			}
+		})
+	}
+}

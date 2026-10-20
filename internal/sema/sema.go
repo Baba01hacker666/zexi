@@ -216,6 +216,12 @@ type checker struct {
 	// recursive instantiations behind one are finite and allowed.
 	indirect int
 
+	// pending records integer literals that defaulted to `i32` without an
+	// expected type. The key is the fresh type instance stored in the binding
+	// and in info.Types for the literal, so a later use can adopt a concrete
+	// integer type in place (see adoptInt).
+	pending map[*types.Type]*pendingInt
+
 	scope     []map[string]*types.Type // local bindings, innermost last
 	mutScope  []map[string]bool        // mutability of tracked bindings (else permissive)
 	typeEnv   map[string]*types.Type   // in-scope type parameters (name -> type)
@@ -223,6 +229,9 @@ type checker struct {
 	loopDepth int
 	breaks    []*breakInfo // one entry per enclosing loop, innermost last
 }
+
+// pendingInt is a defaulted integer literal awaiting a concrete integer type.
+type pendingInt struct{ text string }
 
 // breakInfo tracks the `break` value of one enclosing loop. Only `loop` may
 // carry one; `hasVal`/`val` record the first `break <expr>` seen so later
@@ -1347,6 +1356,9 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 
 	case *ast.PathExpr:
 		if len(x.Segments) == 1 {
+			if t := c.lookupScope(x.Segments[0]); t != nil {
+				c.adoptInt(t, expected)
+			}
 			return c.inferIdent(x.Segments[0], x.Sp)
 		}
 		if len(x.Segments) == 2 {
@@ -1513,7 +1525,14 @@ func (c *checker) inferLiteral(x *ast.LiteralExpr, expected *types.Type) *types.
 			}
 			c.errf(x.Sp, "E0080", "integer literal `%s` does not fit in any integer type", x.Text)
 		}
-		return types.I32T
+		// A fresh instance, never the shared types.I32T: a binding may adopt a
+		// concrete integer type later without changing every other i32.
+		t := &types.Type{Kind: types.I32}
+		if c.pending == nil {
+			c.pending = map[*types.Type]*pendingInt{}
+		}
+		c.pending[t] = &pendingInt{text: x.Text}
+		return t
 	case token.KindFloat:
 		if expected != nil && expected.Kind.IsFloat() {
 			return expected
@@ -1601,12 +1620,34 @@ func suggestName(name string, candidates []string) string {
 	return fmt.Sprintf(" (did you mean `%s`?)", best)
 }
 
+// adoptInt retypes a binding that was defaulted from a bare integer literal
+// when a use demands a concrete integer type. It mutates the type instance in
+// place, so every use of the binding (including aliases created by
+// `let y = x;`, which share the pointer) agrees on the adopted type.
+//
+// It returns nil when the binding is not pending, the demand is not an integer
+// type, or the literal does not fit. In the last case the normal E0080/E0308
+// path produces the diagnostic; adopting would hide the reason.
+func (c *checker) adoptInt(t, want *types.Type) *types.Type {
+	p, ok := c.pending[t]
+	if !ok || want == nil || !want.Kind.IsInt() {
+		return nil
+	}
+	if !intLitFits(p.text, want) {
+		return nil
+	}
+	t.Kind = want.Kind
+	delete(c.pending, t)
+	return t
+}
+
 // inferIdentExpr types a bare name used as a value. A generic function is
 // instantiated when explicit type arguments (`f::<i64>`) or an expected
 // function type determine its parameters.
 func (c *checker) inferIdentExpr(x *ast.IdentExpr, expected *types.Type) *types.Type {
 	// A local binding or constant shadows a function of the same name.
-	if c.lookupScope(x.Name) != nil {
+	if t := c.lookupScope(x.Name); t != nil {
+		c.adoptInt(t, expected)
 		return c.inferIdent(x.Name, x.Sp)
 	}
 	if _, ok := c.info.Consts[x.Name]; ok {
@@ -1772,7 +1813,12 @@ func isComparison(op token.Kind) bool {
 func (c *checker) inferBinary(x *ast.BinExpr) *types.Type {
 	if x.Op == token.KindDotDot || x.Op == token.KindDotDotEq {
 		lt := c.checkExpr(x.L, nil)
-		c.checkExpr(x.R, lt)
+		rt := c.checkExpr(x.R, nil)
+		if c.adoptInt(lt, rt) == nil {
+			// Keep today's literal adoption and its error when the pending
+			// bound cannot take the other side's type.
+			c.checkExpr(x.R, lt)
+		}
 		if !lt.Kind.IsInt() {
 			c.errAt(x, "E0308", "range bounds must be integers, found `%s`", lt)
 		}
@@ -1805,6 +1851,10 @@ func (c *checker) inferBinary(x *ast.BinExpr) *types.Type {
 			lt = c.checkExpr(x.L, rt)
 		case isIntLiteral(x.R) && lt.Kind.IsNumeric():
 			rt = c.checkExpr(x.R, lt)
+		case c.adoptInt(lt, rt) != nil:
+			// A variable defaulted from a bare literal adopts the other
+			// operand's concrete integer type in place.
+		case c.adoptInt(rt, lt) != nil:
 		}
 	}
 	if !types.Equal(lt, rt) {
@@ -4163,7 +4213,10 @@ func (c *checker) inferFor(x *ast.LoopExpr) *types.Type {
 		return types.UnitT
 	}
 	lt := c.checkExpr(rng.L, nil)
-	c.checkExpr(rng.R, lt)
+	rt := c.checkExpr(rng.R, nil)
+	if c.adoptInt(lt, rt) == nil {
+		c.checkExpr(rng.R, lt)
+	}
 	if !lt.Kind.IsInt() {
 		c.errAt(x.Iter, "E0308", "range bounds must be integers, found `%s`", lt)
 		lt = types.I32T

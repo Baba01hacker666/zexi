@@ -347,6 +347,38 @@ fn main() -> i32 {
 `, "2 true false\n7 2\n7\n20\n7 20 9\n")
 }
 
+// TestIntegerLiteralInference checks that a binding defaulted from a bare
+// integer literal adopts a concrete integer type when a later use demands one.
+// The four shapes that used to fail are call arguments, struct-literal fields,
+// a comparison against Vec::len()'s usize, and a for-range bound.
+func TestIntegerLiteralInference(t *testing.T) {
+	wantOutput(t, "int_lit_infer", `fn next(i: i64) -> i64 { return i + 1; }
+struct C { n: i64 }
+
+fn main() -> i32 {
+    let a = 0;
+    println(next(a));
+
+    let k = 7;
+    let c = C { n: k };
+    println(c.n);
+
+    let mut v: Vec<i64> = Vec::new();
+    v.push(5);
+    let i = 0;
+    println(i < v.len());
+
+    let n: i64 = 3;
+    for j in 0..n { println(j); }
+
+    let alias = 4;
+    let copy = alias;
+    println(next(copy), next(alias));
+    0
+}
+`, "1\n7\ntrue\n0\n1\n2\n5 5\n")
+}
+
 // TestStringBuilderGrowth covers the String append path now that the buffer
 // carries a capacity and grows geometrically instead of reallocating to the
 // exact size on every byte. The interesting cases are the ones where growth
