@@ -57,8 +57,18 @@ handles strings, printing, arrays, and the standard library's C shims.
 
 ### 2.4 Semantic analysis (`internal/sema`)
 - Type checking, name resolution.
+- **Generics are monomorphized.** A generic function/struct/enum/impl is kept
+  as a template; the first use with a concrete argument list clones the
+  declaration (`ast.Clone`), binds the parameters, and re-checks/resolves it.
+  Instantiations get a canonical `Base$len:key...` name and become ordinary
+  entries in `Info.Fns`/`FnOrder`/`StructOrd`/`EnumOrd`, so codegen never knows
+  generics existed. Templates are never emitted. `Option`/`Result` are
+  predeclared templates.
+- `?` is lowered during checking to the `match` it means (`Info.TryMatches`);
+  codegen only sees ordinary matches.
 - Move checker (`own.go`): non-`#[copy]` values are move-only; use-after-move
-  is an error.
+  is an error. A by-value `match` consumes an owning scrutinee, moves bound
+  payloads into the arm, and drops the remainder once.
 - Produces `sema.Info` with `FnOrder` (checked functions in declaration order).
 
 ### 2.5 Code generation (`internal/codegen/c`)

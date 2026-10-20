@@ -1,8 +1,9 @@
 # 12. Generics and `Option`/`Result` — design note
 
-> **Status:** design for the M1 generics pass. **Not implemented yet.** This note
-> fixes the surface, the internal model, and the delivery plan before any
-> compiler changes, per the agreed workflow.
+> **Status:** implemented on branch `m1-generics` (stages 1–5), landed as
+> commits `b531034`, `8e53534`, `c679e9c`, `936493a`, and `14b8aad`. Stage 6
+> folds the result back into the user-facing docs. The surface and model below
+> are what shipped; §12.14 records the remaining limits.
 
 This closes the largest remaining M1 gap. Today the parser rejects generic
 syntax outright (`E0900: generics are not supported yet`), `PathType.Args` is
@@ -430,3 +431,33 @@ reveals the clone/re-check approach is too costly, the fallback is to key
 `sema.Info` by `(instantiation, expr)` instead of cloning; that decision point is
 deliberately placed after generic functions work, since functions are the
 simplest case.
+
+## 12.14 Status and known limitations
+
+All six stages landed. Shipped today:
+
+- Generic functions, structs, enums, tuple structs, and inherent impls
+  (methods and associated functions), with inference from arguments, fields,
+  payloads, and the expected type, plus turbofish on calls and types.
+- `Option<T>` / `Result<T, E>` as predeclared templates, bare `Some`/`None`/
+  `Ok`/`Err` from context, and `?` lowered to an ordinary match for both enums.
+- Owned payloads: constructing, moving into and out of an enum, dropping the
+  active variant once, and match-move glue (including guarded arms).
+- Diagnostics: `E0107` arity, `E0282` inference, `E0072` direct recursive
+  instantiation, `E0428` duplicate parameters, `E0507` moving an owned payload
+  out of a borrow, `E0277`/`E0308` for `?` placement and error type, and
+  `E0900` for trait bounds.
+
+Known limits (deliberate for M1):
+
+- Inference through *nested* generic fields (e.g. a field of type
+  `Inner<T>`) is conservative: annotate the literal or use a turbofish.
+  Direct payload/argument inference, which covers the common cases, works.
+- Nested patterns are still rejected (`Err(MyErr::Bad { pos })`); bind the
+  payload and match again, or match the inner enum directly.
+- `?` cannot convert between error types; the error type must match the
+  enclosing function exactly.
+- Borrowed payloads cannot be moved (`E0507`); bind by value or ignore them.
+- The ASan leak/double-free check could not run in the Alpine/musl CI image
+  (no libasan/clang). Drop behavior is covered by the runtime tests in
+  `tests/generics.zx`, `tests/option_result.zx`, and `tests/drop.zx`.

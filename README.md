@@ -40,6 +40,11 @@ This repository contains the **initial design and specification** of Zexi: the v
 > `&mut self`) and **associated functions** (`Point::new(1, 2)`); **enums** with
 > tuple/struct/unit variants and **`match`** with exhaustiveness checking,
 > or-patterns (`A | B`), and range patterns (`1..=9`, `'a'..='z'`);
+> **monomorphized generics** for functions, structs, enums, and impls, with
+> inference and turbofish (`id::<i64>`, `Pair::<i32, str>`); predeclared
+> **`Option<T>`/`Result<T, E>`** and the **`?` operator** (lowered to `match`,
+> with bare `Some`/`None`/`Ok`/`Err` from context); **owned enum payloads** with
+> match move/drop glue;
 > **first-class arrays** with bounds-checked indexing;
 > a **use-after-move checker** for non-`Copy` values (opt into copying with
 > `#[copy]`); the built-in owning heap type **`String`** with **deterministic
@@ -67,15 +72,15 @@ This repository contains the **initial design and specification** of Zexi: the v
 > (`Thread::spawn`, `Chan::new`, `Atomic::new`; see
 > [`docs/11-concurrency.md`](docs/11-concurrency.md)).
 >
-> Not yet implemented: generics, traits/`impl Trait`, full module
+> Not yet implemented: traits (and trait bounds, so generic parameters are
+> unconstrained), `dyn Trait`, associated types, const generics, full module
 > **isolation** (qualified access, `as` aliases, and `pub` checks work, but the
 > merged program is still one flat namespace, so unqualified cross-module names
 > remain visible and ignore `pub`), `Box`/`Vec`,
 > `Send`/`Sync` value passing across threads (today only `i64` handles, arguments,
 > and return values cross a thread boundary),
 > user-defined `Drop`, borrow-lifetime analysis (bound `&`/`*` aliases are not yet
-> tracked), and `Result`/`?`. Enum variants cannot carry
-> owning payloads yet. See `docs/05-roadmap.md`.
+> tracked), nested patterns, and tuple values. See `docs/05-roadmap.md`.
 
 ## How it works
 

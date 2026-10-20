@@ -168,8 +168,9 @@ fn(A, B) -> R function pointer
 
 - `struct` — product type, C-compatible layout by default (`#[repr(C)]` in M1/M2).
 - `enum` — **tagged union**; a discriminant plus the largest variant payload.
-  `Option<T>` and `Result<T,E>` are ordinary library enums, no compiler magic
-  except niche optimizations in M2.
+  Variants may own resources (`Some(String::from("x"))`). `Option<T>` and
+  `Result<T,E>` are predeclared generic enums, so they need no import; they
+  have no compiler magic beyond being always in scope.
 - `impl` — inherent and trait methods. A function declared without a `self`
   parameter is an *associated function*, called as `Type::name(args)` (for
   example `Point::new(1, 2)`); one with `self` is called on a value
@@ -202,9 +203,10 @@ let t = s.clone();       // independent deep copy
 | `push(&mut self, char)` | | append one code point (UTF-8) |
 | `push_str(&mut self, str)` | | append a string slice |
 
-Owning values compose: a `struct` (or array) containing a `String` is itself an
-owning type and gets a generated destructor, so dropping it drops each
-field/element. `Vec<T>` and `Box<T>` arrive with generics (M1).
+Owning values compose: a `struct`, `enum` variant, or array containing a
+`String` is itself an owning type and gets a generated destructor, so dropping
+it drops each field/element/variant payload. `Vec<T>` and `Box<T>` are not
+implemented yet.
 
 `+` concatenates any mix of `str` and `String`, allocating a fresh `String`. A
 number, `bool`, or `char` operand is rendered as text first, so labels are easy
@@ -213,15 +215,38 @@ any number of printable values and separate them with a single space.
 
 ### Generics (M1)
 
-Generics are **monomorphized**: each concrete instantiation is a separate
-function/type. No vtable is required unless the generic parameter is used as a
-`dyn` trait object.
+Generics are **monomorphized**: each concrete instantiation becomes its own
+function or type in the generated C; no vtable or boxing is involved. Type
+arguments are inferred from arguments and the expected type, or written
+explicitly with a turbofish.
 
 ```zexi
-fn max<T: Ord>(a: T, b: T) -> T { if a > b { a } else { b } }
+fn id<T>(x: T) -> T { x }
+
+struct Pair<A, B> { first: A, second: B }
+
+impl<A, B> Pair<A, B> {
+    fn swap(&self) -> Pair<B, A> {
+        Pair { first: self.second, second: self.first }
+    }
+}
+
+enum Maybe<T> { Just(T), Nothing }
+
+let p = Pair { first: 1, second: "one" };
+let q = p.swap();               // Pair<str, i32>
+let n = id::<i64>(7);           // explicit turbofish
+let m: Maybe<i64> = Maybe::Just(3);
 ```
 
-Traits provide bounds; `dyn Trait` gives type-erased dynamic dispatch (M2).
+Type parameters are currently **unconstrained**: there are no trait bounds
+(`fn max<T: Ord>(..)` reports `E0900`), no `dyn Trait`, and no associated
+types or const generics. Explicit arguments may appear on calls and types
+(`id::<i64>`, `Pair::<i32, str>`).
+
+`Option<T>` and `Result<T, E>` are predeclared generic enums with variants
+`Some(T)`/`None` and `Ok(T)`/`Err(E)`. The variant names may be written bare
+(`Ok(n)`, `None`) when the expected type makes the enum unambiguous.
 
 ## 2.4 Type system rules
 
@@ -374,6 +399,12 @@ No exceptions. Two mechanisms:
        Ok(parse(text)?)
    }
    ```
+
+   `e?` is ordinary match-based control flow: it yields the `Ok` payload and
+   returns the `Err` case from the enclosing function. The function must return
+   a `Result` whose error type matches (`E0277`/`E0308` otherwise). The same
+   operator works on `Option<T>` (yielding `Some`'s payload and returning
+   `None`) inside a function that returns `Option`.
 
 2. **`panic`** for unrecoverable bugs; unwinds are **not** supported in M0 — a
    panic aborts (or calls a user hook), keeping the binary small and behavior

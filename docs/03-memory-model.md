@@ -119,7 +119,31 @@ API ("Safety" doc section, and flagged by a lint if missing). The soundness
 argument for Zexi is: **all memory unsafety in a program is syntactically
 confined to `unsafe` blocks.**
 
-## 3.9 The runtime (or lack of one)
+## 3.9 Owned enum payloads and `match`
+
+Enum variants may own resources. Constructing a variant moves its arguments
+into the enum; dropping the enum drops the active variant's payload.
+
+A by-value `match` over an enum that owns memory **consumes** the scrutinee.
+An arm that binds an owned payload moves it out of the scrutinee and drops it
+at the end of the arm; the scrutinee's own destructor then runs once and frees
+only what the arm did not take. A guarded arm binds a shallow copy for the
+guard and takes ownership only once the guard passes, so a failing guard
+leaves the scrutinee intact for the next arm.
+
+```zexi
+enum Msg { Text(String), Ping }
+
+match m {
+    Msg::Text(s) => println(s),   // `s` owns the buffer here
+    Msg::Ping => {}
+}                                  // `m` is dropped once, after the arm
+```
+
+A payload cannot be moved out through a borrow: matching a `&Enum` and binding
+an owned payload reports `E0507`. Match by value, or use a non-owning pattern.
+
+## 3.10 The runtime (or lack of one)
 
 The M0/M1 runtime is what the language cannot lower to inline code:
 

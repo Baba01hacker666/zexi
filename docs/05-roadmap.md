@@ -21,7 +21,10 @@
 > (`Point::new(..)`); value-yielding `loop` (`break <expr>`); enums
 > (unit/tuple/struct variants) with
 > `match` over enums, integers, `bool`, and `char`, guards (`pat if cond`), and
-> exhaustiveness checking; first-class
+> exhaustiveness checking; **monomorphized generics** on functions, structs,
+> enums, and impls (inference, turbofish, generic methods), predeclared
+> `Option<T>`/`Result<T,E>` with the `?` operator, and **owned enum payloads**
+> with match move/drop glue; first-class
 > arrays with bounds-checked indexing; `mut` enforcement (a non-`mut` binding
 > cannot be assigned through, `&mut`-borrowed, or mutated via a `&mut self`
 > method); use-after-move errors for non-`Copy` values (`#[copy]` opts in);
@@ -36,14 +39,14 @@
 > and server (see docs/08), now with a Go-style default mux: top-level
 > `handle_get("/users/{id}", user)` plus `listen(":8080")`, `{name}` route
 > parameters, and `use_before`/`use_after` middleware.
-> Not yet implemented: generics, traits, full per-module **isolation**
+> Not yet implemented: traits and trait bounds (generic parameters are
+> unconstrained), `dyn Trait`, associated types, const generics, full
+> per-module **isolation**
 > (scoped qualified paths, `as` aliases, and `pub` checks are live, but the
 > loader still merges every module into one flat namespace, so unqualified
 > cross-module names remain visible and ignore `pub`), `Vec`/`Box`,
 > user-defined `Drop`, borrow-lifetime analysis (so bound
-> `&`/`*` aliases are not tracked), and `Result`/`?`. Enum variants may not carry
-> resource-owning payloads yet (a `match` binding would alias an owned value; see
-> §5.2).
+> `&`/`*` aliases are not tracked), nested patterns, and tuple values.
 > See `docs/06-backend-strategy.md` for the backend status.
 
 The MVP is milestone **M0**: enough language to compile real, safe, small

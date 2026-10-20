@@ -287,7 +287,76 @@ let m = big as i32;    // truncating integer cast
 let f = 3 as f64;
 ```
 
-## 7.13 Writing it the easy way
+## 7.13 Generics, `Option`, and `Result`
+
+Generic functions and types are monomorphized: each distinct set of type
+arguments becomes its own function/type. Parameters are inferred from the
+arguments and the expected type, or given explicitly with a turbofish. Type
+parameters are unconstrained for now (no trait bounds).
+
+```zx
+fn id<T>(x: T) -> T { x }
+
+struct Pair<A, B> { first: A, second: B }
+
+impl<A, B> Pair<A, B> {
+    fn swap(&self) -> Pair<B, A> {
+        Pair { first: self.second, second: self.first }
+    }
+}
+
+enum Maybe<T> { Just(T), Nothing }
+
+fn main() -> i32 {
+    let p = Pair { first: 1, second: "one" };
+    let q = p.swap();               // Pair<str, i32>
+    println(q.first);               // one
+    println(id::<i64>(7));
+    0
+}
+```
+
+`Option<T>` and `Result<T, E>` are predeclared generic enums
+(`Some(T)`/`None`, `Ok(T)`/`Err(E)`), so they need no import. Bare variant
+names take their enum from context:
+
+```zx
+fn half(x: i64) -> Option<i64> {
+    if x % 2 == 0 { return Some(x / 2); }
+    return None;
+}
+```
+
+`?` is ordinary match-based control flow: it yields the `Ok`/`Some` payload and
+returns the `Err`/`None` case from the enclosing function. That function must
+return the matching enum, and the error type must match.
+
+```zx
+fn parse(s: str) -> Result<i64, str> {
+    if s == "" { return Err("empty"); }
+    return Ok(42);
+}
+
+fn double(s: str) -> Result<i64, str> {
+    let n = parse(s)?;              // early-return on Err
+    return Ok(n * 2);
+}
+
+fn main() -> i32 {
+    match double("x") {
+        Ok(n) => println(n),
+        Err(e) => println(e),
+    }
+    0
+}
+```
+
+A by-value `match` over an enum that owns memory consumes the scrutinee; bound
+payloads move into the arm and are dropped once. A guarded arm copies for the
+guard and takes ownership only after it passes. Binding an owned payload out of
+a borrow is `E0507`.
+
+## 7.14 Writing it the easy way
 
 Zexi borrows Python's ergonomics where they cost nothing at run time:
 
@@ -414,14 +483,14 @@ is the program name) and `arg_at(i)` returns argument `i` as a `String`
 (`""` when out of range) — see `examples/args.zx`. For a complete small
 program that ties it all together, see `examples/guess.zx`.
 
-## 7.14 Not implemented yet (roadmap M1+)
+## 7.15 Not implemented yet (roadmap M1+)
 
-Generics, traits, `Vec`/`Box`, user-defined `Drop`, tuple values (tuple
-*structs* exist; `(a, b)` values and destructuring do not yet), borrow-lifetime
-(NLL) analysis, `Result`/`?`, bindings inside or-patterns, nested patterns, and
-enum variants that own resources. Scoped modules have landed for *qualified*
-access (imports, `as` aliases, `mod::item`, `pub` checks), but the merged
-program is still one flat namespace: unqualified cross-module names remain
-visible and ignore `pub`, so full isolation and package metadata are still M1
-work. See
+Traits (and trait bounds), `dyn Trait`, associated types, const generics,
+`Vec`/`Box`, user-defined `Drop`, tuple values (tuple *structs* exist; `(a, b)`
+values and destructuring do not yet), borrow-lifetime (NLL) analysis, bindings
+inside or-patterns, and nested patterns. Scoped modules have landed for
+*qualified* access (imports, `as` aliases, `mod::item`, `pub` checks), but the
+merged program is still one flat namespace: unqualified cross-module names
+remain visible and ignore `pub`, so full isolation and package metadata are
+still M1 work. See
 [`05-roadmap.md`](05-roadmap.md) for the plan.
