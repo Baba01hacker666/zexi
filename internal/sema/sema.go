@@ -10,6 +10,7 @@ package sema
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -160,11 +161,12 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 	c.checkBodies()
 	c.checkOwnership()
 	c.info.Main = c.info.Fns["main"]
-	if c.info.Main == nil {
+	switch {
+	case c.info.Main == nil:
 		c.errf(token.Span{}, "E0601", "no `main` function found")
-	} else if len(c.info.Main.Params) != 0 {
+	case len(c.info.Main.Params) != 0:
 		c.errf(c.info.Main.Decl.Sp, "E0601", "`main` must take no parameters, found %s", c.info.Main.Sig())
-	} else if !c.info.Main.Ret.Kind.IsInt() && c.info.Main.Ret.Kind != types.Unit {
+	case !c.info.Main.Ret.Kind.IsInt() && c.info.Main.Ret.Kind != types.Unit:
 		c.errf(c.info.Main.Decl.Sp, "E0601", "`main` must return an integer or `()`, found %s", c.info.Main.Ret)
 	}
 	return c.info, dedupeDiags(c.errs)
@@ -505,7 +507,7 @@ func (c *checker) collectEnumVariantsInner(d *ast.EnumDecl, en *types.Enum) {
 		for j, f := range v.Fields {
 			name := f.Name
 			if v.Tup {
-				name = fmt.Sprintf("%d", j)
+				name = strconv.Itoa(j)
 			}
 			ft := c.resolveType(f.Ty)
 			if ft == nil {
@@ -592,7 +594,7 @@ func (c *checker) collectStructFieldsInner(d *ast.StructDecl, st *types.Struct) 
 	for i, f := range d.Fields {
 		name := f.Name
 		if d.Tuple {
-			name = fmt.Sprintf("%d", i)
+			name = strconv.Itoa(i)
 		}
 		ft := c.resolveType(f.Ty)
 		if ft == nil {
@@ -988,16 +990,17 @@ func (c *checker) tryCollectConst(d *ast.ConstDecl) bool {
 		return false
 	}
 	if declared != nil {
-		if val.Untyped && declared.Kind.IsInt() && declared.Kind != types.Invalid {
+		switch {
+		case val.Untyped && declared.Kind.IsInt() && declared.Kind != types.Invalid:
 			if !intValFits(val, declared) {
 				c.errf(d.Val.Span(), "E0080", "constant `%s` does not fit in `%s`", d.Name, declared)
 				return true
 			}
 			val.Ty = declared
-		} else if !c.assignable(declared, val.Ty) {
+		case !c.assignable(declared, val.Ty):
 			c.errf(d.Val.Span(), "E0308", "mismatched types: expected `%s`, found `%s`", declared, val.Ty)
 			return true
-		} else {
+		default:
 			val.Ty = declared
 		}
 	}
@@ -1009,8 +1012,10 @@ func (c *checker) tryCollectConst(d *ast.ConstDecl) bool {
 
 func (c *checker) checkBodies() {
 	// A worklist: instantiating a generic call appends the concrete function to
-	// FnOrder, and it must be checked in turn (index-based, so growth is seen).
-	for i := 0; i < len(c.info.FnOrder); i++ {
+	// FnOrder, and it must be checked in turn. `len` is re-evaluated on every
+	// iteration on purpose, so the bound must not be hoisted (intrange would
+	// range over a snapshot of the original length).
+	for i := 0; i < len(c.info.FnOrder); i++ { //nolint:intrange // FnOrder grows during the loop
 		fn := c.info.FnOrder[i]
 		if fn.Decl.Body == nil {
 			continue
@@ -1022,7 +1027,7 @@ func (c *checker) checkBodies() {
 			if i >= len(fn.Params) {
 				break
 			}
-			c.declare(p.Sp, p.Name, fn.Params[i])
+			c.declare(p.Name, fn.Params[i])
 		}
 		if fn.Self != nil && fn.Self.ByRef && !fn.Self.Mut {
 			// `&self` methods may not mutate the receiver.
@@ -1074,7 +1079,7 @@ func (c *checker) blockAlwaysReturns(b *ast.Block) bool {
 	return false
 }
 
-func (c *checker) checkBlock(b *ast.Block) *types.Type { return c.checkBlockWith(b, nil) }
+func (c *checker) checkBlock(b *ast.Block) { c.checkBlockWith(b, nil) }
 
 // checkBlockWith type-checks a block, giving its trailing expression `want` as
 // the expected type. This is how a function body's tail adopts the declared
@@ -1191,19 +1196,15 @@ func exprHasJump(e ast.Expr) bool {
 		if exprHasJump(x.Callee) {
 			return true
 		}
-		for _, a := range x.Args {
-			if exprHasJump(a) {
-				return true
-			}
+		if slices.ContainsFunc(x.Args, exprHasJump) {
+			return true
 		}
 	case *ast.MethodCallExpr:
 		if exprHasJump(x.Recv) {
 			return true
 		}
-		for _, a := range x.Args {
-			if exprHasJump(a) {
-				return true
-			}
+		if slices.ContainsFunc(x.Args, exprHasJump) {
+			return true
 		}
 	case *ast.StructLitExpr:
 		for _, f := range x.Fields {
@@ -1215,16 +1216,12 @@ func exprHasJump(e ast.Expr) bool {
 		if exprHasJump(x.Value) || exprHasJump(x.Count) {
 			return true
 		}
-		for _, el := range x.Elems {
-			if exprHasJump(el) {
-				return true
-			}
+		if slices.ContainsFunc(x.Elems, exprHasJump) {
+			return true
 		}
 	case *ast.TupleExpr:
-		for _, el := range x.Elems {
-			if exprHasJump(el) {
-				return true
-			}
+		if slices.ContainsFunc(x.Elems, exprHasJump) {
+			return true
 		}
 	case *ast.IfExpr:
 		return exprHasJump(x.Cond) || exprHasJump(x.Then) || exprHasJump(x.Else)
@@ -1250,7 +1247,7 @@ func (c *checker) bindPattern(p ast.Pattern, ty *types.Type, let bool) {
 			return
 		}
 		if pt.Name != "_" {
-			c.declare(pt.Sp, pt.Name, ty)
+			c.declare(pt.Name, ty)
 		}
 	case *ast.WildcardPat:
 	case *ast.TuplePat:
@@ -1782,15 +1779,16 @@ func (c *checker) inferAssign(x *ast.AssignExpr) *types.Type {
 			c.errAt(x.Rhs, "E0308", "mismatched types: expected `%s`, found `%s`", lt, rt)
 		}
 	} else {
-		if lt.Kind == types.StringKind && x.Op == token.KindPlusEq {
+		switch {
+		case lt.Kind == types.StringKind && x.Op == token.KindPlusEq:
 			// `s += t` appends to an owning `String`; a scalar `t` is formatted
 			// as text first.
 			if !isStrLike(rt) && !isScalarText(rt) {
 				c.errAt(x.Rhs, "E0308", "cannot append `%s` to a `String`", rt)
 			}
-		} else if x.Op == token.KindPercentEq && !lt.Kind.IsInt() {
+		case x.Op == token.KindPercentEq && !lt.Kind.IsInt():
 			c.errAt(x, "E0308", "`%%=` requires integers, found `%s`", lt)
-		} else if !lt.Kind.IsNumeric() {
+		case !lt.Kind.IsNumeric():
 			c.errAt(x, "E0308", "compound assignment requires a numeric type, found `%s`", lt)
 		}
 	}
@@ -1853,7 +1851,7 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		return nil
 	}
 	if name == "print" || name == "println" {
-		return c.inferPrint(x, name)
+		return c.inferPrint(x)
 	}
 	if name == "len" {
 		return c.inferLen(x)
@@ -2437,32 +2435,24 @@ func containsParam(t *types.Type) bool {
 	case types.Ref, types.Ptr, types.Slice, types.Array:
 		return containsParam(t.Elem)
 	case types.Tuple:
-		for _, e := range t.Elems {
-			if containsParam(e) {
-				return true
-			}
+		if slices.ContainsFunc(t.Elems, containsParam) {
+			return true
 		}
 	case types.Fn:
-		for _, p := range t.Params {
-			if containsParam(p) {
-				return true
-			}
+		if slices.ContainsFunc(t.Params, containsParam) {
+			return true
 		}
 		return containsParam(t.Ret)
 	case types.StructKind:
 		if t.St != nil {
-			for _, a := range t.St.Args {
-				if containsParam(a) {
-					return true
-				}
+			if slices.ContainsFunc(t.St.Args, containsParam) {
+				return true
 			}
 		}
 	case types.EnumKind:
 		if t.En != nil {
-			for _, a := range t.En.Args {
-				if containsParam(a) {
-					return true
-				}
+			if slices.ContainsFunc(t.En.Args, containsParam) {
+				return true
 			}
 		}
 	}
@@ -2512,12 +2502,7 @@ func (c *checker) applyEnumArgs(sp token.Span, en *types.Enum, args []*types.Typ
 }
 
 func anyContainsParam(ts []*types.Type) bool {
-	for _, t := range ts {
-		if containsParam(t) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(ts, containsParam)
 }
 
 // checkTypeArgArity validates the number of type arguments against a template's
@@ -2927,13 +2912,10 @@ func (c *checker) inferEnumArgsFrom(sp token.Span, tmpl *types.Enum, explicit []
 			}
 		}
 	}
-	if expected != nil {
+	if expected != nil && expected.Kind == types.EnumKind {
 		var got []*types.Type
-		switch expected.Kind {
-		case types.EnumKind:
-			if expected.En != nil && nominalBaseName(expected) == tmpl.Base {
-				got = expected.En.Args
-			}
+		if expected.En != nil && nominalBaseName(expected) == tmpl.Base {
+			got = expected.En.Args
 		}
 		for i, name := range tmpl.Generics {
 			if _, ok := bindings[name]; !ok && i < len(got) {
@@ -3336,7 +3318,8 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 		}
 		c.popScope()
 	}
-	if base != nil && base.Kind == types.EnumKind && !catchAll {
+	switch {
+	case base != nil && base.Kind == types.EnumKind && !catchAll:
 		var missing []string
 		for _, v := range base.En.Variants {
 			if !covered[v.Name] {
@@ -3346,9 +3329,9 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 		if len(missing) > 0 {
 			c.errAt(x, "E0004", "non-exhaustive match: missing `%s`", strings.Join(missing, "`, `"))
 		}
-	} else if base != nil && base.Kind == types.Bool && !catchAll && !(boolsCovered["true"] && boolsCovered["false"]) {
+	case base != nil && base.Kind == types.Bool && !catchAll && (!boolsCovered["true"] || !boolsCovered["false"]):
 		c.errAt(x, "E0004", "non-exhaustive match: cover both `true` and `false`, or add a `_` arm")
-	} else if base != nil && (base.Kind.IsInt() || base.Kind == types.Char || base.Kind == types.Str) && !catchAll {
+	case base != nil && (base.Kind.IsInt() || base.Kind == types.Char || base.Kind == types.Str) && !catchAll:
 		c.errAt(x, "E0004", "non-exhaustive match: add a `_` arm")
 	}
 	if result == nil {
@@ -3460,7 +3443,7 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type, borrowed bool) {
 			if borrowed && st != nil && st.NeedsDrop() {
 				c.errf(pt.Sp, "E0507", "cannot move the owned value `%s` out of a borrowed scrutinee", pt.Name)
 			}
-			c.declare(pt.Sp, pt.Name, st)
+			c.declare(pt.Name, st)
 		}
 		return
 	case *ast.OrPat:
@@ -3558,22 +3541,16 @@ func patternBinds(p ast.Pattern) bool {
 	case *ast.BindPat:
 		return true
 	case *ast.TuplePat:
-		for _, el := range pt.Elems {
-			if patternBinds(el) {
-				return true
-			}
+		if slices.ContainsFunc(pt.Elems, patternBinds) {
+			return true
 		}
 	case *ast.OrPat:
-		for _, alt := range pt.Alts {
-			if patternBinds(alt) {
-				return true
-			}
+		if slices.ContainsFunc(pt.Alts, patternBinds) {
+			return true
 		}
 	case *ast.PathPat:
-		for _, sub := range pt.Sub {
-			if patternBinds(sub) {
-				return true
-			}
+		if slices.ContainsFunc(pt.Sub, patternBinds) {
+			return true
 		}
 		for _, fp := range pt.Fields {
 			if fp.Pat == nil || patternBinds(fp.Pat) {
@@ -3723,10 +3700,8 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 	if m.Self != nil && m.Self.ByRef && m.Self.Mut {
 		c.checkMutable(x.Recv, x.Recv.Span(), "cannot borrow `%s` as mutable, as it is not declared `mut`")
 	}
-	if m.Self != nil && m.Self.ByRef && rt.Kind != types.Ref && rt.Kind != types.Ptr {
-		// Taking `&self` from a value receiver is allowed (a temporary is
-		// addressed); nothing to check here.
-	}
+	// Taking `&self` from a value receiver is allowed (a temporary is
+	// addressed); nothing to check here.
 	c.info.Resolved[x] = m
 	want := m.Params
 	names, defaults := m.ParamNames, m.Defaults
@@ -3965,7 +3940,7 @@ func (c *checker) checkEnumStructLitFields(x *ast.StructLitExpr, en *types.Enum)
 	return &types.Type{Kind: types.EnumKind, En: en}
 }
 
-func (c *checker) inferPrint(x *ast.CallExpr, name string) *types.Type {
+func (c *checker) inferPrint(x *ast.CallExpr) *types.Type {
 	for _, a := range x.Args {
 		at := c.checkExpr(a, nil)
 		if !isPrintable(at) {
@@ -4307,7 +4282,7 @@ func (c *checker) assignable(dst, src *types.Type) bool {
 		return true
 	}
 	// `&mut T` coerces to `&T`.
-	if dst.Kind == types.Ref && src.Kind == types.Ref && dst.Mut == false && src.Mut == true {
+	if dst.Kind == types.Ref && src.Kind == types.Ref && !dst.Mut && src.Mut {
 		return types.Equal(dst.Elem, src.Elem)
 	}
 	return false
@@ -4424,14 +4399,12 @@ func (c *checker) checkMutable(e ast.Expr, sp token.Span, format string) {
 	c.errf(sp, "E0596", format, name)
 }
 
-func (c *checker) declare(sp token.Span, name string, ty *types.Type) {
+func (c *checker) declare(name string, ty *types.Type) {
 	if len(c.scope) == 0 {
 		return
 	}
-	if _, dup := c.scope[len(c.scope)-1][name]; dup {
-		// Shadowing is allowed in Zexi; this only guards against a completely
-		// identical re-declaration, which is still legal but noisy. Do nothing.
-	}
+	// Shadowing and re-declaration are both allowed: a new binding simply
+	// replaces the previous one in the current scope.
 	c.scope[len(c.scope)-1][name] = ty
 }
 
@@ -4451,7 +4424,7 @@ func isIntLiteral(e ast.Expr) bool {
 // t. Unlike intLitFits it works on a computed value, so it also covers negated
 // and combined constants (`const X: u8 = 200 + 100`).
 func intValFits(v ConstVal, t *types.Type) bool {
-	bits := uint(0)
+	var bits uint
 	switch t.Kind {
 	case types.I8, types.U8:
 		bits = 8
@@ -4485,7 +4458,7 @@ func intLitFits(text string, t *types.Type) bool {
 		return true
 	}
 	s := strings.ReplaceAll(text, "_", "")
-	bits := uint(0)
+	var bits uint
 	switch t.Kind {
 	case types.I8, types.U8:
 		bits = 8
@@ -4599,6 +4572,11 @@ func constLiteralFor(cv ConstVal, pt *types.Type, sp token.Span) ast.Expr {
 		return &ast.LiteralExpr{Kind: token.KindFloat, Text: strconv.FormatFloat(cv.Float, 'g', -1, 64), Sp: sp}
 	default:
 		if !invalid && pt.Kind == types.Char {
+			// Check the wide value before narrowing to rune: converting first
+			// would truncate, and a truncated value could look valid.
+			if cv.Int < 0 || cv.Int > utf8.MaxRune {
+				return nil
+			}
 			r := rune(cv.Int)
 			if !utf8.ValidRune(r) {
 				return nil
@@ -4919,7 +4897,7 @@ func decodeEscape(s string) (rune, bool) {
 			if i := strings.IndexByte(s, '}'); i > 2 {
 				if v, err := strconv.ParseUint(s[2:i], 16, 32); err == nil {
 					// Only Unicode scalar values are valid `char`s.
-					if v <= 0x10FFFF && !(v >= 0xD800 && v <= 0xDFFF) {
+					if v <= 0x10FFFF && (v < 0xD800 || v > 0xDFFF) {
 						return rune(v), true
 					}
 				}

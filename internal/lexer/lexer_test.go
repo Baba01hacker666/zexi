@@ -169,7 +169,9 @@ func TestHashCommentAndFStringTokens(t *testing.T) {
 	lx := lexer.New(0, []byte("# a comment\nlet x = f\"a {x} b\" # trailing\n#[copy]"))
 	var kinds []token.Kind
 	var fstr string
-	for _, tk := range lx.All() {
+	all := lx.All()
+	kinds = make([]token.Kind, 0, len(all))
+	for _, tk := range all {
 		kinds = append(kinds, tk.Kind)
 		if tk.Kind == token.KindFString {
 			fstr = tk.Lit

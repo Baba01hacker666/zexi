@@ -9,6 +9,7 @@
 package parser
 
 import (
+	"slices"
 	"strings"
 
 	"zexi/internal/ast"
@@ -76,13 +77,14 @@ func (p *parser) accept(k token.Kind) bool {
 }
 
 // expect consumes a token of kind k or reports a diagnostic.
-func (p *parser) expect(k token.Kind, context string) (token.Token, bool) {
+func (p *parser) expect(k token.Kind, context string) bool {
 	if p.at(k) {
-		return p.bump(), true
+		p.bump()
+		return true
 	}
 	t := p.cur()
 	p.errf(t, "E0201", "expected %s%s, found %s", k, context, t.Kind)
-	return t, false
+	return false
 }
 
 func (p *parser) errf(t token.Token, code, format string, args ...any) {
@@ -165,7 +167,7 @@ func (p *parser) parseAttributes() []string {
 	var attrs []string
 	for p.at(token.KindHash) {
 		p.bump()
-		if _, ok := p.expect(token.KindLBracket, " after `#`"); !ok {
+		if !p.expect(token.KindLBracket, " after `#`") {
 			return attrs
 		}
 		if p.at(token.KindIdentifier) {
@@ -228,7 +230,7 @@ func (p *parser) parseExternFn(vis ast.Visibility, start token.Pos) ast.Item {
 
 func (p *parser) parseParams() []ast.Param {
 	var params []ast.Param
-	if _, ok := p.expect(token.KindLParen, " to begin parameter list"); !ok {
+	if !p.expect(token.KindLParen, " to begin parameter list") {
 		return params
 	}
 	for !p.at(token.KindRParen) && !p.at(token.KindEOF) {
@@ -336,7 +338,7 @@ func (p *parser) parseEnum(vis ast.Visibility, attrs []string, start token.Pos) 
 	}
 	d := &ast.EnumDecl{Vis: vis, Attrs: attrs, Name: name}
 	d.Generics = p.parseGenerics()
-	if _, ok := p.expect(token.KindLBrace, " to begin enum body"); !ok {
+	if !p.expect(token.KindLBrace, " to begin enum body") {
 		return d
 	}
 	for !p.at(token.KindRBrace) && !p.at(token.KindEOF) {
@@ -430,7 +432,7 @@ func (p *parser) parseImpl(start token.Pos) ast.Item {
 		d.Trait = d.SelfTy
 		d.SelfTy = p.parseType()
 	}
-	if _, ok := p.expect(token.KindLBrace, " to begin impl body"); !ok {
+	if !p.expect(token.KindLBrace, " to begin impl body") {
 		return d
 	}
 	for !p.at(token.KindRBrace) && !p.at(token.KindEOF) {
@@ -465,7 +467,7 @@ func (p *parser) parseMod(vis ast.Visibility, start token.Pos) ast.Item {
 		d.Sp = p.spanFrom(start)
 		return d
 	}
-	if _, ok := p.expect(token.KindLBrace, " to begin module body"); !ok {
+	if !p.expect(token.KindLBrace, " to begin module body") {
 		return d
 	}
 	d.Inline = true
@@ -526,19 +528,20 @@ func (p *parser) parseImportLike(start token.Pos, allowDots bool) ast.Item {
 func (p *parser) parseBlock() *ast.Block {
 	start := p.cur().Pos.Offset
 	b := &ast.Block{}
-	if _, ok := p.expect(token.KindLBrace, " to begin block"); !ok {
+	if !p.expect(token.KindLBrace, " to begin block") {
 		b.Sp = p.spanFrom(start)
 		return b
 	}
 	for !p.at(token.KindRBrace) && !p.at(token.KindEOF) {
 		before := p.pos
-		if p.at(token.KindLet) {
+		switch {
+		case p.at(token.KindLet):
 			b.Stmts = append(b.Stmts, p.parseLet())
-		} else if p.at(token.KindDefer) {
+		case p.at(token.KindDefer):
 			b.Stmts = append(b.Stmts, p.parseDefer())
-		} else if p.at(token.KindSemicolon) {
+		case p.at(token.KindSemicolon):
 			p.bump() // stray semicolon
-		} else {
+		default:
 			e := p.parseExpr()
 			switch {
 			case p.accept(token.KindSemicolon):
@@ -941,7 +944,7 @@ func (p *parser) parsePostfix() ast.Expr {
 		switch p.cur().Kind {
 		case token.KindDot:
 			p.bump()
-			name := ""
+			var name string
 			if p.at(token.KindInteger) {
 				name = p.bump().Lit // tuple-struct field: `.0`
 			} else {
@@ -1382,7 +1385,7 @@ func (p *parser) parseMatch() ast.Expr {
 	scrut := p.parseExpr()
 	p.noStructLit--
 	m := &ast.MatchExpr{Scrutinee: scrut}
-	if _, ok := p.expect(token.KindLBrace, " to begin match arms"); !ok {
+	if !p.expect(token.KindLBrace, " to begin match arms") {
 		m.Sp = p.spanFrom(start)
 		return m
 	}
@@ -1507,10 +1510,8 @@ func (p *parser) expectIdentPath(_ string) string {
 // consume the stop token.
 func (p *parser) skipTo(stop ...token.Kind) {
 	for !p.at(token.KindEOF) {
-		for _, k := range stop {
-			if p.at(k) {
-				return
-			}
+		if slices.ContainsFunc(stop, p.at) {
+			return
 		}
 		p.bump()
 	}
@@ -1568,18 +1569,17 @@ func (p *parser) parseGenericArgs() []ast.Type {
 // expectGt consumes one closing `>`. The lexer produces `>>` as a single token,
 // so a `>>` satisfies one closer and is rewritten in place as a single `>` for
 // the next one (as in `Vec<Vec<i64>>`).
-func (p *parser) expectGt(context string) bool {
+func (p *parser) expectGt(context string) {
 	if p.at(token.KindGt) {
 		p.bump()
-		return true
+		return
 	}
 	if p.at(token.KindShr) {
 		t := p.cur()
 		pos := t.Pos
 		pos.Offset++
 		p.toks[p.pos] = token.Token{Kind: token.KindGt, Pos: pos, End: t.End, Lit: ">"}
-		return true
+		return
 	}
 	p.expect(token.KindGt, context)
-	return false
 }

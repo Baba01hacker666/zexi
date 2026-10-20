@@ -17,6 +17,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -426,10 +427,8 @@ func (l *loader) searchDirs(importerDir string) []string {
 		if d == "" {
 			return
 		}
-		for _, x := range dirs {
-			if x == d {
-				return
-			}
+		if slices.Contains(dirs, d) {
+			return
 		}
 		dirs = append(dirs, d)
 	}

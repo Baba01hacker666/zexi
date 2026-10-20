@@ -46,8 +46,14 @@ fn main() -> i32 {
 	}
 
 	// Mutating the clone must not touch the original.
-	origFn := file.Items[len(file.Items)-1].(*ast.FnDecl)
-	cloneFn := clone.Items[len(clone.Items)-1].(*ast.FnDecl)
+	origFn, ok := file.Items[len(file.Items)-1].(*ast.FnDecl)
+	if !ok {
+		t.Fatalf("last item is %T, want *ast.FnDecl", file.Items[len(file.Items)-1])
+	}
+	cloneFn, ok := clone.Items[len(clone.Items)-1].(*ast.FnDecl)
+	if !ok {
+		t.Fatalf("clone's last item is %T, want *ast.FnDecl", clone.Items[len(clone.Items)-1])
+	}
 	if cloneFn == origFn {
 		t.Fatal("Clone returned the same node pointer")
 	}
@@ -61,8 +67,14 @@ fn main() -> i32 {
 	}
 
 	// A generic declaration clone must not share its Generics slice.
-	origStruct := file.Items[1].(*ast.StructDecl)
-	cloneStruct := clone.Items[1].(*ast.StructDecl)
+	origStruct, ok := file.Items[1].(*ast.StructDecl)
+	if !ok {
+		t.Fatalf("item 1 is %T, want *ast.StructDecl", file.Items[1])
+	}
+	cloneStruct, ok := clone.Items[1].(*ast.StructDecl)
+	if !ok {
+		t.Fatalf("clone's item 1 is %T, want *ast.StructDecl", clone.Items[1])
+	}
 	cloneStruct.Generics[0].Name = "Changed"
 	if origStruct.Generics[0].Name != "A" {
 		t.Fatal("generic parameter slice is shared")

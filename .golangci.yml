@@ -1,0 +1,18 @@
+version: "2"
+
+# Linters chosen for a compiler codebase: correctness and clarity checks that
+# catch real mistakes without imposing a blanket formatting style. Purely
+# opinionated linters (wsl, nlreturn, varnamelen, exhaustruct, ...) are left
+# off on purpose.
+linters:
+  default: standard
+  enable:
+    - errorlint
+    - forcetypeassert
+    - gocritic
+    - intrange
+    - modernize
+    - perfsprint
+    - prealloc
+    - unparam
+    - wastedassign

@@ -54,7 +54,7 @@ func (l *Lexer) Next() token.Token {
 	switch {
 	// Prefix forms must be checked before the generic identifier case.
 	case c == 'r' && l.atRawString():
-		return l.scanRawString(startPos, startOff)
+		return l.scanRawString(startPos)
 	case c == 'f' && l.peekAt(1) == '"':
 		return l.scanFString(startPos, startOff)
 	case c == 'b' && l.peekAt(1) == '\'':
@@ -80,13 +80,14 @@ func (l *Lexer) skipTrivia() {
 		case ' ', '\t', '\r', '\n':
 			l.advance()
 		case '/':
-			if l.peekAt(1) == '/' {
+			switch l.peekAt(1) {
+			case '/':
 				for !l.atEnd() && l.peek() != '\n' {
 					l.advance()
 				}
-			} else if l.peekAt(1) == '*' {
+			case '*':
 				l.skipBlockComment()
-			} else {
+			default:
 				return
 			}
 		case '#':
@@ -142,12 +143,12 @@ func (l *Lexer) scanIdent(startPos token.Position, startOff int) token.Token {
 	}
 	text := string(l.src[startOff:l.off])
 	if text == "_" {
-		return l.tok(token.KindUnderscore, "", startPos, startOff)
+		return l.tok(token.KindUnderscore, "", startPos)
 	}
 	if k, ok := token.Lookup(text); ok {
-		return l.tok(k, text, startPos, startOff)
+		return l.tok(k, text, startPos)
 	}
-	return l.tok(token.KindIdentifier, text, startPos, startOff)
+	return l.tok(token.KindIdentifier, text, startPos)
 }
 
 // --- numbers --------------------------------------------------------------
@@ -165,7 +166,7 @@ func (l *Lexer) scanNumber(startPos token.Position, startOff int) token.Token {
 			}
 			l.consumeDigits(isHexDigit)
 			l.checkUnderscores(l.lit(startOff), startPos)
-			return l.tok(kind, l.lit(startOff), startPos, startOff)
+			return l.tok(kind, l.lit(startOff), startPos)
 		case 'b', 'B':
 			l.advance()
 			l.advance()
@@ -174,7 +175,7 @@ func (l *Lexer) scanNumber(startPos token.Position, startOff int) token.Token {
 			}
 			l.consumeDigits(isBinDigit)
 			l.checkUnderscores(l.lit(startOff), startPos)
-			return l.tok(kind, l.lit(startOff), startPos, startOff)
+			return l.tok(kind, l.lit(startOff), startPos)
 		case 'o', 'O':
 			l.advance()
 			l.advance()
@@ -183,7 +184,7 @@ func (l *Lexer) scanNumber(startPos token.Position, startOff int) token.Token {
 			}
 			l.consumeDigits(isOctDigit)
 			l.checkUnderscores(l.lit(startOff), startPos)
-			return l.tok(kind, l.lit(startOff), startPos, startOff)
+			return l.tok(kind, l.lit(startOff), startPos)
 		}
 	}
 
@@ -207,13 +208,13 @@ func (l *Lexer) scanNumber(startPos token.Position, startOff int) token.Token {
 		}
 	}
 	l.checkUnderscores(l.lit(startOff), startPos)
-	return l.tok(kind, l.lit(startOff), startPos, startOff)
+	return l.tok(kind, l.lit(startOff), startPos)
 }
 
 // checkUnderscores rejects misplaced `_` separators in a numeric literal
 // (`1_`, `1__2`, `0x_FF`): each underscore must sit between two digits.
 func (l *Lexer) checkUnderscores(lit string, startPos token.Position) {
-	for i := 0; i < len(lit); i++ {
+	for i := range len(lit) {
 		if lit[i] != '_' {
 			continue
 		}
@@ -259,7 +260,7 @@ func (l *Lexer) scanString(startPos token.Position, startOff int) token.Token {
 	}
 	// Lit is the inner text (quotes excluded); escapes are decoded downstream.
 	inner := l.innerLit(startOff)
-	return l.tok(token.KindString, inner, startPos, startOff)
+	return l.tok(token.KindString, inner, startPos)
 }
 
 // scanFString scans an interpolated string `f"..."`. The literal keeps its
@@ -288,7 +289,7 @@ func (l *Lexer) scanFString(startPos token.Position, startOff int) token.Token {
 	}
 	// Lit is the inner text (the `f"` prefix and closing quote excluded).
 	inner := l.safeSlice(startOff+2, l.off-1)
-	return l.tok(token.KindFString, inner, startPos, startOff)
+	return l.tok(token.KindFString, inner, startPos)
 }
 
 // atRawString reports whether the cursor is at a raw string: `r"..."`,
@@ -305,7 +306,7 @@ func (l *Lexer) atRawString() bool {
 	return l.peekAt(i) == '"'
 }
 
-func (l *Lexer) scanRawString(startPos token.Position, startOff int) token.Token {
+func (l *Lexer) scanRawString(startPos token.Position) token.Token {
 	l.advance() // 'r'
 	hashes := 0
 	for l.peek() == '#' {
@@ -317,11 +318,11 @@ func (l *Lexer) scanRawString(startPos token.Position, startOff int) token.Token
 	for {
 		if l.atEnd() {
 			l.errorf("E0001", startPos, "unterminated raw string literal")
-			return l.tok(token.KindRawString, l.safeSlice(contentStart, l.off), startPos, startOff)
+			return l.tok(token.KindRawString, l.safeSlice(contentStart, l.off), startPos)
 		}
 		if l.peek() == '"' {
 			closed := true
-			for i := 0; i < hashes; i++ {
+			for i := range hashes {
 				if l.peekAt(1+i) != '#' {
 					closed = false
 					break
@@ -330,11 +331,11 @@ func (l *Lexer) scanRawString(startPos token.Position, startOff int) token.Token
 			if closed {
 				contentEnd := l.off
 				l.advance() // closing quote
-				for i := 0; i < hashes; i++ {
+				for range hashes {
 					l.advance()
 				}
 				inner := l.safeSlice(contentStart, contentEnd)
-				return l.tok(token.KindRawString, inner, startPos, startOff)
+				return l.tok(token.KindRawString, inner, startPos)
 			}
 		}
 		l.advance()
@@ -370,7 +371,7 @@ func (l *Lexer) scanChar(startPos token.Position, startOff int, isByte bool) tok
 		kind = token.KindByteChar
 		inner = l.safeSlice(startOff+2, l.off-1)
 	}
-	return l.tok(kind, inner, startPos, startOff)
+	return l.tok(kind, inner, startPos)
 }
 
 // --- operators ------------------------------------------------------------
@@ -406,14 +407,14 @@ func (l *Lexer) scanOperator(startPos token.Position, startOff int) token.Token 
 			for range e.text {
 				l.advance()
 			}
-			return l.tok(e.kind, e.text, startPos, startOff)
+			return l.tok(e.kind, e.text, startPos)
 		}
 	}
 
 	bad := l.advance()
 	l.errs = append(l.errs, diag.New("E0002", "unexpected character %q", string(bad)).
 		WithSpan(token.Span{Start: token.Pos(startOff), End: token.Pos(l.off)}))
-	return l.tok(token.KindInvalid, string(bad), startPos, startOff)
+	return l.tok(token.KindInvalid, string(bad), startPos)
 }
 
 // --- helpers --------------------------------------------------------------
@@ -462,7 +463,7 @@ func (l *Lexer) pos() token.Position {
 	return token.Position{FileID: l.fileID, Line: l.line, Col: l.col, Offset: token.Pos(l.off)}
 }
 
-func (l *Lexer) tok(k token.Kind, lit string, start token.Position, startOff int) token.Token {
+func (l *Lexer) tok(k token.Kind, lit string, start token.Position) token.Token {
 	return token.Token{Kind: k, Lit: lit, Pos: start, End: token.Pos(l.off)}
 }
 
@@ -490,9 +491,9 @@ func (l *Lexer) safeSlice(lo, hi int) string {
 	return string(l.src[lo:hi])
 }
 
-func (l *Lexer) errorf(code string, pos token.Position, format string, args ...any) {
+func (l *Lexer) errorf(code string, pos token.Position, msg string) {
 	span := token.Span{Start: pos.Offset, End: token.Pos(l.off)}
-	l.errs = append(l.errs, diag.New(code, format, args...).WithSpan(span))
+	l.errs = append(l.errs, diag.New(code, "%s", msg).WithSpan(span))
 }
 
 func isIdentStart(c byte) bool {

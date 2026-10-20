@@ -405,9 +405,9 @@ func TestHTTPServerAndClient(t *testing.T) {
 	if err := server.Start(); err != nil {
 		t.Fatalf("starting server: %v", err)
 	}
-	defer server.Process.Kill()
+	defer func() { _ = server.Process.Kill() }()
 
-	if !waitPort("127.0.0.1:18081", 5*time.Second) {
+	if !waitPort("127.0.0.1:18081") {
 		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
 	}
 
@@ -421,7 +421,7 @@ func TestHTTPServerAndClient(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	go func() { server.Wait(); close(done) }()
+	go func() { _ = server.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -549,9 +549,9 @@ fn main() -> i32 {
 	if err := server.Start(); err != nil {
 		t.Fatalf("starting server: %v", err)
 	}
-	defer server.Process.Kill()
+	defer func() { _ = server.Process.Kill() }()
 
-	if !waitPort("127.0.0.1:18082", 5*time.Second) {
+	if !waitPort("127.0.0.1:18082") {
 		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
 	}
 
@@ -565,7 +565,7 @@ fn main() -> i32 {
 	}
 
 	done := make(chan struct{})
-	go func() { server.Wait(); close(done) }()
+	go func() { _ = server.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -593,7 +593,7 @@ func TestStdHTTPClientReadsBodies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	payloads := []string{
 		"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
@@ -621,9 +621,9 @@ func TestStdHTTPClientReadsBodies(t *testing.T) {
 						break
 					}
 				}
-				conn.Write([]byte(payload))
+				_, _ = conn.Write([]byte(payload))
 				time.Sleep(3 * time.Second)
-				conn.Close()
+				_ = conn.Close()
 			}(conn, payload)
 		}
 	}()
@@ -660,7 +660,7 @@ fn main() -> i32 {
 		t.Fatal("failed to build the HTTP client")
 	}
 
-	port := ln.Addr().(*net.TCPAddr).Port
+	port := tcpPort(t, ln)
 	start := time.Now()
 	out, err := exec.Command(cliBin, strconv.Itoa(port)).Output()
 	elapsed := time.Since(start)
@@ -828,9 +828,9 @@ fn main() -> i32 {
 	if err := server.Start(); err != nil {
 		t.Fatalf("starting server: %v", err)
 	}
-	defer server.Process.Kill()
+	defer func() { _ = server.Process.Kill() }()
 
-	if !waitPort("127.0.0.1:18088", 5*time.Second) {
+	if !waitPort("127.0.0.1:18088") {
 		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
 	}
 
@@ -851,7 +851,7 @@ fn main() -> i32 {
 	}
 
 	done := make(chan struct{})
-	go func() { server.Wait(); close(done) }()
+	go func() { _ = server.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -945,9 +945,9 @@ fn main() -> i32 {
 	if err := server.Start(); err != nil {
 		t.Fatalf("starting server: %v", err)
 	}
-	defer server.Process.Kill()
+	defer func() { _ = server.Process.Kill() }()
 
-	if !waitPort("127.0.0.1:18089", 5*time.Second) {
+	if !waitPort("127.0.0.1:18089") {
 		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
 	}
 
@@ -957,7 +957,7 @@ fn main() -> i32 {
 		if err != nil {
 			t.Fatalf("GET %s: %v", path, err)
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Fatalf("reading %s: %v", path, err)
@@ -982,7 +982,7 @@ fn main() -> i32 {
 	}
 
 	done := make(chan struct{})
-	go func() { server.Wait(); close(done) }()
+	go func() { _ = server.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -1024,13 +1024,25 @@ func TestParallelCUnitsMatchSingleFile(t *testing.T) {
 	}
 }
 
-// waitPort reports whether addr accepts a TCP connection within d.
-func waitPort(addr string, d time.Duration) bool {
-	deadline := time.Now().Add(d)
+// tcpPort returns the TCP port a listener is bound to.
+func tcpPort(t *testing.T, ln net.Listener) int {
+	t.Helper()
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener address is %T, want *net.TCPAddr", ln.Addr())
+	}
+	return addr.Port
+}
+
+// waitPort reports whether addr accepts a TCP connection within the startup
+// timeout used by the integration tests.
+func waitPort(addr string) bool {
+	const timeout = 5 * time.Second
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
 		if err == nil {
-			conn.Close()
+			_ = conn.Close()
 			return true
 		}
 		time.Sleep(25 * time.Millisecond)
@@ -1332,7 +1344,7 @@ func TestHighLevelHTTPServeN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := reserve.Addr().(*net.TCPAddr).Port
+	port := tcpPort(t, reserve)
 	if err := reserve.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1369,19 +1381,19 @@ fn main() -> i32 {
 	if err := server.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer server.Process.Kill()
+	defer func() { _ = server.Process.Kill() }()
 	addr := "127.0.0.1:" + strconv.Itoa(port)
-	if !waitPort(addr, 5*time.Second) {
+	if !waitPort(addr) {
 		t.Fatalf("server never started listening; output:\n%s", serverOut.String())
 	}
 
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		resp, err := stdhttp.Get("http://" + addr + "/")
 		if err != nil {
 			t.Fatalf("GET %d: %v", i, err)
 		}
 		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if err != nil {
 			t.Fatalf("reading GET %d: %v", i, err)
 		}
@@ -1416,7 +1428,7 @@ func TestDefaultMuxAndGoClient(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := reserve.Addr().(*net.TCPAddr).Port
+	port := tcpPort(t, reserve)
 	if err := reserve.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1489,8 +1501,8 @@ fn main() -> i32 {
 	if err := server.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer server.Process.Kill()
-	if !waitPort("127.0.0.1:"+strconv.Itoa(port), 5*time.Second) {
+	defer func() { _ = server.Process.Kill() }()
+	if !waitPort("127.0.0.1:" + strconv.Itoa(port)) {
 		t.Fatalf("server never started listening; output:\n%s", serverOut.String())
 	}
 
@@ -1645,7 +1657,7 @@ func TestHighLevelStaticServeDirN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := reserve.Addr().(*net.TCPAddr).Port
+	port := tcpPort(t, reserve)
 	if err := reserve.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1687,9 +1699,9 @@ fn main() -> i32 {
 	if err := server.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer server.Process.Kill()
+	defer func() { _ = server.Process.Kill() }()
 	addr := "127.0.0.1:" + strconv.Itoa(port)
-	if !waitPort(addr, 5*time.Second) {
+	if !waitPort(addr) {
 		t.Fatalf("server never started listening; output:\n%s", serverOut.String())
 	}
 	for _, tc := range []struct {
@@ -1704,7 +1716,7 @@ fn main() -> i32 {
 			t.Fatalf("GET %s: %v", tc.path, err)
 		}
 		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if err != nil {
 			t.Fatalf("reading %s: %v", tc.path, err)
 		}

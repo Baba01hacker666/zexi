@@ -11,6 +11,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -234,7 +235,7 @@ func cmdRun(c cli) int {
 		fmt.Fprintf(os.Stderr, "zexic run: %v\n", err)
 		return 2
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	out := filepath.Join(dir, driver.DefaultOutput(paths[0]))
 	if _, ok := driver.BuildFiles(paths, out, c.opts(), em); !ok {
@@ -247,7 +248,8 @@ func cmdRun(c cli) int {
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
 	if err := child.Run(); err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
 			return ee.ExitCode()
 		}
 		fmt.Fprintf(os.Stderr, "zexic run: %v\n", err)
@@ -311,7 +313,7 @@ func cmdBindgen(c cli) int {
 func emFileID(em *diag.Emitter) int { return em.FirstFileID() }
 
 func usage(w *os.File) {
-	fmt.Fprint(w, `zexi - the Zexi programming language compiler
+	_, _ = fmt.Fprint(w, `zexi - the Zexi programming language compiler
 
 usage:
   zexic <command> [options] <file.zx> [lib.zx ...]

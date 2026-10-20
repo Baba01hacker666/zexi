@@ -4,7 +4,11 @@
 // happens in codegen and layout, never here.
 package types
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+	"strings"
+)
 
 // Kind enumerates the type constructors.
 type Kind uint8
@@ -342,12 +346,7 @@ func (t *Type) NeedsDrop() bool {
 
 // CopyAttr reports whether an attribute list opts a type into `Copy`.
 func CopyAttr(attrs []string) bool {
-	for _, a := range attrs {
-		if a == "copy" {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(attrs, "copy")
 }
 
 // stDisplay renders a nominal type for diagnostics: `Base<Args...>` for an
@@ -359,14 +358,17 @@ func stDisplay(name, base string, args []*Type) string {
 	if base == "" {
 		base = name
 	}
-	s := base + "<"
+	var sb strings.Builder
+	sb.WriteString(base)
+	sb.WriteString("<")
 	for i, a := range args {
 		if i > 0 {
-			s += ", "
+			sb.WriteString(", ")
 		}
-		s += a.String()
+		sb.WriteString(a.String())
 	}
-	return s + ">"
+	sb.WriteString(">")
+	return sb.String()
 }
 
 // String renders a type for diagnostics.
@@ -440,27 +442,31 @@ func (t *Type) String() string {
 	case Slice:
 		return "[" + t.Elem.String() + "]"
 	case Tuple:
-		s := "("
+		var sb strings.Builder
+		sb.WriteString("(")
 		for i, e := range t.Elems {
 			if i > 0 {
-				s += ", "
+				sb.WriteString(", ")
 			}
-			s += e.String()
+			sb.WriteString(e.String())
 		}
-		return s + ")"
+		sb.WriteString(")")
+		return sb.String()
 	case Fn:
-		s := "fn("
+		var sb strings.Builder
+		sb.WriteString("fn(")
 		for i, e := range t.Params {
 			if i > 0 {
-				s += ", "
+				sb.WriteString(", ")
 			}
-			s += e.String()
+			sb.WriteString(e.String())
 		}
-		s += ")"
+		sb.WriteString(")")
 		if t.Ret != nil && t.Ret.Kind != Unit {
-			s += " -> " + t.Ret.String()
+			sb.WriteString(" -> ")
+			sb.WriteString(t.Ret.String())
 		}
-		return s
+		return sb.String()
 	}
 	return "<type>"
 }

@@ -127,11 +127,12 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 			em.Report(diag.New("E9001", "code generation failed: %v", cerr))
 			return nil, false
 		}
-		if len(units) > 1 {
+		switch {
+		case len(units) > 1:
 			art.CHeader, art.CUnits = header, units
-		} else if len(units) == 1 {
+		case len(units) == 1:
 			art.CSrc = header + units[0]
-		} else {
+		default:
 			art.CSrc = header
 		}
 	} else {
@@ -177,10 +178,7 @@ func splitJobs(opts Options, fns int) int {
 		if fns < 64 {
 			return 1
 		}
-		n = runtime.NumCPU()
-		if n > 8 {
-			n = 8
-		}
+		n = min(runtime.NumCPU(), 8)
 	}
 	if n < 1 {
 		n = 1
@@ -256,13 +254,13 @@ func BuildFiles(paths []string, outPath string, opts Options, em *diag.Emitter) 
 				em.Report(diag.New("E9002", "%v", err))
 				return "", false
 			}
-			defer os.Remove(f.Name())
+			defer func() { _ = os.Remove(f.Name()) }()
 			if _, err := f.WriteString(extra); err != nil {
-				f.Close()
+				_ = f.Close()
 				em.Report(diag.New("E9002", "%v", err))
 				return "", false
 			}
-			f.Close()
+			_ = f.Close()
 			opts.CFiles = append(opts.CFiles, f.Name())
 		}
 	}
@@ -291,7 +289,7 @@ func CompileC(csrc, outPath string, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("creating temp dir: %w", err)
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	cfile := filepath.Join(dir, "out.c")
 	if err := os.WriteFile(cfile, []byte(csrc), 0o644); err != nil {
@@ -306,7 +304,7 @@ func CompileC(csrc, outPath string, opts Options) error {
 		cc = "cc"
 	}
 	if _, err := exec.LookPath(cc); err != nil {
-		return fmt.Errorf("C compiler %q not found; install gcc or clang, or set CC", cc)
+		return fmt.Errorf("c compiler %q not found; install gcc or clang, or set CC", cc)
 	}
 
 	args := []string{"-std=gnu11", optFlag(opts.OptLevel), "-fwrapv"}
@@ -338,7 +336,7 @@ func CompileC(csrc, outPath string, opts Options) error {
 	cmd := exec.Command(cc, args...)
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("C compiler (%s %s) failed: %w", cc, strings.Join(args, " "), err)
+		return fmt.Errorf("c compiler (%s %s) failed: %w", cc, strings.Join(args, " "), err)
 	}
 	return nil
 }
@@ -353,7 +351,7 @@ func CompileUnits(header string, units []string, outPath string, opts Options) e
 	if err != nil {
 		return fmt.Errorf("creating temp dir: %w", err)
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 
 	if err := os.WriteFile(filepath.Join(dir, "zexi_gen.h"), []byte(header), 0o644); err != nil {
 		return fmt.Errorf("writing generated header: %w", err)
@@ -367,7 +365,7 @@ func CompileUnits(header string, units []string, outPath string, opts Options) e
 		cc = "cc"
 	}
 	if _, err := exec.LookPath(cc); err != nil {
-		return fmt.Errorf("C compiler %q not found; install gcc or clang, or set CC", cc)
+		return fmt.Errorf("c compiler %q not found; install gcc or clang, or set CC", cc)
 	}
 
 	base := []string{"-std=gnu11", optFlag(opts.OptLevel), "-fwrapv", "-ffunction-sections", "-fdata-sections", "-I" + dir}
@@ -429,7 +427,7 @@ func CompileUnits(header string, units []string, outPath string, opts Options) e
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("linker (%s) failed: %v\n%s", cc, err, stderr.String())
+		return fmt.Errorf("linker (%s) failed: %w\n%s", cc, err, stderr.String())
 	}
 	return nil
 }

@@ -1,6 +1,7 @@
 package sema_test
 
 import (
+	"slices"
 	"testing"
 
 	"zexi/internal/diag"
@@ -33,12 +34,7 @@ func codesOf(ds []diag.Diagnostic) []string {
 }
 
 func has(codes []string, want string) bool {
-	for _, c := range codes {
-		if c == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(codes, want)
 }
 
 func TestUseAfterMove(t *testing.T) {

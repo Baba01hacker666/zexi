@@ -11,10 +11,14 @@ import "reflect"
 // are covered automatically without a hand-written copier.
 func Clone[T any](v T) T {
 	out := deepCopy(reflect.ValueOf(v))
-	if !out.IsValid() {
+	if !out.IsValid() || !out.CanInterface() {
 		return v
 	}
-	return out.Interface().(T)
+	clone, ok := out.Interface().(T)
+	if !ok {
+		return v
+	}
+	return clone
 }
 
 func deepCopy(v reflect.Value) reflect.Value {
@@ -42,7 +46,7 @@ func deepCopy(v reflect.Value) reflect.Value {
 			return v
 		}
 		n := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
-		for i := 0; i < v.Len(); i++ {
+		for i := range v.Len() {
 			n.Index(i).Set(deepCopy(v.Index(i)))
 		}
 		return n
@@ -58,7 +62,7 @@ func deepCopy(v reflect.Value) reflect.Value {
 		return n
 	case reflect.Struct:
 		n := reflect.New(v.Type()).Elem()
-		for i := 0; i < v.NumField(); i++ {
+		for i := range v.NumField() {
 			if n.Field(i).CanSet() {
 				n.Field(i).Set(deepCopy(v.Field(i)))
 			}
@@ -66,7 +70,7 @@ func deepCopy(v reflect.Value) reflect.Value {
 		return n
 	case reflect.Array:
 		n := reflect.New(v.Type()).Elem()
-		for i := 0; i < v.Len(); i++ {
+		for i := range v.Len() {
 			n.Index(i).Set(deepCopy(v.Index(i)))
 		}
 		return n

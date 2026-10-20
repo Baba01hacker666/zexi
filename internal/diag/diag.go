@@ -161,27 +161,27 @@ func (e *Emitter) Render(w io.Writer, fileID int) {
 func (e *Emitter) renderOne(w io.Writer, d Diagnostic, fileID int) {
 	head := d.Severity.String()
 	if d.Code != "" {
-		fmt.Fprintf(w, "%s[%s]: %s\n", head, d.Code, d.Message)
+		_, _ = fmt.Fprintf(w, "%s[%s]: %s\n", head, d.Code, d.Message)
 	} else {
-		fmt.Fprintf(w, "%s: %s\n", head, d.Message)
+		_, _ = fmt.Fprintf(w, "%s: %s\n", head, d.Message)
 	}
 
 	file := e.files[fileID]
 	line, col, text, caret := locate(file, d.Span)
 	if text != "" {
-		fmt.Fprintf(w, "  --> %s:%d:%d\n", file.Name, line, col)
-		fmt.Fprintf(w, "   |\n")
-		fmt.Fprintf(w, "%2d | %s\n", line, text)
-		fmt.Fprintf(w, "   | %s%s\n", strings.Repeat(" ", col-1), caret)
+		_, _ = fmt.Fprintf(w, "  --> %s:%d:%d\n", file.Name, line, col)
+		_, _ = fmt.Fprintf(w, "   |\n")
+		_, _ = fmt.Fprintf(w, "%2d | %s\n", line, text)
+		_, _ = fmt.Fprintf(w, "   | %s%s\n", strings.Repeat(" ", col-1), caret)
 	}
 
 	for _, n := range d.Notes {
-		fmt.Fprintf(w, "   = note: %s\n", n)
+		_, _ = fmt.Fprintf(w, "   = note: %s\n", n)
 	}
 	if d.Help != "" {
-		fmt.Fprintf(w, "   = help: %s\n", d.Help)
+		_, _ = fmt.Fprintf(w, "   = help: %s\n", d.Help)
 	}
-	fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w)
 }
 
 // locate converts a span into a 1-based line/col plus the source line text and
@@ -190,13 +190,10 @@ func locate(f File, s token.Span) (line, col int, text, caret string) {
 	if len(f.Src) == 0 || s.Start < 0 {
 		return 0, 0, "", ""
 	}
-	start := int(s.Start)
-	if start > len(f.Src) {
-		start = len(f.Src)
-	}
+	start := min(int(s.Start), len(f.Src))
 	line, col = 1, 1
 	lineStart := 0
-	for i := 0; i < start; i++ {
+	for i := range start {
 		if f.Src[i] == '\n' {
 			line++
 			lineStart = i + 1
@@ -211,10 +208,7 @@ func locate(f File, s token.Span) (line, col int, text, caret string) {
 	}
 	text = string(f.Src[lineStart:lineEnd])
 
-	n := int(s.End) - int(s.Start)
-	if n < 1 {
-		n = 1
-	}
+	n := max(int(s.End)-int(s.Start), 1)
 	// Do not run the caret past the end of the line (spans may cover a whole
 	// file), and cap absurdly long runs so output stays readable.
 	if avail := lineEnd - (lineStart + col - 1); avail > 0 && n > avail {

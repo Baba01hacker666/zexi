@@ -235,14 +235,15 @@ func translateParam(raw string, idx int) (string, string, bool) {
 	if isArray {
 		// `T name[N]` arrives in Zexi as a pointer to the element type.
 		// A char array is a byte buffer, matching `char *` -> `*mut u8`.
-		if ty == "i8" {
+		switch {
+		case ty == "i8":
 			ty = "*mut u8"
-		} else if strings.HasPrefix(ty, "*") {
+		case strings.HasPrefix(ty, "*"):
 			// `T *name[N]` is a pointer-to-pointer (`char *items[4]` is
 			// `char **`). Zexi has no `**T`, so skip rather than bind
 			// the wrong ABI.
 			return "", "", false
-		} else if ty != "str" {
+		case ty != "str":
 			ty = "*mut " + ty
 		}
 	}

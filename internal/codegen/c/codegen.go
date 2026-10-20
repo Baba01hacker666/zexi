@@ -107,7 +107,7 @@ type writer struct {
 }
 
 func (w *writer) line(format string, a ...any) {
-	for i := 0; i < w.indent; i++ {
+	for range w.indent {
 		w.b.WriteString("    ")
 	}
 	fmt.Fprintf(&w.b, format, a...)
@@ -288,11 +288,11 @@ func walkExprs(root any, fn func(ast.Expr)) {
 			}
 			walk(v.Elem())
 		case reflect.Struct:
-			for i := 0; i < v.NumField(); i++ {
+			for i := range v.NumField() {
 				walk(v.Field(i))
 			}
 		case reflect.Slice, reflect.Array:
-			for i := 0; i < v.Len(); i++ {
+			for i := range v.Len() {
 				walk(v.Index(i))
 			}
 		}
@@ -857,7 +857,7 @@ func (g *gen) prototypes() {
 // fnSignature renders a C function declarator without a body, e.g.
 // `int32_t zx_add(int32_t a, int32_t b)`.
 func fnSignature(fn *sema.Fn) string {
-	var params []string
+	params := make([]string, 0, len(fn.Decl.Params))
 	for i, p := range fn.Decl.Params {
 		pt := types.UnitT
 		if i < len(fn.Params) {
@@ -884,7 +884,7 @@ func (g *gen) funcDef(fn *sema.Fn) {
 	g.counts = map[string]int{}
 	g.pushScope()
 	g.openDropFrame() // function frame: parameters
-	var params []string
+	params := make([]string, 0, len(fn.Decl.Params))
 	for i, p := range fn.Decl.Params {
 		pt := types.UnitT
 		if i < len(fn.Params) {
@@ -1147,12 +1147,9 @@ func (g *gen) forStmt(x *ast.LoopExpr) string {
 	g.w.line("%s %s = %s;", ctype(lt), lo, g.value(rng.L))
 	g.w.line("%s %s = %s;", ctype(lt), hi, g.value(rng.R))
 	g.pushScope()
-	name := ""
-	switch p := x.Pat.(type) {
-	case *ast.BindPat:
+	name := g.fresh("i")
+	if p, ok := x.Pat.(*ast.BindPat); ok {
 		name = g.bind(p.Name)
-	default:
-		name = g.fresh("i")
 	}
 	g.w.line("for (%s %s = %s; %s %s %s; %s++) {", ctype(lt), name, lo, name, op, hi, name)
 	g.w.indent++
@@ -1178,12 +1175,9 @@ func (g *gen) forArray(x *ast.LoopExpr) string {
 	arr := g.tmpName()
 	g.w.line("%s %s = %s;", ctype(it), arr, g.value(x.Iter))
 	g.pushScope()
-	name := ""
-	switch p := x.Pat.(type) {
-	case *ast.BindPat:
+	name := g.fresh("x")
+	if p, ok := x.Pat.(*ast.BindPat); ok {
 		name = g.bind(p.Name)
-	default:
-		name = g.fresh("x")
 	}
 	g.w.line("for (size_t zx_i = 0; zx_i < %d; zx_i++) {", it.Len)
 	g.w.indent++
@@ -1553,11 +1547,11 @@ func (g *gen) ifValue(x *ast.IfExpr) string {
 	sub.line("%s %s;", ctype(t), tmp)
 	sub.line("if (%s) {", g.value(x.Cond))
 	sub.indent++
-	sub.line("%s = %s;", tmp, g.branchValue(x.Then, t))
+	sub.line("%s = %s;", tmp, g.branchValue(x.Then))
 	sub.indent--
-	elseV := ""
+	var elseV string
 	if blk, ok := x.Else.(*ast.Block); ok {
-		elseV = g.branchValue(blk, t)
+		elseV = g.branchValue(blk)
 	} else {
 		elseV = g.value(x.Else)
 	}
@@ -1572,7 +1566,7 @@ func (g *gen) ifValue(x *ast.IfExpr) string {
 
 // branchValue emits a block's value: statements followed by the tail as a
 // value, wrapped as a statement expression.
-func (g *gen) branchValue(b *ast.Block, t *types.Type) string {
+func (g *gen) branchValue(b *ast.Block) string {
 	if len(b.Stmts) == 0 && b.Tail != nil {
 		// Consume, like blockValue does: a resource-owning place used as
 		// a branch value must move, or both the place and the branch
@@ -1841,11 +1835,12 @@ func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
 		if m.Self != nil {
 			isPtr := rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr)
 			if m.Self.ByRef {
-				if isPtr {
+				switch {
+				case isPtr:
 					args = append(args, g.value(x.Recv))
-				} else if isPlaceExpr(x.Recv) {
+				case isPlaceExpr(x.Recv):
 					args = append(args, "(&"+g.value(x.Recv)+")")
-				} else {
+				default:
 					// A temporary receiver: bind it to a local so its address
 					// can be taken.
 					args = append(args, "(&"+g.materialize(x.Recv)+")")
@@ -1893,10 +1888,12 @@ func (g *gen) stringMethodCall(x *ast.MethodCallExpr) string {
 		}
 		specs = append(specs, g.value(a))
 	}
-	rest := ""
+	var restB strings.Builder
 	for _, s := range specs {
-		rest += ", " + s
+		restB.WriteString(", ")
+		restB.WriteString(s)
 	}
+	rest := restB.String()
 
 	rt := g.info.TypeOf(x)
 	recv := g.info.TypeOf(x.Recv)
@@ -2741,7 +2738,7 @@ func safeIdent(name string) string {
 	// not an identifier character. This keeps distinct Zexi names distinct in C
 	// (e.g. `int` -> `z_int`, `int_` -> `int_5f`).
 	var b strings.Builder
-	for i := 0; i < len(name); i++ {
+	for i := range len(name) {
 		ch := name[i]
 		switch {
 		case ch == '_':
@@ -3133,7 +3130,7 @@ func constLiteral(v sema.ConstVal, t *types.Type) string {
 func cString(s string) string {
 	var b strings.Builder
 	b.WriteByte('"')
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		switch c {
 		case '\\':
