@@ -1,0 +1,94 @@
+// tests/vec.zx
+// Coverage for the builtin growable array `Vec<T>`: construction, growth,
+// indexing, removal, iteration, and the destructor for owned elements.
+
+fn unwrap(o: Option<i64>) -> i64 {
+    match o {
+        Some(v) => v,
+        None => -1,
+    }
+}
+
+fn total(v: Vec<i64>) -> i64 {
+    let mut sum: i64 = 0;
+    let mut i: i64 = 0;
+    while i < (v.len() as i64) {
+        sum += v[i];
+        i += 1;
+    }
+    return sum;
+}
+
+fn main() -> i32 {
+    // Construction and growth.
+    let mut v: Vec<i64> = Vec::new();
+    println(v.len(), v.is_empty(), v.capacity());
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    println(v.len(), v.is_empty());
+    println(v.capacity() >= 3);
+
+    // Indexing reads and writes, bounds checked at run time.
+    println(v[0], v[1], v[2]);
+    v[1] = 99;
+    println(v[1], len(v));
+
+    // Iteration over `Copy` elements.
+    for x in v {
+        println(x);
+    }
+
+    // Removal: pop yields Option<T>, remove shifts, swap_remove does not.
+    println(unwrap(v.pop()), v.len());
+    println(v.remove(0), v.len());
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    println(v.swap_remove(0), v[0], v[1], v.len());
+
+    // Insert, truncate, reserve, clear.
+    v.insert(0, 100);
+    println(v[0], v.len());
+    v.truncate(2);
+    println(v.len());
+    v.reserve(1000);
+    println(v.capacity() >= 1000);
+    v.clear();
+    println(v.len(), v.is_empty());
+
+    // Passing a Vec and reading it through a parameter.
+    let mut w: Vec<i64> = Vec::new();
+    w.push(1);
+    w.push(2);
+    w.push(3);
+    let mut dup = w.clone();
+    println(total(w));
+    println(dup.len(), dup[2]);
+    dup.push(4);
+    println(dup.len());
+
+    // Owned elements are dropped exactly once, including through remove.
+    let mut names: Vec<String> = Vec::new();
+    names.push(String::from("alpha"));
+    names.push(String::from("beta"));
+    names.push(String::from("gamma"));
+    println(names.len(), names[0], names[2]);
+    let last = match names.pop() {
+        Some(s) => s,
+        None => String::from("<none>"),
+    };
+    println(last, names.len());
+    let first = names.remove(0);
+    println(first, names.len());
+
+    // A Vec inside a struct, and a Vec of Vecs.
+    let mut grid: Vec<Vec<i64>> = Vec::new();
+    let mut row: Vec<i64> = Vec::new();
+    row.push(7);
+    row.push(8);
+    grid.push(row);
+    println(grid.len(), grid[0].len(), grid[0][1]);
+
+    0
+}

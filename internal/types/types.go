@@ -45,6 +45,7 @@ const (
 	StructKind // nominal product type
 	EnumKind   // nominal tagged union
 	StringKind // builtin owning heap string
+	VecKind    // builtin growable owning array, Vec<T>
 	ParamKind  // a generic type parameter (only while checking a template)
 )
 
@@ -177,6 +178,23 @@ var Builtins = map[string]*Type{
 	"String": StringT,
 }
 
+// ReservedTypeNames are the predeclared generic types. Like the primitive
+// builtins they occupy the type namespace and cannot be redefined.
+var ReservedTypeNames = map[string]bool{
+	"Vec":    true,
+	"Option": true,
+	"Result": true,
+}
+
+// IsBuiltinTypeName reports whether a name is taken by a predeclared type, so
+// a `struct`, `enum`, or `type` may not claim it.
+func IsBuiltinTypeName(name string) bool {
+	if _, ok := Builtins[name]; ok {
+		return true
+	}
+	return ReservedTypeNames[name]
+}
+
 // PtrTo returns *T.
 func PtrTo(elem *Type) *Type { return &Type{Kind: Ptr, Elem: elem} }
 
@@ -281,6 +299,9 @@ func (t *Type) IsCopy() bool {
 		return true
 	case Array:
 		return t.Elem.IsCopy()
+	case VecKind:
+		// A Vec owns a heap buffer; copying the handle would double-free it.
+		return false
 	case Tuple:
 		for _, e := range t.Elems {
 			if !e.IsCopy() {
@@ -332,6 +353,9 @@ func (t *Type) NeedsDrop() bool {
 				}
 			}
 		}
+	case VecKind:
+		// Always: the buffer itself is heap-allocated, whatever it holds.
+		return true
 	case Array:
 		return t.Elem.NeedsDrop()
 	case Tuple:
@@ -342,6 +366,55 @@ func (t *Type) NeedsDrop() bool {
 		}
 	}
 	return false
+}
+
+// AttrName is the identifier part of an attribute: `repr` for `repr(C)`.
+func AttrName(attr string) string {
+	name, _, _ := strings.Cut(attr, "(")
+	return name
+}
+
+// AttrArg is the parenthesized part of an attribute: `C` for `repr(C)`,
+// `never` for `inline(never)`, and "" when there is none.
+func AttrArg(attr string) string {
+	i := strings.IndexByte(attr, '(')
+	if i < 0 || !strings.HasSuffix(attr, ")") {
+		return ""
+	}
+	return attr[i+1 : len(attr)-1]
+}
+
+// HasAttr reports whether an attribute list contains the named attribute,
+// whatever its argument.
+func HasAttr(attrs []string, name string) bool {
+	for _, a := range attrs {
+		if AttrName(a) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// AttrValue returns the argument of the named attribute, and whether it was
+// present.
+func AttrValue(attrs []string, name string) (string, bool) {
+	for _, a := range attrs {
+		if AttrName(a) == name {
+			return AttrArg(a), true
+		}
+	}
+	return "", false
+}
+
+// KnownAttrs are the attributes the compiler understands. Anything else is a
+// diagnostic, so a typo like `#[Copy]` cannot silently do nothing.
+var KnownAttrs = map[string]bool{
+	"copy":      true, // opt a struct or enum into copy semantics
+	"repr":      true, // `repr(C)`: C layout, which is already the default
+	"inline":    true, // hint (or `inline(never)`) to the C compiler
+	"no_mangle": true, // keep the Zexi name as the C symbol, with external linkage
+	"export":    true, // alias for `no_mangle`, for the C bridge
+	"allow":     true, // accepted and ignored, so lints can be named locally
 }
 
 // CopyAttr reports whether an attribute list opts a type into `Copy`.
@@ -394,6 +467,8 @@ func (t *Type) String() string {
 		return "str"
 	case StringKind:
 		return "String"
+	case VecKind:
+		return "Vec<" + t.Elem.String() + ">"
 	case Never:
 		return "never"
 	case StructKind:

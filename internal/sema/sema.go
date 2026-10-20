@@ -41,6 +41,12 @@ type Fn struct {
 	Recv       *types.Type // receiver type for methods (struct or enum), else nil
 	Extern     bool
 	ABI        string
+	// Inline records `#[inline]`; InlineNever records `#[inline(never)]`.
+	Inline      bool
+	InlineNever bool
+	// NoMangle keeps the Zexi name as the C symbol and gives it external
+	// linkage, so C code can call it (`#[no_mangle]` or `#[export]`).
+	NoMangle bool
 }
 
 // SelfParam describes a method receiver.
@@ -367,7 +373,7 @@ func (c *checker) registerAlias(d *ast.TypeAlias) {
 		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
 		return
 	}
-	if _, dup := types.Builtins[d.Name]; dup {
+	if types.IsBuiltinTypeName(d.Name) {
 		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
 		return
 	}
@@ -480,7 +486,12 @@ func (c *checker) registerEnum(d *ast.EnumDecl) {
 		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
 		return
 	}
+	if types.IsBuiltinTypeName(d.Name) && d.Name != "Option" && d.Name != "Result" {
+		c.errf(d.Sp, "E0428", "the name `%s` is reserved for the predeclared type", d.Name)
+		return
+	}
 	names := c.checkGenerics(d.Generics)
+	c.checkTypeAttrs(d.Attrs, d.Sp, "enum", d.Name)
 	en := &types.Enum{Name: d.Name, Base: d.Name, Generics: names, Generic: len(names) > 0, Copy: types.CopyAttr(d.Attrs)}
 	c.info.Enums[d.Name] = en
 	c.enumDecls[d.Name] = d
@@ -562,9 +573,33 @@ func (c *checker) addPreludeEnum(name string, params []string, variants []prelud
 	c.enumDecls[name] = d
 }
 
+// checkTypeAttrs validates the attributes on a struct or enum. `#[copy]` opts
+// into copy semantics and `#[repr(C)]` names the layout the backend already
+// uses; anything else is a typo the user should hear about.
+func (c *checker) checkTypeAttrs(attrs []string, sp token.Span, what, name string) {
+	for _, a := range attrs {
+		nm := types.AttrName(a)
+		switch nm {
+		case "copy", "allow":
+		case "repr":
+			if arg := types.AttrArg(a); arg != "" && arg != "C" && arg != "c" {
+				c.errf(sp, "E0539", "`#[repr(%s)]` is not supported; the only layout is `#[repr(C)]`, which is already the default", arg)
+			}
+		default:
+			if !types.KnownAttrs[nm] {
+				c.errf(sp, "E0539", "unknown attribute `#[%s]` on %s `%s`", nm, what, name)
+			}
+		}
+	}
+}
+
 func (c *checker) registerStruct(d *ast.StructDecl) {
 	if _, dup := c.info.Structs[d.Name]; dup {
 		c.errf(d.Sp, "E0428", "the struct `%s` is defined multiple times", d.Name)
+		return
+	}
+	if types.IsBuiltinTypeName(d.Name) {
+		c.errf(d.Sp, "E0428", "the name `%s` is reserved for the predeclared type", d.Name)
 		return
 	}
 	if _, dup := c.aliasDecls[d.Name]; dup {
@@ -572,6 +607,7 @@ func (c *checker) registerStruct(d *ast.StructDecl) {
 		return
 	}
 	names := c.checkGenerics(d.Generics)
+	c.checkTypeAttrs(d.Attrs, d.Sp, "struct", d.Name)
 	st := &types.Struct{Name: d.Name, Base: d.Name, Generics: names, Generic: len(names) > 0, Tuple: d.Tuple, Copy: types.CopyAttr(d.Attrs)}
 	c.info.Structs[d.Name] = st
 	c.structDecls[d.Name] = d
@@ -864,8 +900,41 @@ func (c *checker) makeFn(d *ast.FnDecl, recv *types.Type) *Fn {
 	return fn
 }
 
+// applyFnAttrs reads a function's `#[...]` attributes, recording the ones the
+// backend acts on and rejecting the ones the compiler does not know, so a typo
+// cannot silently do nothing.
+func (c *checker) applyFnAttrs(fn *Fn, d *ast.FnDecl) {
+	for _, a := range d.Attrs {
+		switch types.AttrName(a) {
+		case "inline":
+			if types.AttrArg(a) == "never" {
+				fn.InlineNever = true
+			} else {
+				fn.Inline = true
+			}
+		case "no_mangle", "export":
+			if recv := fn.Recv; recv != nil {
+				c.errf(d.Sp, "E0599", "`#[%s]` is not allowed on a method; put it on a plain function", types.AttrName(a))
+				continue
+			}
+			if len(d.Generics) > 0 {
+				c.errf(d.Sp, "E0599", "`#[%s]` is not allowed on a generic function; C needs one concrete symbol", types.AttrName(a))
+				continue
+			}
+			fn.NoMangle = true
+		case "allow":
+			// Accepted and ignored.
+		default:
+			if !types.KnownAttrs[types.AttrName(a)] {
+				c.errf(d.Sp, "E0539", "unknown attribute `#[%s]`", types.AttrName(a))
+			}
+		}
+	}
+}
+
 func (c *checker) makeFnInner(d *ast.FnDecl, recv *types.Type) *Fn {
 	fn := &Fn{Decl: d, Name: d.Name, Recv: recv}
+	c.applyFnAttrs(fn, d)
 	if recv != nil {
 		fn.QualName = nominalName(recv) + "::" + d.Name
 	} else {
@@ -1133,7 +1202,7 @@ func (c *checker) checkStmt(s ast.Stmt) {
 			c.errf(st.Val.Span(), "E0308", "mismatched types: expected `%s`, found `%s`", declared, initT)
 		}
 		c.info.DeclTypes[st] = ty
-		c.bindPattern(st.Pat, ty, true)
+		c.bindPattern(st.Pat, ty)
 		if bp, ok := st.Pat.(*ast.BindPat); ok {
 			c.markMut(bp.Name, st.Mut)
 		}
@@ -1240,10 +1309,10 @@ func exprHasJump(e ast.Expr) bool {
 	return false
 }
 
-func (c *checker) bindPattern(p ast.Pattern, ty *types.Type, let bool) {
+func (c *checker) bindPattern(p ast.Pattern, ty *types.Type) {
 	switch pt := p.(type) {
 	case *ast.BindPat:
-		if let && pt.Name == "" {
+		if pt.Name == "" {
 			return
 		}
 		if pt.Name != "_" {
@@ -1691,6 +1760,15 @@ func isScalarText(t *types.Type) bool {
 	return t.Kind.IsNumeric() || t.Kind == types.Bool || t.Kind == types.Char
 }
 
+// isComparison reports whether op is one of the six comparison operators.
+func isComparison(op token.Kind) bool {
+	switch op {
+	case token.KindEqEq, token.KindBangEq, token.KindLt, token.KindLe, token.KindGt, token.KindGe:
+		return true
+	}
+	return false
+}
+
 func (c *checker) inferBinary(x *ast.BinExpr) *types.Type {
 	if x.Op == token.KindDotDot || x.Op == token.KindDotDotEq {
 		lt := c.checkExpr(x.L, nil)
@@ -1714,8 +1792,10 @@ func (c *checker) inferBinary(x *ast.BinExpr) *types.Type {
 			return types.StringT
 		}
 	}
-	// `==` / `!=` compare the bytes of any two string-like operands.
-	if (x.Op == token.KindEqEq || x.Op == token.KindBangEq) && isStrLike(lt) && isStrLike(rt) {
+	// Comparison over any two string-like operands compares bytes, so `"a" < b`
+	// works for every mix of `str` and `String`. Ordering follows byte value,
+	// the same order Rust's Ord gives str.
+	if isComparison(x.Op) && isStrLike(lt) && isStrLike(rt) {
 		return types.BoolT
 	}
 	// Integer literals adopt the type of the other operand.
@@ -1818,6 +1898,9 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 	if p, ok := x.Callee.(*ast.PathExpr); ok && len(p.Segments) == 2 {
 		if p.Segments[0] == "String" {
 			return c.inferStringCtor(x, p.Segments[1])
+		}
+		if p.Segments[0] == "Vec" {
+			return c.inferVecCtor(x, p, p.Segments[1], expected)
 		}
 		// `Type::name(args)` may also name an associated function: one declared
 		// in an `impl` block without a `self` parameter.
@@ -2795,18 +2878,26 @@ func (c *checker) inferLen(x *ast.CallExpr) *types.Type {
 		return types.UsizeT
 	}
 	t := c.checkExpr(x.Args[0], nil)
-	if t != nil && (t.Kind == types.Array || t.Kind == types.Str || t.Kind == types.Slice || t.Kind == types.StringKind) {
+	if base := recvBase(t); base != nil && base.Kind == types.VecKind {
 		return types.UsizeT
 	}
-	c.errAt(x.Args[0], "E0308", "`len` expects an array, slice, `str`, or `String`, found `%s`", t)
+	if t != nil && (t.Kind == types.Array || t.Kind == types.Str || t.Kind == types.Slice ||
+		t.Kind == types.StringKind || t.Kind == types.VecKind) {
+		return types.UsizeT
+	}
+	c.errAt(x.Args[0], "E0308", "`len` expects an array, slice, `str`, `String`, or `Vec`, found `%s`", t)
 	return types.UsizeT
 }
 
-// inferIndex checks `xs[i]` for arrays and slices.
+// inferIndex checks `xs[i]` for arrays, slices, and Vecs, including a Vec
+// reached through a borrow (`&Vec<T>`).
 func (c *checker) inferIndex(x *ast.IndexExpr) *types.Type {
 	rt := c.checkExpr(x.Recv, nil)
 	it := c.checkExpr(x.Index, nil)
-	if rt == nil || (rt.Kind != types.Array && rt.Kind != types.Slice) {
+	if base := recvBase(rt); base != nil && base.Kind == types.VecKind {
+		rt = base
+	}
+	if rt == nil || (rt.Kind != types.Array && rt.Kind != types.Slice && rt.Kind != types.VecKind) {
 		c.errAt(x, "E0608", "cannot index a value of type `%s`", rt)
 		return nil
 	}
@@ -3668,6 +3759,9 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 	if base != nil && base.Kind == types.StringKind {
 		return c.inferStringMethod(x)
 	}
+	if base != nil && base.Kind == types.VecKind {
+		return c.inferVecMethod(x, base)
+	}
 	// `len()` is also available directly on arrays and `str` values.
 	if x.Name == "len" && len(x.Args) == 0 && base != nil && (base.Kind == types.Array || base.Kind == types.Str) {
 		return types.UsizeT
@@ -4041,14 +4135,28 @@ func (c *checker) inferFor(x *ast.LoopExpr) *types.Type {
 				c.errAt(x.Iter, "E0507", "cannot iterate an array of non-`Copy` element type `%s` by value", it.Elem)
 			}
 			c.pushScope()
-			c.bindPattern(x.Pat, it.Elem, true)
+			c.bindPattern(x.Pat, it.Elem)
 			c.loopDepth++
 			c.checkBlock(x.Body)
 			c.loopDepth--
 			c.popScope()
 			return types.UnitT
 		}
-		c.errAt(x.Iter, "E0900", "`for` iterates an integer range (`a..b`) or an array (roadmap M0)")
+		if base := recvBase(it); base != nil && base.Kind == types.VecKind {
+			// As with arrays, elements must be `Copy`: the binding is a copy
+			// of each element, and an owned element would be dropped twice.
+			if !base.Elem.IsCopy() {
+				c.errAt(x.Iter, "E0507", "cannot iterate a `Vec` of non-`Copy` element type `%s` by value", base.Elem)
+			}
+			c.pushScope()
+			c.bindPattern(x.Pat, base.Elem)
+			c.loopDepth++
+			c.checkBlock(x.Body)
+			c.loopDepth--
+			c.popScope()
+			return types.UnitT
+		}
+		c.errAt(x.Iter, "E0900", "`for` iterates an integer range (`a..b`), an array, or a `Vec`")
 		c.loopDepth++
 		c.checkBlock(x.Body)
 		c.loopDepth--
@@ -4061,7 +4169,7 @@ func (c *checker) inferFor(x *ast.LoopExpr) *types.Type {
 		lt = types.I32T
 	}
 	c.pushScope()
-	c.bindPattern(x.Pat, lt, true)
+	c.bindPattern(x.Pat, lt)
 	c.loopDepth++
 	c.checkBlock(x.Body)
 	c.loopDepth--
@@ -4183,6 +4291,9 @@ func (c *checker) resolveType(t ast.Type) *types.Type {
 			return nil
 		}
 		name := x.Segments[0]
+		if name == "Vec" {
+			return c.resolveVecType(x.Sp, x.Args)
+		}
 		if len(x.Args) > 0 {
 			args := make([]*types.Type, len(x.Args))
 			for i, a := range x.Args {

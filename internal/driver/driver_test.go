@@ -56,6 +56,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/encoding.zx",
 		"../../tests/generics.zx",
 		"../../tests/option_result.zx",
+		"../../tests/vec.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -120,11 +121,22 @@ func TestRunPrograms(t *testing.T) {
 			}, "\n"),
 		},
 		{
+			file: "../../tests/vec.zx",
+			want: strings.Join([]string{
+				"0 true 0", "3 false", "true", "10 20 30", "99 3",
+				"10", "99", "30", "30 2", "10 1", "99 3 1 3", "100 4",
+				"2", "true", "0 true", "6", "3 3", "4",
+				"3 alpha gamma", "gamma 2", "alpha 1", "1 2 8", "",
+			}, "\n"),
+		},
+		{
 			file: "../../tests/strings.zx",
 			want: strings.Join([]string{
 				"4", "false", "zexi lang!", "zexi lang!", "Ada", "36",
 				"Hello, world!", "zexi lang!!!", "zexi lang!", "alpha!", "beta",
-				"second", "",
+				"second",
+				"true", "false", "true", "true", "true",
+				"true", "true", "true", "true", "",
 			}, "\n"),
 		},
 		{
@@ -2089,5 +2101,141 @@ fn main() -> i32 {
 	}
 	if want := "true true true\nfalse fallback\n0\nset\n0\nfalse\n0 0\n0\ntrue\n5\n0\ntrue\n0\nfalse\n"; string(raw) != want {
 		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
+	}
+}
+
+// TestExportedAttributes checks the M1 attribute surface: `#[export]` and
+// `#[no_mangle]` give a function its plain Zexi name with external linkage so
+// C code can call it, and such a function is emitted even when nothing in Zexi
+// calls it. `#[inline]` and `#[inline(never)]` are passed through to the C
+// compiler, and `#[repr(C)]` names the layout the backend already uses.
+func TestExportedAttributes(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	glue := `#include <stdio.h>
+#include <stdint.h>
+int64_t zexi_add(int64_t a, int64_t b);
+int64_t public_name(int64_t n);
+void run_c(void) {
+    printf("c sees add=%lld public=%lld\n",
+           (long long)zexi_add(20, 22), (long long)public_name(3));
+}
+`
+	main := `#[export]
+fn zexi_add(a: i64, b: i64) -> i64 { return a + b; }
+
+#[no_mangle]
+fn public_name(n: i64) -> i64 { return n * 2; }
+
+#[inline]
+fn fast(x: i64) -> i64 { return x + 1; }
+
+#[inline(never)]
+fn slow(x: i64) -> i64 { return x - 1; }
+
+#[repr(C)]
+#[copy]
+struct Pair { x: i32, y: i32 }
+
+extern "C" fn run_c();
+
+fn main() -> i32 {
+    println(fast(1), slow(1));
+    let p = Pair { x: 1, y: 2 };
+    let q = p;
+    println(p.x, q.y);
+    run_c();
+    0
+}
+`
+	gluePath := filepath.Join(dir, "glue.c")
+	mainPath := filepath.Join(dir, "main.zx")
+	if err := os.WriteFile(gluePath, []byte(glue), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mainPath, []byte(main), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, out, driver.Options{CFiles: []string{gluePath}}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("attribute bridge build failed")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running attribute program: %v", err)
+	}
+	want := "2 0\n1 2\nc sees add=42 public=6\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestUnknownAttributeIsRejected checks that a misspelled attribute is a
+// diagnostic rather than a silent no-op.
+func TestUnknownAttributeIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad.zx")
+	src := `#[Copy]
+struct S { x: i32 }
+
+#[bogus]
+fn f() -> i32 { 0 }
+
+fn main() -> i32 { 0 }
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	em := diag.NewEmitter()
+	if _, ok := driver.FrontEnd(path, driver.Options{}, em); ok {
+		t.Fatal("expected the unknown attributes to be rejected")
+	}
+	var buf strings.Builder
+	em.Render(&buf, em.FirstFileID())
+	got := buf.String()
+	for _, want := range []string{"E0539", "#[Copy]", "#[bogus]"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("diagnostics missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestBuiltinTypeNamesAreReserved checks that a user declaration cannot claim
+// a predeclared type name. `struct String` used to reach the C backend and
+// fail there with a raw "conflicting types for 'zx_String'" error, and
+// `struct i32` silently shadowed the primitive.
+func TestBuiltinTypeNamesAreReserved(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"struct String", "struct String { x: i32 }\nfn main() -> i32 { 0 }\n"},
+		{"struct Vec", "struct Vec { x: i32 }\nfn main() -> i32 { 0 }\n"},
+		{"enum String", "enum String { A, B }\nfn main() -> i32 { 0 }\n"},
+		{"struct i32", "struct i32 { x: i64 }\nfn main() -> i32 { 0 }\n"},
+		{"struct str", "struct str { x: i64 }\nfn main() -> i32 { 0 }\n"},
+		{"alias Option", "type Option = i64;\nfn main() -> i32 { 0 }\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "bad.zx")
+			if err := os.WriteFile(path, []byte(tc.src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			em := diag.NewEmitter()
+			if _, ok := driver.FrontEnd(path, driver.Options{}, em); ok {
+				t.Fatalf("%s should have been rejected", tc.name)
+			}
+			var buf strings.Builder
+			em.Render(&buf, em.FirstFileID())
+			if !strings.Contains(buf.String(), "E0428") {
+				t.Fatalf("%s: expected E0428, got:\n%s", tc.name, buf.String())
+			}
+		})
 	}
 }

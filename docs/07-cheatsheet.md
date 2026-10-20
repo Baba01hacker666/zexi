@@ -31,6 +31,9 @@ struct Pair(i32, i32);           // tuple struct: `Pair(3, 4)`, fields `.0`/`.1`
 #[copy]                          // opt into copy semantics
 struct Vec2 { x: f64, y: f64 }
 
+#[repr(C)]                       // C layout — accepted, and already the default
+struct Handle { fd: i32 }
+
 enum Shape { Circle(f64), Rect(f64, f64), Point }
 
 impl Point {
@@ -40,6 +43,57 @@ impl Point {
     fn new(x: f64, y: f64) -> Point { Point { x, y } }
 }
 ```
+
+### Attributes
+
+```zx
+#[copy]                          // struct/enum: copy instead of move
+struct Vec2 { x: f64, y: f64 }
+
+#[repr(C)]                       // struct: C layout — accepted, already the default
+struct Handle { fd: i32 }
+
+#[export]                        // fn: keep the Zexi name, external linkage
+fn my_add(a: i64, b: i64) -> i64 { return a + b; }
+
+#[no_mangle]                     // same as `#[export]`
+fn also_visible(n: i64) -> i64 { return n; }
+
+#[inline]                        // fn: hint to the C compiler
+fn tiny(x: i64) -> i64 { return x + 1; }
+
+#[inline(never)]                 // fn: do not inline
+fn opaque(x: i64) -> i64 { return x; }
+```
+
+An attribute the compiler does not recognize is **E0539**, so a typo such as
+`#[Copy]` is reported instead of silently doing nothing. `#[repr(...)]` accepts
+only `C`.
+
+`#[export]` and `#[no_mangle]` are the C-bridge entry points: the function keeps
+its Zexi name as its C symbol with external linkage, and it is emitted even when
+nothing in Zexi calls it. Paired with `extern "C"` declarations for the other
+direction, C and Zexi can call each other both ways:
+
+```zx
+#[export]
+fn zexi_add(a: i64, b: i64) -> i64 { return a + b; }
+
+extern "C" fn run_c();           // defined in the .c file
+
+fn main() -> i32 { run_c(); 0 }
+```
+
+```c
+/* glue.c, built with `zexic build main.zx --csrc=glue.c` */
+#include <stdint.h>
+int64_t zexi_add(int64_t a, int64_t b);
+void run_c(void) { zexi_add(20, 22); }
+```
+
+In multi-unit builds (`--jobs=N`) `#[inline]` is dropped rather than emitted,
+because a bare C `inline` definition provides no external symbol for the other
+translation units to link against.
 
 ## 7.3 Types
 
@@ -264,10 +318,49 @@ function parameter, `push_str`, or `==`), so `.as_str()` is usually unnecessary.
 When a number, `bool`, or `char` is concatenated with `+` (or `+=`) it is
 formatted into text first, which removes the need for a manual `int_to_str`.
 
+All six comparison operators work on any mix of `str` and `String` and compare
+**bytes**, so `"Z" < "a"` is `true` — the same order Rust's `Ord` gives `str`.
+`len()` and the string operations are byte-based, not character-based.
+Appends (`push`, `push_byte`, `push_str`) grow the buffer geometrically, so
+building a string in a loop is amortized O(1) per byte, and `clear()` keeps the
+buffer for reuse.
+
 Values move by default; a moved-out value is a compile error if used again.
 Buffers are freed exactly once at scope exit (including on early `return` /
 `break` / `continue` and on reassignment) — no GC, no leaks. `#[copy]` types
 copy instead of moving.
+
+### `Vec<T>`: the growable array
+
+```zx
+let mut v: Vec<i64> = Vec::new();     // or Vec::with_capacity(100)
+v.push(10);
+v.push(20);
+v.insert(1, 15);                      // shift-insert at an index
+println(v.len(), v.is_empty());       // 3 false
+println(v[0], v[1], v[2]);            // 10 15 20
+
+let last: Option<i64> = v.pop();      // Some(20), or None when empty
+let mid: i64 = v.remove(0);           // shift-remove, returns the element
+v.swap_remove(0);                     // O(1) remove, order not preserved
+v.truncate(1);                        // drop everything past index 1
+v.reserve(64);                        // grow the capacity up front
+v.clear();
+```
+
+`Vec<T>` owns its buffer and is move-only, like `String`: elements are dropped
+when the `Vec` goes out of scope, is reassigned, or is truncated. Indexing is
+bounds-checked and panics rather than reading out of bounds.
+
+Two operations need a `Copy` element type, because there is no element-wise
+clone trait yet:
+
+- `clone` on a `Vec<String>` is E0277 — build a new `Vec` and push each element.
+- `for x in v` borrows the elements, so it needs `Copy` too; iterating a
+  `Vec<String>` is E0507. Index with `v[i]` instead.
+
+Nested (`Vec<Vec<i64>>`) and struct-holding (`Vec<Item>`) vectors work, and a
+struct may hold a `Vec` field. See `tests/vec.zx` for a full tour.
 
 ## 7.11 Printing
 
@@ -486,9 +579,9 @@ program that ties it all together, see `examples/guess.zx`.
 ## 7.15 Not implemented yet (roadmap M1+)
 
 Traits (and trait bounds), `dyn Trait`, associated types, const generics,
-`Vec`/`Box`, user-defined `Drop`, tuple values (tuple *structs* exist; `(a, b)`
-values and destructuring do not yet), borrow-lifetime (NLL) analysis, bindings
-inside or-patterns, and nested patterns. Scoped modules have landed for
+`HashMap`, `Box`, user-defined `Drop`, tuple values (tuple *structs* exist;
+`(a, b)` values and destructuring do not yet), borrow-lifetime (NLL) analysis,
+bindings inside or-patterns, and nested patterns. Scoped modules have landed for
 *qualified* access (imports, `as` aliases, `mod::item`, `pub` checks), but the
 merged program is still one flat namespace: unqualified cross-module names
 remain visible and ignore `pub`, so full isolation and package metadata are

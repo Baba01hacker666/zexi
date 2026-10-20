@@ -35,7 +35,10 @@ type Visibility bool
 
 // FnDecl is a function or method declaration.
 type FnDecl struct {
-	Vis      Visibility
+	Vis Visibility
+	// Attrs holds `#[...]` attributes spelled with their argument, as in
+	// `inline`, `inline(never)`, `no_mangle`, or `export`.
+	Attrs    []string
 	Unsafe   bool
 	Extern   string // "" unless `extern "C"`, which is stored here
 	Name     string
