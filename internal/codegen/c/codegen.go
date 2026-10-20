@@ -62,6 +62,17 @@ type gen struct {
 	// their definitions are collected in core (emitted into unit 0).
 	split bool
 	core  *writer
+	// pendingMoves tracks owned pattern bindings that were copied out for a
+	// guard and must be taken (moved) once the guard succeeds.
+	pendingMoves []pendingMove
+}
+
+// pendingMove is an owned pattern binding whose move out of the scrutinee is
+// deferred until a guard has passed.
+type pendingMove struct {
+	name string
+	ty   *types.Type
+	expr string
 }
 
 // loopLabel are the jump targets of one source-level loop.
@@ -539,6 +550,12 @@ func (g *gen) collectDropTypes() {
 			walk(p)
 		}
 		walk(f.Ret)
+	}
+	for _, st := range g.info.StructOrd {
+		walk(&types.Type{Kind: types.StructKind, St: st})
+	}
+	for _, en := range g.info.EnumOrd {
+		walk(&types.Type{Kind: types.EnumKind, En: en})
 	}
 	for _, t := range g.info.Types {
 		walk(t)
@@ -1937,8 +1954,15 @@ func (g *gen) structLitValue(x *ast.StructLitExpr) string {
 	if len(x.Path) != 1 {
 		return "0 /* invalid struct literal */"
 	}
-	st, ok := g.info.Structs[x.Path[0]]
-	if !ok {
+	// A generic struct's literal is an instantiation, so prefer the checked
+	// type of the expression over the (field-less) template declaration.
+	var st *types.Struct
+	if t := g.info.TypeOf(x); t != nil && t.Kind == types.StructKind && t.St != nil {
+		st = t.St
+	} else if s, ok := g.info.Structs[x.Path[0]]; ok {
+		st = s
+	}
+	if st == nil {
 		return "0 /* unknown struct */"
 	}
 	inits := map[string]ast.Expr{}
@@ -2140,23 +2164,45 @@ func (g *gen) matchValue(x *ast.MatchExpr) string {
 	save := g.w
 	g.w = sub
 	g.pushScope()
-	st := g.info.TypeOf(x.Scrutinee)
-	scrut := g.value(x.Scrutinee)
-	st, scrut = g.matchScrutinee(st, scrut)
+	orig := g.info.TypeOf(x.Scrutinee)
+	st, scrut := g.matchScrutinee(orig, g.value(x.Scrutinee))
+	// A by-value match consumes its scrutinee: owned payloads are moved into
+	// the bindings, and the remaining value is dropped once at the match end.
+	owned := matchOwnsScrutinee(orig, st)
+	if owned {
+		scrut = g.consume(x.Scrutinee)
+	}
 	m := g.fresh("m")
 	sub.line("%s %s = %s;", ctype(st), m, scrut)
+	if owned {
+		g.openDropFrame()
+		g.registerDrop(m, st)
+	}
 	result := ""
 	if t != nil && t.Kind != types.Unit && t.Kind != types.Never {
 		result = g.fresh("r")
 		sub.line("%s %s;", ctype(t), result)
 	}
 	g.emitMatchArms(x, st, m, result, sub)
+	if owned {
+		g.closeDropFrame()
+	}
 	if result != "" {
 		sub.line("%s;", result)
 	}
 	g.popScope()
 	g.w = save
 	return "({ " + sub.b.String() + " })"
+}
+
+// matchOwnsScrutinee reports whether the match takes ownership of its
+// scrutinee. A reference or pointer scrutinee is matched through the borrow and
+// is never dropped by the match.
+func matchOwnsScrutinee(orig, st *types.Type) bool {
+	if orig != nil && (orig.Kind == types.Ref || orig.Kind == types.Ptr) {
+		return false
+	}
+	return st != nil && st.NeedsDrop()
 }
 
 // matchHasGuard reports whether any arm of the match carries a guard.
@@ -2261,11 +2307,21 @@ func (g *gen) emitGuardedArms(x *ast.MatchExpr, st *types.Type, m, result string
 			w.indent++
 		}
 		g.pushScope()
-		g.bindArm(w, arm.Pat, st, m, isEnum)
+		g.openDropFrame()
+		armFrame := g.dropFrames[len(g.dropFrames)-1]
+		g.pendingMoves = nil
+		g.bindArm(w, arm.Pat, st, m, isEnum, arm.Guard != nil)
+		pend := g.pendingMoves
+		g.pendingMoves = nil
 		g.trapDepth++
 		if arm.Guard != nil {
 			w.line("if (%s) {", g.value(arm.Guard))
 			w.indent++
+		}
+		// The guard passed: take ownership of any payloads copied for it.
+		for _, pm := range pend {
+			w.line("%s = zx_move_%s(&(%s));", pm.name, typeMangle(pm.ty), pm.expr)
+			g.registerDrop(pm.name, pm.ty)
 		}
 		if result != "" {
 			w.line("%s = %s;", result, g.consume(arm.Body))
@@ -2275,11 +2331,15 @@ func (g *gen) emitGuardedArms(x *ast.MatchExpr, st *types.Type, m, result string
 			g.stmtExpr(arm.Body)
 			g.w = save
 		}
+		// On success the arm's payload bindings are released before `break`;
+		// when a guard fails they are released on the fall-through path below.
+		g.emitFrameExit(armFrame)
 		w.line("break;")
 		if arm.Guard != nil {
 			w.indent--
 			w.line("}")
 		}
+		g.dropFrames = g.dropFrames[:len(g.dropFrames)-1]
 		g.trapDepth--
 		g.popScope()
 		if cond != "" {
@@ -2296,12 +2356,22 @@ func (g *gen) emitGuardedArms(x *ast.MatchExpr, st *types.Type, m, result string
 // matchStmt emits a `match` in statement position.
 func (g *gen) matchStmt(x *ast.MatchExpr) {
 	g.pushScope()
-	st := g.info.TypeOf(x.Scrutinee)
-	scrut := g.value(x.Scrutinee)
-	st, scrut = g.matchScrutinee(st, scrut)
+	orig := g.info.TypeOf(x.Scrutinee)
+	st, scrut := g.matchScrutinee(orig, g.value(x.Scrutinee))
+	owned := matchOwnsScrutinee(orig, st)
+	if owned {
+		scrut = g.consume(x.Scrutinee)
+	}
 	m := g.fresh("m")
 	g.w.line("%s %s = %s;", ctype(st), m, scrut)
+	if owned {
+		g.openDropFrame()
+		g.registerDrop(m, st)
+	}
 	g.emitMatchArms(x, st, m, "", g.w)
+	if owned {
+		g.closeDropFrame()
+	}
 	g.popScope()
 }
 
@@ -2324,7 +2394,8 @@ func (g *gen) emitSwitch(x *ast.MatchExpr, st *types.Type, m, result string, w *
 		}
 		w.indent++
 		g.pushScope()
-		g.bindArm(w, arm.Pat, st, m, isEnum)
+		g.openDropFrame()
+		g.bindArm(w, arm.Pat, st, m, isEnum, false)
 		g.trapDepth++
 		if result != "" {
 			w.line("%s = %s;", result, g.consume(arm.Body))
@@ -2334,6 +2405,7 @@ func (g *gen) emitSwitch(x *ast.MatchExpr, st *types.Type, m, result string, w *
 			g.stmtExpr(arm.Body)
 			g.w = save
 		}
+		g.closeDropFrame()
 		g.trapDepth--
 		g.popScope()
 		w.line("break;")
@@ -2363,11 +2435,26 @@ func (g *gen) armLabel(p ast.Pattern, isEnum bool) (string, bool) {
 
 // bindArm declares the variables a pattern introduces, hoisting payload fields
 // out of the tagged union into locals.
-func (g *gen) bindArm(w *writer, p ast.Pattern, st *types.Type, m string, isEnum bool) {
+func (g *gen) bindArm(w *writer, p ast.Pattern, st *types.Type, m string, isEnum, deferMove bool) {
 	switch pt := p.(type) {
 	case *ast.BindPat:
 		if pt.Name != "_" {
-			w.line("%s %s = %s;", ctype(st), g.bind(pt.Name), m)
+			name := g.bind(pt.Name)
+			if st != nil && st.NeedsDrop() {
+				if deferMove {
+					// A guard may fail, so bind a shallow copy for it; ownership
+					// transfers only once the guard has passed.
+					w.line("%s %s = %s;", ctype(st), name, m)
+					g.pendingMoves = append(g.pendingMoves, pendingMove{name: name, ty: st, expr: m})
+				} else {
+					// The whole (consumed) scrutinee moves into the binding, so
+					// the match-level destructor is left empty.
+					w.line("%s %s = zx_move_%s(&%s);", ctype(st), name, typeMangle(st), m)
+					g.registerDrop(name, st)
+				}
+			} else {
+				w.line("%s %s = %s;", ctype(st), name, m)
+			}
 		}
 	case *ast.PathPat:
 		v := g.info.PatVariant[pt]
@@ -2380,7 +2467,7 @@ func (g *gen) bindArm(w *writer, p ast.Pattern, st *types.Type, m string, isEnum
 				break
 			}
 			f := v.Fields[i]
-			g.bindPatTo(w, sub, base+"."+fieldName(f.Name), f.Ty)
+			g.bindPatTo(w, sub, base+"."+fieldName(f.Name), f.Ty, deferMove)
 		}
 		for _, fp := range pt.Fields {
 			f, ok := variantFieldOf(v, fp.Name)
@@ -2391,17 +2478,30 @@ func (g *gen) bindArm(w *writer, p ast.Pattern, st *types.Type, m string, isEnum
 			if sub == nil {
 				sub = &ast.BindPat{Name: fp.Name}
 			}
-			g.bindPatTo(w, sub, base+"."+fieldName(f.Name), f.Ty)
+			g.bindPatTo(w, sub, base+"."+fieldName(f.Name), f.Ty, deferMove)
 		}
 	}
 }
 
 // bindPatTo recursively declares bindings for a sub-pattern.
-func (g *gen) bindPatTo(w *writer, p ast.Pattern, cExpr string, ty *types.Type) {
+func (g *gen) bindPatTo(w *writer, p ast.Pattern, cExpr string, ty *types.Type, deferMove bool) {
 	switch pt := p.(type) {
 	case *ast.BindPat:
 		if pt.Name != "_" {
-			w.line("%s %s = %s;", ctype(ty), g.bind(pt.Name), cExpr)
+			name := g.bind(pt.Name)
+			if ty != nil && ty.NeedsDrop() {
+				if deferMove {
+					w.line("%s %s = %s;", ctype(ty), name, cExpr)
+					g.pendingMoves = append(g.pendingMoves, pendingMove{name: name, ty: ty, expr: cExpr})
+				} else {
+					// Move the payload out of the consumed scrutinee so the match
+					// destructor cannot free it a second time.
+					w.line("%s %s = zx_move_%s(&(%s));", ctype(ty), name, typeMangle(ty), cExpr)
+					g.registerDrop(name, ty)
+				}
+			} else {
+				w.line("%s %s = %s;", ctype(ty), name, cExpr)
+			}
 		}
 	case *ast.PathPat:
 		v := g.info.PatVariant[pt]
@@ -2414,7 +2514,7 @@ func (g *gen) bindPatTo(w *writer, p ast.Pattern, cExpr string, ty *types.Type) 
 				break
 			}
 			f := v.Fields[i]
-			g.bindPatTo(w, sub, base+"."+fieldName(f.Name), f.Ty)
+			g.bindPatTo(w, sub, base+"."+fieldName(f.Name), f.Ty, deferMove)
 		}
 		for _, fp := range pt.Fields {
 			f, ok := variantFieldOf(v, fp.Name)
@@ -2425,7 +2525,7 @@ func (g *gen) bindPatTo(w *writer, p ast.Pattern, cExpr string, ty *types.Type) 
 			if sub == nil {
 				sub = &ast.BindPat{Name: fp.Name}
 			}
-			g.bindPatTo(w, sub, base+"."+fieldName(f.Name), f.Ty)
+			g.bindPatTo(w, sub, base+"."+fieldName(f.Name), f.Ty, deferMove)
 		}
 	}
 }

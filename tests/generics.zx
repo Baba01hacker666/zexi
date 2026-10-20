@@ -18,6 +18,35 @@ struct Box2 { a: i64, b: i64 }
 
 fn sum(b: Box2) -> i64 { return b.a + b.b; }
 
+// --- generic structs, enums, and impls ---
+
+struct Pair<A, B> { first: A, second: B }
+
+impl<A, B> Pair<A, B> {
+    fn swap(&self) -> Pair<B, A> {
+        return Pair { first: self.second, second: self.first };
+    }
+    fn first_of(&self) -> A { return self.first; }
+}
+
+enum Maybe<T> { Just(T), Nothing }
+
+fn unwrap_or(m: Maybe<i64>, fallback: i64) -> i64 {
+    match m {
+        Maybe::Just(v) => v,
+        Maybe::Nothing => fallback,
+    }
+}
+
+enum Owned<T> { Val(T), Empty }
+
+fn owned_len(o: Owned<String>) -> i32 {
+    match o {
+        Owned::Val(s) => s.len() as i32,
+        Owned::Empty => 0,
+    }
+}
+
 fn main() -> i32 {
     println(id(7));                 // inferred: id<i32>
     println(id::<i64>(7));          // explicit turbofish
@@ -32,5 +61,15 @@ fn main() -> i32 {
     println(g(9));
     let b = Box2 { a: 3, b: 4 };
     println(sum(id(b)));
+
+    let p = Pair { first: 10, second: true };
+    println(p.first_of());
+    let q = p.swap();
+    println(q.first);
+    println(q.second);
+    println(unwrap_or(Maybe::Just(5), 0));
+    println(unwrap_or(Maybe::Nothing, 6));
+    println(owned_len(Owned::Val(String::from("four"))));
+    println(owned_len(Owned::Empty));
     0
 }

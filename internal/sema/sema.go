@@ -117,9 +117,12 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 			Types:      map[ast.Expr]*types.Type{},
 			DeclTypes:  map[ast.Stmt]*types.Type{},
 		},
-		aliasDecls: map[string]*ast.TypeAlias{},
-		aliasTypes: map[string]*types.Type{},
-		aliasBusy:  map[string]bool{},
+		aliasDecls:  map[string]*ast.TypeAlias{},
+		aliasTypes:  map[string]*types.Type{},
+		aliasBusy:   map[string]bool{},
+		structDecls: map[string]*ast.StructDecl{},
+		enumDecls:   map[string]*ast.EnumDecl{},
+		instBusy:    map[string]bool{},
 	}
 	c.collect()
 	c.checkBodies()
@@ -161,6 +164,17 @@ type checker struct {
 	aliasDecls map[string]*ast.TypeAlias
 	aliasTypes map[string]*types.Type
 	aliasBusy  map[string]bool
+
+	// structDecls/enumDecls keep the declaration AST for generic types so an
+	// instantiation can clone it and re-resolve its fields with concrete
+	// arguments (the same clone-and-recheck strategy as generic functions).
+	structDecls map[string]*ast.StructDecl
+	enumDecls   map[string]*ast.EnumDecl
+	// instBusy guards against infinitely recursive generic instantiation.
+	instBusy map[string]bool
+	// indirect counts enclosing references/pointers while resolving a type;
+	// recursive instantiations behind one are finite and allowed.
+	indirect int
 
 	scope     []map[string]*types.Type // local bindings, innermost last
 	mutScope  []map[string]bool        // mutability of tracked bindings (else permissive)
@@ -435,6 +449,7 @@ func (c *checker) registerEnum(d *ast.EnumDecl) {
 	names := c.checkGenerics(d.Generics)
 	en := &types.Enum{Name: d.Name, Base: d.Name, Generics: names, Generic: len(names) > 0, Copy: types.CopyAttr(d.Attrs)}
 	c.info.Enums[d.Name] = en
+	c.enumDecls[d.Name] = d
 	if !en.Generic {
 		c.info.EnumOrd = append(c.info.EnumOrd, en)
 	}
@@ -442,12 +457,10 @@ func (c *checker) registerEnum(d *ast.EnumDecl) {
 
 func (c *checker) collectEnumVariants(d *ast.EnumDecl) {
 	en, ok := c.info.Enums[d.Name]
-	if !ok || len(en.Variants) > 0 {
-		return
+	if !ok || en.Generic || len(en.Variants) > 0 {
+		return // duplicate, template, or already filled
 	}
-	c.withTypeParams(en.Generics, func() {
-		c.collectEnumVariantsInner(d, en)
-	})
+	c.collectEnumVariantsInner(d, en)
 }
 
 func (c *checker) collectEnumVariantsInner(d *ast.EnumDecl, en *types.Enum) {
@@ -465,12 +478,6 @@ func (c *checker) collectEnumVariantsInner(d *ast.EnumDecl, en *types.Enum) {
 			ft := c.resolveType(f.Ty)
 			if ft == nil {
 				ft = &types.Type{Kind: types.Invalid}
-			}
-			if !en.Generic && ft.NeedsDrop() {
-				// Binding a payload in a `match` aliases the owned value, so a
-				// payload that owns heap memory could be freed twice. Until the
-				// borrow checker lands, keep enum payloads resource-free.
-				c.errf(v.Sp, "E0900", "enum variant `%s` cannot carry the resource-owning type `%s` yet: match bindings would alias owned values (roadmap M2)", v.Name, ft)
 			}
 			tv.Fields = append(tv.Fields, types.Field{Name: name, Ty: ft})
 		}
@@ -499,19 +506,20 @@ func (c *checker) registerStruct(d *ast.StructDecl) {
 	names := c.checkGenerics(d.Generics)
 	st := &types.Struct{Name: d.Name, Base: d.Name, Generics: names, Generic: len(names) > 0, Tuple: d.Tuple, Copy: types.CopyAttr(d.Attrs)}
 	c.info.Structs[d.Name] = st
+	c.structDecls[d.Name] = d
 	if !st.Generic {
 		c.info.StructOrd = append(c.info.StructOrd, st)
 	}
 }
 
+// collectStructFields fills a non-generic struct's fields. A generic template's
+// fields are resolved per instantiation instead (see instantiateStruct).
 func (c *checker) collectStructFields(d *ast.StructDecl) {
 	st, ok := c.info.Structs[d.Name]
-	if !ok || len(st.Fields) > 0 {
-		return // duplicate or already filled
+	if !ok || st.Generic || len(st.Fields) > 0 {
+		return // duplicate, template, or already filled
 	}
-	c.withTypeParams(st.Generics, func() {
-		c.collectStructFieldsInner(d, st)
-	})
+	c.collectStructFieldsInner(d, st)
 }
 
 func (c *checker) collectStructFieldsInner(d *ast.StructDecl, st *types.Struct) {
@@ -540,31 +548,207 @@ func (c *checker) collectImpl(d *ast.ImplBlock) {
 		c.errf(d.Sp, "E0900", "trait impls are not supported by the compiler yet (roadmap M1)")
 		return
 	}
-	if len(d.Generics) > 0 {
-		c.errf(d.Sp, "E0900", "generic impls are not supported yet (roadmap M1)")
-		return
-	}
 	name := typePathName(d.SelfTy)
-	recvT := c.nominalType(name)
-	if recvT == nil {
+	baseSt, hasStruct := c.info.Structs[name]
+	baseEn, hasEnum := c.info.Enums[name]
+	if !hasStruct && !hasEnum {
 		c.errf(d.Sp, "E0118", "no type named `%s` in this scope", name)
 		return
 	}
+	generic := (hasStruct && baseSt.Generic) || (hasEnum && baseEn.Generic)
+	params := c.checkGenerics(d.Generics)
+	pt, isPath := d.SelfTy.(*ast.PathType)
+
+	// `impl Pair<T> { .. }` may introduce its parameters implicitly through the
+	// self type. Accept that spelling when the arguments are unknown names.
+	if generic && len(params) == 0 && isPath && len(pt.Args) == len(typeGenerics(baseSt, baseEn)) {
+		var implicit []string
+		ok := true
+		for _, a := range pt.Args {
+			at, isArgPath := a.(*ast.PathType)
+			if !isArgPath || len(at.Segments) != 1 || len(at.Args) != 0 || isKnownTypeName(c, at.Segments[0]) {
+				ok = false
+				break
+			}
+			implicit = append(implicit, at.Segments[0])
+		}
+		if ok {
+			params = implicit
+		}
+	}
+
+	if len(params) == 0 {
+		if generic {
+			c.errf(d.Sp, "E0107", "`%s` expects %d type argument(s); write `impl<T, ..> %s<T, ..>`", name, len(typeGenerics(baseSt, baseEn)), name)
+			return
+		}
+		if isPath && len(pt.Args) > 0 {
+			c.errf(d.Sp, "E0107", "`%s` is not generic", name)
+			return
+		}
+		recvT := c.nominalType(name)
+		if c.info.Methods[name] == nil {
+			c.info.Methods[name] = map[string]*Fn{}
+		}
+		for _, m := range d.Fns {
+			fn := c.makeFn(m, recvT)
+			if fn == nil {
+				continue
+			}
+			if _, dup := c.info.Methods[name][m.Name]; dup {
+				c.errf(m.Sp, "E0592", "duplicate method `%s` on `%s`", m.Name, name)
+				continue
+			}
+			c.info.Methods[name][m.Name] = fn
+			if !fn.Generic {
+				c.info.FnOrder = append(c.info.FnOrder, fn)
+			}
+		}
+		return
+	}
+
+	// Generic impl: require the receiver to apply the impl's parameters in
+	// declaration order (`impl<T, U> Pair<T, U>`), which keeps the mapping from
+	// a concrete receiver's arguments back to the template positional.
+	if !generic {
+		c.errf(d.Sp, "E0107", "`%s` is not generic", name)
+		return
+	}
+	want := typeGenerics(baseSt, baseEn)
+	if !isPath || len(pt.Segments) != 1 || len(pt.Args) != len(params) || len(params) != len(want) {
+		c.errf(d.Sp, "E0900", "a generic impl must be written `impl<T, ..> %s<T, ..>` with one parameter per type argument", name)
+		return
+	}
+	for i, a := range pt.Args {
+		at, isArgPath := a.(*ast.PathType)
+		if !isArgPath || len(at.Segments) != 1 || len(at.Args) != 0 || at.Segments[0] != params[i] {
+			c.errf(d.Sp, "E0900", "a generic impl must apply its type parameters in declaration order")
+			return
+		}
+	}
+	recvT := c.nominalType(name)
 	if c.info.Methods[name] == nil {
 		c.info.Methods[name] = map[string]*Fn{}
 	}
 	for _, m := range d.Fns {
-		fn := c.makeFn(m, recvT)
-		if fn == nil {
+		if len(m.Generics) > 0 {
+			c.errf(m.Sp, "E0900", "type parameters on methods are not supported yet (roadmap M1)")
 			continue
 		}
+		var fn *Fn
+		c.withTypeParams(params, func() {
+			fn = c.makeFnInner(m, recvT)
+		})
+		fn.Generics = params
+		fn.Generic = true
 		if _, dup := c.info.Methods[name][m.Name]; dup {
 			c.errf(m.Sp, "E0592", "duplicate method `%s` on `%s`", m.Name, name)
 			continue
 		}
 		c.info.Methods[name][m.Name] = fn
-		c.info.FnOrder = append(c.info.FnOrder, fn)
+		// A method template is not emitted; instantiations go to FnOrder.
 	}
+}
+
+// typeGenerics returns the declared type-parameter names of a nominal template.
+func typeGenerics(st *types.Struct, en *types.Enum) []string {
+	if st != nil {
+		return st.Generics
+	}
+	if en != nil {
+		return en.Generics
+	}
+	return nil
+}
+
+func isKnownTypeName(c *checker, name string) bool {
+	if _, ok := types.Builtins[name]; ok {
+		return true
+	}
+	if _, ok := c.info.Structs[name]; ok {
+		return true
+	}
+	if _, ok := c.info.Enums[name]; ok {
+		return true
+	}
+	_, ok := c.aliasDecls[name]
+	return ok
+}
+
+// instantiateMethod specializes a generic-impl method for a concrete receiver.
+func (c *checker) instantiateMethod(tmpl *Fn, recv *types.Type) *Fn {
+	key := typeKey(recv) + "::" + tmpl.Name
+	if fn, ok := c.info.Fns[key]; ok {
+		return fn
+	}
+	clone := ast.Clone(tmpl.Decl)
+	clone.Generics = nil
+	bind := paramBindings(tmpl.Generics, nominalArgs(recv))
+	var fn *Fn
+	c.withBindings(bind, func() {
+		fn = c.makeFnInner(clone, recv)
+	})
+	fn.Name = tmpl.Name
+	fn.QualName = nominalName(recv) + "::" + tmpl.Name
+	fn.Generics = nil
+	fn.Generic = false
+	c.info.Fns[key] = fn
+	c.info.FnOrder = append(c.info.FnOrder, fn)
+	return fn
+}
+
+// instantiateAssociatedMethod specializes a generic-impl associated function
+// (one without a `self` receiver). Because there is no receiver value to
+// inspect, its arguments are inferred from the turbofish and the expected type.
+func (c *checker) instantiateAssociatedMethod(tmpl *Fn, p *ast.PathExpr, expected *types.Type) *Fn {
+	base := p.Segments[0]
+	bindings := map[string]*types.Type{}
+	if len(p.TypeArgs) > len(tmpl.Generics) {
+		c.errf(p.Sp, "E0107", "`%s` takes %d type argument(s) but %d were supplied", base, len(tmpl.Generics), len(p.TypeArgs))
+	}
+	for i, name := range tmpl.Generics {
+		if i < len(p.TypeArgs) {
+			if t := c.resolveType(p.TypeArgs[i]); t != nil {
+				bindings[name] = t
+			}
+		}
+	}
+	if expected != nil {
+		switch expected.Kind {
+		case types.StructKind:
+			if expected.St != nil && nominalBaseName(expected) == base {
+				for i, name := range tmpl.Generics {
+					if _, ok := bindings[name]; !ok && i < len(expected.St.Args) {
+						bindings[name] = expected.St.Args[i]
+					}
+				}
+			}
+		case types.EnumKind:
+			if expected.En != nil && nominalBaseName(expected) == base {
+				for i, name := range tmpl.Generics {
+					if _, ok := bindings[name]; !ok && i < len(expected.En.Args) {
+						bindings[name] = expected.En.Args[i]
+					}
+				}
+			}
+		}
+	}
+	args := c.bindGenericArgs(p.Sp, tmpl.Generics, bindings)
+	if args == nil {
+		return nil
+	}
+	var recv *types.Type
+	if st, ok := c.info.Structs[base]; ok {
+		recv = c.instantiateStruct(p.Sp, st, args)
+	} else if en, ok := c.info.Enums[base]; ok {
+		recv = c.instantiateEnum(p.Sp, en, args)
+	} else {
+		return nil
+	}
+	if recv == nil || recv.Kind == types.Invalid {
+		return nil
+	}
+	return c.instantiateMethod(tmpl, recv)
 }
 
 // nominalType resolves a bare type name to a struct or enum type, or nil.
@@ -1039,13 +1223,26 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 				c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope", x.Segments[0])
 				return nil
 			}
+			if en.Generic {
+				args, ok := c.inferEnumArgsFrom(x.Sp, en, x.TypeArgs, expected)
+				if !ok {
+					return &types.Type{Kind: types.Invalid}
+				}
+				t := c.instantiateEnum(x.Sp, en, args)
+				if t.Kind != types.EnumKind || t.En == nil {
+					return &types.Type{Kind: types.Invalid}
+				}
+				en = t.En
+			} else if len(x.TypeArgs) > 0 {
+				c.errf(x.Sp, "E0107", "`%s` is not generic", en.Base)
+			}
 			v, ok := en.Variant(x.Segments[1])
 			if !ok {
 				c.errf(x.Sp, "E0599", "no variant `%s` on enum `%s`", x.Segments[1], en.Name)
 				return nil
 			}
 			if len(v.Fields) > 0 {
-				c.errf(x.Sp, "E0061", "variant `%s::%s` requires %d argument(s)", en.Name, v.Name, len(v.Fields))
+				c.errf(x.Sp, "E0061", "variant `%s::%s` requires %d argument(s)", en.Base, v.Name, len(v.Fields))
 				return nil
 			}
 			c.info.Ctors[x] = &Ctor{Enum: en, Variant: v}
@@ -1127,7 +1324,7 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		c.errAt(x, "E0061", "named arguments are only supported for function and method calls")
 		return c.checkExpr(x.Val, nil)
 	case *ast.StructLitExpr:
-		return c.inferStructLit(x)
+		return c.inferStructLit(x, expected)
 	case *ast.IndexExpr:
 		return c.inferIndex(x)
 	case *ast.SliceExpr:
@@ -1308,7 +1505,7 @@ func (c *checker) inferIdentExpr(x *ast.IdentExpr, expected *types.Type) *types.
 	if expected != nil && expected.Kind == types.Fn {
 		c.unify(&types.Type{Kind: types.Fn, Params: fn.Params, Ret: fn.Ret}, expected, bindings)
 	}
-	args := c.bindGenericArgs(x.Sp, fn, bindings)
+	args := c.bindGenericArgs(x.Sp, fn.Generics, bindings)
 	if args == nil {
 		return &types.Type{Kind: types.Invalid}
 	}
@@ -1559,6 +1756,15 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		// `Type::name(args)` may also name an associated function: one declared
 		// in an `impl` block without a `self` parameter.
 		if m, ok := c.info.Methods[p.Segments[0]][p.Segments[1]]; ok {
+			if m.Generic {
+				m = c.instantiateAssociatedMethod(m, p, expected)
+				if m == nil {
+					for _, a := range x.Args {
+						c.checkExpr(a, nil)
+					}
+					return &types.Type{Kind: types.Invalid}
+				}
+			}
 			if m.Self != nil {
 				c.errf(p.Sp, "E0599", "`%s::%s` takes `self`; call it with `.` on a value", p.Segments[0], p.Segments[1])
 				for _, a := range x.Args {
@@ -1568,7 +1774,7 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 			}
 			return c.checkCallArgs(x, m, fmt.Sprintf("function `%s::%s`", p.Segments[0], p.Segments[1]))
 		}
-		return c.inferVariantCtor(x, p)
+		return c.inferVariantCtor(x, p, expected)
 	}
 	name, ok := calleeName(x.Callee)
 	if !ok {
@@ -1606,21 +1812,65 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 			}
 			return &types.Type{Kind: types.StructKind, St: st}
 		}
-		c.info.TupleCtors[x] = st
-		if len(x.Args) != len(st.Fields) {
-			c.errAt(x, "E0061", "tuple struct `%s` takes %d field(s) but %d were supplied", name, len(st.Fields), len(x.Args))
+		concrete := st
+		if st.Generic {
+			bindings := map[string]*types.Type{}
+			explicit := calleeTypeArgs(x.Callee)
+			if len(explicit) > len(st.Generics) {
+				c.errAt(x.Callee, "E0107", "`%s` takes %d type argument(s) but %d were supplied", st.Base, len(st.Generics), len(explicit))
+			}
+			for i, gname := range st.Generics {
+				if i < len(explicit) {
+					if t := c.resolveType(explicit[i]); t != nil {
+						bindings[gname] = t
+					}
+				}
+			}
+			if expected != nil && expected.Kind == types.StructKind && expected.St != nil && nominalBaseName(expected) == st.Base {
+				for i, gname := range st.Generics {
+					if _, ok := bindings[gname]; !ok && i < len(expected.St.Args) {
+						bindings[gname] = expected.St.Args[i]
+					}
+				}
+			}
+			for i, a := range x.Args {
+				pat := c.structFieldPattern(st, strconv.Itoa(i))
+				if pat == nil {
+					continue
+				}
+				at := c.checkExpr(a, nil)
+				c.unify(pat, at, bindings)
+			}
+			args := c.bindGenericArgs(x.Callee.Span(), st.Generics, bindings)
+			if args == nil {
+				for _, a := range x.Args {
+					c.checkExpr(a, nil)
+				}
+				return &types.Type{Kind: types.Invalid}
+			}
+			t := c.instantiateStruct(x.Callee.Span(), st, args)
+			if t.Kind != types.StructKind || t.St == nil {
+				return &types.Type{Kind: types.Invalid}
+			}
+			concrete = t.St
+		} else if len(calleeTypeArgs(x.Callee)) > 0 {
+			c.errAt(x.Callee, "E0107", "`%s` is not generic", st.Base)
+		}
+		c.info.TupleCtors[x] = concrete
+		if len(x.Args) != len(concrete.Fields) {
+			c.errAt(x, "E0061", "tuple struct `%s` takes %d field(s) but %d were supplied", name, len(concrete.Fields), len(x.Args))
 		}
 		for i, a := range x.Args {
 			var want *types.Type
-			if i < len(st.Fields) {
-				want = st.Fields[i].Ty
+			if i < len(concrete.Fields) {
+				want = concrete.Fields[i].Ty
 			}
 			at := c.checkExpr(a, want)
 			if want != nil && !c.argAssignable(want, at, false) {
 				c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
 			}
 		}
-		return &types.Type{Kind: types.StructKind, St: st}
+		return &types.Type{Kind: types.StructKind, St: concrete}
 	}
 	// A local binding of function type can be called directly: this is the
 	// indirect call the router/handler APIs are built on.
@@ -1815,7 +2065,7 @@ func (c *checker) checkGenericCall(x *ast.CallExpr, tmpl *Fn, explicit []ast.Typ
 			c.unify(tmpl.Params[i], at, bindings)
 		}
 	}
-	args := c.bindGenericArgs(x.Callee.Span(), tmpl, bindings)
+	args := c.bindGenericArgs(x.Callee.Span(), tmpl.Generics, bindings)
 	if args == nil {
 		return &types.Type{Kind: types.Invalid}
 	}
@@ -1825,12 +2075,12 @@ func (c *checker) checkGenericCall(x *ast.CallExpr, tmpl *Fn, explicit []ast.Typ
 	return c.checkCallArgs(x, inst, label)
 }
 
-// bindGenericArgs materializes the concrete arguments for a generic function,
+// bindGenericArgs materializes the concrete arguments for a generic item,
 // reporting E0282 for any parameter inference left unbound.
-func (c *checker) bindGenericArgs(sp token.Span, tmpl *Fn, bindings map[string]*types.Type) []*types.Type {
-	args := make([]*types.Type, len(tmpl.Generics))
+func (c *checker) bindGenericArgs(sp token.Span, generics []string, bindings map[string]*types.Type) []*types.Type {
+	args := make([]*types.Type, len(generics))
 	ok := true
-	for i, name := range tmpl.Generics {
+	for i, name := range generics {
 		if t, found := bindings[name]; found && t != nil && t.Kind != types.Invalid {
 			args[i] = t
 			continue
@@ -2024,6 +2274,217 @@ func compound(tag string, parts ...string) string {
 		b.WriteString(p)
 	}
 	return b.String()
+}
+
+// paramBindings maps a template's parameter names to concrete arguments.
+func paramBindings(names []string, args []*types.Type) map[string]*types.Type {
+	b := make(map[string]*types.Type, len(names))
+	for i, n := range names {
+		if i < len(args) && args[i] != nil {
+			b[n] = args[i]
+		}
+	}
+	return b
+}
+
+// containsParam reports whether t mentions a type parameter anywhere.
+func containsParam(t *types.Type) bool {
+	if t == nil {
+		return false
+	}
+	switch t.Kind {
+	case types.ParamKind:
+		return true
+	case types.Ref, types.Ptr, types.Slice, types.Array:
+		return containsParam(t.Elem)
+	case types.Tuple:
+		for _, e := range t.Elems {
+			if containsParam(e) {
+				return true
+			}
+		}
+	case types.Fn:
+		for _, p := range t.Params {
+			if containsParam(p) {
+				return true
+			}
+		}
+		return containsParam(t.Ret)
+	case types.StructKind:
+		if t.St != nil {
+			for _, a := range t.St.Args {
+				if containsParam(a) {
+					return true
+				}
+			}
+		}
+	case types.EnumKind:
+		if t.En != nil {
+			for _, a := range t.En.Args {
+				if containsParam(a) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// applyStructArgs resolves a written application `Foo<..>` of a nominal type.
+func (c *checker) applyStructArgs(sp token.Span, st *types.Struct, args []*types.Type) *types.Type {
+	if !st.Generic {
+		c.errf(sp, "E0107", "`%s` is not generic", st.Base)
+		return &types.Type{Kind: types.StructKind, St: st}
+	}
+	args, ok := c.checkTypeArgArity(sp, st.Base, st.Generics, args)
+	if !ok {
+		return &types.Type{Kind: types.Invalid}
+	}
+	if anyContainsParam(args) {
+		// A parametric application inside a template: represent it as the bare
+		// template. It is only ever used for inference patterns and is never
+		// emitted; the concrete instantiation re-resolves from the AST.
+		return &types.Type{Kind: types.StructKind, St: st}
+	}
+	return c.instantiateStruct(sp, st, args)
+}
+
+// applyEnumArgs resolves a written application `E<..>` of a nominal type.
+func (c *checker) applyEnumArgs(sp token.Span, en *types.Enum, args []*types.Type) *types.Type {
+	if !en.Generic {
+		c.errf(sp, "E0107", "`%s` is not generic", en.Base)
+		return &types.Type{Kind: types.EnumKind, En: en}
+	}
+	args, ok := c.checkTypeArgArity(sp, en.Base, en.Generics, args)
+	if !ok {
+		return &types.Type{Kind: types.Invalid}
+	}
+	if anyContainsParam(args) {
+		return &types.Type{Kind: types.EnumKind, En: en}
+	}
+	return c.instantiateEnum(sp, en, args)
+}
+
+func anyContainsParam(ts []*types.Type) bool {
+	for _, t := range ts {
+		if containsParam(t) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkTypeArgArity validates the number of type arguments against a template's
+// parameters, padding or truncating so callers never index out of range.
+func (c *checker) checkTypeArgArity(sp token.Span, base string, params []string, args []*types.Type) ([]*types.Type, bool) {
+	if len(args) == len(params) {
+		return args, true
+	}
+	c.errf(sp, "E0107", "`%s` expects %d type argument(s) but %d were supplied", base, len(params), len(args))
+	for len(args) < len(params) {
+		args = append(args, &types.Type{Kind: types.Invalid})
+	}
+	return args[:len(params)], false
+}
+
+// instantiateStruct builds the concrete struct for a type argument list by
+// cloning the declaration and re-resolving its fields with the arguments bound.
+func (c *checker) instantiateStruct(sp token.Span, tmpl *types.Struct, args []*types.Type) *types.Type {
+	key := instKey(tmpl.Name, args)
+	if c.instBusy[key] {
+		// Recursion through a reference or pointer is fine: the C definition
+		// only needs a forward declaration. Direct recursion has no finite C
+		// representation.
+		if c.indirect > 0 {
+			if st, ok := c.info.Structs[key]; ok {
+				return &types.Type{Kind: types.StructKind, St: st}
+			}
+			return &types.Type{Kind: types.Invalid}
+		}
+		c.errf(sp, "E0072", "recursive generic type `%s` has infinite size; store it behind a pointer or reference", tmpl.Base)
+		return &types.Type{Kind: types.Invalid}
+	}
+	if st, ok := c.info.Structs[key]; ok {
+		return &types.Type{Kind: types.StructKind, St: st}
+	}
+	c.instBusy[key] = true
+	defer delete(c.instBusy, key)
+	d := ast.Clone(c.structDecls[tmpl.Name])
+	if d == nil {
+		return &types.Type{Kind: types.Invalid}
+	}
+	st := &types.Struct{Name: key, Base: tmpl.Base, Args: args, Tuple: tmpl.Tuple, Copy: tmpl.Copy}
+	c.info.Structs[key] = st
+	c.info.StructOrd = append(c.info.StructOrd, st)
+	c.withBindings(paramBindings(tmpl.Generics, args), func() {
+		c.collectStructFieldsInner(d, st)
+	})
+	return &types.Type{Kind: types.StructKind, St: st}
+}
+
+// instantiateEnum is the enum counterpart of instantiateStruct.
+func (c *checker) instantiateEnum(sp token.Span, tmpl *types.Enum, args []*types.Type) *types.Type {
+	key := instKey(tmpl.Name, args)
+	if c.instBusy[key] {
+		if c.indirect > 0 {
+			if en, ok := c.info.Enums[key]; ok {
+				return &types.Type{Kind: types.EnumKind, En: en}
+			}
+			return &types.Type{Kind: types.Invalid}
+		}
+		c.errf(sp, "E0072", "recursive generic type `%s` has infinite size; store it behind a pointer or reference", tmpl.Base)
+		return &types.Type{Kind: types.Invalid}
+	}
+	if en, ok := c.info.Enums[key]; ok {
+		return &types.Type{Kind: types.EnumKind, En: en}
+	}
+	c.instBusy[key] = true
+	defer delete(c.instBusy, key)
+	d := ast.Clone(c.enumDecls[tmpl.Name])
+	if d == nil {
+		return &types.Type{Kind: types.Invalid}
+	}
+	en := &types.Enum{Name: key, Base: tmpl.Base, Args: args, Copy: tmpl.Copy}
+	c.info.Enums[key] = en
+	c.info.EnumOrd = append(c.info.EnumOrd, en)
+	c.withBindings(paramBindings(tmpl.Generics, args), func() {
+		c.collectEnumVariantsInner(d, en)
+	})
+	return &types.Type{Kind: types.EnumKind, En: en}
+}
+
+// nominalBaseName returns the source (base) name of a nominal type, so method
+// lookup can find the template shared by all instantiations.
+func nominalBaseName(t *types.Type) string {
+	switch {
+	case t == nil:
+		return ""
+	case t.Kind == types.StructKind && t.St != nil:
+		if t.St.Base != "" {
+			return t.St.Base
+		}
+		return t.St.Name
+	case t.Kind == types.EnumKind && t.En != nil:
+		if t.En.Base != "" {
+			return t.En.Base
+		}
+		return t.En.Name
+	}
+	return ""
+}
+
+// nominalArgs returns a nominal type's instantiation arguments (nil if it is
+// not generic).
+func nominalArgs(t *types.Type) []*types.Type {
+	switch {
+	case t == nil:
+		return nil
+	case t.Kind == types.StructKind && t.St != nil:
+		return t.St.Args
+	case t.Kind == types.EnumKind && t.En != nil:
+		return t.En.Args
+	}
+	return nil
 }
 
 // stringCtorSig describes a builtin `String` constructor.
@@ -2306,9 +2767,41 @@ func (c *checker) inferArrayLit(x *ast.ArrayLitExpr, expected *types.Type) *type
 	return &types.Type{Kind: types.Array, Elem: elemT, Len: int64(len(x.Elems))}
 }
 
+// inferEnumArgsFrom resolves an enum's arguments from turbofish and the
+// expected type, for a construction site with no payload to infer from.
+func (c *checker) inferEnumArgsFrom(sp token.Span, tmpl *types.Enum, explicit []ast.Type, expected *types.Type) ([]*types.Type, bool) {
+	bindings := map[string]*types.Type{}
+	if len(explicit) > len(tmpl.Generics) {
+		c.errf(sp, "E0107", "`%s` takes %d type argument(s) but %d were supplied", tmpl.Base, len(tmpl.Generics), len(explicit))
+	}
+	for i, name := range tmpl.Generics {
+		if i < len(explicit) {
+			if t := c.resolveType(explicit[i]); t != nil {
+				bindings[name] = t
+			}
+		}
+	}
+	if expected != nil {
+		var got []*types.Type
+		switch expected.Kind {
+		case types.EnumKind:
+			if expected.En != nil && nominalBaseName(expected) == tmpl.Base {
+				got = expected.En.Args
+			}
+		}
+		for i, name := range tmpl.Generics {
+			if _, ok := bindings[name]; !ok && i < len(got) {
+				bindings[name] = got[i]
+			}
+		}
+	}
+	args := c.bindGenericArgs(sp, tmpl.Generics, bindings)
+	return args, args != nil
+}
+
 // inferVariantCtor checks `Enum::Variant(args)`.
-func (c *checker) inferVariantCtor(x *ast.CallExpr, p *ast.PathExpr) *types.Type {
-	en, ok := c.info.Enums[p.Segments[0]]
+func (c *checker) inferVariantCtor(x *ast.CallExpr, p *ast.PathExpr, expected *types.Type) *types.Type {
+	tmpl, ok := c.info.Enums[p.Segments[0]]
 	if !ok {
 		c.errf(p.Sp, "E0412", "cannot find type `%s` in this scope", p.Segments[0])
 		for _, a := range x.Args {
@@ -2316,6 +2809,24 @@ func (c *checker) inferVariantCtor(x *ast.CallExpr, p *ast.PathExpr) *types.Type
 		}
 		return nil
 	}
+	en := tmpl
+	if tmpl.Generic {
+		var okArgs bool
+		en, okArgs = c.instantiateEnumForVariant(x, p, tmpl, expected)
+		if !okArgs {
+			for _, a := range x.Args {
+				c.checkExpr(a, nil)
+			}
+			return &types.Type{Kind: types.Invalid}
+		}
+	} else if len(p.TypeArgs) > 0 {
+		c.errf(p.Sp, "E0107", "`%s` is not generic", tmpl.Base)
+	}
+	return c.checkVariantCtor(x, p, en)
+}
+
+// checkVariantCtor checks a variant constructor against a concrete enum.
+func (c *checker) checkVariantCtor(x *ast.CallExpr, p *ast.PathExpr, en *types.Enum) *types.Type {
 	v, ok := en.Variant(p.Segments[1])
 	if !ok {
 		c.errf(p.Sp, "E0599", "no variant `%s` on enum `%s`", p.Segments[1], en.Name)
@@ -2339,6 +2850,97 @@ func (c *checker) inferVariantCtor(x *ast.CallExpr, p *ast.PathExpr) *types.Type
 		}
 	}
 	return &types.Type{Kind: types.EnumKind, En: en}
+}
+
+// instantiateEnumForVariant infers an enum's arguments for a variant
+// construction from turbofish, the expected type, and the payload arguments.
+func (c *checker) instantiateEnumForVariant(x *ast.CallExpr, p *ast.PathExpr, tmpl *types.Enum, expected *types.Type) (*types.Enum, bool) {
+	bindings := map[string]*types.Type{}
+	if len(p.TypeArgs) > len(tmpl.Generics) {
+		c.errf(p.Sp, "E0107", "`%s` takes %d type argument(s) but %d were supplied", tmpl.Base, len(tmpl.Generics), len(p.TypeArgs))
+	}
+	for i, name := range tmpl.Generics {
+		if i < len(p.TypeArgs) {
+			if t := c.resolveType(p.TypeArgs[i]); t != nil {
+				bindings[name] = t
+			}
+		}
+	}
+	if expected != nil && expected.Kind == types.EnumKind && expected.En != nil && nominalBaseName(expected) == tmpl.Base {
+		for i, name := range tmpl.Generics {
+			if _, ok := bindings[name]; !ok && i < len(expected.En.Args) {
+				bindings[name] = expected.En.Args[i]
+			}
+		}
+	}
+	patterns := c.enumVariantPatterns(tmpl, p.Segments[1])
+	for i, a := range x.Args {
+		if i >= len(patterns) {
+			break
+		}
+		at := c.checkExpr(a, nil)
+		c.unify(patterns[i], at, bindings)
+	}
+	args := c.bindGenericArgs(p.Sp, tmpl.Generics, bindings)
+	if args == nil {
+		return nil, false
+	}
+	t := c.instantiateEnum(p.Sp, tmpl, args)
+	if t.Kind != types.EnumKind || t.En == nil {
+		return nil, false
+	}
+	return t.En, true
+}
+
+// enumFieldPattern resolves one named field of a variant with the enum's type
+// parameters in scope, for inference at a struct-variant literal.
+func (c *checker) enumFieldPattern(tmpl *types.Enum, variantName, fieldName string) *types.Type {
+	d := c.enumDecls[tmpl.Name]
+	if d == nil {
+		return nil
+	}
+	var out *types.Type
+	c.withTypeParams(tmpl.Generics, func() {
+		for _, v := range d.Variants {
+			if v.Name != variantName {
+				continue
+			}
+			for i, f := range v.Fields {
+				name := f.Name
+				if v.Tup {
+					name = strconv.Itoa(i)
+				}
+				if name == fieldName {
+					out = c.resolveType(f.Ty)
+					return
+				}
+			}
+			return
+		}
+	})
+	return out
+}
+
+// enumVariantPatterns resolves a variant's field types with the enum's type
+// parameters in scope, for inference at a construction site.
+func (c *checker) enumVariantPatterns(tmpl *types.Enum, variantName string) []*types.Type {
+	d := c.enumDecls[tmpl.Name]
+	if d == nil {
+		return nil
+	}
+	var out []*types.Type
+	c.withTypeParams(tmpl.Generics, func() {
+		for _, v := range d.Variants {
+			if v.Name != variantName {
+				continue
+			}
+			for _, f := range v.Fields {
+				out = append(out, c.resolveType(f.Ty))
+			}
+			return
+		}
+	})
+	return out
 }
 
 // isCatchAll reports whether a pattern matches every value (a binding or `_`).
@@ -2456,7 +3058,8 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 			}
 		}
 		c.pushScope()
-		c.checkPattern(arm.Pat, st)
+		borrowed := st != nil && (st.Kind == types.Ref || st.Kind == types.Ptr)
+		c.checkPattern(arm.Pat, st, borrowed)
 		if pp, ok := arm.Pat.(*ast.PathPat); ok && !guarded {
 			if v := c.info.PatVariant[pp]; v != nil {
 				if covered[v.Name] {
@@ -2523,12 +3126,15 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 
 // checkPattern type-checks a pattern against the scrutinee type and declares its
 // bindings in the current scope.
-func (c *checker) checkPattern(p ast.Pattern, st *types.Type) {
+func (c *checker) checkPattern(p ast.Pattern, st *types.Type, borrowed bool) {
 	switch pt := p.(type) {
 	case *ast.WildcardPat:
 		return
 	case *ast.BindPat:
 		if pt.Name != "_" {
+			if borrowed && st != nil && st.NeedsDrop() {
+				c.errf(pt.Sp, "E0507", "cannot move the owned value `%s` out of a borrowed scrutinee", pt.Name)
+			}
 			c.declare(pt.Sp, pt.Name, st)
 		}
 		return
@@ -2539,7 +3145,7 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type) {
 				// binds nothing for an or-pattern arm.
 				c.errf(alt.Span(), "E0900", "or-pattern alternatives cannot bind variables; match on the whole value and destructure in the arm body instead")
 			}
-			c.checkPattern(alt, st)
+			c.checkPattern(alt, st, borrowed)
 		}
 		return
 	case *ast.RangePat:
@@ -2599,7 +3205,7 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type) {
 				break
 			}
 			c.rejectNestedPat(sub)
-			c.checkPattern(sub, v.Fields[i].Ty)
+			c.checkPattern(sub, v.Fields[i].Ty, borrowed)
 		}
 		for _, fp := range pt.Fields {
 			f, ok := variantField(v, fp.Name)
@@ -2612,7 +3218,7 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type) {
 				sub = &ast.BindPat{Name: fp.Name, Sp: fp.Sp}
 			}
 			c.rejectNestedPat(sub)
-			c.checkPattern(sub, f.Ty)
+			c.checkPattern(sub, f.Ty, borrowed)
 		}
 		return
 	default:
@@ -2771,7 +3377,7 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 		}
 		return nil
 	}
-	m, ok := c.info.Methods[nominalName(base)][x.Name]
+	m, ok := c.info.Methods[nominalBaseName(base)][x.Name]
 	if !ok {
 		c.errAt(x, "E0599", "no method `%s` on type `%s`", x.Name, base)
 		for _, a := range x.Args {
@@ -2779,8 +3385,11 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 		}
 		return nil
 	}
+	if m.Generic {
+		m = c.instantiateMethod(m, base)
+	}
 	if m.Self == nil {
-		c.errAt(x, "E0599", "`%s::%s` takes no `self`, so it cannot be called with `.`", nominalName(base), x.Name)
+		c.errAt(x, "E0599", "`%s::%s` takes no `self`, so it cannot be called with `.`", base, x.Name)
 		for _, a := range x.Args {
 			c.checkExpr(a, nil)
 		}
@@ -2802,9 +3411,9 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 			names, defaults = names[1:], defaults[1:]
 		}
 	}
-	x.Args = c.resolveArgs(x.Sp, x.Args, names, defaults, fmt.Sprintf("method `%s::%s`", nominalName(base), x.Name))
+	x.Args = c.resolveArgs(x.Sp, x.Args, names, defaults, fmt.Sprintf("method `%s::%s`", base, x.Name))
 	if len(x.Args) != len(want) {
-		c.errAt(x, "E0061", "method `%s::%s` takes %d argument(s) but %d were supplied", nominalName(base), x.Name, len(want), len(x.Args))
+		c.errAt(x, "E0061", "method `%s::%s` takes %d argument(s) but %d were supplied", base, x.Name, len(want), len(x.Args))
 	}
 	for i, a := range x.Args {
 		var wt *types.Type
@@ -2819,19 +3428,44 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 	return m.Ret
 }
 
-func (c *checker) inferStructLit(x *ast.StructLitExpr) *types.Type {
+func (c *checker) inferStructLit(x *ast.StructLitExpr, expected *types.Type) *types.Type {
 	if len(x.Path) == 2 {
-		return c.inferEnumStructLit(x)
+		return c.inferEnumStructLit(x, expected)
 	}
 	if len(x.Path) != 1 {
 		c.errAt(x, "E0900", "path-qualified struct literals are not supported yet (roadmap M1)")
 		return nil
 	}
-	st, ok := c.info.Structs[x.Path[0]]
+	tmpl, ok := c.info.Structs[x.Path[0]]
 	if !ok {
 		c.errAt(x, "E0412", "cannot find type `%s` in this scope", x.Path[0])
+		for _, fi := range x.Fields {
+			c.checkExpr(fi.Val, nil)
+		}
 		return nil
 	}
+	st := tmpl
+	if tmpl.Generic {
+		args, ok := c.inferStructArgs(x, tmpl, expected)
+		if !ok {
+			for _, fi := range x.Fields {
+				c.checkExpr(fi.Val, nil)
+			}
+			return &types.Type{Kind: types.Invalid}
+		}
+		t := c.instantiateStruct(x.Sp, tmpl, args)
+		if t.Kind != types.StructKind || t.St == nil {
+			return &types.Type{Kind: types.Invalid}
+		}
+		st = t.St
+	} else if len(x.TypeArgs) > 0 {
+		c.errAt(x, "E0107", "`%s` is not generic", tmpl.Base)
+	}
+	return c.checkStructLitFields(x, st)
+}
+
+// checkStructLitFields checks a struct literal against a concrete struct.
+func (c *checker) checkStructLitFields(x *ast.StructLitExpr, st *types.Struct) *types.Type {
 	seen := map[string]bool{}
 	for _, fi := range x.Fields {
 		f, ok := st.Field(fi.Name)
@@ -2857,13 +3491,120 @@ func (c *checker) inferStructLit(x *ast.StructLitExpr) *types.Type {
 	return &types.Type{Kind: types.StructKind, St: st}
 }
 
-// inferEnumStructLit checks `Enum::Variant { field: value, .. }`.
-func (c *checker) inferEnumStructLit(x *ast.StructLitExpr) *types.Type {
-	en, ok := c.info.Enums[x.Path[0]]
-	if !ok {
-		c.errAt(x, "E0412", "cannot find type `%s` in this scope", x.Path[0])
+// inferStructArgs infers a generic struct's arguments from turbofish, the
+// expected type, and field initializers.
+func (c *checker) inferStructArgs(x *ast.StructLitExpr, tmpl *types.Struct, expected *types.Type) ([]*types.Type, bool) {
+	bindings := map[string]*types.Type{}
+	if len(x.TypeArgs) > len(tmpl.Generics) {
+		c.errAt(x, "E0107", "`%s` takes %d type argument(s) but %d were supplied", tmpl.Base, len(tmpl.Generics), len(x.TypeArgs))
+	}
+	for i, name := range tmpl.Generics {
+		if i < len(x.TypeArgs) {
+			if t := c.resolveType(x.TypeArgs[i]); t != nil {
+				bindings[name] = t
+			}
+		}
+	}
+	if expected != nil && expected.Kind == types.StructKind && expected.St != nil && nominalBaseName(expected) == tmpl.Base {
+		for i, name := range tmpl.Generics {
+			if _, ok := bindings[name]; !ok && i < len(expected.St.Args) {
+				bindings[name] = expected.St.Args[i]
+			}
+		}
+	}
+	for _, fi := range x.Fields {
+		pattern := c.structFieldPattern(tmpl, fi.Name)
+		if pattern == nil {
+			continue
+		}
+		at := c.checkExpr(fi.Val, nil)
+		c.unify(pattern, at, bindings)
+	}
+	args := c.bindGenericArgs(x.Sp, tmpl.Generics, bindings)
+	return args, args != nil
+}
+
+// structFieldPattern resolves a template field's type with the template's type
+// parameters in scope, for inference at a literal.
+func (c *checker) structFieldPattern(tmpl *types.Struct, fieldName string) *types.Type {
+	d := c.structDecls[tmpl.Name]
+	if d == nil {
 		return nil
 	}
+	var out *types.Type
+	c.withTypeParams(tmpl.Generics, func() {
+		for i, f := range d.Fields {
+			name := f.Name
+			if d.Tuple {
+				name = strconv.Itoa(i)
+			}
+			if name == fieldName {
+				out = c.resolveType(f.Ty)
+				return
+			}
+		}
+	})
+	return out
+}
+
+// inferEnumStructLit checks `Enum::Variant { field: value, .. }`.
+func (c *checker) inferEnumStructLit(x *ast.StructLitExpr, expected *types.Type) *types.Type {
+	tmpl, ok := c.info.Enums[x.Path[0]]
+	if !ok {
+		c.errAt(x, "E0412", "cannot find type `%s` in this scope", x.Path[0])
+		for _, fi := range x.Fields {
+			c.checkExpr(fi.Val, nil)
+		}
+		return nil
+	}
+	en := tmpl
+	if tmpl.Generic {
+		bindings := map[string]*types.Type{}
+		if len(x.TypeArgs) > len(tmpl.Generics) {
+			c.errAt(x, "E0107", "`%s` takes %d type argument(s) but %d were supplied", tmpl.Base, len(tmpl.Generics), len(x.TypeArgs))
+		}
+		for i, name := range tmpl.Generics {
+			if i < len(x.TypeArgs) {
+				if t := c.resolveType(x.TypeArgs[i]); t != nil {
+					bindings[name] = t
+				}
+			}
+		}
+		if expected != nil && expected.Kind == types.EnumKind && expected.En != nil && nominalBaseName(expected) == tmpl.Base {
+			for i, name := range tmpl.Generics {
+				if _, ok := bindings[name]; !ok && i < len(expected.En.Args) {
+					bindings[name] = expected.En.Args[i]
+				}
+			}
+		}
+		for _, fi := range x.Fields {
+			pattern := c.enumFieldPattern(tmpl, x.Path[1], fi.Name)
+			if pattern == nil {
+				continue
+			}
+			at := c.checkExpr(fi.Val, nil)
+			c.unify(pattern, at, bindings)
+		}
+		args := c.bindGenericArgs(x.Sp, tmpl.Generics, bindings)
+		if args == nil {
+			for _, fi := range x.Fields {
+				c.checkExpr(fi.Val, nil)
+			}
+			return &types.Type{Kind: types.Invalid}
+		}
+		t := c.instantiateEnum(x.Sp, tmpl, args)
+		if t.Kind != types.EnumKind || t.En == nil {
+			return &types.Type{Kind: types.Invalid}
+		}
+		en = t.En
+	} else if len(x.TypeArgs) > 0 {
+		c.errAt(x, "E0107", "`%s` is not generic", tmpl.Base)
+	}
+	return c.checkEnumStructLitFields(x, en)
+}
+
+// checkEnumStructLitFields checks an enum struct-variant literal.
+func (c *checker) checkEnumStructLitFields(x *ast.StructLitExpr, en *types.Enum) *types.Type {
 	v, ok := en.Variant(x.Path[1])
 	if !ok {
 		c.errAt(x, "E0599", "no variant `%s` on enum `%s`", x.Path[1], en.Name)
@@ -3127,6 +3868,9 @@ func (c *checker) resolveType(t ast.Type) *types.Type {
 		}
 		if len(x.Segments) == 1 {
 			if t, ok := c.typeEnv[x.Segments[0]]; ok {
+				if len(x.Args) > 0 {
+					c.errf(x.Sp, "E0107", "type parameter `%s` cannot take type arguments", x.Segments[0])
+				}
 				return t
 			}
 		}
@@ -3134,24 +3878,55 @@ func (c *checker) resolveType(t ast.Type) *types.Type {
 			c.errf(x.Sp, "E0900", "type paths are not supported by the compiler yet (roadmap M1)")
 			return nil
 		}
-		if bt, ok := types.Builtins[x.Segments[0]]; ok {
+		name := x.Segments[0]
+		if len(x.Args) > 0 {
+			args := make([]*types.Type, len(x.Args))
+			for i, a := range x.Args {
+				args[i] = c.resolveType(a)
+			}
+			if st, ok := c.info.Structs[name]; ok {
+				return c.applyStructArgs(x.Sp, st, args)
+			}
+			if en, ok := c.info.Enums[name]; ok {
+				return c.applyEnumArgs(x.Sp, en, args)
+			}
+			if _, ok := c.aliasDecls[name]; ok {
+				c.errf(x.Sp, "E0107", "type alias `%s` is not generic", name)
+				return c.resolveAlias(name, x.Sp)
+			}
+			c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope", name)
+			return nil
+		}
+		if bt, ok := types.Builtins[name]; ok {
 			return bt
 		}
-		if st, ok := c.info.Structs[x.Segments[0]]; ok {
+		if st, ok := c.info.Structs[name]; ok {
+			if st.Generic {
+				c.errf(x.Sp, "E0107", "`%s` expects %d type argument(s)", st.Base, len(st.Generics))
+			}
 			return &types.Type{Kind: types.StructKind, St: st}
 		}
-		if en, ok := c.info.Enums[x.Segments[0]]; ok {
+		if en, ok := c.info.Enums[name]; ok {
+			if en.Generic {
+				c.errf(x.Sp, "E0107", "`%s` expects %d type argument(s)", en.Base, len(en.Generics))
+			}
 			return &types.Type{Kind: types.EnumKind, En: en}
 		}
-		if _, ok := c.aliasDecls[x.Segments[0]]; ok {
-			return c.resolveAlias(x.Segments[0], x.Sp)
+		if _, ok := c.aliasDecls[name]; ok {
+			return c.resolveAlias(name, x.Sp)
 		}
-		c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope", x.Segments[0])
+		c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope", name)
 		return nil
 	case *ast.RefType:
-		return types.RefTo(c.resolveType(x.Elem), x.Mut)
+		c.indirect++
+		elem := c.resolveType(x.Elem)
+		c.indirect--
+		return types.RefTo(elem, x.Mut)
 	case *ast.PtrType:
-		return types.PtrTo(c.resolveType(x.Elem))
+		c.indirect++
+		elem := c.resolveType(x.Elem)
+		c.indirect--
+		return types.PtrTo(elem)
 	case *ast.TupleType:
 		if len(x.Elems) == 0 {
 			return types.UnitT

@@ -173,16 +173,17 @@ fn main() -> i32 {
 	}
 }
 
-func TestEnumOwningPayloadRejected(t *testing.T) {
+func TestEnumOwningPayloadAccepted(t *testing.T) {
+	// Enum variants may carry resource-owning payloads; a `match` moves the
+	// payload into the binding (see the codegen move-glue tests).
 	src := `enum E { S(String), A }
 fn main() -> i32 {
     let e = E::S(String::from("x"));
     match e { E::A => println(0), E::S(s) => println(s.len()) }
     0
 }`
-	ok, codes := check(t, src)
-	if ok || !has(codes, "E0900") {
-		t.Fatalf("expected E0900, got %v", codes)
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
 	}
 }
 
@@ -1155,7 +1156,11 @@ func TestGenericTemplatesAreDeclaredNotEmitted(t *testing.T) {
 	src := `struct Pair<A, B> { first: A, second: B }
 enum Opt<T> { Some(T), None }
 fn id<T>(x: T) -> T { x }
-fn main() -> i32 { 0 }`
+fn main() -> i32 {
+    let p = Pair { first: 1, second: true };
+    let o = Opt::Some(2);
+    0
+}`
 	file, pd := parser.Parse(0, []byte(src))
 	if len(pd) > 0 {
 		t.Fatalf("unexpected parse diagnostics: %v", codesOf(pd))
@@ -1172,15 +1177,25 @@ fn main() -> i32 { 0 }`
 		t.Fatalf("template signature did not resolve to parameter types: %s", id.Sig())
 	}
 	st := info.Structs["Pair"]
-	if st == nil || !st.Generic || len(st.Generics) != 2 || st.Fields[0].Ty.Kind != types.ParamKind {
+	if st == nil || !st.Generic || len(st.Generics) != 2 {
 		t.Fatalf("generic struct not registered as a template: %#v", st)
 	}
 	en := info.Enums["Opt"]
-	if en == nil || !en.Generic || len(en.Generics) != 1 || en.Variants[0].Fields[0].Ty.Kind != types.ParamKind {
+	if en == nil || !en.Generic || len(en.Generics) != 1 {
 		t.Fatalf("generic enum not registered as a template: %#v", en)
 	}
-	if len(info.StructOrd) != 0 || len(info.EnumOrd) != 0 {
-		t.Fatalf("templates must not be queued for emission")
+	if len(info.StructOrd) != 1 || len(info.EnumOrd) != 1 {
+		t.Fatalf("expected exactly the two instantiations to be queued, got %d structs and %d enums", len(info.StructOrd), len(info.EnumOrd))
+	}
+	for _, s := range info.StructOrd {
+		if s.Generic || s.Base != "Pair" || len(s.Args) != 2 || len(s.Fields) != 2 {
+			t.Fatalf("struct instantiation not concrete: %#v", s)
+		}
+	}
+	for _, e := range info.EnumOrd {
+		if e.Generic || e.Base != "Opt" || len(e.Args) != 1 {
+			t.Fatalf("enum instantiation not concrete: %#v", e)
+		}
 	}
 	for _, fn := range info.FnOrder {
 		if fn == id {
@@ -1205,12 +1220,44 @@ fn main() -> i32 { 0 }`)
 	}
 }
 
-func TestGenericImplRejectedForNow(t *testing.T) {
-	_, codes := check(t, `struct Pair<T> { v: T }
+func TestGenericImplMethodInstantiation(t *testing.T) {
+	src := `struct Pair<T> { v: T }
 impl<T> Pair<T> { fn get(&self) -> T { self.v } }
-fn main() -> i32 { 0 }`)
-	if !has(codes, "E0900") {
-		t.Fatalf("expected E0900 for a generic impl, got %v", codes)
+fn main() -> i32 {
+    let p = Pair { v: 1 };
+    println(p.get());
+    0
+}`
+	file, pd := parser.Parse(0, []byte(src))
+	if len(pd) > 0 {
+		t.Fatalf("unexpected parse diagnostics: %v", codesOf(pd))
+	}
+	info, ds := sema.Check(file)
+	if len(ds) > 0 {
+		t.Fatalf("unexpected diagnostics: %v", codesOf(ds))
+	}
+	tmpl := info.Methods["Pair"]["get"]
+	if tmpl == nil || !tmpl.Generic {
+		t.Fatalf("method template not registered: %#v", tmpl)
+	}
+	found := false
+	for _, fn := range info.FnOrder {
+		if fn.Name == "get" && fn.Recv != nil && fn.Recv.St != nil && fn.Recv.St.Base == "Pair" && len(fn.Recv.St.Args) == 1 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no `Pair<i64>::get` instantiation in FnOrder")
+	}
+}
+
+func TestGenericImplImplicitParams(t *testing.T) {
+	// `impl Pair<T>` (parameters introduced by the self type) is accepted too.
+	ok, codes := check(t, `struct Pair<T> { v: T }
+impl Pair<T> { fn get(&self) -> T { self.v } }
+fn main() -> i32 { let p = Pair { v: 1 }; println(p.get()); 0 }`)
+	if !ok {
+		t.Fatalf("expected clean, got %v", codes)
 	}
 }
 
@@ -1290,5 +1337,100 @@ func TestGenericInferenceAndErrors(t *testing.T) {
 				t.Fatalf("expected %s, got %v", tc.want, codes)
 			}
 		})
+	}
+}
+
+func TestGenericStructInference(t *testing.T) {
+	src := `struct Pair<A, B> { first: A, second: B }
+impl<A, B> Pair<A, B> {
+    fn swap(&self) -> Pair<B, A> { Pair { first: self.second, second: self.first } }
+}
+fn main() -> i32 {
+    let p = Pair { first: 1, second: true };
+    let q: Pair<bool, i32> = p.swap();
+    let r = Pair::<str, i64> { first: "x", second: 2 };
+    println(q.first);
+    println(r.second);
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestGenericStructNeedsAnnotation(t *testing.T) {
+	_, codes := check(t, `struct Box<T> { v: T }
+fn main() -> i32 { let b = Box { }; 0 }`)
+	if !has(codes, "E0282") {
+		t.Fatalf("expected E0282, got %v", codes)
+	}
+}
+
+func TestGenericTypeArity(t *testing.T) {
+	_, codes := check(t, `struct Pair<A, B> { first: A, second: B }
+fn main() -> i32 { let p: Pair<i32> = Pair { first: 1, second: 2 }; 0 }`)
+	if !has(codes, "E0107") {
+		t.Fatalf("expected E0107, got %v", codes)
+	}
+}
+
+func TestRecursiveGenericTypeRejected(t *testing.T) {
+	_, codes := check(t, `struct N<T> { next: N<T> }
+fn f(n: N<i32>) -> i32 { 0 }
+fn main() -> i32 { 0 }`)
+	if !has(codes, "E0072") {
+		t.Fatalf("expected E0072, got %v", codes)
+	}
+}
+
+func TestRecursiveGenericTypeBehindReferenceAllowed(t *testing.T) {
+	ok, codes := check(t, `struct N<T> { v: T, next: &N<T> }
+fn f(n: N<i32>) -> i32 { return n.v; }
+fn main() -> i32 { 0 }`)
+	if !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestOwnedPayloadMatchByBorrowRejected(t *testing.T) {
+	_, codes := check(t, `enum E { S(String), A }
+fn peek(e: &E) -> i32 { match e { E::S(s) => s.len() as i32, E::A => 0 } }
+fn main() -> i32 { 0 }`)
+	if !has(codes, "E0507") {
+		t.Fatalf("expected E0507, got %v", codes)
+	}
+}
+
+func TestGenericEnumStructVariant(t *testing.T) {
+	src := `enum R<T, E> { Ok(T), Err { e: E, code: i64 } }
+fn code(r: R<String, str>) -> i64 {
+    match r { R::Ok(s) => s.len() as i64, R::Err { code, .. } => code }
+}
+fn main() -> i32 {
+    let a: R<String, str> = R::Ok(String::from("abc"));
+    let b: R<String, str> = R::Err { e: "bad", code: 7 };
+    println(code(a) + code(b));
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestGenericAssociatedFunction(t *testing.T) {
+	src := `struct P<T> { v: T }
+impl<T> P<T> {
+    fn make(v: T) -> P<T> { P { v: v } }
+    fn get(&self) -> T { self.v }
+}
+fn main() -> i32 {
+    let p = P::<i64>::make(5);
+    let q: P<str> = P::make("hi");
+    println(p.get());
+    println(q.get());
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
 	}
 }

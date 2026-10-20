@@ -385,7 +385,9 @@ func (m *mover) ifExpr(x *ast.IfExpr) {
 }
 
 func (m *mover) matchExpr(x *ast.MatchExpr) {
-	m.use(x.Scrutinee)
+	// A match takes its scrutinee by value: when the scrutinee owns heap
+	// resources it is moved, so patterns may move payloads out of it.
+	m.consume(x.Scrutinee)
 	before := m.snapshot()
 	result := before
 	for _, arm := range x.Arms {
