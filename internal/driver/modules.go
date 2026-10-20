@@ -318,6 +318,7 @@ func (l *loader) bindUse(m *module, d *ast.UseDecl) {
 		}
 		if target != nil && qual != "" {
 			l.bind(m, []string{qual}, target, d.Sp)
+			l.reexport(m, target, d)
 		}
 		return
 	}
@@ -344,6 +345,7 @@ func (l *loader) bindUse(m *module, d *ast.UseDecl) {
 	}
 	if d.As != "" {
 		l.bind(m, []string{d.As}, target, d.Sp)
+		l.reexport(m, target, d)
 		return
 	}
 	// Bind the full path (`http::server::Router`) and its last segment
@@ -354,6 +356,22 @@ func (l *loader) bindUse(m *module, d *ast.UseDecl) {
 	l.bind(m, parts, target, d.Sp)
 	if len(parts) > 0 {
 		l.bind(m, parts[len(parts)-1:], target, d.Sp)
+	}
+	l.reexport(m, target, d)
+}
+
+// reexport makes a `pub use` re-export the target module's public items under
+// their own names, so a downstream module can reach them as
+// `this_module::item`. Without it a qualified access would only see the items
+// declared directly in this module.
+func (l *loader) reexport(m *module, target *module, d *ast.UseDecl) {
+	if target == nil || !d.Vis {
+		return
+	}
+	for name, pub := range target.exports {
+		if pub {
+			m.exports[name] = true
+		}
 	}
 }
 

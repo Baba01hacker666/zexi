@@ -1989,6 +1989,57 @@ func TestModulePrivacy(t *testing.T) {
 	}
 }
 
+// TestGlobAndReexport checks the two self-contained module pieces that do not
+// require full isolation: a `pub use` re-exports the target's public items so
+// a downstream module can reach them, and `use foo::*;` parses (the flat
+// namespace already makes the items visible, so it is a no-op for resolution).
+func TestGlobAndReexport(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	files := map[string]string{
+		"lib.zx":    "pub fn triple(n: i32) -> i32 { n * 3 }\nfn secret() -> i32 { 1 }\n",
+		"facade.zx": "pub use \"lib.zx\" as lib;\n",
+		"main.zx": `use "facade.zx" as fac;
+use "lib.zx" as lib;
+use lib::*;
+fn main() -> i32 { println(fac::triple(2), lib::triple(2), triple(3)); 0 }
+`,
+		"bad.zx": `use "facade.zx" as fac;
+fn main() -> i32 { fac::secret() }
+`,
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(filepath.Join(dir, "main.zx"), out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("glob/re-export program failed to build")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running glob/re-export program: %v", err)
+	}
+	if want := "6 6 9\n"; string(raw) != want {
+		t.Fatalf("output mismatch: got %q want %q", string(raw), want)
+	}
+
+	em = diag.NewEmitter()
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "bad.zx"), driver.Options{}, em); ok {
+		t.Fatal("expected a private item not to be re-exported")
+	}
+	var buf bytes.Buffer
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E0412") {
+		t.Fatalf("expected E0412 for a non-re-exported item, got:\n%s", buf.String())
+	}
+}
+
 // TestModuleUnknownItem and TestModuleUsedAsValue cover the two other
 // qualified-path mistakes: a missing export and treating a module as a value.
 func TestModuleQualifiedDiagnostics(t *testing.T) {

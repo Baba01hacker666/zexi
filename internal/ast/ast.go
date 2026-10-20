@@ -160,11 +160,15 @@ func (d *ModDecl) Span() token.Span { return d.Sp }
 // resolves it to source files (a library import) before type checking. `As` is
 // retained by the parser for the future scoped-module model.
 type UseDecl struct {
+	Vis  Visibility
 	Path []string
 	// File is the literal path of `use "file.zx";` / `import "file.zx";`,
 	// resolved relative to the importing file. Empty for a named-library path.
 	File string
 	As   string
+	// Glob is `use foo::*;` / `pub use foo::*;`: bring every public item of
+	// the target module into scope (and re-export them when Vis is set).
+	Glob bool
 	Sp   token.Span
 }
 
