@@ -45,6 +45,7 @@ const (
 	StructKind // nominal product type
 	EnumKind   // nominal tagged union
 	StringKind // builtin owning heap string
+	VecKind    // builtin growable owning array, Vec<T>
 	ParamKind  // a generic type parameter (only while checking a template)
 )
 
@@ -281,6 +282,9 @@ func (t *Type) IsCopy() bool {
 		return true
 	case Array:
 		return t.Elem.IsCopy()
+	case VecKind:
+		// A Vec owns a heap buffer; copying the handle would double-free it.
+		return false
 	case Tuple:
 		for _, e := range t.Elems {
 			if !e.IsCopy() {
@@ -332,6 +336,9 @@ func (t *Type) NeedsDrop() bool {
 				}
 			}
 		}
+	case VecKind:
+		// Always: the buffer itself is heap-allocated, whatever it holds.
+		return true
 	case Array:
 		return t.Elem.NeedsDrop()
 	case Tuple:
@@ -394,6 +401,8 @@ func (t *Type) String() string {
 		return "str"
 	case StringKind:
 		return "String"
+	case VecKind:
+		return "Vec<" + t.Elem.String() + ">"
 	case Never:
 		return "never"
 	case StructKind:

@@ -1819,6 +1819,9 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		if p.Segments[0] == "String" {
 			return c.inferStringCtor(x, p.Segments[1])
 		}
+		if p.Segments[0] == "Vec" {
+			return c.inferVecCtor(x, p, p.Segments[1], expected)
+		}
 		// `Type::name(args)` may also name an associated function: one declared
 		// in an `impl` block without a `self` parameter.
 		if m, ok := c.info.Methods[p.Segments[0]][p.Segments[1]]; ok {
@@ -2795,10 +2798,11 @@ func (c *checker) inferLen(x *ast.CallExpr) *types.Type {
 		return types.UsizeT
 	}
 	t := c.checkExpr(x.Args[0], nil)
-	if t != nil && (t.Kind == types.Array || t.Kind == types.Str || t.Kind == types.Slice || t.Kind == types.StringKind) {
+	if t != nil && (t.Kind == types.Array || t.Kind == types.Str || t.Kind == types.Slice ||
+		t.Kind == types.StringKind || t.Kind == types.VecKind) {
 		return types.UsizeT
 	}
-	c.errAt(x.Args[0], "E0308", "`len` expects an array, slice, `str`, or `String`, found `%s`", t)
+	c.errAt(x.Args[0], "E0308", "`len` expects an array, slice, `str`, `String`, or `Vec`, found `%s`", t)
 	return types.UsizeT
 }
 
@@ -2806,7 +2810,7 @@ func (c *checker) inferLen(x *ast.CallExpr) *types.Type {
 func (c *checker) inferIndex(x *ast.IndexExpr) *types.Type {
 	rt := c.checkExpr(x.Recv, nil)
 	it := c.checkExpr(x.Index, nil)
-	if rt == nil || (rt.Kind != types.Array && rt.Kind != types.Slice) {
+	if rt == nil || (rt.Kind != types.Array && rt.Kind != types.Slice && rt.Kind != types.VecKind) {
 		c.errAt(x, "E0608", "cannot index a value of type `%s`", rt)
 		return nil
 	}
@@ -3668,6 +3672,9 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 	if base != nil && base.Kind == types.StringKind {
 		return c.inferStringMethod(x)
 	}
+	if base != nil && base.Kind == types.VecKind {
+		return c.inferVecMethod(x, base)
+	}
 	// `len()` is also available directly on arrays and `str` values.
 	if x.Name == "len" && len(x.Args) == 0 && base != nil && (base.Kind == types.Array || base.Kind == types.Str) {
 		return types.UsizeT
@@ -4048,7 +4055,21 @@ func (c *checker) inferFor(x *ast.LoopExpr) *types.Type {
 			c.popScope()
 			return types.UnitT
 		}
-		c.errAt(x.Iter, "E0900", "`for` iterates an integer range (`a..b`) or an array (roadmap M0)")
+		if it != nil && it.Kind == types.VecKind {
+			// As with arrays, elements must be `Copy`: the binding is a copy
+			// of each element, and an owned element would be dropped twice.
+			if !it.Elem.IsCopy() {
+				c.errAt(x.Iter, "E0507", "cannot iterate a `Vec` of non-`Copy` element type `%s` by value", it.Elem)
+			}
+			c.pushScope()
+			c.bindPattern(x.Pat, it.Elem, true)
+			c.loopDepth++
+			c.checkBlock(x.Body)
+			c.loopDepth--
+			c.popScope()
+			return types.UnitT
+		}
+		c.errAt(x.Iter, "E0900", "`for` iterates an integer range (`a..b`), an array, or a `Vec`")
 		c.loopDepth++
 		c.checkBlock(x.Body)
 		c.loopDepth--
@@ -4183,6 +4204,9 @@ func (c *checker) resolveType(t ast.Type) *types.Type {
 			return nil
 		}
 		name := x.Segments[0]
+		if name == "Vec" {
+			return c.resolveVecType(x.Sp, x.Args)
+		}
 		if len(x.Args) > 0 {
 			args := make([]*types.Type, len(x.Args))
 			for i, a := range x.Args {
