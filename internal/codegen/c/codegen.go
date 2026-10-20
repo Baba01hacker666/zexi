@@ -29,6 +29,11 @@ import (
 type Options struct {
 	// NoStd drops the standard headers for freestanding targets. Unused in M0.
 	NoStd bool
+	// DebugChecks turns on the checks that release builds elide: signed and
+	// unsigned integer overflow on `+ - * -` panics instead of wrapping.
+	// Division and modulo by zero always panic, in every profile, because
+	// they are not a performance choice — they are undefined behaviour.
+	DebugChecks bool
 }
 
 type gen struct {
@@ -49,6 +54,9 @@ type gen struct {
 	trapDepth  int  // compiler-generated constructs (matches) since the innermost loop
 	hasString  bool // whether the program uses the builtin `String`
 	hasChar    bool // whether a `char` value is printed (needs the UTF-8 helper)
+	// hasPanic marks that the program contains at least one run-time check
+	// that can fail, so `zx_panicf` must be defined in the unit.
+	hasPanic bool
 	// externNames is the set of C-visible function names (`extern "C"`
 	// declarations and `main`): locals mangle to `zx_<name>`, which must
 	// never shadow one of these (a local `motto` would hide the C
@@ -127,7 +135,7 @@ func Generate(info *sema.Info, opts Options) (string, error) {
 	for _, fn := range g.reachableFns() {
 		g.funcDef(fn)
 	}
-	g.charRuntime()
+	g.lateRuntime()
 	return g.w.b.String(), nil
 }
 
@@ -167,7 +175,7 @@ func GenerateSplit(info *sema.Info, opts Options, n int) (string, []string, erro
 	units := make([]string, n)
 	for i, w := range writers {
 		g.w = w
-		g.charRuntime()
+		g.lateRuntime()
 		body := w.b.String()
 		if i == 0 {
 			body = "// Command-line argument storage (defined once per program).\nint zx_argc;\nchar **zx_argv;\n\n" + g.core.b.String() + body
@@ -335,9 +343,22 @@ func (g *gen) preamble() {
 	g.w.line("#include <stdio.h>")
 	g.w.line("#include <stdlib.h>")
 	g.w.line("#include <string.h>")
+	g.w.line("#include <stdarg.h>")
+	g.w.line("")
+	g.w.line("// Overflow detection uses the compiler builtins when they exist; without")
+	g.w.line("// them the checked helpers fall back to plain (wrapping) arithmetic.")
+	g.w.line("#if defined(__GNUC__) || defined(__clang__)")
+	g.w.line("#define ZX_OVERFLOW_BUILTINS 1")
+	g.w.line("#define ZX_NORETURN __attribute__((noreturn))")
+	g.w.line("#else")
+	g.w.line("#define ZX_NORETURN")
+	g.w.line("#endif")
 	g.w.line("")
 	g.w.line("// Defined only when a `char` is printed.")
 	g.w.line("static int zx_print_char(uint32_t c);")
+	g.w.line("")
+	g.w.line("// Defined only when the program can panic at run time.")
+	g.w.line("static ZX_NORETURN void zx_panicf(const char *fmt, ...);")
 	g.w.line("")
 	g.w.line("// Command-line arguments, captured by `main` for arg_count()/arg_at().")
 	g.w.line("extern int zx_argc;")
@@ -351,21 +372,124 @@ func (g *gen) preamble() {
 // produce minimal C.
 func (g *gen) runtime() {
 	if len(g.arrayOrder) > 0 {
+		g.hasPanic = true
 		g.boundsHelper()
 	}
 	if g.hasString {
+		// The allocator can fail, which is a panic path.
+		g.hasPanic = true
 		g.w.raw(zxStringRuntime)
+	}
+	// Which arithmetic needs checking is only known once bodies are lowered,
+	// and C requires a declaration before the first use, so a debug build
+	// emits the whole (tiny) family here. Unused helpers are dropped by the
+	// linker's section GC.
+	if g.opts.DebugChecks {
+		for _, ct := range intCTypes {
+			for _, op := range []string{"add", "sub", "mul"} {
+				g.arithHelper(op, ct)
+			}
+			if strings.HasPrefix(ct, "int") {
+				g.arithHelper("neg", ct)
+			}
+		}
 	}
 }
 
+// lateRuntime emits the helpers whose need is only discovered while lowering
+// bodies. Like the `char` printer, each unit that needs one gets its own
+// static copy; the linker drops the copies it does not use.
+func (g *gen) lateRuntime() {
+	g.charRuntime()
+	if g.hasPanic {
+		g.panicHelper()
+	}
+}
+
+// panicHelper defines `zx_panicf`, the single exit path for every run-time
+// fault. stdout is flushed first: C buffers it when it is not a terminal, so
+// without this a panic would silently swallow everything the program had
+// already printed.
+func (g *gen) panicHelper() {
+	g.w.line("")
+	g.w.line("// Report a run-time fault and stop. stdout is flushed so output")
+	g.w.line("// produced before the panic is not lost in the C buffer.")
+	g.w.line("static ZX_NORETURN void zx_panicf(const char *fmt, ...) {")
+	g.w.line("    va_list ap;")
+	g.w.line("    fflush(stdout);")
+	g.w.line(`    fputs("zexi panic: ", stderr);`)
+	g.w.line("    va_start(ap, fmt);")
+	g.w.line("    vfprintf(stderr, fmt, ap);")
+	g.w.line("    va_end(ap);")
+	g.w.line(`    fputc('\n', stderr);`)
+	g.w.line("    fflush(stderr);")
+	g.w.line("    exit(101);")
+	g.w.line("}")
+	g.w.line("")
+}
+
+// arithOps names the overflow-checked arithmetic helpers.
+var arithOps = map[string]string{"add": "add", "sub": "subtract", "mul": "multiply"}
+
+// checkedArithName is the name of the overflow-checked helper for `op` on the
+// C type `ct`.
+func checkedArithName(op, ct string) string {
+	return "zx_" + op + "_" + strings.ReplaceAll(ct, " ", "")
+}
+
+// intCTypes lists the C spelling of every Zexi integer type. On some platforms
+// two of these are the same underlying type, which is fine: the helpers differ
+// by name, and unused ones cost nothing.
+var intCTypes = []string{
+	"int8_t", "int16_t", "int32_t", "int64_t", "intptr_t",
+	"uint8_t", "uint16_t", "uint32_t", "uint64_t", "size_t",
+}
+
+// wantCheckedArith returns the name of the checked helper for `op` on `ct`.
+// Debug builds emit the whole family in the preamble, so a helper is never
+// referenced before its declaration.
+func (g *gen) wantCheckedArith(op, ct string) string {
+	g.hasPanic = true
+	return checkedArithName(op, ct)
+}
+
+// arithHelper emits one overflow-checked arithmetic helper. The check uses the
+// compiler builtins when they exist and degrades to wrapping arithmetic when
+// they do not, so the generated C stays portable.
+func (g *gen) arithHelper(op, ct string) {
+	name := checkedArithName(op, ct)
+	signed := strings.HasPrefix(ct, "int")
+	switch op {
+	case "neg":
+		g.w.line("static inline %s %s(%s a) {", ct, name, ct)
+		g.w.line("#ifdef ZX_OVERFLOW_BUILTINS")
+		if signed {
+			g.w.line(`    if (a == (%s)((%s)1 << (sizeof(%s) * 8 - 1))) zx_panicf("attempt to negate with overflow");`, ct, ct, ct)
+		}
+		g.w.line("#endif")
+		g.w.line("    return (%s)(-a);", ct)
+		g.w.line("}")
+		return
+	}
+	builtin := "__builtin_" + op + "_overflow"
+	g.w.line("static inline %s %s(%s a, %s b) {", ct, name, ct, ct)
+	g.w.line("#ifdef ZX_OVERFLOW_BUILTINS")
+	g.w.line("    %s r;", ct)
+	g.w.line(`    if (%s(a, b, &r)) zx_panicf("attempt to %s with overflow");`, builtin, arithOps[op])
+	g.w.line("    return r;")
+	g.w.line("#else")
+	g.w.line("    return (%s)(a %s b);", ct, arithOps[op])
+	g.w.line("#endif")
+	g.w.line("}")
+}
+
 func (g *gen) boundsHelper() {
-	g.w.line("// Bounds-checked array index: aborts with a message instead of reading")
+	g.w.line("// Bounds-checked array index: panics with a message instead of reading")
 	g.w.line("// out of bounds. (M0-alpha: no backtrace yet.)")
 	g.w.line("static inline int64_t zx_bounds(int64_t i, int64_t n) {")
 	g.w.line("    if (i < 0) { i += n; }")
 	g.w.line("    if (i < 0 || i >= n) {")
-	g.w.line(`        fprintf(stderr, "zexi: index %%lld out of bounds (len %%lld)\n", (long long)i, (long long)n);`)
-	g.w.line("        abort();")
+	g.w.line(`        zx_panicf("index %%lld out of bounds for length %%lld", (long long)i, (long long)n);`)
 	g.w.line("    }")
 	g.w.line("    return i;")
 	g.w.line("}")
@@ -1147,10 +1271,11 @@ func (g *gen) forStmt(x *ast.LoopExpr) string {
 	g.w.line("%s %s = %s;", ctype(lt), lo, g.value(rng.L))
 	g.w.line("%s %s = %s;", ctype(lt), hi, g.value(rng.R))
 	g.pushScope()
-	name := g.fresh("i")
-	if p, ok := x.Pat.(*ast.BindPat); ok {
-		name = g.bind(p.Name)
-	}
+	// Bind the loop variable exactly once. Binding a placeholder first would
+	// both burn a unique suffix and shadow an outer loop variable of the same
+	// name in this scope, so references to the outer variable inside a nested
+	// loop would resolve to a C name that is never declared.
+	name := g.bindLoopVar(x.Pat)
 	g.w.line("for (%s %s = %s; %s %s %s; %s++) {", ctype(lt), name, lo, name, op, hi, name)
 	g.w.indent++
 	res := g.loopResult(x)
@@ -1175,13 +1300,14 @@ func (g *gen) forArray(x *ast.LoopExpr) string {
 	arr := g.tmpName()
 	g.w.line("%s %s = %s;", ctype(it), arr, g.value(x.Iter))
 	g.pushScope()
-	name := g.fresh("x")
-	if p, ok := x.Pat.(*ast.BindPat); ok {
-		name = g.bind(p.Name)
-	}
-	g.w.line("for (size_t zx_i = 0; zx_i < %d; zx_i++) {", it.Len)
+	// See forStmt: bind the element name exactly once.
+	name := g.bindLoopVar(x.Pat)
+	// The iteration counter is a compiler temporary (`zx__tN`), so a user
+	// local named `i` in the body cannot shadow it.
+	ctr := g.tmpName()
+	g.w.line("for (size_t %s = 0; %s < %d; %s++) {", ctr, ctr, it.Len, ctr)
 	g.w.indent++
-	g.w.line("%s %s = %s.e[zx_i];", ctype(it.Elem), name, arr)
+	g.w.line("%s %s = %s.e[%s];", ctype(it.Elem), name, arr, ctr)
 	res := g.loopResult(x)
 	brk, cont := g.openLoop(res)
 	g.blockStmts(x.Body, nil)
@@ -1272,6 +1398,13 @@ func (g *gen) value(e ast.Expr) string {
 					// `-9223372036854775808` is not a valid C constant; the
 					// <stdint.h> macro is.
 					return macro
+				}
+			}
+			if g.opts.DebugChecks {
+				// -INT_MIN overflows; the checked helper reports it instead of
+				// silently producing the same negative value.
+				if t := g.info.TypeOf(x); t != nil && t.Kind.IsInt() && t.Kind.IsSigned() {
+					return "(" + g.wantCheckedArith("neg", ctype(t)) + "(" + g.value(x.X) + "))"
 				}
 			}
 			return "(-" + g.value(x.X) + ")"
@@ -1525,7 +1658,76 @@ func (g *gen) binValue(x *ast.BinExpr) string {
 			})
 		}
 	}
+	if g.checkedInt(x) {
+		return g.checkedBinOp(x)
+	}
 	return "(" + g.value(x.L) + " " + x.Op.String() + " " + g.value(x.R) + ")"
+}
+
+// checkedInt reports whether `x` is an integer operation that needs a run-time
+// check: division and modulo by zero always do, and `+ - *` do in a debug
+// build.
+func (g *gen) checkedInt(x *ast.BinExpr) bool {
+	switch x.Op {
+	case token.KindSlash, token.KindPercent:
+		t := g.info.TypeOf(x)
+		return t != nil && t.Kind.IsInt()
+	case token.KindPlus, token.KindMinus, token.KindStar:
+		if !g.opts.DebugChecks {
+			return false
+		}
+		t := g.info.TypeOf(x)
+		return t != nil && t.Kind.IsInt()
+	}
+	return false
+}
+
+// checkedBinOp lowers a checked integer operation to a single statement
+// expression: both operands are evaluated exactly once, in order, and the fault
+// panics instead of trapping or wrapping silently.
+func (g *gen) checkedBinOp(x *ast.BinExpr) string {
+	g.hasPanic = true
+	t := g.info.TypeOf(x)
+	ct := ctype(t)
+	// Operand statements (a nested match, say) are emitted to the enclosing
+	// writer first; only the checks stay inside the statement expression.
+	lv, rv := g.value(x.L), g.value(x.R)
+	a, b, r := g.tmpName(), g.tmpName(), g.tmpName()
+	var b2 strings.Builder
+	fmt.Fprintf(&b2, "%s %s = %s; %s %s = %s; ", ct, a, lv, ct, b, rv)
+	fmt.Fprintf(&b2, "%s %s; ", ct, r)
+	if x.Op == token.KindSlash || x.Op == token.KindPercent {
+		// A zero divisor traps on every target, so this check is not optional:
+		// without it the process dies on SIGFPE with no message and takes the
+		// buffered output with it.
+		what := "divide"
+		if x.Op == token.KindPercent {
+			what = "calculate the remainder of a division"
+		}
+		fmt.Fprintf(&b2, "if (%s == 0) zx_panicf(\"attempt to %s by zero\"); ", b, what)
+		switch {
+		case x.Op == token.KindSlash && t.Kind.IsSigned():
+			// x86 also traps on INT_MIN / -1, even under -fwrapv, so handle a
+			// divisor of -1 without the divide instruction.
+			fmt.Fprintf(&b2, "if (%s == (%s)(-1)) { if (%s == (%s)((%s)1 << (sizeof(%s) * 8 - 1))) zx_panicf(\"attempt to divide with overflow\"); %s = (%s)(-%s); } else %s = (%s)(%s / %s); ",
+				b, ct, a, ct, ct, ct, r, ct, a, r, ct, a, b)
+		case x.Op == token.KindPercent && t.Kind.IsSigned():
+			// The remainder of any value by -1 is zero; skipping the divide
+			// also avoids the INT_MIN % -1 trap.
+			fmt.Fprintf(&b2, "%s = (%s == (%s)(-1)) ? (%s)0 : (%s)(%s %% %s); ", r, b, ct, ct, ct, a, b)
+		default:
+			op := "/"
+			if x.Op == token.KindPercent {
+				op = "%"
+			}
+			fmt.Fprintf(&b2, "%s = (%s)(%s %s %s); ", r, ct, a, op, b)
+		}
+	} else {
+		op := map[token.Kind]string{token.KindPlus: "add", token.KindMinus: "sub", token.KindStar: "mul"}[x.Op]
+		fmt.Fprintf(&b2, "%s = %s(%s, %s); ", r, g.wantCheckedArith(op, ct), a, b)
+	}
+	fmt.Fprintf(&b2, "%s;", r)
+	return "({ " + b2.String() + " })"
 }
 
 func (g *gen) ifValue(x *ast.IfExpr) string {
@@ -2178,7 +2380,7 @@ func (g *gen) matchValue(x *ast.MatchExpr) string {
 	if owned {
 		scrut = g.consume(x.Scrutinee)
 	}
-	m := g.fresh("m")
+	m := g.tmpName()
 	sub.line("%s %s = %s;", ctype(st), m, scrut)
 	if owned {
 		g.openDropFrame()
@@ -2186,7 +2388,7 @@ func (g *gen) matchValue(x *ast.MatchExpr) string {
 	}
 	result := ""
 	if t != nil && t.Kind != types.Unit && t.Kind != types.Never {
-		result = g.fresh("r")
+		result = g.tmpName()
 		sub.line("%s %s;", ctype(t), result)
 	}
 	g.emitMatchArms(x, st, m, result, sub)
@@ -2376,7 +2578,7 @@ func (g *gen) matchStmt(x *ast.MatchExpr) {
 	if owned {
 		scrut = g.consume(x.Scrutinee)
 	}
-	m := g.fresh("m")
+	m := g.tmpName()
 	g.w.line("%s %s = %s;", ctype(st), m, scrut)
 	if owned {
 		g.openDropFrame()
@@ -2762,7 +2964,20 @@ func safeIdent(name string) string {
 // the same unique scheme so the two agree.
 func localName(name string) string { return "zx_" + safeIdent(name) }
 
-func (g *gen) fresh(hint string) string { return g.bind(hint) }
+// bindLoopVar binds a `for` loop's pattern variable to its C name. It must be
+// called exactly once per loop: binding a placeholder name first would burn a
+// unique suffix *and* record that name in the loop's scope, so a reference to
+// an outer loop variable of the same name would resolve to a C identifier that
+// is never declared.
+func (g *gen) bindLoopVar(p ast.Pattern) string {
+	if bp, ok := p.(*ast.BindPat); ok {
+		return g.bind(bp.Name)
+	}
+	// A wildcard (or any other non-binding pattern) still needs a C name for
+	// the element; use a compiler temporary so it cannot collide with a user
+	// binding of the same name.
+	return g.tmpName()
+}
 
 func (g *gen) bind(name string) string {
 	c := "zx_" + safeIdent(name)
@@ -2986,6 +3201,17 @@ func (g *gen) assignValue(x *ast.AssignExpr) string {
 		}
 	}
 	if x.Op != token.KindEq {
+		if op, ok := compoundArithOp[x.Op]; ok && g.opts.DebugChecks {
+			if t := g.info.TypeOf(x.Lhs); t != nil && t.Kind.IsInt() {
+				// Bind the place once through a pointer, so a subscript with a
+				// side effect is still evaluated exactly once.
+				lhs := g.value(x.Lhs)
+				rhs := g.value(x.Rhs)
+				p, res := g.tmpName(), g.tmpName()
+				return fmt.Sprintf("({ %s *%s = &(%s); %s %s = %s(*%s, %s); *%s = %s; })",
+					ctype(t), p, lhs, ctype(t), res, g.wantCheckedArith(op, ctype(t)), p, rhs, p, res)
+			}
+		}
 		return "(" + g.value(x.Lhs) + " " + x.Op.String() + " " + g.value(x.Rhs) + ")"
 	}
 	lt := g.info.TypeOf(x.Lhs)
@@ -3001,6 +3227,14 @@ func (g *gen) assignValue(x *ast.AssignExpr) string {
 }
 
 // --- types and literals ---------------------------------------------------
+
+// compoundArithOp maps a compound assignment operator to the checked helper
+// that implements its arithmetic.
+var compoundArithOp = map[token.Kind]string{
+	token.KindPlusEq:  "add",
+	token.KindMinusEq: "sub",
+	token.KindStarEq:  "mul",
+}
 
 func ctype(t *types.Type) string {
 	if t == nil {
@@ -3183,7 +3417,7 @@ static zx_String zx_string_from(const char *p) {
     if (!p) p = "";
     s.len = strlen(p);
     s.ptr = (char *)malloc(s.len + 1);
-    if (!s.ptr) { fputs("zexi: out of memory\n", stderr); abort(); }
+    if (!s.ptr) zx_panicf("out of memory");
     memcpy(s.ptr, p, s.len + 1);
     return s;
 }
@@ -3197,7 +3431,7 @@ static zx_String zx_string_with_capacity(size_t n) {
     zx_String s;
     s.len = 0;
     s.ptr = (char *)malloc(n + 1);
-    if (!s.ptr) { fputs("zexi: out of memory\n", stderr); abort(); }
+    if (!s.ptr) zx_panicf("out of memory");
     s.ptr[0] = 0;
     return s;
 }
@@ -3210,7 +3444,7 @@ static zx_String zx_string_concat(const char *a, const char *b) {
     zx_String r;
     r.len = la + lb;
     r.ptr = (char *)malloc(la + lb + 1);
-    if (!r.ptr) { fputs("zexi: out of memory\n", stderr); abort(); }
+    if (!r.ptr) zx_panicf("out of memory");
     if (la) memcpy(r.ptr, a, la);
     if (lb) memcpy(r.ptr + la, b, lb);
     r.ptr[la + lb] = 0;
@@ -3233,7 +3467,7 @@ static zx_String zx_string_slice(const char *s, int64_t lo, int64_t hi) {
     zx_String r;
     r.len = len;
     r.ptr = (char *)malloc(len + 1);
-    if (!r.ptr) { fputs("zexi: out of memory\\n", stderr); abort(); }
+    if (!r.ptr) zx_panicf("out of memory");
     if (len) memcpy(r.ptr, s + lo, len);
     r.ptr[len] = 0;
     return r;
@@ -3255,7 +3489,7 @@ static void zx_string_push_str(zx_String *s, const char *p) {
         if (here >= base && here <= base + (uintptr_t)s->len) off = (long)(here - base);
     }
     char *np = (char *)realloc(s->ptr, s->len + n + 1);
-    if (!np) { fputs("zexi: out of memory\n", stderr); abort(); }
+    if (!np) zx_panicf("out of memory");
     s->ptr = np;
     if (off >= 0) src = s->ptr + off;
     /* memmove: the source may overlap the destination (self-append). */
@@ -3290,7 +3524,7 @@ static void zx_string_push(zx_String *s, uint32_t c) {
     char buf[4];
     int n = zx_utf8_encode(c, buf);
     char *np = (char *)realloc(s->ptr, s->len + (size_t)n + 1);
-    if (!np) { fputs("zexi: out of memory\n", stderr); abort(); }
+    if (!np) zx_panicf("out of memory");
     s->ptr = np;
     memcpy(s->ptr + s->len, buf, (size_t)n);
     s->len += (size_t)n;
@@ -3301,7 +3535,7 @@ static void zx_string_push(zx_String *s, uint32_t c) {
 // already-encoded data into a String (e.g. a socket read).
 static void zx_string_push_byte(zx_String *s, uint8_t b) {
     char *np = (char *)realloc(s->ptr, s->len + 2);
-    if (!np) { fputs("zexi: out of memory\n", stderr); abort(); }
+    if (!np) zx_panicf("out of memory");
     s->ptr = np;
     s->ptr[s->len] = (char)b;
     s->len += 1;
@@ -3312,7 +3546,7 @@ static zx_String zx_string_clone(const zx_String *s) {
     zx_String r;
     r.len = s->len;
     r.ptr = (char *)malloc(r.len + 1);
-    if (!r.ptr) { fputs("zexi: out of memory\n", stderr); abort(); }
+    if (!r.ptr) zx_panicf("out of memory");
     if (s->ptr) memcpy(r.ptr, s->ptr, r.len + 1); else r.ptr[0] = 0;
     return r;
 }
@@ -3357,7 +3591,7 @@ static zx_String zx_string_substr(const zx_String *s, size_t start, size_t n) {
     zx_String r;
     r.len = n;
     r.ptr = (char *)malloc(n + 1);
-    if (!r.ptr) { fputs("zexi: out of memory\n", stderr); abort(); }
+    if (!r.ptr) zx_panicf("out of memory");
     if (n && s->ptr) memcpy(r.ptr, s->ptr + start, n);
     r.ptr[n] = 0;
     return r;
@@ -3370,7 +3604,7 @@ static zx_String zx_string_trim(const zx_String *s) {
     zx_String r;
     r.len = b - a;
     r.ptr = (char *)malloc(r.len + 1);
-    if (!r.ptr) { fputs("zexi: out of memory\n", stderr); abort(); }
+    if (!r.ptr) zx_panicf("out of memory");
     if (r.len) memcpy(r.ptr, s->ptr + a, r.len);
     r.ptr[r.len] = 0;
     return r;

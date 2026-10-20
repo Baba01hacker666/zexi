@@ -121,8 +121,11 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 	}
 
 	art := &Artifacts{Info: info, FileID: l.firstID}
+	// Debug builds check integer overflow; release builds wrap (see
+	// docs/03-memory-model.md). Division by zero panics in both.
+	cgOpts := zenc.Options{DebugChecks: opts.OptLevel == "0"}
 	if jobs := splitJobs(opts, len(info.FnOrder)); jobs > 1 {
-		header, units, cerr := zenc.GenerateSplit(info, zenc.Options{}, jobs)
+		header, units, cerr := zenc.GenerateSplit(info, cgOpts, jobs)
 		if cerr != nil {
 			em.Report(diag.New("E9001", "code generation failed: %v", cerr))
 			return nil, false
@@ -136,7 +139,7 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 			art.CSrc = header
 		}
 	} else {
-		csrc, cerr := zenc.Generate(info, zenc.Options{})
+		csrc, cerr := zenc.Generate(info, cgOpts)
 		if cerr != nil {
 			em.Report(diag.New("E9001", "code generation failed: %v", cerr))
 			return nil, false
