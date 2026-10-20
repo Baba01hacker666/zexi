@@ -44,7 +44,7 @@
 > per-module **isolation**
 > (scoped qualified paths, `as` aliases, and `pub` checks are live, but the
 > loader still merges every module into one flat namespace, so unqualified
-> cross-module names remain visible and ignore `pub`), `Vec`/`Box`,
+> cross-module names remain visible and ignore `pub`), `Box`,
 > user-defined `Drop`, borrow-lifetime analysis (so bound
 > `&`/`*` aliases are not tracked), nested patterns, and tuple values.
 > See `docs/06-backend-strategy.md` for the backend status.
@@ -136,12 +136,17 @@ seam.
   `Iterator`, `Clone`/`Copy`/`Drop`, `From`/`Into`, `dyn Trait` (M1 late).
 - **Real ownership checker:** NLL, lifetime elision + explicit lifetimes,
   conditional moves, drop flags.
-- **Strings & collections:** `String`, `Vec<T>`, `HashMap` (in `alloc`).
+- **Strings & collections:** `String` and `Vec<T>` are live; `HashMap` (in
+  `alloc`) is the remaining piece, and needs a `Hash` trait to key on.
 - **Formatting:** `println`/`print` accept any number of values (space separated)
   today; a full `println(fmt, args)` with a monomorphized formatting trait (no
   reflection) arrives with generics.
-- **Attributes:** `#[repr(C)]`, `#[inline]`, `#[no_mangle]`, `#[export]`.
-- **FFI:** `extern "C"` functions and structs, for libc and C libraries.
+- **Attributes:** `#[repr(C)]`, `#[inline]`, `#[no_mangle]`, `#[export]` are
+  live, as is `#[copy]`; an attribute the compiler does not know is E0539.
+  `#[repr(C)]` is accepted and is already the default layout.
+- **FFI:** `extern "C"` functions are live, in both directions — C calls into
+  `#[export]`/`#[no_mangle]` functions and Zexi calls out through `extern "C"`
+  declarations. `extern "C"` structs remain.
 - **Concurrency (preview):** `thread` gives OS threads, `i64` channels, and
   `i64` atomics over a pthread shim, linked only when imported. Only `i64`
   values cross a thread boundary, which keeps the subset data-race-free; full
