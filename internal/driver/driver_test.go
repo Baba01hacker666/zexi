@@ -134,7 +134,9 @@ func TestRunPrograms(t *testing.T) {
 			want: strings.Join([]string{
 				"4", "false", "zexi lang!", "zexi lang!", "Ada", "36",
 				"Hello, world!", "zexi lang!!!", "zexi lang!", "alpha!", "beta",
-				"second", "",
+				"second",
+				"true", "false", "true", "true", "true",
+				"true", "true", "true", "true", "",
 			}, "\n"),
 		},
 		{

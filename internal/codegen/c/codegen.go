@@ -1705,16 +1705,14 @@ func (g *gen) binValue(x *ast.BinExpr) string {
 			return "zx_string_concat(" + ps[0] + ", " + ps[1] + ")"
 		})
 	}
-	// String equality compares bytes, not pointers, for any mix of `str` and
-	// `String`.
-	if x.Op == token.KindEqEq || x.Op == token.KindBangEq {
-		if isStrType(g.info.TypeOf(x.L)) && isStrType(g.info.TypeOf(x.R)) {
+	// String comparison compares bytes, not pointers, for any mix of `str` and
+	// `String`. Ordering follows strcmp's byte order, which is the same order
+	// Rust's Ord gives str.
+	if isStrType(g.info.TypeOf(x.L)) && isStrType(g.info.TypeOf(x.R)) {
+		switch x.Op {
+		case token.KindEqEq, token.KindBangEq, token.KindLt, token.KindLe, token.KindGt, token.KindGe:
 			return g.withStrArgs([]ast.Expr{x.L, x.R}, "bool", false, func(ps []string) string {
-				cmp := "strcmp(" + ps[0] + ", " + ps[1] + ")"
-				if x.Op == token.KindEqEq {
-					return "(" + cmp + " == 0)"
-				}
-				return "(" + cmp + " != 0)"
+				return "(strcmp(" + ps[0] + ", " + ps[1] + ") " + x.Op.String() + " 0)"
 			})
 		}
 	}

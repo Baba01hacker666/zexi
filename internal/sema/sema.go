@@ -1756,6 +1756,15 @@ func isScalarText(t *types.Type) bool {
 	return t.Kind.IsNumeric() || t.Kind == types.Bool || t.Kind == types.Char
 }
 
+// isComparison reports whether op is one of the six comparison operators.
+func isComparison(op token.Kind) bool {
+	switch op {
+	case token.KindEqEq, token.KindBangEq, token.KindLt, token.KindLe, token.KindGt, token.KindGe:
+		return true
+	}
+	return false
+}
+
 func (c *checker) inferBinary(x *ast.BinExpr) *types.Type {
 	if x.Op == token.KindDotDot || x.Op == token.KindDotDotEq {
 		lt := c.checkExpr(x.L, nil)
@@ -1779,8 +1788,10 @@ func (c *checker) inferBinary(x *ast.BinExpr) *types.Type {
 			return types.StringT
 		}
 	}
-	// `==` / `!=` compare the bytes of any two string-like operands.
-	if (x.Op == token.KindEqEq || x.Op == token.KindBangEq) && isStrLike(lt) && isStrLike(rt) {
+	// Comparison over any two string-like operands compares bytes, so `"a" < b`
+	// works for every mix of `str` and `String`. Ordering follows byte value,
+	// the same order Rust's Ord gives str.
+	if isComparison(x.Op) && isStrLike(lt) && isStrLike(rt) {
 		return types.BoolT
 	}
 	// Integer literals adopt the type of the other operand.

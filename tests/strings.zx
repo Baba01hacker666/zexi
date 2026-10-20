@@ -50,5 +50,19 @@ fn main() -> i32 {
     msg = String::from("second");
     println(msg);
 
+    // Ordering compares bytes, for any mix of `str` and `String`. Byte order
+    // puts every uppercase letter before every lowercase one.
+    println("abc" < "abd");
+    println("abc" < "abc");
+    println("abc" <= "abc");
+    println("Z" < "a");
+    println("" < "a");
+    let lo = String::from("apple");
+    let hi = String::from("banana");
+    println(lo < hi);
+    println(hi > lo);
+    println(lo < "applez");
+    println("apple" <= lo);
+
     0
 }
