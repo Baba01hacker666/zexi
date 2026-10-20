@@ -99,6 +99,34 @@ type Ctor struct {
 // TypeOf returns the inferred type of an expression, or nil.
 func (in *Info) TypeOf(e ast.Expr) *types.Type { return in.Types[e] }
 
+// PlaceThroughBorrow reports whether e denotes a value reached through a
+// reference or pointer: an expression of reference/pointer type, a dereference
+// of one, or a field/element reached by auto-dereferencing one. Such a place is
+// borrowed, so it cannot be moved out of (and a match must not drop it).
+func (in *Info) PlaceThroughBorrow(e ast.Expr) bool {
+	switch x := e.(type) {
+	case *ast.UnExpr:
+		if x.Op == token.KindStar {
+			if t := in.TypeOf(x.X); t != nil && (t.Kind == types.Ref || t.Kind == types.Ptr) {
+				return true
+			}
+			return in.PlaceThroughBorrow(x.X)
+		}
+	case *ast.FieldExpr:
+		if t := in.TypeOf(x.Recv); t != nil && (t.Kind == types.Ref || t.Kind == types.Ptr) {
+			return true
+		}
+		return in.PlaceThroughBorrow(x.Recv)
+	case *ast.IndexExpr:
+		if t := in.TypeOf(x.Recv); t != nil && (t.Kind == types.Ref || t.Kind == types.Ptr) {
+			return true
+		}
+		return in.PlaceThroughBorrow(x.Recv)
+	}
+	t := in.TypeOf(e)
+	return t != nil && (t.Kind == types.Ref || t.Kind == types.Ptr)
+}
+
 // Check resolves names and infers types across the file.
 func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 	c := &checker{
@@ -757,7 +785,7 @@ func (c *checker) instantiateAssociatedMethod(tmpl *Fn, p *ast.PathExpr, expecte
 			if expected.St != nil && nominalBaseName(expected) == base {
 				for i, name := range tmpl.Generics {
 					if _, ok := bindings[name]; !ok && i < len(expected.St.Args) {
-						bindings[name] = expected.St.Args[i]
+						bindConcrete(bindings, name, expected.St.Args[i])
 					}
 				}
 			}
@@ -765,7 +793,7 @@ func (c *checker) instantiateAssociatedMethod(tmpl *Fn, p *ast.PathExpr, expecte
 			if expected.En != nil && nominalBaseName(expected) == base {
 				for i, name := range tmpl.Generics {
 					if _, ok := bindings[name]; !ok && i < len(expected.En.Args) {
-						bindings[name] = expected.En.Args[i]
+						bindConcrete(bindings, name, expected.En.Args[i])
 					}
 				}
 			}
@@ -1869,17 +1897,19 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 			if expected != nil && expected.Kind == types.StructKind && expected.St != nil && nominalBaseName(expected) == st.Base {
 				for i, gname := range st.Generics {
 					if _, ok := bindings[gname]; !ok && i < len(expected.St.Args) {
-						bindings[gname] = expected.St.Args[i]
+						bindConcrete(bindings, gname, expected.St.Args[i])
 					}
 				}
 			}
-			for i, a := range x.Args {
-				pat := c.structFieldPattern(st, strconv.Itoa(i))
-				if pat == nil {
-					continue
+			if !allBound(st.Generics, bindings) {
+				for i, a := range x.Args {
+					pat := c.structFieldPattern(st, strconv.Itoa(i))
+					if pat == nil {
+						continue
+					}
+					at := c.checkExpr(a, hintType(pat))
+					c.unify(pat, at, bindings)
 				}
-				at := c.checkExpr(a, nil)
-				c.unify(pat, at, bindings)
 			}
 			args := c.bindGenericArgs(x.Callee.Span(), st.Generics, bindings)
 			if args == nil {
@@ -2104,10 +2134,16 @@ func (c *checker) checkGenericCall(x *ast.CallExpr, tmpl *Fn, explicit []ast.Typ
 		c.unify(tmpl.Ret, expected, bindings)
 	}
 	x.Args = c.resolveArgs(x.Sp, x.Args, tmpl.ParamNames, tmpl.Defaults, label)
-	for i, a := range x.Args {
-		at := c.checkExpr(a, nil)
-		if i < len(tmpl.Params) {
-			c.unify(tmpl.Params[i], at, bindings)
+	if !allBound(tmpl.Generics, bindings) {
+		for i, a := range x.Args {
+			var hint *types.Type
+			if i < len(tmpl.Params) {
+				hint = hintType(tmpl.Params[i])
+			}
+			at := c.checkExpr(a, hint)
+			if i < len(tmpl.Params) {
+				c.unify(tmpl.Params[i], at, bindings)
+			}
 		}
 	}
 	args := c.bindGenericArgs(x.Callee.Span(), tmpl.Generics, bindings)
@@ -2140,12 +2176,41 @@ func (c *checker) bindGenericArgs(sp token.Span, generics []string, bindings map
 	return args
 }
 
+// allBound reports whether every type parameter already has a concrete binding.
+// When it does, the untyped inference pre-pass is unnecessary (and would check
+// arguments such as bare `Some`/`None` without the context they need).
+func allBound(generics []string, bindings map[string]*types.Type) bool {
+	for _, name := range generics {
+		if t, ok := bindings[name]; !ok || t == nil || t.Kind == types.Invalid || containsParam(t) {
+			return false
+		}
+	}
+	return true
+}
+
+// bindConcrete records a concrete type for a parameter, ignoring parametric
+// (template-only) candidates; those cannot become instantiation arguments.
+func bindConcrete(b map[string]*types.Type, name string, t *types.Type) {
+	if t == nil || t.Kind == types.Invalid || containsParam(t) {
+		return
+	}
+	if _, ok := b[name]; !ok {
+		b[name] = t
+	}
+}
+
 // unify structurally matches a (possibly generic) parameter type against a
 // concrete type, recording parameter bindings. It deliberately does not report
 // diagnostics: the caller checks assignability against the instantiated
 // signature, which produces the precise error.
 func (c *checker) unify(pat, got *types.Type, b map[string]*types.Type) bool {
 	if pat == nil || got == nil || got.Kind == types.Invalid || pat.Kind == types.Invalid {
+		return true
+	}
+	// A parametric type is never a concrete binding; binding it would create a
+	// recursive/partly-generic instantiation. Leave the parameter unbound so
+	// the caller reports E0282.
+	if got.Kind == types.ParamKind || containsParam(got) {
 		return true
 	}
 	if pat.Kind == types.ParamKind {
@@ -2191,8 +2256,37 @@ func (c *checker) unify(pat, got *types.Type, b map[string]*types.Type) bool {
 			ok = false
 		}
 		return ok
+	case types.StructKind:
+		if pat.St == nil || got.St == nil {
+			return true
+		}
+		return c.unifyNominal(nominalBaseName(pat), pat.St.Args, nominalBaseName(got), got.St.Args, b)
+	case types.EnumKind:
+		if pat.En == nil || got.En == nil {
+			return true
+		}
+		return c.unifyNominal(nominalBaseName(pat), pat.En.Args, nominalBaseName(got), got.En.Args, b)
 	}
 	return true
+}
+
+// unifyNominal matches two applications of the same nominal type, binding
+// parameters from their argument lists (an empty argument list means a bare
+// template or a non-generic type, which has nothing to bind).
+func (c *checker) unifyNominal(patName string, patArgs []*types.Type, gotName string, gotArgs []*types.Type, b map[string]*types.Type) bool {
+	if patName != gotName {
+		return false
+	}
+	if len(patArgs) == 0 || len(gotArgs) == 0 || len(patArgs) != len(gotArgs) {
+		return len(patArgs) == 0 || len(gotArgs) == 0
+	}
+	ok := true
+	for i := range patArgs {
+		if !c.unify(patArgs[i], gotArgs[i], b) {
+			ok = false
+		}
+	}
+	return ok
 }
 
 // withBindings runs fn with additional type-parameter bindings layered over the
@@ -2386,10 +2480,14 @@ func (c *checker) applyStructArgs(sp token.Span, st *types.Struct, args []*types
 		return &types.Type{Kind: types.Invalid}
 	}
 	if anyContainsParam(args) {
-		// A parametric application inside a template: represent it as the bare
-		// template. It is only ever used for inference patterns and is never
-		// emitted; the concrete instantiation re-resolves from the AST.
-		return &types.Type{Kind: types.StructKind, St: st}
+		// A parametric application inside a template: keep the arguments so
+		// that inference can unify them with a concrete instantiation. This
+		// descriptor is never emitted; the concrete instantiation re-resolves
+		// from the AST.
+		return &types.Type{Kind: types.StructKind, St: &types.Struct{
+			Name: st.Name, Base: st.Base, Args: args, Generics: st.Generics,
+			Tuple: st.Tuple, Copy: st.Copy, Generic: true,
+		}}
 	}
 	return c.instantiateStruct(sp, st, args)
 }
@@ -2405,7 +2503,10 @@ func (c *checker) applyEnumArgs(sp token.Span, en *types.Enum, args []*types.Typ
 		return &types.Type{Kind: types.Invalid}
 	}
 	if anyContainsParam(args) {
-		return &types.Type{Kind: types.EnumKind, En: en}
+		return &types.Type{Kind: types.EnumKind, En: &types.Enum{
+			Name: en.Name, Base: en.Base, Args: args, Generics: en.Generics,
+			Copy: en.Copy, Generic: true,
+		}}
 	}
 	return c.instantiateEnum(sp, en, args)
 }
@@ -2836,12 +2937,43 @@ func (c *checker) inferEnumArgsFrom(sp token.Span, tmpl *types.Enum, explicit []
 		}
 		for i, name := range tmpl.Generics {
 			if _, ok := bindings[name]; !ok && i < len(got) {
-				bindings[name] = got[i]
+				bindConcrete(bindings, name, got[i])
 			}
 		}
 	}
 	args := c.bindGenericArgs(sp, tmpl.Generics, bindings)
 	return args, args != nil
+}
+
+// hintType returns a nominal pattern type that can give a bare variant or
+// struct literal the context it needs, or nil for other patterns.
+func hintType(t *types.Type) *types.Type {
+	if t == nil {
+		return nil
+	}
+	if (t.Kind == types.EnumKind && t.En != nil) || (t.Kind == types.StructKind && t.St != nil) {
+		return t
+	}
+	return nil
+}
+
+// templateHasVariant reports whether a template-only enum descriptor declares
+// the named variant, so a bare variant is recognised (rather than reported as
+// an unknown function) even when its type arguments are not inferable yet.
+func (c *checker) templateHasVariant(en *types.Enum, name string) bool {
+	if en == nil || !en.Generic || en.Base == "" || len(en.Variants) > 0 {
+		return false
+	}
+	d := c.enumDecls[en.Base]
+	if d == nil {
+		return false
+	}
+	for _, v := range d.Variants {
+		if v.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // inferBareVariantCtor resolves `Ok(x)` / `Err(e)` / `Some(x)` when the callee
@@ -2853,6 +2985,12 @@ func (c *checker) inferBareVariantCtor(x *ast.CallExpr, name string, expected *t
 	}
 	v, ok := expected.En.Variant(name)
 	if !ok {
+		if c.templateHasVariant(expected.En, name) {
+			for _, a := range x.Args {
+				c.checkExpr(a, nil)
+			}
+			return &types.Type{Kind: types.EnumKind, En: expected.En}
+		}
 		return nil
 	}
 	c.info.Ctors[x] = &Ctor{Enum: expected.En, Variant: v}
@@ -2879,7 +3017,13 @@ func (c *checker) inferBareUnitVariant(x *ast.IdentExpr, expected *types.Type) *
 		return nil
 	}
 	v, ok := expected.En.Variant(x.Name)
-	if !ok || len(v.Fields) != 0 {
+	if !ok {
+		if c.templateHasVariant(expected.En, x.Name) {
+			return &types.Type{Kind: types.EnumKind, En: expected.En}
+		}
+		return nil
+	}
+	if len(v.Fields) != 0 {
 		return nil
 	}
 	c.info.Ctors[x] = &Ctor{Enum: expected.En, Variant: v}
@@ -2956,17 +3100,19 @@ func (c *checker) instantiateEnumForVariant(x *ast.CallExpr, p *ast.PathExpr, tm
 	if expected != nil && expected.Kind == types.EnumKind && expected.En != nil && nominalBaseName(expected) == tmpl.Base {
 		for i, name := range tmpl.Generics {
 			if _, ok := bindings[name]; !ok && i < len(expected.En.Args) {
-				bindings[name] = expected.En.Args[i]
+				bindConcrete(bindings, name, expected.En.Args[i])
 			}
 		}
 	}
 	patterns := c.enumVariantPatterns(tmpl, p.Segments[1])
-	for i, a := range x.Args {
-		if i >= len(patterns) {
-			break
+	if !allBound(tmpl.Generics, bindings) {
+		for i, a := range x.Args {
+			if i >= len(patterns) {
+				break
+			}
+			at := c.checkExpr(a, hintType(patterns[i]))
+			c.unify(patterns[i], at, bindings)
 		}
-		at := c.checkExpr(a, nil)
-		c.unify(patterns[i], at, bindings)
 	}
 	args := c.bindGenericArgs(p.Sp, tmpl.Generics, bindings)
 	if args == nil {
@@ -3145,7 +3291,7 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 			}
 		}
 		c.pushScope()
-		borrowed := st != nil && (st.Kind == types.Ref || st.Kind == types.Ptr)
+		borrowed := c.info.PlaceThroughBorrow(x.Scrutinee)
 		c.checkPattern(arm.Pat, st, borrowed)
 		if pp, ok := arm.Pat.(*ast.PathPat); ok && !guarded {
 			if v := c.info.PatVariant[pp]; v != nil {
@@ -3687,17 +3833,19 @@ func (c *checker) inferStructArgs(x *ast.StructLitExpr, tmpl *types.Struct, expe
 	if expected != nil && expected.Kind == types.StructKind && expected.St != nil && nominalBaseName(expected) == tmpl.Base {
 		for i, name := range tmpl.Generics {
 			if _, ok := bindings[name]; !ok && i < len(expected.St.Args) {
-				bindings[name] = expected.St.Args[i]
+				bindConcrete(bindings, name, expected.St.Args[i])
 			}
 		}
 	}
-	for _, fi := range x.Fields {
-		pattern := c.structFieldPattern(tmpl, fi.Name)
-		if pattern == nil {
-			continue
+	if !allBound(tmpl.Generics, bindings) {
+		for _, fi := range x.Fields {
+			pattern := c.structFieldPattern(tmpl, fi.Name)
+			if pattern == nil {
+				continue
+			}
+			at := c.checkExpr(fi.Val, hintType(pattern))
+			c.unify(pattern, at, bindings)
 		}
-		at := c.checkExpr(fi.Val, nil)
-		c.unify(pattern, at, bindings)
 	}
 	args := c.bindGenericArgs(x.Sp, tmpl.Generics, bindings)
 	return args, args != nil
@@ -3752,17 +3900,19 @@ func (c *checker) inferEnumStructLit(x *ast.StructLitExpr, expected *types.Type)
 		if expected != nil && expected.Kind == types.EnumKind && expected.En != nil && nominalBaseName(expected) == tmpl.Base {
 			for i, name := range tmpl.Generics {
 				if _, ok := bindings[name]; !ok && i < len(expected.En.Args) {
-					bindings[name] = expected.En.Args[i]
+					bindConcrete(bindings, name, expected.En.Args[i])
 				}
 			}
 		}
-		for _, fi := range x.Fields {
-			pattern := c.enumFieldPattern(tmpl, x.Path[1], fi.Name)
-			if pattern == nil {
-				continue
+		if !allBound(tmpl.Generics, bindings) {
+			for _, fi := range x.Fields {
+				pattern := c.enumFieldPattern(tmpl, x.Path[1], fi.Name)
+				if pattern == nil {
+					continue
+				}
+				at := c.checkExpr(fi.Val, hintType(pattern))
+				c.unify(pattern, at, bindings)
 			}
-			at := c.checkExpr(fi.Val, nil)
-			c.unify(pattern, at, bindings)
 		}
 		args := c.bindGenericArgs(x.Sp, tmpl.Generics, bindings)
 		if args == nil {

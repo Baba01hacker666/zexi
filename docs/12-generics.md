@@ -128,26 +128,37 @@ monomorphized.
 ### 12.4.2 Instantiation keys and names
 
 Every concrete instantiation gets a **canonical key** that is an injective
-encoding of the base name plus its type arguments:
+encoding of the base name plus its type arguments. Each argument is
+length-prefixed, so the format can never be ambiguous:
 
 ```
-instName("Pair", [i64, str]) == "Pair$i64$str"
-instName("Result", [u32, ParseError]) == "Result$u32$ParseError"
+instKey("Pair", [i64, str]) == "Pair$3:i64$3:str"
+instKey("Result", [u32, ParseError]) == "Result$3:u32$10:ParseError"
 ```
 
-- The `$` separator cannot occur in a Zexi identifier, and codegen's existing
-  `safeIdent` hex-escapes it (`$` → `_24_`) while escaping `_` as `_5f`, so
-  downstream C names (`zx_Pair_24i64_24str`) stay unique.
-- `typeKey(t)` is an injective rendering of a type; nested types join with `$`
-  (`&Pair$i64$str` → `r$Pair$i64$str`). A unit test asserts injectivity over a
-  representative set.
+- `typeKey(t)` renders a type injectively. Compound types use `$`-tagged,
+  length-prefixed parts (`compound(tag, parts...)`):
+
+  | Type | Key |
+  | --- | --- |
+  | `Param T` | `$1:p1:T` |
+  | `&T` / `&mut T` / `*T` | `$2:r1:0…` / `$2:r1:1…` / `$1:x…` |
+  | `[T; N]` / `[T]` | `$1:a<len>…` / `$1:s…` |
+  | `(A, B)` | `$1:t…` |
+  | `fn(A) -> R` | `$1:f…` |
+
+  Struct/enum instantiations use their own canonical `Name` as their key, so
+  nesting composes directly.
+- The `$` separator cannot occur in a Zexi identifier, and codegen's `safeIdent`
+  hex-escapes `$` as `_24_`, `:` as `_3a_`, and `_` as `_5f_`, so downstream C
+  names (`zx_Pair_24_3_3a_i64_24_3_3a_str`) stay unique.
 
 `types.Struct`/`types.Enum` gain display fields so diagnostics stay readable
 while the map key stays mangled:
 
 ```go
 type Struct struct {
-    Name  string      // canonical key, e.g. "Pair$i64$str"
+    Name  string      // canonical key, e.g. "Pair$3:i64$3:str"
     Base  string      // source name, e.g. "Pair" (== Name for non-generic types)
     Args  []*Type     // instantiation arguments, nil for non-generic types
     ...
@@ -156,6 +167,9 @@ type Struct struct {
 
 `types.Type.String()` prints `Base<Args…>` when `Args != nil`, else `Name`. This
 keeps every existing `String()`-based diagnostic correct and human-readable.
+Parametric applications inside templates (e.g. `Pair<T, i64>` in a template
+signature) keep their `Args` too, as a template-only descriptor that inference
+can unify; such descriptors are never emitted.
 
 ### 12.4.3 Templates vs. instantiations
 
@@ -265,10 +279,12 @@ enum Option<T> { Some(T), None }
 enum Result<T, E> { Ok(T), Err(E) }
 ```
 
-### 12.6.2 Desugaring `?`
+### 12.6.2 Lowering `?`
 
-`e?` is lowered to a `match` **before** type checking, so the checker and
-codegen only ever see ordinary `match`:
+`e?` is lowered to an ordinary `match` **during type checking**, in
+`inferTry`; codegen never sees a `?`. The synthesized `match` (with its
+bindings and early-return arm) is stored in `Info.TryMatches`, keyed by the
+`*ast.TryExpr`, and codegen emits it with the normal match path:
 
 ```zx
 // in a function returning Result<..,..>
@@ -284,13 +300,15 @@ let n = match parse_u32(s) {
 match e { Option::Some(v) => v, Option::None => return Option::None }
 ```
 
-- The desugar runs as a small AST pass over each function body, using the
-  **base name of the function's declared return type** to choose the
-  `Result`/`Ok`/`Err` or `Option`/`Some`/`None` shape.
-- Anything else is `E0277`: "the `?` operator requires the enclosing function to
-  return `Result` or `Option`".
-- Constructors are emitted **qualified** (`Result::Err(..)`), which the checker
-  already supports; no bare-variant resolution is required.
+- The enclosing function's return type (`c.cur.Ret`) must be an instantiated
+  `Result<_, E>` or `Option<_>`, and the operand must be the matching enum.
+  The desugared arms are checked like hand-written code, so the usual match
+  rules (exhaustiveness, moves, drops) apply.
+- For `Result`, the operand's error type must be assignable to the function's
+  error type; there is no `From` conversion. Anything else is `E0277` (wrong
+  return shape) or `E0308` (error-type mismatch).
+- The desugared constructors are **qualified** (`Result::Err(..)`,
+  `Option::None`), so lowering does not depend on bare-variant resolution.
 - The payload binding is a normal move (§12.7), so `Result<String, E>?` is sound.
 
 ### 12.6.3 Bare-variant ergonomics (small addition)
@@ -332,6 +350,15 @@ and the match scrutinee is never dropped, so owned payloads either double-free
 With those three changes the `E0900` guard is removed and `collectDropTypes`
 (which already recurses through enum variants) automatically emits drop glue for
 every owning instantiation.
+
+**Borrowed scrutinees.** A scrutinee reached through a borrow — `match *e` with
+`e: &E`, or `match self.field`/`match (*p).field` where the receiver is a
+reference or pointer — is never consumed or dropped: codegen copies the value
+shallowly for the switch and the caller keeps ownership. `Info.PlaceThroughBorrow`
+(shared by sema's `inferMatch` and codegen's `matchOwnsScrutinee`) recognizes
+the bare reference/pointer case, a dereference of one, and a field/element
+reached by auto-dereferencing one. Binding an owned payload in such a match is
+`E0507`, because a borrow cannot transfer ownership.
 
 ## 12.8 Codegen changes
 
@@ -450,14 +477,19 @@ All six stages landed. Shipped today:
 
 Known limits (deliberate for M1):
 
-- Inference through *nested* generic fields (e.g. a field of type
-  `Inner<T>`) is conservative: annotate the literal or use a turbofish.
-  Direct payload/argument inference, which covers the common cases, works.
+- Bare variants need an expected type. A call such as `take(Some(42))` where
+  `take<T>(o: Option<T>)` has no annotation cannot infer `T` from the bare
+  `Some` payload; add a turbofish (`take::<i64>(Some(42))`) or annotate the
+  binding. Nominal inference itself (including nested generic arguments and
+  fields) works: `first(p)` infers from a concrete `Pair<i64, str>`.
 - Nested patterns are still rejected (`Err(MyErr::Bad { pos })`); bind the
   payload and match again, or match the inner enum directly.
 - `?` cannot convert between error types; the error type must match the
   enclosing function exactly.
 - Borrowed payloads cannot be moved (`E0507`); bind by value or ignore them.
+  This includes matching through `match *e` and `match self.field` in a
+  `&self` method, which are otherwise safe (the caller keeps ownership).
 - The ASan leak/double-free check could not run in the Alpine/musl CI image
   (no libasan/clang). Drop behavior is covered by the runtime tests in
-  `tests/generics.zx`, `tests/option_result.zx`, and `tests/drop.zx`.
+  `tests/generics.zx`, `tests/enums.zx`, `tests/option_result.zx`, and
+  `tests/drop.zx`.

@@ -81,9 +81,8 @@ M1/M2 are additive.
 - Primitives: `bool i8 i16 i32 i64 u8 u16 u32 u64 isize usize f32 f64 char`.
 - `()`, tuples, `[T; N]`, `[T]` + `&[T]`, `&T`, `&mut T`, `*T` (unsafe), `str`.
 - `struct`, `enum` (tagged union) with `match`.
-- No generic `Option<T>`/`Result<T,E>` yet — their syntax and `?` propagation
-  remain the principal M0/M1 error-handling gap. Concrete enums and `match`
-  cover many small-program cases today.
+- Predeclared generic `Option<T>`/`Result<T,E>` with `?` propagation (lowered
+  to `match`); the error type must match exactly (no `From` conversion yet).
 
 **Declarations & statements**
 - `fn`, `struct`, `enum`, `const`, `type` aliases.
@@ -99,11 +98,11 @@ M1/M2 are additive.
   value. Moves transfer ownership and null the source, so a moved-out value is
   never freed twice.
 - The one heap type is the built-in `String` (an owning UTF-8 buffer). A
-  `struct` or array containing a `String` is itself an owning value and gets a
-  generated destructor; dropping it drops each field/element.
-- **Known M0 gaps (documented, not yet closed):** enum variants cannot carry
-  owning payloads (a `match` binding would alias an owned value, which needs the
-  borrow checker); a `str` borrowed from a temporary `String` prolongs that
+  `struct`, `enum` variant, or array containing a `String` is itself an owning
+  value and gets a generated destructor; dropping it drops each
+  field/element/payload.
+- **Known M0 gaps (documented, not yet closed):** a `str` borrowed from a
+  temporary `String` prolongs that
   temporary until the end of the statement; bound `&`/`*` aliases are not tracked
   across moves (no lifetime analysis). Full handling arrives with M1/M2.
 - Explicit heap only via built-in heap types (`String` now, `Box<T>`/`Vec<T>` at

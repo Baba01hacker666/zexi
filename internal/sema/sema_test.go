@@ -1492,3 +1492,84 @@ func TestBareVariantsNeedContext(t *testing.T) {
 		t.Fatalf("expected E0425 for an uninferable bare variant, got %v", codes)
 	}
 }
+
+func TestMatchThroughBorrowRejected(t *testing.T) {
+	src := `enum E { S(String), A }
+fn peek(e: &E) -> i32 { match *e { E::S(s) => s.len() as i32, E::A => 0 } }
+fn main() -> i32 { 0 }`
+	if _, codes := check(t, src); !has(codes, "E0507") {
+		t.Fatalf("expected E0507, got %v", codes)
+	}
+}
+
+func TestMatchThroughFieldBorrowRejected(t *testing.T) {
+	src := `enum E { S(String), A }
+struct H { e: E }
+impl H {
+    fn take(&self) -> i32 { match self.e { E::S(s) => s.len() as i32, E::A => 0 } }
+}
+fn main() -> i32 { 0 }`
+	if _, codes := check(t, src); !has(codes, "E0507") {
+		t.Fatalf("expected E0507, got %v", codes)
+	}
+}
+
+func TestMatchNoDropEnumTwice(t *testing.T) {
+	src := `enum Color { Red, Green }
+fn main() -> i32 {
+    let c = Color::Red;
+    match c { Color::Red => println(1), Color::Green => println(2) }
+    match c { Color::Red => println(3), Color::Green => println(4) }
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestMatchBorrowedNoDropFieldDoesNotMoveStruct(t *testing.T) {
+	src := `enum Color { Red, Green }
+struct S { c: Color }
+fn peek(s: &S) -> bool { match s.c { Color::Red => true, Color::Green => false } }
+fn main() -> i32 {
+    let s = S { c: Color::Red };
+    println(peek(&s));
+    match s.c { Color::Red => println(1), Color::Green => println(2) }
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestGenericNominalArgumentInference(t *testing.T) {
+	src := `struct Boxed<T> { value: T }
+fn unbox<T>(b: Boxed<T>) -> T { b.value }
+struct Pair<A, B> { first: A, second: B }
+fn first<A, B>(p: Pair<A, B>) -> A { p.first }
+fn main() -> i32 {
+    let b: Boxed<i64> = Boxed { value: 3 };
+    let p: Pair<bool, i64> = Pair { first: true, second: 1 };
+    println(unbox(b));
+    println(first(p));
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestGenericCallWithBareVariantTurbofish(t *testing.T) {
+	src := `fn take<T>(o: Option<T>) -> T {
+    match o { Some(v) => v, None => 0 }
+}
+fn main() -> i32 {
+    println(take::<i64>(Some(41)));
+    let p: Option<i64> = None;
+    println(take(p));
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}

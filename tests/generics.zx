@@ -31,6 +31,12 @@ impl<A, B> Pair<A, B> {
 
 enum Maybe<T> { Just(T), Nothing }
 
+// Inference through a nominal type argument: the parameter pattern is
+// `Boxed<T>`, matched against a concrete `Boxed<i64>`.
+struct Boxed<T> { value: T }
+
+fn unbox<T>(b: Boxed<T>) -> T { return b.value; }
+
 fn unwrap_or(m: Maybe<i64>, fallback: i64) -> i64 {
     match m {
         Maybe::Just(v) => v,
@@ -71,5 +77,11 @@ fn main() -> i32 {
     println(unwrap_or(Maybe::Nothing, 6));
     println(owned_len(Owned::Val(String::from("four"))));
     println(owned_len(Owned::Empty));
+
+    let nb: Boxed<i64> = Boxed { value: 12 };
+    println(unbox(nb));                       // infer T from Boxed<i64>
+
+    let opt_pair: Pair<Option<i64>, i64> = Pair { first: None, second: 1 };
+    match opt_pair.first { Some(v) => println(v), None => println(0) }
     0
 }

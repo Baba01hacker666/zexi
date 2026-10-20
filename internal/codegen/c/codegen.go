@@ -2177,7 +2177,7 @@ func (g *gen) matchValue(x *ast.MatchExpr) string {
 	st, scrut := g.matchScrutinee(orig, g.value(x.Scrutinee))
 	// A by-value match consumes its scrutinee: owned payloads are moved into
 	// the bindings, and the remaining value is dropped once at the match end.
-	owned := matchOwnsScrutinee(orig, st)
+	owned := g.matchOwnsScrutinee(x.Scrutinee, st)
 	if owned {
 		scrut = g.consume(x.Scrutinee)
 	}
@@ -2212,10 +2212,11 @@ func (g *gen) exprDiverges(e ast.Expr) bool {
 }
 
 // matchOwnsScrutinee reports whether the match takes ownership of its
-// scrutinee. A reference or pointer scrutinee is matched through the borrow and
-// is never dropped by the match.
-func matchOwnsScrutinee(orig, st *types.Type) bool {
-	if orig != nil && (orig.Kind == types.Ref || orig.Kind == types.Ptr) {
+// scrutinee. A scrutinee reached through a borrow (a reference/pointer, a
+// dereference, or a field/element of one) is matched through the borrow and is
+// never moved or dropped by the match.
+func (g *gen) matchOwnsScrutinee(e ast.Expr, st *types.Type) bool {
+	if g.info.PlaceThroughBorrow(e) {
 		return false
 	}
 	return st != nil && st.NeedsDrop()
@@ -2374,7 +2375,7 @@ func (g *gen) matchStmt(x *ast.MatchExpr) {
 	g.pushScope()
 	orig := g.info.TypeOf(x.Scrutinee)
 	st, scrut := g.matchScrutinee(orig, g.value(x.Scrutinee))
-	owned := matchOwnsScrutinee(orig, st)
+	owned := g.matchOwnsScrutinee(x.Scrutinee, st)
 	if owned {
 		scrut = g.consume(x.Scrutinee)
 	}

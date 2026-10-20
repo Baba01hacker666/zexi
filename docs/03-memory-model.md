@@ -140,8 +140,11 @@ match m {
 }                                  // `m` is dropped once, after the arm
 ```
 
-A payload cannot be moved out through a borrow: matching a `&Enum` and binding
-an owned payload reports `E0507`. Match by value, or use a non-owning pattern.
+A payload cannot be moved out through a borrow: matching through a reference
+(a `&Enum`, `match *e`, or a field of a borrowed struct such as `match
+self.kind`) and binding an owned payload reports `E0507`. Such a match reads
+the value and leaves the owner intact. Match by value, or use a non-owning
+pattern.
 
 ## 3.10 The runtime (or lack of one)
 
