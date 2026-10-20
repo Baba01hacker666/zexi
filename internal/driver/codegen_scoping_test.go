@@ -267,3 +267,39 @@ func TestCheckedArithmeticStaysCorrect(t *testing.T) {
 		}
 	}
 }
+
+// TestStringBuilderGrowth covers the String append path now that the buffer
+// carries a capacity and grows geometrically instead of reallocating to the
+// exact size on every byte. The interesting cases are the ones where growth
+// could go wrong: appending a slice of the string's own buffer (the source may
+// be invalidated by the realloc), refilling after clear, and starting from a
+// preallocated capacity.
+func TestStringBuilderGrowth(t *testing.T) {
+	wantOutput(t, "strbuild", `fn main() -> i32 {
+    let mut b = String::new();
+    let mut i = 0;
+    while i < 300 { b.push_byte(97); i = i + 1; }
+    println(b.len());
+
+    let mut c = String::new();
+    c.push_str("abc");
+    c.push_str(c.as_str());
+    println(c);
+
+    let mut d = String::with_capacity(64);
+    let mut j = 0;
+    while j < 10 { d.push_str("xy"); j = j + 1; }
+    println(d, d.len());
+    d.clear();
+    println(d.len());
+    d.push_str("refilled");
+    println(d);
+
+    let mut e = String::new();
+    e.push('é');
+    e.push_byte(33);
+    println(e, e.len());
+    0
+}
+`, "300\nabcabc\nxyxyxyxyxyxyxyxyxyxy 20\n0\nrefilled\né! 3\n")
+}

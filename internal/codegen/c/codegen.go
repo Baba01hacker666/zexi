@@ -3482,10 +3482,25 @@ func firstRune(inner string) rune {
 // destructor run is a no-op). This is emitted once at the top of every program.
 const zxStringRuntime = `
 // --- builtin String: an owning, UTF-8 heap string -------------------------
-typedef struct { char *ptr; size_t len; } zx_String;
+typedef struct { char *ptr; size_t len; size_t cap; } zx_String;
+
+/* Grow so that len + extra + 1 bytes fit, doubling the capacity so repeated
+   appends are amortized O(1). The cap field is a lower bound on the
+   allocation; it may be stale on a value built by a compound literal, so it is
+   only trusted as a hint and never used to shrink an allocation. */
+static void zx_string_reserve(zx_String *s, size_t extra) {
+    size_t need = s->len + extra + 1;
+    if (s->cap >= need) return;
+    size_t nc = s->cap >= s->len ? s->cap * 2 : s->len + 1;
+    if (nc < need) nc = need;
+    char *np = (char *)realloc(s->ptr, nc);
+    if (!np) zx_panicf("out of memory");
+    s->ptr = np;
+    s->cap = nc;
+}
 
 static zx_String zx_string_new(void) {
-    zx_String s; s.ptr = NULL; s.len = 0; return s;
+    zx_String s; s.ptr = NULL; s.len = 0; s.cap = 0; return s;
 }
 
 static zx_String zx_string_from(const char *p) {
@@ -3495,6 +3510,7 @@ static zx_String zx_string_from(const char *p) {
     s.ptr = (char *)malloc(s.len + 1);
     if (!s.ptr) zx_panicf("out of memory");
     memcpy(s.ptr, p, s.len + 1);
+    s.cap = s.len + 1;
     return s;
 }
 
@@ -3509,6 +3525,7 @@ static zx_String zx_string_with_capacity(size_t n) {
     s.ptr = (char *)malloc(n + 1);
     if (!s.ptr) zx_panicf("out of memory");
     s.ptr[0] = 0;
+    s.cap = n + 1;
     return s;
 }
 
@@ -3521,6 +3538,7 @@ static zx_String zx_string_concat(const char *a, const char *b) {
     r.len = la + lb;
     r.ptr = (char *)malloc(la + lb + 1);
     if (!r.ptr) zx_panicf("out of memory");
+    r.cap = la + lb + 1;
     if (la) memcpy(r.ptr, a, la);
     if (lb) memcpy(r.ptr + la, b, lb);
     r.ptr[la + lb] = 0;
@@ -3544,12 +3562,14 @@ static zx_String zx_string_slice(const char *s, int64_t lo, int64_t hi) {
     r.len = len;
     r.ptr = (char *)malloc(len + 1);
     if (!r.ptr) zx_panicf("out of memory");
+    r.cap = len + 1;
     if (len) memcpy(r.ptr, s + lo, len);
     r.ptr[len] = 0;
     return r;
 }
 static bool zx_string_is_empty(const zx_String *s) { return s->len == 0; }
 static const char *zx_string_as_str(const zx_String *s) { return s->ptr ? s->ptr : ""; }
+/* Clear keeps the buffer, so a cleared string can be refilled for free. */
 static void zx_string_clear(zx_String *s) { if (s->ptr) s->ptr[0] = 0; s->len = 0; }
 
 static void zx_string_push_str(zx_String *s, const char *p) {
@@ -3564,9 +3584,7 @@ static void zx_string_push_str(zx_String *s, const char *p) {
         uintptr_t base = (uintptr_t)s->ptr, here = (uintptr_t)p;
         if (here >= base && here <= base + (uintptr_t)s->len) off = (long)(here - base);
     }
-    char *np = (char *)realloc(s->ptr, s->len + n + 1);
-    if (!np) zx_panicf("out of memory");
-    s->ptr = np;
+    zx_string_reserve(s, n);
     if (off >= 0) src = s->ptr + off;
     /* memmove: the source may overlap the destination (self-append). */
     memmove(s->ptr + s->len, src, n + 1);
@@ -3599,9 +3617,7 @@ static int zx_utf8_encode(unsigned int c, char *out) {
 static void zx_string_push(zx_String *s, uint32_t c) {
     char buf[4];
     int n = zx_utf8_encode(c, buf);
-    char *np = (char *)realloc(s->ptr, s->len + (size_t)n + 1);
-    if (!np) zx_panicf("out of memory");
-    s->ptr = np;
+    zx_string_reserve(s, (size_t)n);
     memcpy(s->ptr + s->len, buf, (size_t)n);
     s->len += (size_t)n;
     s->ptr[s->len] = 0;
@@ -3610,9 +3626,7 @@ static void zx_string_push(zx_String *s, uint32_t c) {
 // Append one raw byte (no UTF-8 encoding), used when copying binary or
 // already-encoded data into a String (e.g. a socket read).
 static void zx_string_push_byte(zx_String *s, uint8_t b) {
-    char *np = (char *)realloc(s->ptr, s->len + 2);
-    if (!np) zx_panicf("out of memory");
-    s->ptr = np;
+    zx_string_reserve(s, 1);
     s->ptr[s->len] = (char)b;
     s->len += 1;
     s->ptr[s->len] = 0;
@@ -3623,6 +3637,7 @@ static zx_String zx_string_clone(const zx_String *s) {
     r.len = s->len;
     r.ptr = (char *)malloc(r.len + 1);
     if (!r.ptr) zx_panicf("out of memory");
+    r.cap = r.len + 1;
     if (s->ptr) memcpy(r.ptr, s->ptr, r.len + 1); else r.ptr[0] = 0;
     return r;
 }
@@ -3668,6 +3683,7 @@ static zx_String zx_string_substr(const zx_String *s, size_t start, size_t n) {
     r.len = n;
     r.ptr = (char *)malloc(n + 1);
     if (!r.ptr) zx_panicf("out of memory");
+    r.cap = n + 1;
     if (n && s->ptr) memcpy(r.ptr, s->ptr + start, n);
     r.ptr[n] = 0;
     return r;
@@ -3681,6 +3697,7 @@ static zx_String zx_string_trim(const zx_String *s) {
     r.len = b - a;
     r.ptr = (char *)malloc(r.len + 1);
     if (!r.ptr) zx_panicf("out of memory");
+    r.cap = r.len + 1;
     if (r.len) memcpy(r.ptr, s->ptr + a, r.len);
     r.ptr[r.len] = 0;
     return r;
@@ -3691,6 +3708,6 @@ static int64_t zx_string_parse_i64(const zx_String *s) {
     return (int64_t)strtoll(s->ptr, NULL, 10);
 }
 
-static void zx_drop_String(zx_String *s) { free(s->ptr); s->ptr = NULL; s->len = 0; }
-static zx_String zx_move_String(zx_String *v) { zx_String t = *v; v->ptr = NULL; v->len = 0; return t; }
+static void zx_drop_String(zx_String *s) { free(s->ptr); s->ptr = NULL; s->len = 0; s->cap = 0; }
+static zx_String zx_move_String(zx_String *v) { zx_String t = *v; v->ptr = NULL; v->len = 0; v->cap = 0; return t; }
 `
