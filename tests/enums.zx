@@ -49,6 +49,31 @@ fn handle(m: Message) -> i32 {
     }
 }
 
+// Owned payloads: matching through a borrow must not steal the payload.
+enum Owned { Text(String), Empty }
+
+fn peek(o: &Owned) -> i32 {
+    match *o {
+        Owned::Text(_) => 1,
+        Owned::Empty => 0,
+    }
+}
+
+struct Holder { o: Owned }
+
+impl Holder {
+    fn is_text(&self) -> bool {
+        match self.o {
+            Owned::Text(_) => true,
+            Owned::Empty => false,
+        }
+    }
+}
+
+// Enums with no heap payloads are only read by `match`, so they can be
+// matched more than once.
+enum Color { Red, Green }
+
 fn main() -> i32 {
     let a = Shape::Circle(2.0);
     let b = Shape::Rect(3.0, 4.0);
@@ -72,6 +97,19 @@ fn main() -> i32 {
     let mut s = Shape::Circle(1.0);
     s = Shape::Rect(2.0, 5.0);
     println(area(s));
+
+    let owned = Owned::Text(String::from("kept"));
+    println(peek(&owned));
+    println(peek(&owned));
+    match owned { Owned::Text(t) => println(t), Owned::Empty => println("empty") }
+
+    let h = Holder { o: Owned::Text(String::from("field")) };
+    println(h.is_text());
+    match h.o { Owned::Text(t) => println(t), Owned::Empty => println("empty") }
+
+    let col = Color::Red;
+    match col { Color::Red => println("red"), Color::Green => println("green") }
+    match col { Color::Red => println("again"), Color::Green => println("green") }
 
     0
 }

@@ -1,0 +1,81 @@
+// `Option`, `Result`, and the `?` operator. These enums are predeclared and
+// behave like ordinary generic enums; `?` is ordinary match-based control flow.
+// Bare `Ok`/`Err`/`Some`/`None` take their type from context.
+
+enum MyErr { Oops, Bad { pos: i64 } }
+
+fn parse(s: str) -> Result<i64, MyErr> {
+    if s == "" { return Err(MyErr::Oops); }
+    let text = String::from(s);
+    let mut n: i64 = 0;
+    let mut i: usize = 0;
+    while i < text.len() {
+        let c = text.byte_at(i);
+        if c < 48 || c > 57 { return Err(MyErr::Bad { pos: i as i64 }); }
+        n = n * 10 + (c - 48);
+        i += 1;
+    }
+    return Ok(n);
+}
+
+fn sum(a: str, b: str) -> Result<i64, MyErr> {
+    let x = parse(a)?;
+    let y = parse(b)?;
+    return Ok(x + y);
+}
+
+fn half(x: i64) -> Option<i64> {
+    if x % 2 == 0 { return Some(x / 2); }
+    return None;
+}
+
+fn quarter(x: i64) -> Option<i64> {
+    let a = half(x)?;
+    let b = half(a)?;
+    return Some(b);
+}
+
+fn owned(s: str) -> Result<String, MyErr> {
+    if s == "" { return Err(MyErr::Oops); }
+    return Ok(String::from(s));
+}
+
+fn twice(s: str) -> Result<i64, MyErr> {
+    let a = owned(s)?;
+    let b = owned(s)?;
+    return Ok((a.len() + b.len()) as i64);
+}
+
+fn describe(e: MyErr) -> i32 {
+    match e {
+        MyErr::Oops => { println("oops"); 1 }
+        MyErr::Bad { pos } => { println(pos); 2 }
+    }
+}
+
+fn report(r: Result<i64, MyErr>) -> i32 {
+    match r {
+        Ok(v) => { println(v); 0 }
+        Err(e) => describe(e),
+    }
+}
+
+fn main() -> i32 {
+    report(parse("42"));
+    report(parse(""));
+    report(parse("4x2"));
+    report(sum("1", "2"));
+    report(sum("1", ""));
+    report(twice("abc"));
+    report(twice(""));
+
+    match quarter(40) { Some(v) => println(v), None => println(-1) }
+    match quarter(10) { Some(v) => println(v), None => println(-2) }
+
+    let missing: Option<i64> = None;
+    match missing { Some(v) => println(v), None => println(0) }
+
+    let found: Option<i64> = Some(3);
+    match found { Some(v) => println(v), None => println(-1) }
+    0
+}

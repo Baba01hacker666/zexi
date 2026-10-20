@@ -31,6 +31,8 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../examples/regex.zx",
 		"../../examples/local_tools.zx",
 		"../../examples/math_tools.zx",
+		"../../examples/result.zx",
+		"../../examples/enum_match.zx",
 		"../../tests/tour.zx",
 		"../../tests/structs.zx",
 		"../../tests/enums.zx",
@@ -52,6 +54,8 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/threads.zx",
 		"../../tests/formatting.zx",
 		"../../tests/encoding.zx",
+		"../../tests/generics.zx",
+		"../../tests/option_result.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -99,7 +103,8 @@ func TestRunPrograms(t *testing.T) {
 		{
 			file: "../../tests/enums.zx",
 			want: strings.Join([]string{
-				"false", "true", "12.5664", "12", "0", "zero", "one", "many", "0", "7", "-1", "10", "",
+				"false", "true", "12.5664", "12", "0", "zero", "one", "many", "0", "7", "-1", "10",
+				"1", "1", "kept", "true", "field", "red", "again", "",
 			}, "\n"),
 		},
 		{
@@ -295,6 +300,55 @@ func TestRunPrograms(t *testing.T) {
 				"000000310f923099",
 				"",
 			}, "\n"),
+		},
+		{
+			file: "../../tests/generics.zx",
+			want: strings.Join([]string{
+				"7",
+				"7",
+				"hey",
+				"21",
+				"1",
+				"b",
+				"42",
+				"9",
+				"7",
+				"10",
+				"true",
+				"10",
+				"5",
+				"6",
+				"4",
+				"0",
+				"12",
+				"0",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/option_result.zx",
+			want: strings.Join([]string{
+				"42",
+				"oops",
+				"1",
+				"3",
+				"oops",
+				"6",
+				"oops",
+				"10",
+				"-2",
+				"0",
+				"3",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../examples/result.zx",
+			want: "42\n",
+		},
+		{
+			file: "../../examples/enum_match.zx",
+			want: "9.14159\n7\n",
 		},
 	}
 

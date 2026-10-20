@@ -1,0 +1,87 @@
+// Generic functions are monomorphized: every distinct instantiation becomes a
+// separate function in the generated C. This covers inference, explicit
+// turbofish, nesting, and generic functions used as values.
+fn id<T>(x: T) -> T { return x; }
+
+fn twice<T>(x: T) -> T { return id(x); }
+
+fn pick<T>(a: T, b: T, first: bool) -> T {
+    if first { return a; }
+    return b;
+}
+
+fn apply<T>(f: fn(T) -> T, v: T) -> T { return f(v); }
+
+fn inc(x: i64) -> i64 { return x + 1; }
+
+struct Box2 { a: i64, b: i64 }
+
+fn sum(b: Box2) -> i64 { return b.a + b.b; }
+
+// --- generic structs, enums, and impls ---
+
+struct Pair<A, B> { first: A, second: B }
+
+impl<A, B> Pair<A, B> {
+    fn swap(&self) -> Pair<B, A> {
+        return Pair { first: self.second, second: self.first };
+    }
+    fn first_of(&self) -> A { return self.first; }
+}
+
+enum Maybe<T> { Just(T), Nothing }
+
+// Inference through a nominal type argument: the parameter pattern is
+// `Boxed<T>`, matched against a concrete `Boxed<i64>`.
+struct Boxed<T> { value: T }
+
+fn unbox<T>(b: Boxed<T>) -> T { return b.value; }
+
+fn unwrap_or(m: Maybe<i64>, fallback: i64) -> i64 {
+    match m {
+        Maybe::Just(v) => v,
+        Maybe::Nothing => fallback,
+    }
+}
+
+enum Owned<T> { Val(T), Empty }
+
+fn owned_len(o: Owned<String>) -> i32 {
+    match o {
+        Owned::Val(s) => s.len() as i32,
+        Owned::Empty => 0,
+    }
+}
+
+fn main() -> i32 {
+    println(id(7));                 // inferred: id<i32>
+    println(id::<i64>(7));          // explicit turbofish
+    let s: str = id("hey");
+    println(s);
+    println(twice(21));             // nested: id<i32> instantiated from twice<i32>
+    println(pick(1, 2, true));
+    println(pick::<str>("a", "b", false));
+    let f: fn(i64) -> i64 = inc;
+    println(apply::<i64>(f, 41));
+    let g: fn(i64) -> i64 = id::<i64>;
+    println(g(9));
+    let b = Box2 { a: 3, b: 4 };
+    println(sum(id(b)));
+
+    let p = Pair { first: 10, second: true };
+    println(p.first_of());
+    let q = p.swap();
+    println(q.first);
+    println(q.second);
+    println(unwrap_or(Maybe::Just(5), 0));
+    println(unwrap_or(Maybe::Nothing, 6));
+    println(owned_len(Owned::Val(String::from("four"))));
+    println(owned_len(Owned::Empty));
+
+    let nb: Boxed<i64> = Boxed { value: 12 };
+    println(unbox(nb));                       // infer T from Boxed<i64>
+
+    let opt_pair: Pair<Option<i64>, i64> = Pair { first: None, second: 1 };
+    match opt_pair.first { Some(v) => println(v), None => println(0) }
+    0
+}

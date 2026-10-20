@@ -221,7 +221,8 @@ func (m *mover) use(e ast.Expr) {
 			m.consume(x.Val)
 		}
 	case *ast.TryExpr:
-		m.use(x.X)
+		// `?` consumes its operand, which the desugared match takes by value.
+		m.consume(x.X)
 	case *ast.InterpStrExpr:
 		// Interpolation reads (borrows) its values; it never moves them.
 		for _, part := range x.Parts {
@@ -385,7 +386,14 @@ func (m *mover) ifExpr(x *ast.IfExpr) {
 }
 
 func (m *mover) matchExpr(x *ast.MatchExpr) {
-	m.use(x.Scrutinee)
+	// A match takes its scrutinee by value only when it owns heap resources
+	// (mirroring codegen): otherwise it is merely read, so a no-payload enum
+	// can be matched again, and matching a field does not move its container.
+	if t := m.c.info.TypeOf(x.Scrutinee); t != nil && t.NeedsDrop() && !m.c.info.PlaceThroughBorrow(x.Scrutinee) {
+		m.consume(x.Scrutinee)
+	} else {
+		m.use(x.Scrutinee)
+	}
 	before := m.snapshot()
 	result := before
 	for _, arm := range x.Arms {

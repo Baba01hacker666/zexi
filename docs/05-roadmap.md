@@ -21,7 +21,10 @@
 > (`Point::new(..)`); value-yielding `loop` (`break <expr>`); enums
 > (unit/tuple/struct variants) with
 > `match` over enums, integers, `bool`, and `char`, guards (`pat if cond`), and
-> exhaustiveness checking; first-class
+> exhaustiveness checking; **monomorphized generics** on functions, structs,
+> enums, and impls (inference, turbofish, generic methods), predeclared
+> `Option<T>`/`Result<T,E>` with the `?` operator, and **owned enum payloads**
+> with match move/drop glue; first-class
 > arrays with bounds-checked indexing; `mut` enforcement (a non-`mut` binding
 > cannot be assigned through, `&mut`-borrowed, or mutated via a `&mut self`
 > method); use-after-move errors for non-`Copy` values (`#[copy]` opts in);
@@ -36,14 +39,14 @@
 > and server (see docs/08), now with a Go-style default mux: top-level
 > `handle_get("/users/{id}", user)` plus `listen(":8080")`, `{name}` route
 > parameters, and `use_before`/`use_after` middleware.
-> Not yet implemented: generics, traits, full per-module **isolation**
+> Not yet implemented: traits and trait bounds (generic parameters are
+> unconstrained), `dyn Trait`, associated types, const generics, full
+> per-module **isolation**
 > (scoped qualified paths, `as` aliases, and `pub` checks are live, but the
 > loader still merges every module into one flat namespace, so unqualified
 > cross-module names remain visible and ignore `pub`), `Vec`/`Box`,
 > user-defined `Drop`, borrow-lifetime analysis (so bound
-> `&`/`*` aliases are not tracked), and `Result`/`?`. Enum variants may not carry
-> resource-owning payloads yet (a `match` binding would alias an owned value; see
-> §5.2).
+> `&`/`*` aliases are not tracked), nested patterns, and tuple values.
 > See `docs/06-backend-strategy.md` for the backend status.
 
 The MVP is milestone **M0**: enough language to compile real, safe, small
@@ -78,9 +81,8 @@ M1/M2 are additive.
 - Primitives: `bool i8 i16 i32 i64 u8 u16 u32 u64 isize usize f32 f64 char`.
 - `()`, tuples, `[T; N]`, `[T]` + `&[T]`, `&T`, `&mut T`, `*T` (unsafe), `str`.
 - `struct`, `enum` (tagged union) with `match`.
-- No generic `Option<T>`/`Result<T,E>` yet — their syntax and `?` propagation
-  remain the principal M0/M1 error-handling gap. Concrete enums and `match`
-  cover many small-program cases today.
+- Predeclared generic `Option<T>`/`Result<T,E>` with `?` propagation (lowered
+  to `match`); the error type must match exactly (no `From` conversion yet).
 
 **Declarations & statements**
 - `fn`, `struct`, `enum`, `const`, `type` aliases.
@@ -96,11 +98,11 @@ M1/M2 are additive.
   value. Moves transfer ownership and null the source, so a moved-out value is
   never freed twice.
 - The one heap type is the built-in `String` (an owning UTF-8 buffer). A
-  `struct` or array containing a `String` is itself an owning value and gets a
-  generated destructor; dropping it drops each field/element.
-- **Known M0 gaps (documented, not yet closed):** enum variants cannot carry
-  owning payloads (a `match` binding would alias an owned value, which needs the
-  borrow checker); a `str` borrowed from a temporary `String` prolongs that
+  `struct`, `enum` variant, or array containing a `String` is itself an owning
+  value and gets a generated destructor; dropping it drops each
+  field/element/payload.
+- **Known M0 gaps (documented, not yet closed):** a `str` borrowed from a
+  temporary `String` prolongs that
   temporary until the end of the statement; bound `&`/`*` aliases are not tracked
   across moves (no lifetime analysis). Full handling arrives with M1/M2.
 - Explicit heap only via built-in heap types (`String` now, `Box<T>`/`Vec<T>` at
