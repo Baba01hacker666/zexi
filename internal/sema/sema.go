@@ -41,6 +41,12 @@ type Fn struct {
 	Recv       *types.Type // receiver type for methods (struct or enum), else nil
 	Extern     bool
 	ABI        string
+	// Inline records `#[inline]`; InlineNever records `#[inline(never)]`.
+	Inline      bool
+	InlineNever bool
+	// NoMangle keeps the Zexi name as the C symbol and gives it external
+	// linkage, so C code can call it (`#[no_mangle]` or `#[export]`).
+	NoMangle bool
 }
 
 // SelfParam describes a method receiver.
@@ -481,6 +487,7 @@ func (c *checker) registerEnum(d *ast.EnumDecl) {
 		return
 	}
 	names := c.checkGenerics(d.Generics)
+	c.checkTypeAttrs(d.Attrs, d.Sp, "enum", d.Name)
 	en := &types.Enum{Name: d.Name, Base: d.Name, Generics: names, Generic: len(names) > 0, Copy: types.CopyAttr(d.Attrs)}
 	c.info.Enums[d.Name] = en
 	c.enumDecls[d.Name] = d
@@ -562,6 +569,26 @@ func (c *checker) addPreludeEnum(name string, params []string, variants []prelud
 	c.enumDecls[name] = d
 }
 
+// checkTypeAttrs validates the attributes on a struct or enum. `#[copy]` opts
+// into copy semantics and `#[repr(C)]` names the layout the backend already
+// uses; anything else is a typo the user should hear about.
+func (c *checker) checkTypeAttrs(attrs []string, sp token.Span, what, name string) {
+	for _, a := range attrs {
+		nm := types.AttrName(a)
+		switch nm {
+		case "copy", "allow":
+		case "repr":
+			if arg := types.AttrArg(a); arg != "" && arg != "C" && arg != "c" {
+				c.errf(sp, "E0539", "`#[repr(%s)]` is not supported; the only layout is `#[repr(C)]`, which is already the default", arg)
+			}
+		default:
+			if !types.KnownAttrs[nm] {
+				c.errf(sp, "E0539", "unknown attribute `#[%s]` on %s `%s`", nm, what, name)
+			}
+		}
+	}
+}
+
 func (c *checker) registerStruct(d *ast.StructDecl) {
 	if _, dup := c.info.Structs[d.Name]; dup {
 		c.errf(d.Sp, "E0428", "the struct `%s` is defined multiple times", d.Name)
@@ -572,6 +599,7 @@ func (c *checker) registerStruct(d *ast.StructDecl) {
 		return
 	}
 	names := c.checkGenerics(d.Generics)
+	c.checkTypeAttrs(d.Attrs, d.Sp, "struct", d.Name)
 	st := &types.Struct{Name: d.Name, Base: d.Name, Generics: names, Generic: len(names) > 0, Tuple: d.Tuple, Copy: types.CopyAttr(d.Attrs)}
 	c.info.Structs[d.Name] = st
 	c.structDecls[d.Name] = d
@@ -864,8 +892,37 @@ func (c *checker) makeFn(d *ast.FnDecl, recv *types.Type) *Fn {
 	return fn
 }
 
+// applyFnAttrs reads a function's `#[...]` attributes, recording the ones the
+// backend acts on and rejecting the ones the compiler does not know, so a typo
+// cannot silently do nothing.
+func (c *checker) applyFnAttrs(fn *Fn, d *ast.FnDecl) {
+	for _, a := range d.Attrs {
+		switch types.AttrName(a) {
+		case "inline":
+			if types.AttrArg(a) == "never" {
+				fn.InlineNever = true
+			} else {
+				fn.Inline = true
+			}
+		case "no_mangle", "export":
+			if recv := fn.Recv; recv != nil {
+				c.errf(d.Sp, "E0599", "`#[%s]` is not allowed on a method; put it on a plain function", types.AttrName(a))
+				continue
+			}
+			fn.NoMangle = true
+		case "allow":
+			// Accepted and ignored.
+		default:
+			if !types.KnownAttrs[types.AttrName(a)] {
+				c.errf(d.Sp, "E0539", "unknown attribute `#[%s]`", types.AttrName(a))
+			}
+		}
+	}
+}
+
 func (c *checker) makeFnInner(d *ast.FnDecl, recv *types.Type) *Fn {
 	fn := &Fn{Decl: d, Name: d.Name, Recv: recv}
+	c.applyFnAttrs(fn, d)
 	if recv != nil {
 		fn.QualName = nominalName(recv) + "::" + d.Name
 	} else {

@@ -124,11 +124,11 @@ func (p *parser) parseItem() ast.Item {
 
 	switch p.cur().Kind {
 	case token.KindFn:
-		return p.parseFn(vis, start)
+		return p.parseFn(vis, attrs, start)
 	case token.KindUnsafe:
 		p.bump()
 		if p.at(token.KindFn) {
-			d := p.parseFn(vis, start)
+			d := p.parseFn(vis, attrs, start)
 			if f, ok := d.(*ast.FnDecl); ok {
 				f.Unsafe = true
 			}
@@ -137,7 +137,7 @@ func (p *parser) parseItem() ast.Item {
 		p.errf(p.cur(), "E0202", "expected `fn` after `unsafe`")
 		return nil
 	case token.KindExtern:
-		return p.parseExternFn(vis, start)
+		return p.parseExternFn(vis, attrs, start)
 	case token.KindStruct:
 		return p.parseStruct(vis, attrs, start)
 	case token.KindEnum:
@@ -160,9 +160,10 @@ func (p *parser) parseItem() ast.Item {
 	}
 }
 
-// parseAttributes consumes `#[...]` attribute lists and returns the top-level
-// attribute names (for example `copy` in `#[copy]`). Nested/complex attributes
-// are consumed but their contents ignored.
+// parseAttributes consumes `#[...]` attribute lists and returns one string per
+// attribute, spelling the whole attribute including any argument: `copy` for
+// `#[copy]`, `repr(C)` for `#[repr(C)]`, `inline(never)` for `#[inline(never)]`.
+// AttrName and AttrArg split that back apart.
 func (p *parser) parseAttributes() []string {
 	var attrs []string
 	for p.at(token.KindHash) {
@@ -170,9 +171,7 @@ func (p *parser) parseAttributes() []string {
 		if !p.expect(token.KindLBracket, " after `#`") {
 			return attrs
 		}
-		if p.at(token.KindIdentifier) {
-			attrs = append(attrs, p.cur().Lit)
-		}
+		var parts []string
 		depth := 1
 		for depth > 0 && !p.at(token.KindEOF) {
 			switch p.cur().Kind {
@@ -181,22 +180,37 @@ func (p *parser) parseAttributes() []string {
 			case token.KindRBracket:
 				depth--
 			}
+			if depth > 0 {
+				parts = append(parts, attrTokenText(p.cur()))
+			}
 			p.bump()
+		}
+		if s := strings.Join(parts, ""); s != "" {
+			attrs = append(attrs, s)
 		}
 	}
 	return attrs
 }
 
+// attrTokenText renders one token inside an attribute: punctuation tokens carry
+// no literal, so their spelling comes from the kind.
+func attrTokenText(t token.Token) string {
+	if t.Lit != "" {
+		return t.Lit
+	}
+	return t.Kind.String()
+}
+
 // skipAttributes consumes and discards attribute lists.
 func (p *parser) skipAttributes() { _ = p.parseAttributes() }
 
-func (p *parser) parseFn(vis ast.Visibility, start token.Pos) ast.Item {
+func (p *parser) parseFn(vis ast.Visibility, attrs []string, start token.Pos) ast.Item {
 	p.bump() // fn
 	name, ok := p.expectIdent("function name")
 	if !ok {
 		return nil
 	}
-	fn := &ast.FnDecl{Vis: vis, Name: name, Sp: p.spanFrom(start)}
+	fn := &ast.FnDecl{Vis: vis, Attrs: attrs, Name: name, Sp: p.spanFrom(start)}
 	fn.Generics = p.parseGenerics()
 	fn.Params = p.parseParams()
 	if p.accept(token.KindArrow) {
@@ -211,7 +225,7 @@ func (p *parser) parseFn(vis ast.Visibility, start token.Pos) ast.Item {
 	return fn
 }
 
-func (p *parser) parseExternFn(vis ast.Visibility, start token.Pos) ast.Item {
+func (p *parser) parseExternFn(vis ast.Visibility, attrs []string, start token.Pos) ast.Item {
 	p.bump() // extern
 	abi := ""
 	if p.at(token.KindString) {
@@ -221,7 +235,7 @@ func (p *parser) parseExternFn(vis ast.Visibility, start token.Pos) ast.Item {
 		p.errf(p.cur(), "E0202", "expected `fn` in `extern` declaration")
 		return nil
 	}
-	d := p.parseFn(vis, start)
+	d := p.parseFn(vis, attrs, start)
 	if f, ok := d.(*ast.FnDecl); ok {
 		f.Extern = abi
 	}
@@ -437,10 +451,10 @@ func (p *parser) parseImpl(start token.Pos) ast.Item {
 	}
 	for !p.at(token.KindRBrace) && !p.at(token.KindEOF) {
 		before := p.pos
-		p.skipAttributes()
+		attrs := p.parseAttributes()
 		vis := ast.Visibility(p.accept(token.KindPub))
 		if p.at(token.KindFn) {
-			if f, ok := p.parseFn(vis, p.cur().Pos.Offset).(*ast.FnDecl); ok {
+			if f, ok := p.parseFn(vis, attrs, p.cur().Pos.Offset).(*ast.FnDecl); ok {
 				d.Fns = append(d.Fns, f)
 			}
 		} else {

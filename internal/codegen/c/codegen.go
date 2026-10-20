@@ -192,7 +192,7 @@ func newGen(info *sema.Info, opts Options) *gen {
 	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}, arrays: map[string]*types.Type{}, arrSeen: map[string]bool{}, vecs: map[string]*types.Type{}, vecSeen: map[string]bool{}, dropSeen: map[string]bool{}, externNames: map[string]bool{}}
 	g.used = usedFns(info)
 	for _, fn := range info.FnOrder {
-		if fn.Extern || fn.Name == "main" {
+		if fn.Extern || fn.Name == "main" || fn.NoMangle {
 			g.externNames[funcName(fn)] = true
 		}
 	}
@@ -228,12 +228,12 @@ func (g *gen) reachableFns() []*sema.Fn {
 	return out
 }
 
-// usedFns computes the set of functions reachable from `main`, following
-// direct calls, method calls, and names used as values (callbacks). Only
-// reachable functions are emitted, so importing a large library costs
-// nothing unless its functions are actually called — the C side stays small
-// and fast to compile. When there is no entry point (defensive), everything
-// is kept.
+// usedFns computes the set of functions reachable from `main` and from every
+// `#[no_mangle]`/`#[export]` function, following direct calls, method calls,
+// and names used as values (callbacks). Only reachable functions are emitted,
+// so importing a large library costs nothing unless its functions are actually
+// called — the C side stays small and fast to compile. When there is no entry
+// point (defensive), everything is kept.
 func usedFns(info *sema.Info) map[*sema.Fn]bool {
 	if info.Main == nil || info.Main.Decl == nil || info.Main.Decl.Body == nil {
 		all := map[*sema.Fn]bool{}
@@ -251,6 +251,13 @@ func usedFns(info *sema.Info) map[*sema.Fn]bool {
 		}
 	}
 	add(info.Main)
+	// `#[no_mangle]`/`#[export]` functions are entry points for C callers, so
+	// they are roots even when nothing in Zexi calls them.
+	for _, f := range info.FnOrder {
+		if f.NoMangle {
+			add(f)
+		}
+	}
 	for len(queue) > 0 {
 		f := queue[0]
 		queue = queue[1:]
@@ -1008,11 +1015,7 @@ func (g *gen) prototypes() {
 			if !g.used[fn] {
 				continue // unreachable: never emitted, never declared
 			}
-			link := "static "
-			if g.split {
-				link = ""
-			}
-			g.w.line("%s%s;", link, fnSignature(fn))
+			g.w.line("%s%s;", g.staticPrefix(fn), fnSignature(fn))
 		} else if fn.Extern {
 			g.w.line("%s;", fnSignature(fn))
 		}
@@ -1088,10 +1091,22 @@ func (g *gen) staticPrefix(fn *sema.Fn) string {
 	if fn.Extern || fn.Name == "main" {
 		return ""
 	}
+	if fn.NoMangle {
+		// Exported for the C bridge: external linkage under the Zexi name.
+		return ""
+	}
 	if g.split {
 		// Multi-unit output: bodies live in different translation units, so
-		// user functions need external linkage.
+		// user functions need external linkage. A bare `inline` definition
+		// would emit no external symbol and cross-unit calls would not link,
+		// so the hint is dropped rather than paired with `extern inline`.
 		return ""
+	}
+	switch {
+	case fn.InlineNever:
+		return "static __attribute__((noinline)) "
+	case fn.Inline:
+		return "static inline "
 	}
 	return "static "
 }
@@ -2967,8 +2982,9 @@ func funcName(fn *sema.Fn) string {
 	if fn.Recv != nil {
 		return "zx_" + safeIdent(fn.Recv.String()) + "_" + safeIdent(fn.Name)
 	}
-	if fn.Name == "main" || fn.Extern {
-		// `main` and `extern "C"` functions keep their exact C name.
+	if fn.Name == "main" || fn.Extern || fn.NoMangle {
+		// `main`, `extern "C"` functions, and `#[no_mangle]`/`#[export]`
+		// functions keep their exact Zexi name as the C symbol.
 		return fn.Name
 	}
 	return "zx_" + safeIdent(fn.Name)

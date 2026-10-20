@@ -351,6 +351,57 @@ func (t *Type) NeedsDrop() bool {
 	return false
 }
 
+// AttrName is the identifier part of an attribute: `repr` for `repr(C)`.
+func AttrName(attr string) string {
+	if i := strings.IndexByte(attr, '('); i >= 0 {
+		return attr[:i]
+	}
+	return attr
+}
+
+// AttrArg is the parenthesized part of an attribute: `C` for `repr(C)`,
+// `never` for `inline(never)`, and "" when there is none.
+func AttrArg(attr string) string {
+	i := strings.IndexByte(attr, '(')
+	if i < 0 || !strings.HasSuffix(attr, ")") {
+		return ""
+	}
+	return attr[i+1 : len(attr)-1]
+}
+
+// HasAttr reports whether an attribute list contains the named attribute,
+// whatever its argument.
+func HasAttr(attrs []string, name string) bool {
+	for _, a := range attrs {
+		if AttrName(a) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// AttrValue returns the argument of the named attribute, and whether it was
+// present.
+func AttrValue(attrs []string, name string) (string, bool) {
+	for _, a := range attrs {
+		if AttrName(a) == name {
+			return AttrArg(a), true
+		}
+	}
+	return "", false
+}
+
+// KnownAttrs are the attributes the compiler understands. Anything else is a
+// diagnostic, so a typo like `#[Copy]` cannot silently do nothing.
+var KnownAttrs = map[string]bool{
+	"copy":      true, // opt a struct or enum into copy semantics
+	"repr":      true, // `repr(C)`: C layout, which is already the default
+	"inline":    true, // hint (or `inline(never)`) to the C compiler
+	"no_mangle": true, // keep the Zexi name as the C symbol, with external linkage
+	"export":    true, // alias for `no_mangle`, for the C bridge
+	"allow":     true, // accepted and ignored, so lints can be named locally
+}
+
 // CopyAttr reports whether an attribute list opts a type into `Copy`.
 func CopyAttr(attrs []string) bool {
 	return slices.Contains(attrs, "copy")

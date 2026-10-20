@@ -2101,3 +2101,103 @@ fn main() -> i32 {
 		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
 	}
 }
+
+// TestExportedAttributes checks the M1 attribute surface: `#[export]` and
+// `#[no_mangle]` give a function its plain Zexi name with external linkage so
+// C code can call it, and such a function is emitted even when nothing in Zexi
+// calls it. `#[inline]` and `#[inline(never)]` are passed through to the C
+// compiler, and `#[repr(C)]` names the layout the backend already uses.
+func TestExportedAttributes(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	glue := `#include <stdio.h>
+#include <stdint.h>
+int64_t zexi_add(int64_t a, int64_t b);
+int64_t public_name(int64_t n);
+void run_c(void) {
+    printf("c sees add=%lld public=%lld\n",
+           (long long)zexi_add(20, 22), (long long)public_name(3));
+}
+`
+	main := `#[export]
+fn zexi_add(a: i64, b: i64) -> i64 { return a + b; }
+
+#[no_mangle]
+fn public_name(n: i64) -> i64 { return n * 2; }
+
+#[inline]
+fn fast(x: i64) -> i64 { return x + 1; }
+
+#[inline(never)]
+fn slow(x: i64) -> i64 { return x - 1; }
+
+#[repr(C)]
+#[copy]
+struct Pair { x: i32, y: i32 }
+
+extern "C" fn run_c();
+
+fn main() -> i32 {
+    println(fast(1), slow(1));
+    let p = Pair { x: 1, y: 2 };
+    let q = p;
+    println(p.x, q.y);
+    run_c();
+    0
+}
+`
+	gluePath := filepath.Join(dir, "glue.c")
+	mainPath := filepath.Join(dir, "main.zx")
+	if err := os.WriteFile(gluePath, []byte(glue), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mainPath, []byte(main), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, out, driver.Options{CFiles: []string{gluePath}}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("attribute bridge build failed")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running attribute program: %v", err)
+	}
+	want := "2 0\n1 2\nc sees add=42 public=6\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestUnknownAttributeIsRejected checks that a misspelled attribute is a
+// diagnostic rather than a silent no-op.
+func TestUnknownAttributeIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad.zx")
+	src := `#[Copy]
+struct S { x: i32 }
+
+#[bogus]
+fn f() -> i32 { 0 }
+
+fn main() -> i32 { 0 }
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	em := diag.NewEmitter()
+	if _, ok := driver.FrontEnd(path, driver.Options{}, em); ok {
+		t.Fatal("expected the unknown attributes to be rejected")
+	}
+	var buf strings.Builder
+	em.Render(&buf, em.FirstFileID())
+	got := buf.String()
+	for _, want := range []string{"E0539", "#[Copy]", "#[bogus]"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("diagnostics missing %q:\n%s", want, got)
+		}
+	}
+}
