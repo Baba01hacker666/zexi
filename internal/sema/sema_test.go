@@ -1650,3 +1650,34 @@ fn main() -> i32 { let m: HashMap<Point, i32> = HashMap::new(); println(m.len())
 		t.Fatalf("hashable key: expected clean, got %v", codes)
 	}
 }
+
+// TestPrintlnFormat checks `{}` interpolation in println/print: the literal
+// first argument becomes the format string, each placeholder is type-checked
+// as printable, and arity mismatches are diagnosed.
+func TestPrintlnFormat(t *testing.T) {
+	ok, codes := check(t, `fn main() -> i32 {
+    println("x = {}", 42);
+    println("{} and {}", true, 'Z');
+    0
+}`)
+	if !ok {
+		t.Fatalf("format call: expected clean, got %v", codes)
+	}
+
+	ok, codes = check(t, `fn main() -> i32 { println("a {} b", 1, 2); 0 }`)
+	if ok || !has(codes, "E0061") {
+		t.Fatalf("arity: expected E0061, got ok=%v codes=%v", ok, codes)
+	}
+
+	ok, codes = check(t, `struct P { x: i32 }
+fn main() -> i32 { println("p {}", P { x: 1 }); 0 }`)
+	if ok || !has(codes, "E0277") {
+		t.Fatalf("non-printable: expected E0277, got ok=%v codes=%v", ok, codes)
+	}
+
+	// Without `{}` the call keeps its old space-separated meaning.
+	ok, codes = check(t, `fn main() -> i32 { println("a", 1, 2); 0 }`)
+	if !ok {
+		t.Fatalf("space separated: expected clean, got %v", codes)
+	}
+}

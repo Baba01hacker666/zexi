@@ -2067,6 +2067,9 @@ func (g *gen) printfCall(x *ast.CallExpr, name string) string {
 	if len(x.Args) == 0 {
 		return fmt.Sprintf(`printf("%s")`, nl)
 	}
+	if format, ok := formatLiteralC(x.Args); ok {
+		return g.printFormat(x.Args[1:], format, nl)
+	}
 	if len(x.Args) == 1 {
 		return g.printOne(x.Args[0], nl)
 	}
@@ -2077,6 +2080,66 @@ func (g *gen) printfCall(x *ast.CallExpr, name string) string {
 			parts = append(parts, `printf(" ")`)
 		}
 		parts = append(parts, g.printOne(arg, ""))
+	}
+	if nl != "" {
+		parts = append(parts, fmt.Sprintf(`printf("%s")`, nl))
+	}
+	return "({ " + strings.Join(parts, "; ") + "; (void)0; })"
+}
+
+// formatLiteralC returns the decoded format string when a call's first
+// argument is a string literal containing at least one `{}` placeholder.
+func formatLiteralC(args []ast.Expr) (string, bool) {
+	if len(args) == 0 {
+		return "", false
+	}
+	lit, ok := args[0].(*ast.LiteralExpr)
+	if !ok {
+		return "", false
+	}
+	switch lit.Kind {
+	case token.KindString:
+		decoded, ok := sema.DecodeString(lit.Text)
+		if !ok {
+			return "", false
+		}
+		return decoded, strings.Contains(decoded, "{}")
+	case token.KindRawString:
+		return lit.Text, strings.Contains(lit.Text, "{}")
+	}
+	return "", false
+}
+
+// splitFormat splits a format string on `{}` into alternating text and
+// placeholder segments. The result has one more element than there are
+// placeholders, so segment i is followed by argument i.
+func splitFormat(format string) []string {
+	var segs []string
+	rest := format
+	for {
+		i := strings.Index(rest, "{}")
+		if i < 0 {
+			segs = append(segs, rest)
+			return segs
+		}
+		segs = append(segs, rest[:i])
+		rest = rest[i+2:]
+	}
+}
+
+// printFormat prints a `{}`-formatted string: literal segments are emitted
+// with `%s`, and each placeholder is printed with the same per-type lowering
+// `printOne` uses, so `String`, `char`, and numeric values all work.
+func (g *gen) printFormat(args []ast.Expr, format, nl string) string {
+	segs := splitFormat(format)
+	parts := make([]string, 0, len(segs)*2+1)
+	for i, seg := range segs {
+		if seg != "" {
+			parts = append(parts, `printf("%s", `+cString(seg)+`)`)
+		}
+		if i < len(args) {
+			parts = append(parts, g.printOne(args[i], ""))
+		}
 	}
 	if nl != "" {
 		parts = append(parts, fmt.Sprintf(`printf("%s")`, nl))

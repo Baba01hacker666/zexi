@@ -4090,7 +4090,49 @@ func (c *checker) checkEnumStructLitFields(x *ast.StructLitExpr, en *types.Enum)
 	return &types.Type{Kind: types.EnumKind, En: en}
 }
 
+// formatLiteral returns the decoded format string when a call's first argument
+// is a string literal containing at least one `{}` placeholder. The remaining
+// arguments are then the values to interpolate.
+func formatLiteral(args []ast.Expr) (string, bool) {
+	if len(args) == 0 {
+		return "", false
+	}
+	lit, ok := args[0].(*ast.LiteralExpr)
+	if !ok {
+		return "", false
+	}
+	switch lit.Kind {
+	case token.KindString:
+		decoded, ok := DecodeString(lit.Text)
+		if !ok {
+			return "", false
+		}
+		return decoded, strings.Contains(decoded, "{}")
+	case token.KindRawString:
+		return lit.Text, strings.Contains(lit.Text, "{}")
+	}
+	return "", false
+}
+
+// countFormatArgs returns the number of `{}` placeholders in a format string.
+func countFormatArgs(format string) int {
+	return strings.Count(format, "{}")
+}
+
 func (c *checker) inferPrint(x *ast.CallExpr) *types.Type {
+	if format, ok := formatLiteral(x.Args); ok {
+		want := countFormatArgs(format)
+		if want != len(x.Args)-1 {
+			c.errAt(x, "E0061", "format string has %d placeholder(s) but %d argument(s) were supplied", want, len(x.Args)-1)
+		}
+		for _, a := range x.Args[1:] {
+			at := c.checkExpr(a, nil)
+			if !isPrintable(at) {
+				c.errAt(a, "E0277", "`%s` cannot be printed", at)
+			}
+		}
+		return types.UnitT
+	}
 	for _, a := range x.Args {
 		at := c.checkExpr(a, nil)
 		if !isPrintable(at) {
