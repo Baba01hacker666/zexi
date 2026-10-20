@@ -1434,3 +1434,61 @@ fn main() -> i32 {
 		t.Fatalf("expected clean, got %v", codes)
 	}
 }
+
+func TestQuestionOperatorDesugars(t *testing.T) {
+	src := `enum E { No }
+fn parse(s: str) -> Result<i64, E> {
+    if s == "" { return Err(E::No); }
+    return Ok(1);
+}
+fn twice(s: str) -> Result<i64, E> {
+    let n = parse(s)?;
+    return Ok(n + n);
+}
+fn maybe(x: i64) -> Option<i64> {
+    if x > 0 { return Some(x); }
+    return None;
+}
+fn call(x: i64) -> Option<i64> {
+    let v = maybe(x)?;
+    return Some(v + 1);
+}
+fn main() -> i32 {
+    match twice("a") { Ok(v) => println(v), Err(_) => println(0) }
+    match call(1) { Some(v) => println(v), None => println(0) }
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestQuestionRequiresResultReturn(t *testing.T) {
+	_, codes := check(t, `fn f() -> i64 { let x = g()?; x }
+fn g() -> Result<i64, str> { Ok(1) }
+fn main() -> i32 { 0 }`)
+	if !has(codes, "E0277") {
+		t.Fatalf("expected E0277, got %v", codes)
+	}
+}
+
+func TestQuestionCanonicalErrorMismatch(t *testing.T) {
+	_, codes := check(t, `enum A { X }
+enum B { Y }
+fn one() -> Result<i64, A> { Ok(1) }
+fn two() -> Result<i64, B> {
+    let n = one()?;
+    Ok(n)
+}
+fn main() -> i32 { 0 }`)
+	if !has(codes, "E0308") {
+		t.Fatalf("expected E0308, got %v", codes)
+	}
+}
+
+func TestBareVariantsNeedContext(t *testing.T) {
+	_, codes := check(t, `fn main() -> i32 { let x = Some(1); 0 }`)
+	if !has(codes, "E0425") {
+		t.Fatalf("expected E0425 for an uninferable bare variant, got %v", codes)
+	}
+}

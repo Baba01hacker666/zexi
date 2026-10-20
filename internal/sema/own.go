@@ -221,7 +221,8 @@ func (m *mover) use(e ast.Expr) {
 			m.consume(x.Val)
 		}
 	case *ast.TryExpr:
-		m.use(x.X)
+		// `?` consumes its operand, which the desugared match takes by value.
+		m.consume(x.X)
 	case *ast.InterpStrExpr:
 		// Interpolation reads (borrows) its values; it never moves them.
 		for _, part := range x.Parts {

@@ -83,6 +83,8 @@ type Info struct {
 	TupleCtors map[ast.Expr]*types.Struct // resolved tuple-struct construction
 	Aliases    map[string]*types.Type     // resolved `type` aliases
 	PatVariant map[ast.Pattern]*types.Variant
+	// TryMatches maps a `?` expression to the ordinary `match` it desugars to.
+	TryMatches map[*ast.TryExpr]*ast.MatchExpr
 	Types      map[ast.Expr]*types.Type
 	DeclTypes  map[ast.Stmt]*types.Type
 	Main       *Fn
@@ -114,6 +116,7 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 			TupleCtors: map[ast.Expr]*types.Struct{},
 			Aliases:    map[string]*types.Type{},
 			PatVariant: map[ast.Pattern]*types.Variant{},
+			TryMatches: map[*ast.TryExpr]*ast.MatchExpr{},
 			Types:      map[ast.Expr]*types.Type{},
 			DeclTypes:  map[ast.Stmt]*types.Type{},
 		},
@@ -124,6 +127,7 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 		enumDecls:   map[string]*ast.EnumDecl{},
 		instBusy:    map[string]bool{},
 	}
+	c.registerPrelude()
 	c.collect()
 	c.checkBodies()
 	c.checkOwnership()
@@ -492,6 +496,40 @@ func (c *checker) collectEnumVariantsInner(d *ast.EnumDecl, en *types.Enum) {
 			}
 		}
 	}
+}
+
+// registerPrelude declares the generic enums that are always in scope, exactly
+// like ordinary generic enums (they are instantiated on demand).
+func (c *checker) registerPrelude() {
+	c.addPreludeEnum("Option", []string{"T"}, []preludeVariant{
+		{name: "Some", fields: []string{"T"}},
+		{name: "None"},
+	})
+	c.addPreludeEnum("Result", []string{"T", "E"}, []preludeVariant{
+		{name: "Ok", fields: []string{"T"}},
+		{name: "Err", fields: []string{"E"}},
+	})
+}
+
+type preludeVariant struct {
+	name   string
+	fields []string
+}
+
+func (c *checker) addPreludeEnum(name string, params []string, variants []preludeVariant) {
+	d := &ast.EnumDecl{Name: name}
+	for _, p := range params {
+		d.Generics = append(d.Generics, ast.GenericParam{Name: p})
+	}
+	for _, v := range variants {
+		av := ast.Variant{Name: v.name, Tup: len(v.fields) > 0}
+		for _, f := range v.fields {
+			av.Fields = append(av.Fields, ast.Field{Ty: &ast.PathType{Segments: []string{f}}})
+		}
+		d.Variants = append(d.Variants, av)
+	}
+	c.info.Enums[name] = &types.Enum{Name: name, Base: name, Generics: params, Generic: true}
+	c.enumDecls[name] = d
 }
 
 func (c *checker) registerStruct(d *ast.StructDecl) {
@@ -1332,8 +1370,7 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 	case *ast.ArrayLitExpr:
 		return c.inferArrayLit(x, expected)
 	case *ast.TryExpr:
-		c.errf(x.Sp, "E0900", "the `?` operator is not supported by the compiler yet (roadmap M0)")
-		return nil
+		return c.inferTry(x, expected)
 	}
 	c.errf(e.Span(), "E0900", "unsupported expression")
 	return nil
@@ -1483,6 +1520,9 @@ func (c *checker) inferIdentExpr(x *ast.IdentExpr, expected *types.Type) *types.
 	}
 	fn, ok := c.info.Fns[x.Name]
 	if !ok {
+		if t := c.inferBareUnitVariant(x, expected); t != nil {
+			return t
+		}
 		return c.inferIdent(x.Name, x.Sp)
 	}
 	if !fn.Generic {
@@ -1893,6 +1933,11 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 	}
 	fn, ok := c.info.Fns[name]
 	if !ok {
+		// A bare variant name (`Ok(x)`, `Some(x)`) resolves against the
+		// expected enum type, so the examples read naturally.
+		if t := c.inferBareVariantCtor(x, name, expected); t != nil {
+			return t
+		}
 		cands := []string{"print", "println", "len", "cstr", "from_cstr", "arg_count", "arg_at"}
 		for n := range c.info.Fns {
 			cands = append(cands, n)
@@ -2799,6 +2844,48 @@ func (c *checker) inferEnumArgsFrom(sp token.Span, tmpl *types.Enum, explicit []
 	return args, args != nil
 }
 
+// inferBareVariantCtor resolves `Ok(x)` / `Err(e)` / `Some(x)` when the callee
+// is a bare identifier and the expected type is an enum with that variant.
+// returns nil when the name is not a variant of the expected enum.
+func (c *checker) inferBareVariantCtor(x *ast.CallExpr, name string, expected *types.Type) *types.Type {
+	if expected == nil || expected.Kind != types.EnumKind || expected.En == nil {
+		return nil
+	}
+	v, ok := expected.En.Variant(name)
+	if !ok {
+		return nil
+	}
+	c.info.Ctors[x] = &Ctor{Enum: expected.En, Variant: v}
+	if len(x.Args) != len(v.Fields) {
+		c.errAt(x, "E0061", "variant `%s::%s` takes %d field(s) but %d were supplied", expected.En.Base, v.Name, len(v.Fields), len(x.Args))
+	}
+	for i, a := range x.Args {
+		var want *types.Type
+		if i < len(v.Fields) {
+			want = v.Fields[i].Ty
+		}
+		at := c.checkExpr(a, want)
+		if want != nil && !c.argAssignable(want, at, false) {
+			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
+		}
+	}
+	return &types.Type{Kind: types.EnumKind, En: expected.En}
+}
+
+// inferBareUnitVariant resolves a bare unit-variant name (`None`) in value
+// position from the expected enum type.
+func (c *checker) inferBareUnitVariant(x *ast.IdentExpr, expected *types.Type) *types.Type {
+	if expected == nil || expected.Kind != types.EnumKind || expected.En == nil {
+		return nil
+	}
+	v, ok := expected.En.Variant(x.Name)
+	if !ok || len(v.Fields) != 0 {
+		return nil
+	}
+	c.info.Ctors[x] = &Ctor{Enum: expected.En, Variant: v}
+	return &types.Type{Kind: types.EnumKind, En: expected.En}
+}
+
 // inferVariantCtor checks `Enum::Variant(args)`.
 func (c *checker) inferVariantCtor(x *ast.CallExpr, p *ast.PathExpr, expected *types.Type) *types.Type {
 	tmpl, ok := c.info.Enums[p.Segments[0]]
@@ -3122,6 +3209,98 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 		result = types.UnitT
 	}
 	return result
+}
+
+// inferTry lowers `e?` to an ordinary match over the operand. The desugared
+// match is kept in Info.TryMatches so codegen (which never sees `?`) can emit
+// it.
+func (c *checker) inferTry(x *ast.TryExpr, expected *types.Type) *types.Type {
+	ret := c.cur.Ret
+	retBase := ""
+	if ret != nil && ret.Kind == types.EnumKind && ret.En != nil {
+		retBase = nominalBaseName(ret)
+	}
+	if retBase != "Result" && retBase != "Option" {
+		c.errAt(x, "E0277", "the `?` operator requires the enclosing function to return `Result` or `Option`")
+		c.checkExpr(x.X, nil)
+		return nil
+	}
+	src := c.checkExpr(x.X, nil)
+	srcBase := nominalBaseName(src)
+	if src == nil || src.Kind != types.EnumKind || (srcBase != "Result" && srcBase != "Option") {
+		c.errAt(x, "E0308", "the `?` operator requires a `Result` or `Option` operand, found `%s`", src)
+		return nil
+	}
+	if srcBase == "Result" && retBase != "Result" {
+		c.errAt(x, "E0277", "`?` on a `Result` requires the enclosing function to return a `Result`")
+		return nil
+	}
+	if srcBase == "Option" && retBase != "Option" {
+		c.errAt(x, "E0277", "`?` on an `Option` requires the enclosing function to return an `Option`")
+		return nil
+	}
+	needOk, needErr := "Ok", "Err"
+	if srcBase == "Option" {
+		needOk, needErr = "Some", "None"
+	}
+	if _, ok := src.En.Variant(needOk); !ok {
+		c.errAt(x, "E0277", "`?` requires a `%s` operand with a `%s` variant", srcBase, needOk)
+		return nil
+	}
+	if _, ok := src.En.Variant(needErr); !ok {
+		c.errAt(x, "E0277", "`?` requires a `%s` operand with a `%s` variant", srcBase, needErr)
+		return nil
+	}
+	// The enclosing return type must be able to carry the early return.
+	retErr := "Err"
+	if srcBase == "Option" {
+		retErr = "None"
+	}
+	if _, ok := ret.En.Variant(retErr); !ok {
+		c.errAt(x, "E0277", "`?` requires the enclosing return type to have a `%s` variant", retErr)
+		return nil
+	}
+	if srcBase == "Result" && len(src.En.Args) == 2 && len(ret.En.Args) == 2 {
+		if !c.assignable(ret.En.Args[1], src.En.Args[1]) {
+			c.errAt(x, "E0308", "`?` cannot convert the error type `%s` to `%s`", src.En.Args[1], ret.En.Args[1])
+		}
+	}
+
+	const okName, errName = "__try_ok", "__try_err"
+	okPat := &ast.PathPat{
+		Path: []string{srcBase, "Ok"},
+		Sub:  []ast.Pattern{&ast.BindPat{Name: okName, Sp: x.Sp}},
+		Sp:   x.Sp,
+	}
+	var errPat ast.Pattern
+	var errBody ast.Expr
+	if srcBase == "Result" {
+		okPat.Path[1] = "Ok"
+		errPat = &ast.PathPat{
+			Path: []string{"Result", "Err"},
+			Sub:  []ast.Pattern{&ast.BindPat{Name: errName, Sp: x.Sp}},
+			Sp:   x.Sp,
+		}
+		errBody = &ast.JumpExpr{Kind: token.KindReturn, Sp: x.Sp, Val: &ast.CallExpr{
+			Callee: &ast.PathExpr{Segments: []string{"Result", "Err"}, Sp: x.Sp},
+			Args:   []ast.Expr{&ast.IdentExpr{Name: errName, Sp: x.Sp}},
+			Sp:     x.Sp,
+		}}
+	} else {
+		okPat.Path[1] = "Some"
+		errPat = &ast.PathPat{Path: []string{"Option", "None"}, Sp: x.Sp}
+		errBody = &ast.JumpExpr{Kind: token.KindReturn, Sp: x.Sp, Val: &ast.PathExpr{Segments: []string{"Option", "None"}, Sp: x.Sp}}
+	}
+	m := &ast.MatchExpr{
+		Scrutinee: x.X,
+		Arms: []ast.MatchArm{
+			{Pat: okPat, Body: &ast.IdentExpr{Name: okName, Sp: x.Sp}, Sp: x.Sp},
+			{Pat: errPat, Body: errBody, Sp: x.Sp},
+		},
+		Sp: x.Sp,
+	}
+	c.info.TryMatches[x] = m
+	return c.checkExpr(m, expected)
 }
 
 // checkPattern type-checks a pattern against the scrutinee type and declares its

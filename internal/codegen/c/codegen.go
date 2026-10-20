@@ -1256,6 +1256,9 @@ func (g *gen) value(e ast.Expr) string {
 		if fn := g.info.FnValues[x]; fn != nil {
 			return funcName(fn)
 		}
+		if ctor := g.info.Ctors[x]; ctor != nil {
+			return g.enumConstruct(ctor, nil)
+		}
 		return g.identValue(x.Name, x.Sp)
 
 	case *ast.PathExpr:
@@ -1335,6 +1338,12 @@ func (g *gen) value(e ast.Expr) string {
 
 	case *ast.MatchExpr:
 		return g.matchValue(x)
+
+	case *ast.TryExpr:
+		if m := g.info.TryMatches[x]; m != nil {
+			return g.matchValue(m)
+		}
+		return "0 /* unsupported try */"
 
 	case *ast.LoopExpr:
 		return g.loopValue(x)
@@ -2195,6 +2204,13 @@ func (g *gen) matchValue(x *ast.MatchExpr) string {
 	return "({ " + sub.b.String() + " })"
 }
 
+// exprDiverges reports whether evaluating e always leaves the current function
+// or loop (its type is `never`), so a match arm cannot assign a result.
+func (g *gen) exprDiverges(e ast.Expr) bool {
+	t := g.info.TypeOf(e)
+	return t != nil && t.Kind == types.Never
+}
+
 // matchOwnsScrutinee reports whether the match takes ownership of its
 // scrutinee. A reference or pointer scrutinee is matched through the borrow and
 // is never dropped by the match.
@@ -2323,7 +2339,7 @@ func (g *gen) emitGuardedArms(x *ast.MatchExpr, st *types.Type, m, result string
 			w.line("%s = zx_move_%s(&(%s));", pm.name, typeMangle(pm.ty), pm.expr)
 			g.registerDrop(pm.name, pm.ty)
 		}
-		if result != "" {
+		if result != "" && !g.exprDiverges(arm.Body) {
 			w.line("%s = %s;", result, g.consume(arm.Body))
 		} else {
 			save := g.w
@@ -2397,7 +2413,7 @@ func (g *gen) emitSwitch(x *ast.MatchExpr, st *types.Type, m, result string, w *
 		g.openDropFrame()
 		g.bindArm(w, arm.Pat, st, m, isEnum, false)
 		g.trapDepth++
-		if result != "" {
+		if result != "" && !g.exprDiverges(arm.Body) {
 			w.line("%s = %s;", result, g.consume(arm.Body))
 		} else {
 			save := g.w

@@ -1,6 +1,7 @@
 // examples/enum_match.zx
 // Tagged unions + exhaustive match. No null: absence is Option<T>.
 
+#[copy]
 enum Shape {
     Circle(f64),
     Rect { w: f64, h: f64 },
@@ -15,20 +16,20 @@ fn area(s: Shape) -> f64 {
     }
 }
 
-fn first_positive(xs: &[i64]) -> Option<i64> {
+fn first_positive(xs: [i64; 4]) -> Option<i64> {
     for x in xs {
-        if *x > 0 { return Some(*x); }
+        if x > 0 { return Some(x); }
     }
-    None
+    return None;
 }
 
 fn main() -> i32 {
-    let shapes = [Shape::Circle(1.0), Shape::Rect { w: 2.0, h: 3.0 }];
+    let shapes = [Shape::Circle(1.0), Shape::Rect { w: 2.0, h: 3.0 }, Shape::Unit];
     let mut total = 0.0;
     for s in shapes { total += area(s); }
     println(total);
 
-    match first_positive(&[0, -1, 7, 9]) {
+    match first_positive([0, -1, 7, 9]) {
         Some(n) => println(n),
         None    => println("none"),
     }
