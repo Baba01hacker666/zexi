@@ -373,7 +373,7 @@ func (c *checker) registerAlias(d *ast.TypeAlias) {
 		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
 		return
 	}
-	if _, dup := types.Builtins[d.Name]; dup {
+	if types.IsBuiltinTypeName(d.Name) {
 		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
 		return
 	}
@@ -486,6 +486,10 @@ func (c *checker) registerEnum(d *ast.EnumDecl) {
 		c.errf(d.Sp, "E0428", "the type `%s` is defined multiple times", d.Name)
 		return
 	}
+	if types.IsBuiltinTypeName(d.Name) && d.Name != "Option" && d.Name != "Result" {
+		c.errf(d.Sp, "E0428", "the name `%s` is reserved for the predeclared type", d.Name)
+		return
+	}
 	names := c.checkGenerics(d.Generics)
 	c.checkTypeAttrs(d.Attrs, d.Sp, "enum", d.Name)
 	en := &types.Enum{Name: d.Name, Base: d.Name, Generics: names, Generic: len(names) > 0, Copy: types.CopyAttr(d.Attrs)}
@@ -592,6 +596,10 @@ func (c *checker) checkTypeAttrs(attrs []string, sp token.Span, what, name strin
 func (c *checker) registerStruct(d *ast.StructDecl) {
 	if _, dup := c.info.Structs[d.Name]; dup {
 		c.errf(d.Sp, "E0428", "the struct `%s` is defined multiple times", d.Name)
+		return
+	}
+	if types.IsBuiltinTypeName(d.Name) {
+		c.errf(d.Sp, "E0428", "the name `%s` is reserved for the predeclared type", d.Name)
 		return
 	}
 	if _, dup := c.aliasDecls[d.Name]; dup {

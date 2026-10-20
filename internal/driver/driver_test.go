@@ -2201,3 +2201,39 @@ fn main() -> i32 { 0 }
 		}
 	}
 }
+
+// TestBuiltinTypeNamesAreReserved checks that a user declaration cannot claim
+// a predeclared type name. `struct String` used to reach the C backend and
+// fail there with a raw "conflicting types for 'zx_String'" error, and
+// `struct i32` silently shadowed the primitive.
+func TestBuiltinTypeNamesAreReserved(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"struct String", "struct String { x: i32 }\nfn main() -> i32 { 0 }\n"},
+		{"struct Vec", "struct Vec { x: i32 }\nfn main() -> i32 { 0 }\n"},
+		{"enum String", "enum String { A, B }\nfn main() -> i32 { 0 }\n"},
+		{"struct i32", "struct i32 { x: i64 }\nfn main() -> i32 { 0 }\n"},
+		{"struct str", "struct str { x: i64 }\nfn main() -> i32 { 0 }\n"},
+		{"alias Option", "type Option = i64;\nfn main() -> i32 { 0 }\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "bad.zx")
+			if err := os.WriteFile(path, []byte(tc.src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			em := diag.NewEmitter()
+			if _, ok := driver.FrontEnd(path, driver.Options{}, em); ok {
+				t.Fatalf("%s should have been rejected", tc.name)
+			}
+			var buf strings.Builder
+			em.Render(&buf, em.FirstFileID())
+			if !strings.Contains(buf.String(), "E0428") {
+				t.Fatalf("%s: expected E0428, got:\n%s", tc.name, buf.String())
+			}
+		})
+	}
+}

@@ -178,6 +178,23 @@ var Builtins = map[string]*Type{
 	"String": StringT,
 }
 
+// ReservedTypeNames are the predeclared generic types. Like the primitive
+// builtins they occupy the type namespace and cannot be redefined.
+var ReservedTypeNames = map[string]bool{
+	"Vec":    true,
+	"Option": true,
+	"Result": true,
+}
+
+// IsBuiltinTypeName reports whether a name is taken by a predeclared type, so
+// a `struct`, `enum`, or `type` may not claim it.
+func IsBuiltinTypeName(name string) bool {
+	if _, ok := Builtins[name]; ok {
+		return true
+	}
+	return ReservedTypeNames[name]
+}
+
 // PtrTo returns *T.
 func PtrTo(elem *Type) *Type { return &Type{Kind: Ptr, Elem: elem} }
 
