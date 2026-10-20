@@ -1,6 +1,7 @@
 package driver_test
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,7 +14,7 @@ import (
 
 // buildAndRun compiles src to a binary in a temp dir, runs it, and returns its
 // combined stdout/stderr plus the process state.
-func buildAndRun(t *testing.T, name, src string, opts driver.Options, args ...string) (string, *exec.ExitError) {
+func buildAndRun(t *testing.T, name, src string, opts driver.Options) (string, *exec.ExitError) {
 	t.Helper()
 	if _, err := exec.LookPath("cc"); err != nil {
 		t.Skip("no C compiler available")
@@ -30,12 +31,11 @@ func buildAndRun(t *testing.T, name, src string, opts driver.Options, args ...st
 		em.Render(&sb, em.FirstFileID())
 		t.Fatalf("failed to build %s:\n%s", name, sb.String())
 	}
-	cmd := exec.Command(out, args...)
+	cmd := exec.Command(out)
 	raw, err := cmd.CombinedOutput()
 	var ee *exec.ExitError
 	if err != nil {
-		ee, _ = err.(*exec.ExitError)
-		if ee == nil {
+		if !errors.As(err, &ee) {
 			t.Fatalf("running %s: %v", name, err)
 		}
 	}
@@ -178,6 +178,56 @@ func TestRuntimePanics(t *testing.T) {
 `,
 			want: "before\nzexi panic: index 3 out of bounds for length 3\n",
 		},
+		{
+			name: "compound_divide_by_zero",
+			src: `fn main() -> i32 {
+    let mut x: i64 = 10;
+    let d = arg_count() - 1;
+    println("before");
+    x /= d;
+    println(x);
+    0
+}
+`,
+			want: "before\nzexi panic: attempt to divide by zero\n",
+		},
+		{
+			name: "compound_remainder_by_zero",
+			src: `fn main() -> i32 {
+    let mut x: i64 = 10;
+    let d = arg_count() - 1;
+    println("before");
+    x %= d;
+    println(x);
+    0
+}
+`,
+			want: "before\nzexi panic: attempt to calculate the remainder of a division by zero\n",
+		},
+		{
+			name: "compound_divide_overflow",
+			src: `fn main() -> i32 {
+    let mut x: i64 = -9223372036854775808;
+    let d: i64 = -1;
+    println("before");
+    x /= d;
+    0
+}
+`,
+			want: "before\nzexi panic: attempt to divide with overflow\n",
+		},
+		{
+			name: "vec_capacity_overflow",
+			src: `fn main() -> i32 {
+    let mut v: Vec<i64> = Vec::new();
+    let huge: usize = 18446744073709551615;
+    println("before");
+    v.reserve(huge);
+    0
+}
+`,
+			want: "before\nzexi panic: capacity overflow\n",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -241,6 +291,8 @@ func TestCheckedArithmeticStaysCorrect(t *testing.T) {
         xs[i] -= 1;
         i += 1;
     }
+    xs[0] /= 2;
+    xs[1] %= 5;
     println(xs[0], xs[1], xs[2]);
     let m: i8 = -128;
     println(m / 2, m % 7);
@@ -249,7 +301,7 @@ func TestCheckedArithmeticStaysCorrect(t *testing.T) {
 `
 	want := "3 -3 -3 3\n" +
 		"1 -1 1 -1\n" +
-		"21 23 25\n" +
+		"10 3 25\n" +
 		"-64 -2\n"
 	// Both profiles must agree: the checks report faults, they never change a
 	// value that does not overflow.
@@ -266,6 +318,33 @@ func TestCheckedArithmeticStaysCorrect(t *testing.T) {
 			t.Fatalf("%s output mismatch\n got: %q\nwant: %q", label, got, want)
 		}
 	}
+}
+
+// TestBorrowedVecReceivers checks that a `&Vec<T>`/`&mut Vec<T>` receiver is
+// dereferenced before lowering. Such a parameter is `Vec<T> *` in C; before the
+// fix, `v.len()` emitted `(v).len`, mutation passed `&v` (a `Vec<T> **`), and
+// indexing, `len`, and `for` rejected the borrow outright.
+func TestBorrowedVecReceivers(t *testing.T) {
+	wantOutput(t, "vec_borrow", `fn grow(v: &mut Vec<i64>) {
+    v.push(10);
+    v.push(20);
+    v[0] = 7;
+    println(v.len(), v.capacity() >= 2, v.is_empty());
+    println(v[0], len(v));
+    for x in v { println(x); }
+}
+
+fn peek(v: &Vec<i64>) -> i64 {
+    return v[0] + (v.len() as i64);
+}
+
+fn main() -> i32 {
+    let mut v: Vec<i64> = Vec::new();
+    grow(&mut v);
+    println(v[0], v[1], peek(&v));
+    0
+}
+`, "2 true false\n7 2\n7\n20\n7 20 9\n")
 }
 
 // TestStringBuilderGrowth covers the String append path now that the buffer

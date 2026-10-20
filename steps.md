@@ -109,7 +109,7 @@ Then:
 ```bash
 source /tmp/env.sh
 cd /home/user/zexi
-gofmt -l . && go vet ./... && go test ./...
+test -z "$(gofmt -l .)" && go vet ./... && go test ./...
 go build -o /tmp/zexic ./cmd/zexic      # the driver for probing .zx programs
 ```
 
@@ -455,7 +455,7 @@ Run these, in this order, and do not report done until all are clean:
 
 ```bash
 source /tmp/env.sh && cd /home/user/zexi
-gofmt -l .          # must print nothing
+test -z "$(gofmt -l .)"   # must print nothing
 go vet ./...        # must print nothing
 go test ./...       # all packages ok; internal/driver takes ~8s
 ```

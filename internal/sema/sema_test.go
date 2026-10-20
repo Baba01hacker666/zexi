@@ -1569,3 +1569,25 @@ fn main() -> i32 {
 		t.Fatalf("expected clean, got %v", codes)
 	}
 }
+
+// TestGenericExportIsRejected checks that `#[export]`/`#[no_mangle]` cannot be
+// put on a generic function. An instantiation is named with an `instKey` such
+// as `id$3:i64`; with NoMangle that name would reach the C backend, where `$`
+// and `:` are not valid identifier characters. C also needs one concrete
+// symbol, not a template.
+func TestGenericExportIsRejected(t *testing.T) {
+	for _, attr := range []string{"export", "no_mangle"} {
+		src := "#[" + attr + "]\nfn id<T>(x: T) -> T { x }\nfn main() -> i32 { println(id(1)); 0 }"
+		ok, codes := check(t, src)
+		if ok || !has(codes, "E0599") {
+			t.Fatalf("#[%s] on a generic: expected E0599, got ok=%v codes=%v", attr, ok, codes)
+		}
+	}
+	// The same attribute stays legal on a plain function.
+	src := `#[export]
+fn plain(x: i64) -> i64 { x }
+fn main() -> i32 { println(plain(1)); 0 }`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("plain function: expected clean, got %v", codes)
+	}
+}

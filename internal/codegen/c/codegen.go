@@ -474,8 +474,7 @@ func (g *gen) wantCheckedArith(op, ct string) string {
 func (g *gen) arithHelper(op, ct string) {
 	name := checkedArithName(op, ct)
 	signed := strings.HasPrefix(ct, "int")
-	switch op {
-	case "neg":
+	if op == "neg" {
 		g.w.line("static inline %s %s(%s a) {", ct, name, ct)
 		g.w.line("#ifdef ZX_OVERFLOW_BUILTINS")
 		if signed {
@@ -1351,7 +1350,7 @@ func (g *gen) forStmt(x *ast.LoopExpr) string {
 // then each element (a `Copy` value, enforced by sema) is bound in turn.
 func (g *gen) forArray(x *ast.LoopExpr) string {
 	it := g.info.TypeOf(x.Iter)
-	if it != nil && it.Kind == types.VecKind {
+	if base := recvBase(it); base != nil && base.Kind == types.VecKind {
 		return g.vecForLoop(x)
 	}
 	if it == nil || it.Kind != types.Array {
@@ -1755,37 +1754,67 @@ func (g *gen) checkedBinOp(x *ast.BinExpr) string {
 	fmt.Fprintf(&b2, "%s %s = %s; %s %s = %s; ", ct, a, lv, ct, b, rv)
 	fmt.Fprintf(&b2, "%s %s; ", ct, r)
 	if x.Op == token.KindSlash || x.Op == token.KindPercent {
-		// A zero divisor traps on every target, so this check is not optional:
-		// without it the process dies on SIGFPE with no message and takes the
-		// buffered output with it.
-		what := "divide"
-		if x.Op == token.KindPercent {
-			what = "calculate the remainder of a division"
-		}
-		fmt.Fprintf(&b2, "if (%s == 0) zx_panicf(\"attempt to %s by zero\"); ", b, what)
-		switch {
-		case x.Op == token.KindSlash && t.Kind.IsSigned():
-			// x86 also traps on INT_MIN / -1, even under -fwrapv, so handle a
-			// divisor of -1 without the divide instruction.
-			fmt.Fprintf(&b2, "if (%s == (%s)(-1)) { if (%s == (%s)((%s)1 << (sizeof(%s) * 8 - 1))) zx_panicf(\"attempt to divide with overflow\"); %s = (%s)(-%s); } else %s = (%s)(%s / %s); ",
-				b, ct, a, ct, ct, ct, r, ct, a, r, ct, a, b)
-		case x.Op == token.KindPercent && t.Kind.IsSigned():
-			// The remainder of any value by -1 is zero; skipping the divide
-			// also avoids the INT_MIN % -1 trap.
-			fmt.Fprintf(&b2, "%s = (%s == (%s)(-1)) ? (%s)0 : (%s)(%s %% %s); ", r, b, ct, ct, ct, a, b)
-		default:
-			op := "/"
-			if x.Op == token.KindPercent {
-				op = "%"
-			}
-			fmt.Fprintf(&b2, "%s = (%s)(%s %s %s); ", r, ct, a, op, b)
-		}
+		b2.WriteString(g.checkedDivMod(x.Op, t, a, b, r))
 	} else {
 		op := map[token.Kind]string{token.KindPlus: "add", token.KindMinus: "sub", token.KindStar: "mul"}[x.Op]
 		fmt.Fprintf(&b2, "%s = %s(%s, %s); ", r, g.wantCheckedArith(op, ct), a, b)
 	}
 	fmt.Fprintf(&b2, "%s;", r)
 	return "({ " + b2.String() + " })"
+}
+
+// checkedDivMod emits the zero-divisor and signed-overflow checks and stores the
+// quotient or remainder in r. a and b are already-evaluated operands of type t.
+func (g *gen) checkedDivMod(op token.Kind, t *types.Type, a, b, r string) string {
+	g.hasPanic = true
+	ct := ctype(t)
+	var sb strings.Builder
+	// A zero divisor traps on every target, so this check is not optional:
+	// without it the process dies on SIGFPE with no message and takes the
+	// buffered output with it.
+	what := "divide"
+	if op == token.KindPercent {
+		what = "calculate the remainder of a division"
+	}
+	fmt.Fprintf(&sb, "if (%s == 0) zx_panicf(\"attempt to %s by zero\"); ", b, what)
+	switch {
+	case op == token.KindSlash && t.Kind.IsSigned():
+		// x86 also traps on INT_MIN / -1, even under -fwrapv, so handle a
+		// divisor of -1 without the divide instruction.
+		fmt.Fprintf(&sb, "if (%s == (%s)(-1)) { if (%s == (%s)((%s)1 << (sizeof(%s) * 8 - 1))) zx_panicf(\"attempt to divide with overflow\"); %s = (%s)(-%s); } else %s = (%s)(%s / %s); ",
+			b, ct, a, ct, ct, ct, r, ct, a, r, ct, a, b)
+	case op == token.KindPercent && t.Kind.IsSigned():
+		// The remainder of any value by -1 is zero; skipping the divide
+		// also avoids the INT_MIN % -1 trap.
+		fmt.Fprintf(&sb, "%s = (%s == (%s)(-1)) ? (%s)0 : (%s)(%s %% %s); ", r, b, ct, ct, ct, a, b)
+	default:
+		opStr := "/"
+		if op == token.KindPercent {
+			opStr = "%"
+		}
+		fmt.Fprintf(&sb, "%s = (%s)(%s %s %s); ", r, ct, a, opStr, b)
+	}
+	return sb.String()
+}
+
+// checkedCompoundDiv lowers `lhs /= rhs` and `lhs %= rhs` for integers through
+// the same run-time checks as the binary forms. The left-hand place is bound
+// once through a pointer, so a subscript with a side effect is evaluated
+// exactly once.
+func (g *gen) checkedCompoundDiv(x *ast.AssignExpr, t *types.Type) string {
+	g.hasPanic = true
+	ct := ctype(t)
+	op := token.KindSlash
+	if x.Op == token.KindPercentEq {
+		op = token.KindPercent
+	}
+	p, a, b, r := g.tmpName(), g.tmpName(), g.tmpName(), g.tmpName()
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s *%s = &(%s); %s %s = *%s; %s %s = %s; %s %s; ",
+		ct, p, g.value(x.Lhs), ct, a, p, ct, b, g.value(x.Rhs), ct, r)
+	sb.WriteString(g.checkedDivMod(op, t, a, b, r))
+	fmt.Fprintf(&sb, " *%s = %s; })", p, r)
+	return "({ " + sb.String()
 }
 
 func (g *gen) ifValue(x *ast.IfExpr) string {
@@ -2330,8 +2359,8 @@ func (g *gen) indexValue(x *ast.IndexExpr) string {
 	if rt != nil && rt.Kind == types.Array {
 		return "(" + recv + ").e[zx_bounds(" + idx + ", " + strconv.FormatInt(rt.Len, 10) + ")]"
 	}
-	if rt != nil && rt.Kind == types.VecKind {
-		return vecIndex("("+recv+")", idx)
+	if base := recvBase(rt); base != nil && base.Kind == types.VecKind {
+		return vecIndex("("+g.vecReceiverValue(x.Recv)+")", idx)
 	}
 	return "(" + recv + ")[" + idx + "]"
 }
@@ -2430,6 +2459,9 @@ func (g *gen) lenValue(x *ast.CallExpr) string {
 		tm := g.tmpName()
 		return "({ zx_String " + tm + " = " + g.value(x.Args[0]) +
 			"; size_t zx_n = zx_string_len(&" + tm + "); zx_drop_String(&" + tm + "); zx_n; })"
+	}
+	if base := recvBase(t); base != nil && base.Kind == types.VecKind {
+		return g.vecLenValue(x)
 	}
 	return "0"
 }
@@ -3280,6 +3312,15 @@ func (g *gen) assignValue(x *ast.AssignExpr) string {
 				p, res := g.tmpName(), g.tmpName()
 				return fmt.Sprintf("({ %s *%s = &(%s); %s %s = %s(*%s, %s); *%s = %s; })",
 					ctype(t), p, lhs, ctype(t), res, g.wantCheckedArith(op, ctype(t)), p, rhs, p, res)
+			}
+		}
+		if x.Op == token.KindSlashEq || x.Op == token.KindPercentEq {
+			if t := g.info.TypeOf(x.Lhs); t != nil && t.Kind.IsInt() {
+				// Division and modulo are checked in every profile: a zero
+				// divisor (and INT_MIN / -1) is undefined behaviour, not a
+				// performance choice. The place is bound once through a
+				// pointer, like the debug arithmetic path above.
+				return g.checkedCompoundDiv(x, t)
 			}
 		}
 		return "(" + g.value(x.Lhs) + " " + x.Op.String() + " " + g.value(x.Rhs) + ")"

@@ -917,6 +917,10 @@ func (c *checker) applyFnAttrs(fn *Fn, d *ast.FnDecl) {
 				c.errf(d.Sp, "E0599", "`#[%s]` is not allowed on a method; put it on a plain function", types.AttrName(a))
 				continue
 			}
+			if len(d.Generics) > 0 {
+				c.errf(d.Sp, "E0599", "`#[%s]` is not allowed on a generic function; C needs one concrete symbol", types.AttrName(a))
+				continue
+			}
 			fn.NoMangle = true
 		case "allow":
 			// Accepted and ignored.
@@ -1198,7 +1202,7 @@ func (c *checker) checkStmt(s ast.Stmt) {
 			c.errf(st.Val.Span(), "E0308", "mismatched types: expected `%s`, found `%s`", declared, initT)
 		}
 		c.info.DeclTypes[st] = ty
-		c.bindPattern(st.Pat, ty, true)
+		c.bindPattern(st.Pat, ty)
 		if bp, ok := st.Pat.(*ast.BindPat); ok {
 			c.markMut(bp.Name, st.Mut)
 		}
@@ -1305,10 +1309,10 @@ func exprHasJump(e ast.Expr) bool {
 	return false
 }
 
-func (c *checker) bindPattern(p ast.Pattern, ty *types.Type, let bool) {
+func (c *checker) bindPattern(p ast.Pattern, ty *types.Type) {
 	switch pt := p.(type) {
 	case *ast.BindPat:
-		if let && pt.Name == "" {
+		if pt.Name == "" {
 			return
 		}
 		if pt.Name != "_" {
@@ -2874,6 +2878,9 @@ func (c *checker) inferLen(x *ast.CallExpr) *types.Type {
 		return types.UsizeT
 	}
 	t := c.checkExpr(x.Args[0], nil)
+	if base := recvBase(t); base != nil && base.Kind == types.VecKind {
+		return types.UsizeT
+	}
 	if t != nil && (t.Kind == types.Array || t.Kind == types.Str || t.Kind == types.Slice ||
 		t.Kind == types.StringKind || t.Kind == types.VecKind) {
 		return types.UsizeT
@@ -2882,10 +2889,14 @@ func (c *checker) inferLen(x *ast.CallExpr) *types.Type {
 	return types.UsizeT
 }
 
-// inferIndex checks `xs[i]` for arrays and slices.
+// inferIndex checks `xs[i]` for arrays, slices, and Vecs, including a Vec
+// reached through a borrow (`&Vec<T>`).
 func (c *checker) inferIndex(x *ast.IndexExpr) *types.Type {
 	rt := c.checkExpr(x.Recv, nil)
 	it := c.checkExpr(x.Index, nil)
+	if base := recvBase(rt); base != nil && base.Kind == types.VecKind {
+		rt = base
+	}
 	if rt == nil || (rt.Kind != types.Array && rt.Kind != types.Slice && rt.Kind != types.VecKind) {
 		c.errAt(x, "E0608", "cannot index a value of type `%s`", rt)
 		return nil
@@ -4124,21 +4135,21 @@ func (c *checker) inferFor(x *ast.LoopExpr) *types.Type {
 				c.errAt(x.Iter, "E0507", "cannot iterate an array of non-`Copy` element type `%s` by value", it.Elem)
 			}
 			c.pushScope()
-			c.bindPattern(x.Pat, it.Elem, true)
+			c.bindPattern(x.Pat, it.Elem)
 			c.loopDepth++
 			c.checkBlock(x.Body)
 			c.loopDepth--
 			c.popScope()
 			return types.UnitT
 		}
-		if it != nil && it.Kind == types.VecKind {
+		if base := recvBase(it); base != nil && base.Kind == types.VecKind {
 			// As with arrays, elements must be `Copy`: the binding is a copy
 			// of each element, and an owned element would be dropped twice.
-			if !it.Elem.IsCopy() {
-				c.errAt(x.Iter, "E0507", "cannot iterate a `Vec` of non-`Copy` element type `%s` by value", it.Elem)
+			if !base.Elem.IsCopy() {
+				c.errAt(x.Iter, "E0507", "cannot iterate a `Vec` of non-`Copy` element type `%s` by value", base.Elem)
 			}
 			c.pushScope()
-			c.bindPattern(x.Pat, it.Elem, true)
+			c.bindPattern(x.Pat, base.Elem)
 			c.loopDepth++
 			c.checkBlock(x.Body)
 			c.loopDepth--
@@ -4158,7 +4169,7 @@ func (c *checker) inferFor(x *ast.LoopExpr) *types.Type {
 		lt = types.I32T
 	}
 	c.pushScope()
-	c.bindPattern(x.Pat, lt, true)
+	c.bindPattern(x.Pat, lt)
 	c.loopDepth++
 	c.checkBlock(x.Body)
 	c.loopDepth--

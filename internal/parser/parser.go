@@ -201,9 +201,6 @@ func attrTokenText(t token.Token) string {
 	return t.Kind.String()
 }
 
-// skipAttributes consumes and discards attribute lists.
-func (p *parser) skipAttributes() { _ = p.parseAttributes() }
-
 func (p *parser) parseFn(vis ast.Visibility, attrs []string, start token.Pos) ast.Item {
 	p.bump() // fn
 	name, ok := p.expectIdent("function name")

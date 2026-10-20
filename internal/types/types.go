@@ -370,10 +370,8 @@ func (t *Type) NeedsDrop() bool {
 
 // AttrName is the identifier part of an attribute: `repr` for `repr(C)`.
 func AttrName(attr string) string {
-	if i := strings.IndexByte(attr, '('); i >= 0 {
-		return attr[:i]
-	}
-	return attr
+	name, _, _ := strings.Cut(attr, "(")
+	return name
 }
 
 // AttrArg is the parenthesized part of an attribute: `C` for `repr(C)`,

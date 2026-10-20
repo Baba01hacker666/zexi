@@ -177,8 +177,9 @@ func (g *gen) emitVecRuntime(name string, t *types.Type) {
 	g.w.line("// Vec<%s> helpers", t.Elem)
 	g.w.line("%svoid zx_vec_reserve_%s(%s *v, size_t want) {", lp, name, name)
 	g.w.line("    if (want <= v->cap) return;")
+	g.w.line(`    if (want > SIZE_MAX / sizeof(%s)) zx_panicf("capacity overflow");`, et)
 	g.w.line("    size_t cap = v->cap ? v->cap : 4;")
-	g.w.line("    while (cap < want) cap *= 2;")
+	g.w.line("    while (cap < want) cap = (cap > SIZE_MAX / 2) ? want : cap * 2;")
 	g.w.line("    %s *np = (%s *)realloc(v->ptr, cap * sizeof(%s));", et, et, et)
 	g.w.line(`    if (!np) zx_panicf("out of memory");`)
 	g.w.line("    v->ptr = np;")
@@ -187,6 +188,7 @@ func (g *gen) emitVecRuntime(name string, t *types.Type) {
 	g.w.line("")
 
 	g.w.line("%svoid zx_vec_push_%s(%s *v, %s x) {", lp, name, name, et)
+	g.w.line(`    if (v->len == SIZE_MAX) zx_panicf("capacity overflow");`)
 	g.w.line("    zx_vec_reserve_%s(v, v->len + 1);", name)
 	g.w.line("    v->ptr[v->len++] = x;")
 	g.w.line("}")
@@ -230,6 +232,7 @@ func (g *gen) emitVecRuntime(name string, t *types.Type) {
 
 	g.w.line("%svoid zx_vec_insert_%s(%s *v, size_t i, %s x) {", lp, name, name, et)
 	g.w.line(`    if (i > v->len) zx_panicf("insertion index %%zu out of bounds for length %%zu", i, v->len);`)
+	g.w.line(`    if (v->len == SIZE_MAX) zx_panicf("capacity overflow");`)
 	g.w.line("    zx_vec_reserve_%s(v, v->len + 1);", name)
 	g.w.line("    if (i < v->len) memmove(&v->ptr[i + 1], &v->ptr[i], (v->len - i) * sizeof(%s));", et)
 	g.w.line("    v->ptr[i] = x;")
@@ -274,6 +277,24 @@ func (g *gen) vecCtorValue(x *ast.CallExpr, name string) string {
 		"(&" + tm + ", (size_t)(" + g.value(x.Args[0]) + ")); " + tm + "; })"
 }
 
+// vecReceiverValue lowers a Vec receiver to the handle itself. A borrowed
+// receiver (`&Vec<T>` or `&mut Vec<T>`, as in a parameter) is a `Vec<T> *` in
+// C, so it is dereferenced once per reference level.
+func (g *gen) vecReceiverValue(e ast.Expr) string {
+	recv := g.value(e)
+	for t := g.info.TypeOf(e); t != nil && (t.Kind == types.Ref || t.Kind == types.Ptr); t = t.Elem {
+		recv = "(*" + recv + ")"
+	}
+	return recv
+}
+
+// vecBorrowedReceiver reports whether a receiver is a reference rather than a
+// Vec value. Borrowed receivers are not temporaries: they must not be
+// materialized and dropped.
+func vecBorrowedReceiver(t *types.Type) bool {
+	return t != nil && (t.Kind == types.Ref || t.Kind == types.Ptr)
+}
+
 // vecMethodCall lowers a builtin method call on a `Vec<T>`. A call on a
 // temporary receiver borrows it for the duration and drops it afterwards.
 func (g *gen) vecMethodCall(x *ast.MethodCallExpr) string {
@@ -282,9 +303,9 @@ func (g *gen) vecMethodCall(x *ast.MethodCallExpr) string {
 		return "0 /* unresolved Vec method */"
 	}
 	vn := vecTypeName(t)
-	recv := g.value(x.Recv)
+	recv := g.vecReceiverValue(x.Recv)
 	var prologue, epilogue string
-	if !isPlaceExpr(x.Recv) {
+	if !isPlaceExpr(x.Recv) && !vecBorrowedReceiver(g.info.TypeOf(x.Recv)) {
 		tm := g.tmpName()
 		prologue = ctype(t) + " " + tm + " = " + recv + "; "
 		recv = tm
@@ -373,12 +394,12 @@ func vecIndex(recv, idx string) string {
 // read in place rather than copied: copying it would alias the buffer, and the
 // copy's destructor would then free the caller's memory.
 func (g *gen) vecForLoop(x *ast.LoopExpr) string {
-	it := g.info.TypeOf(x.Iter)
+	it := recvBase(g.info.TypeOf(x.Iter))
 	if it == nil || it.Kind != types.VecKind {
 		return ""
 	}
-	recv := g.value(x.Iter)
-	if !isPlaceExpr(x.Iter) {
+	recv := g.vecReceiverValue(x.Iter)
+	if !isPlaceExpr(x.Iter) && !vecBorrowedReceiver(g.info.TypeOf(x.Iter)) {
 		// Materialize the temporary and register it in the *enclosing* drop
 		// frame, so a `break` out of the loop still frees it at scope exit.
 		tm := g.tmpName()
@@ -409,8 +430,8 @@ func (g *gen) vecLenValue(x *ast.CallExpr) string {
 	if len(x.Args) != 1 {
 		return "0"
 	}
-	if isPlaceExpr(x.Args[0]) {
-		return "(" + g.value(x.Args[0]) + ").len"
+	if isPlaceExpr(x.Args[0]) || vecBorrowedReceiver(g.info.TypeOf(x.Args[0])) {
+		return "(" + g.vecReceiverValue(x.Args[0]) + ").len"
 	}
 	t := g.info.TypeOf(x.Args[0])
 	tm := g.tmpName()
