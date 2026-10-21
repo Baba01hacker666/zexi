@@ -1591,3 +1591,125 @@ fn main() -> i32 { println(plain(1)); 0 }`
 		t.Fatalf("plain function: expected clean, got %v", codes)
 	}
 }
+
+// TestDefaultedIntegerLiteralNegatives checks the limits of literal
+// adoption: it never crosses into floats, never admits a literal that does
+// not fit, and first demand wins when two demands conflict.
+func TestDefaultedIntegerLiteralNegatives(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{
+			name: "float expected",
+			src: `fn want(x: f64) -> f64 { return x; }
+fn main() -> i32 { let x = 0; println(want(x)); 0 }`,
+		},
+		{
+			name: "does not fit",
+			src:  `fn main() -> i32 { let x = 300; let y: i8 = x; println(y); 0 }`,
+		},
+		{
+			name: "conflicting demands",
+			src: `fn next(i: i64) -> i64 { return i + 1; }
+fn main() -> i32 { let x = 0; println(next(x)); let y: u32 = x; println(y); 0 }`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			if ok || !has(codes, "E0308") {
+				t.Fatalf("expected E0308, got ok=%v codes=%v", ok, codes)
+			}
+		})
+	}
+}
+
+// TestHashMapKeyTypes checks the closed set of key types with a built-in hash:
+// a struct key is rejected, and the arity is enforced.
+func TestHashMapKeyTypes(t *testing.T) {
+	src := `struct Point { x: i32, y: i32 }
+fn main() -> i32 { let m: HashMap<Point, i32> = HashMap::new(); println(m.len()); 0 }`
+	ok, codes := check(t, src)
+	if ok || !has(codes, "E0308") {
+		t.Fatalf("struct key: expected E0308, got ok=%v codes=%v", ok, codes)
+	}
+
+	ok, codes = check(t, `fn main() -> i32 { let m: HashMap<i32> = HashMap::new(); println(m.len()); 0 }`)
+	if ok || !has(codes, "E0107") {
+		t.Fatalf("arity: expected E0107, got ok=%v codes=%v", ok, codes)
+	}
+
+	ok, codes = check(t, `fn main() -> i32 {
+    let mut m: HashMap<i32, String> = HashMap::new();
+    m.insert(1, String::from("x"));
+    println(m.len(), m.contains_key(1));
+    0
+}`)
+	if !ok {
+		t.Fatalf("hashable key: expected clean, got %v", codes)
+	}
+}
+
+// TestHashMapTemporaryGet checks that `get`, which returns `Option<&V>`, is
+// rejected on a temporary map that would be dropped at the end of the call.
+// Place and borrowed receivers stay valid.
+func TestHashMapTemporaryGet(t *testing.T) {
+	ok, codes := check(t, `fn make() -> HashMap<i32, i32> { HashMap::new() }
+fn first(m: &HashMap<i32, i32>) -> bool {
+    match m.get(1) {
+        Some(_) => true,
+        None => false,
+    }
+}
+fn main() -> i32 {
+    let mut m: HashMap<i32, i32> = HashMap::new();
+    m.insert(1, 2);
+    let _p = m.get(1);
+    println(first(&m));
+    0
+}`)
+	if !ok {
+		t.Fatalf("place/borrowed get: expected clean, got %v", codes)
+	}
+
+	ok, codes = check(t, `fn make() -> HashMap<i32, i32> { HashMap::new() }
+fn main() -> i32 {
+    let _p = make().get(1);
+    0
+}`)
+	if ok || !has(codes, "E0716") {
+		t.Fatalf("temporary get: expected E0716, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+// TestPrintlnFormat checks `{}` interpolation in println/print: the literal
+// first argument becomes the format string, each placeholder is type-checked
+// as printable, and arity mismatches are diagnosed.
+func TestPrintlnFormat(t *testing.T) {
+	ok, codes := check(t, `fn main() -> i32 {
+    println("x = {}", 42);
+    println("{} and {}", true, 'Z');
+    0
+}`)
+	if !ok {
+		t.Fatalf("format call: expected clean, got %v", codes)
+	}
+
+	ok, codes = check(t, `fn main() -> i32 { println("a {} b", 1, 2); 0 }`)
+	if ok || !has(codes, "E0061") {
+		t.Fatalf("arity: expected E0061, got ok=%v codes=%v", ok, codes)
+	}
+
+	ok, codes = check(t, `struct P { x: i32 }
+fn main() -> i32 { println("p {}", P { x: 1 }); 0 }`)
+	if ok || !has(codes, "E0277") {
+		t.Fatalf("non-printable: expected E0277, got ok=%v codes=%v", ok, codes)
+	}
+
+	// Without `{}` the call keeps its old space-separated meaning.
+	ok, codes = check(t, `fn main() -> i32 { println("a", 1, 2); 0 }`)
+	if !ok {
+		t.Fatalf("space separated: expected clean, got %v", codes)
+	}
+}

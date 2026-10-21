@@ -57,6 +57,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/generics.zx",
 		"../../tests/option_result.zx",
 		"../../tests/vec.zx",
+		"../../tests/hashmap.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -127,6 +128,17 @@ func TestRunPrograms(t *testing.T) {
 				"10", "99", "30", "30 2", "10 1", "99 3 1 3", "100 4",
 				"2", "true", "0 true", "6", "3 3", "4",
 				"3 alpha gamma", "gamma 2", "alpha 1", "1 2 8", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/hashmap.zx",
+			want: strings.Join([]string{
+				"2 false", "one", "one", "2", "two", "1 false", "0",
+				"11 0", "3", "-1",
+				"4 true true true true", "1 3", "false true true true",
+				"3 2", "true true", "4 true true",
+				"true false", "true true", "true true", "true false", "true false",
+				"200", "200", "42 42", "",
 			}, "\n"),
 		},
 		{
@@ -284,6 +296,11 @@ func TestRunPrograms(t *testing.T) {
 				"[   ab]",
 				"[ ab  ]",
 				"[abcd]",
+				"base 16: 0x255",
+				"pi: 3.14",
+				"flag true and char Z",
+				"owned has 5 bytes",
+				"percent 100% and 7",
 				"",
 			}, "\n"),
 		},
@@ -1232,7 +1249,8 @@ fn main() -> i32 {
 
 // TestImportFacadesAndModLayout exercises the M1-oriented source organization
 // layer: package-shaped imports, a local module file, a directory module, and
-// an inline module all flatten into the current program namespace.
+// an inline module. Public module items are reached through their qualifier;
+// private ones stay in their own module.
 func TestImportFacadesAndModLayout(t *testing.T) {
 	if _, err := exec.LookPath("cc"); err != nil {
 		t.Skip("no C compiler available")
@@ -1242,9 +1260,9 @@ func TestImportFacadesAndModLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 	files := map[string]string{
-		"helper.zx": `fn triple(n: i32) -> i32 { n * 3 }
+		"helper.zx": `pub fn triple(n: i32) -> i32 { n * 3 }
 `,
-		"nested/mod.zx": `fn seven() -> i32 { 7 }
+		"nested/mod.zx": `pub fn seven() -> i32 { 7 }
 `,
 		"main.zx": `import math.basic;
 import text.ascii;
@@ -1256,10 +1274,10 @@ import net.tcp;
 import http.client;
 mod helper;
 mod nested;
-mod inline { fn add(a: i32, b: i32) -> i32 { a + b } }
+mod inline { pub fn add(a: i32, b: i32) -> i32 { a + b } }
 
 fn main() -> i32 {
-    println(triple(14), seven(), add(2, 3));
+    println(helper::triple(14), nested::seven(), inline::add(2, 3));
     println(abs(sin(PI / 2.0) - 1.0) < 0.00001);
     println(to_upper("zexi"));
     println(upper("hi"), lower("BYE"), strip("  zexi  "), contains("zexi", "ex"), is_blank(" \t"), is_match("[0-9]+", "v42"));
@@ -1971,6 +1989,208 @@ func TestModulePrivacy(t *testing.T) {
 	em.Render(&buf, em.FirstFileID())
 	if !strings.Contains(buf.String(), "E0603") {
 		t.Fatalf("expected E0603 for private item, got:\n%s", buf.String())
+	}
+}
+
+// TestGlobAndReexport checks that `pub use` re-exports the target's public
+// items to a downstream module, that `use foo::*;` brings public items into
+// unqualified scope, and that private items are not re-exported.
+func TestGlobAndReexport(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	files := map[string]string{
+		"lib.zx":    "pub fn triple(n: i32) -> i32 { n * 3 }\nfn secret() -> i32 { 1 }\n",
+		"facade.zx": "pub use \"lib.zx\" as lib;\n",
+		"main.zx": `use "facade.zx" as fac;
+use "lib.zx" as lib;
+use lib::*;
+fn main() -> i32 { println(fac::triple(2), lib::triple(2), triple(3)); 0 }
+`,
+		"bad.zx": `use "facade.zx" as fac;
+fn main() -> i32 { fac::secret() }
+`,
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(filepath.Join(dir, "main.zx"), out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("glob/re-export program failed to build")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running glob/re-export program: %v", err)
+	}
+	if want := "6 6 9\n"; string(raw) != want {
+		t.Fatalf("output mismatch: got %q want %q", string(raw), want)
+	}
+
+	em = diag.NewEmitter()
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "bad.zx"), driver.Options{}, em); ok {
+		t.Fatal("expected a private item not to be re-exported")
+	}
+	var buf bytes.Buffer
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E0412") {
+		t.Fatalf("expected E0412 for a non-re-exported item, got:\n%s", buf.String())
+	}
+}
+
+// TestInlineModuleImportsAndFileGlob checks that imports declared inside an
+// inline module bind in that module's scope, that `use "file.zx"::*;` parses,
+// that a dangling `::` is rejected, and that an empty inline module does not
+// inherit its enclosing file's items.
+func TestInlineModuleImportsAndFileGlob(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	files := map[string]string{
+		"helpers.zx": "pub fn triple(n: i32) -> i32 { n * 3 }\n",
+		"main.zx": `use "helpers.zx"::*;
+mod inline {
+    use math;
+    mod inner {
+        use math;
+        pub fn root2() -> f64 { math::sqrt(9.0) }
+    }
+    pub fn root() -> f64 { math::sqrt(4.0) }
+}
+fn main() -> i32 { println(inline::root(), inline::inner::root2(), triple(4)); 0 }
+`,
+		"empty.zx": `mod empty {}
+pub fn value() -> i32 { 7 }
+fn main() -> i32 { println(empty::value()); 0 }
+`,
+		"badglob.zx": `use "helpers.zx"::;
+fn main() -> i32 { 0 }
+`,
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(filepath.Join(dir, "main.zx"), out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("inline-import/file-glob program failed to build")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running inline-import/file-glob program: %v", err)
+	}
+	if want := "2 3 12\n"; string(raw) != want {
+		t.Fatalf("output mismatch: got %q want %q", string(raw), want)
+	}
+
+	// An empty inline module must not silently expose the enclosing file's
+	// declarations through its qualifier.
+	em = diag.NewEmitter()
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "empty.zx"), driver.Options{}, em); ok {
+		t.Fatal("expected empty::value to be rejected")
+	}
+	var buf bytes.Buffer
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E0412") {
+		t.Fatalf("expected E0412 for empty module lookup, got:\n%s", buf.String())
+	}
+
+	// A file glob must consume `::` before `*` and reject a dangling separator.
+	em = diag.NewEmitter()
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "badglob.zx"), driver.Options{}, em); ok {
+		t.Fatal("expected a dangling file-import separator to be rejected")
+	}
+	buf.Reset()
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E0202") {
+		t.Fatalf("expected E0202 for a dangling file-import separator, got:\n%s", buf.String())
+	}
+}
+
+// TestModuleIsolation checks that two modules may declare the same private
+// helper (and even the same public type name) without colliding in the merged
+// program, while a private item from a `use`-imported module is not visible
+// unqualified in the importer.
+func TestModuleIsolation(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	files := map[string]string{
+		"a.zx": `fn helper() -> i32 { 1 }
+pub fn a() -> i32 { helper() }
+pub struct Pair { pub n: i32 }
+pub fn pair() -> Pair { Pair { n: 10 } }
+`,
+		"b.zx": `fn helper() -> i32 { 2 }
+pub fn b() -> i32 { helper() }
+pub struct Pair { pub n: i32 }
+pub fn pair() -> Pair { Pair { n: 20 } }
+`,
+		"main.zx": `use "a.zx" as a;
+use "b.zx" as b;
+fn main() -> i32 {
+    let pa: a::Pair = a::pair();
+    let pb: b::Pair = b::pair();
+    println(a::a(), b::b(), pa.n, pb.n);
+    0
+}
+`,
+		"bad.zx": `use "a.zx" as a;
+fn main() -> i32 { helper() }
+`,
+		"badmod.zx": `mod a;
+fn main() -> i32 { helper() }
+`,
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(filepath.Join(dir, "main.zx"), out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("isolated-module program failed to build")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running isolated-module program: %v", err)
+	}
+	if want := "1 2 10 20\n"; string(raw) != want {
+		t.Fatalf("output mismatch: got %q want %q", string(raw), want)
+	}
+
+	// A private item imported through `use` must not leak into the importer's
+	// unqualified namespace.
+	em = diag.NewEmitter()
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "bad.zx"), driver.Options{}, em); ok {
+		t.Fatal("expected a private used item to be unreachable unqualified")
+	}
+	var buf bytes.Buffer
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E0425") {
+		t.Fatalf("expected E0425 for the private unqualified name, got:\n%s", buf.String())
+	}
+
+	// The same is true for a module loaded with `mod name;`.
+	em = diag.NewEmitter()
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "badmod.zx"), driver.Options{}, em); ok {
+		t.Fatal("expected a private `mod` item to be unreachable unqualified")
+	}
+	buf.Reset()
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E0425") {
+		t.Fatalf("expected E0425 for the private mod name, got:\n%s", buf.String())
 	}
 }
 

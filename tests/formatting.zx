@@ -49,5 +49,14 @@ fn main() -> i32 {
     println("[" + fmt::align_center("ab", 5) + "]");
     println("[" + fmt::align_center("abcd", 2) + "]");
 
+    // println with `{}` placeholders: the argument's type drives the
+    // conversion, and literal text is emitted verbatim.
+    println("base 16: 0x{}", 255);
+    println("pi: {}", fmt::fixed_point(3.14159, 2));
+    println("flag {} and char {}", true, 'Z');
+    let label = String::from("owned");
+    println("{} has {} bytes", label.as_str(), label.len());
+    println("percent 100% and {}", 7);
+
     0
 }

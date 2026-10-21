@@ -91,7 +91,57 @@ type module struct {
 	file   *ast.File
 
 	imports []importBinding
-	exports map[string]bool // top-level names reachable through a qualified path
+	exports map[string]bool // top-level names, with whether each is `pub`
+
+	// items is set for an inline `mod name { ... }` block; file modules use
+	// file.Items instead. parent points at the enclosing module, and submods
+	// maps an inline module's name to its own module.
+	items   []ast.Item
+	parent  *module
+	submods map[string]*module
+
+	// symbols holds this module's own top-level declarations. exportSyms is
+	// the set reachable through a qualified path (public declarations plus
+	// `pub use` re-exports); importSyms is the set an unqualified reference in
+	// this module may resolve to (public items of plain/glob imports).
+	symbols    map[string]*symbol
+	exportSyms map[string]*symbol
+	importSyms map[string]*symbol
+	ambiguous  map[string][]string // unqualified names exported by >1 import
+
+	// members are the file modules of a directory-package aggregate module.
+	members []*module
+	id      int
+
+	// flattenPrivate marks modules whose private items keep their source
+	// spelling. Only the files named directly on the command line need this:
+	// they are one program, whereas `use`/`import`/`mod` modules isolate their
+	// private names.
+	flattenPrivate bool
+}
+
+// symbolKind classifies a module-level declaration. Methods and enum variants
+// are not module symbols: they are reached through their type name.
+type symbolKind int
+
+const (
+	symFn symbolKind = iota
+	symStruct
+	symEnum
+	symConst
+	symAlias
+)
+
+// symbol is one module-level declaration and the unique internal name it is
+// lowered under when the flat namespace would otherwise collide or leak a
+// private name across modules.
+type symbol struct {
+	name     string
+	internal string
+	mod      *module
+	kind     symbolKind
+	pub      bool
+	decl     ast.Item
 }
 
 // importBinding maps a path prefix used in source to the module it names. A
@@ -116,6 +166,10 @@ type loader struct {
 	mods  map[string]*module // load key -> module
 	order []*module          // load order, for deterministic merging
 
+	entry      *module                  // the program module (first input path)
+	useTargets map[*ast.UseDecl]*module // resolved target of each use/import
+	nextModID  int
+
 	firstID int
 
 	usesNet    bool // program imports net/http/fs (needs the shared C runtime)
@@ -125,7 +179,12 @@ type loader struct {
 }
 
 func newLoader(em *diag.Emitter) *loader {
-	return &loader{em: em, merged: &ast.File{}, mods: map[string]*module{}}
+	return &loader{
+		em:         em,
+		merged:     &ast.File{},
+		mods:       map[string]*module{},
+		useTargets: map[*ast.UseDecl]*module{},
+	}
 }
 
 // loadDiskFile loads one file from disk and everything it imports, returning
@@ -135,6 +194,12 @@ func (l *loader) loadDiskFile(filePath string) int {
 	if m == nil {
 		return 0
 	}
+	if l.entry == nil {
+		l.entry = m
+	}
+	// Files named directly on the command line are one program, exactly as
+	// before module isolation.
+	m.flattenPrivate = true
 	return m.fileID
 }
 
@@ -208,7 +273,7 @@ func (l *loader) loadModule(key, display string, src []byte, dir string) *module
 	m.file = file
 	m.exports = computeExports(file.Items)
 	l.order = append(l.order, m)
-	l.collectImports(m, file.Items, nil)
+	l.collectImports(m, m, file.Items, nil)
 	return m
 }
 
@@ -244,26 +309,42 @@ func computeExports(items []ast.Item) map[string]bool {
 // Inline `mod { ... }` blocks become synthetic modules so `mod::item` is
 // checked against their exports too; prefix carries the enclosing inline-module
 // path so nested `mod outer { mod inner { .. } }` binds `outer::inner::item`.
-func (l *loader) collectImports(m *module, items []ast.Item, prefix []string) {
+// root is the file module whose flat namespace is being built; owner is the
+// inline module that directly contains items, so imports declared inside an
+// inline block bind in that block's scope.
+func (l *loader) collectImports(root, owner *module, items []ast.Item, prefix []string) {
 	for _, it := range items {
 		switch d := it.(type) {
 		case *ast.UseDecl:
-			l.bindUse(m, d)
+			l.bindUse(owner, d)
 		case *ast.ModDecl:
 			if d.Inline {
 				childPrefix := append(append([]string{}, prefix...), d.Name)
-				sub := &module{
-					key:     m.key + "::" + strings.Join(childPrefix, "::"),
-					dir:     m.dir,
-					file:    m.file,
-					exports: computeExports(d.Items),
+				childItems := d.Items
+				if childItems == nil {
+					childItems = []ast.Item{}
 				}
+				sub := &module{
+					key:     root.key + "::" + strings.Join(childPrefix, "::"),
+					dir:     owner.dir,
+					file:    owner.file,
+					items:   childItems,
+					exports: computeExports(childItems),
+				}
+				sub.parent = owner
 				l.mods[sub.key] = sub
-				m.imports = append(m.imports, importBinding{prefix: childPrefix, target: sub})
-				l.collectImports(m, d.Items, childPrefix)
+				if owner.submods == nil {
+					owner.submods = map[string]*module{}
+				}
+				owner.submods[d.Name] = sub
+				l.bind(owner, []string{d.Name}, sub, d.Sp)
+				if owner != root {
+					l.bind(root, childPrefix, sub, d.Sp)
+				}
+				l.collectImports(root, sub, childItems, childPrefix)
 				continue
 			}
-			l.bindMod(m, d, prefix)
+			l.bindMod(root, owner, d, prefix)
 		}
 	}
 }
@@ -273,32 +354,35 @@ func (l *loader) collectImports(m *module, items []ast.Item, prefix []string) {
 // files), searching next to the declaring file and at the project root. It
 // records the `name::` qualifier (respecting any enclosing inline-module
 // prefix).
-func (l *loader) bindMod(m *module, d *ast.ModDecl, prefix []string) {
+func (l *loader) bindMod(root, owner *module, d *ast.ModDecl, prefix []string) {
 	qual := append(append([]string{}, prefix...), d.Name)
-	for _, dir := range l.searchDirs(m.dir) {
+	bind := func(target *module) {
+		if target == nil {
+			return
+		}
+		l.bind(owner, []string{d.Name}, target, d.Sp)
+		if owner != root {
+			l.bind(root, qual, target, d.Sp)
+		}
+	}
+	for _, dir := range l.searchDirs(owner.dir) {
 		cand := filepath.Join(dir, d.Name+".zx")
 		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
-			if target := l.loadDisk(cand); target != nil {
-				l.bind(m, qual, target, d.Sp)
-			}
+			bind(l.loadDisk(cand))
 			return
 		}
 	}
-	for _, dir := range l.searchDirs(m.dir) {
+	for _, dir := range l.searchDirs(owner.dir) {
 		pkgDir := filepath.Join(dir, d.Name)
 		st, err := os.Stat(pkgDir)
 		if err != nil || !st.IsDir() {
 			continue
 		}
 		if modFile := filepath.Join(pkgDir, "mod.zx"); fileExists(modFile) {
-			if target := l.loadDisk(modFile); target != nil {
-				l.bind(m, qual, target, d.Sp)
-			}
+			bind(l.loadDisk(modFile))
 			return
 		}
-		if pkg := l.loadPackage(pkgDir); pkg != nil {
-			l.bind(m, qual, pkg, d.Sp)
-		}
+		bind(l.loadPackage(pkgDir))
 		return
 	}
 	l.em.Report(diag.New("E9023", "cannot find module `%s` (looked for %s.zx and %s/mod.zx)", d.Name, d.Name, d.Name).WithSpan(d.Sp))
@@ -311,6 +395,9 @@ func (l *loader) bindUse(m *module, d *ast.UseDecl) {
 		// `use "helpers.zx";` / `import "helpers.zx";` — relative to the
 		// importing file.
 		target := l.loadDisk(filepath.Join(m.dir, filepath.FromSlash(d.File)))
+		if target != nil {
+			l.useTargets[d] = target
+		}
 		qual := d.As
 		if qual == "" {
 			base := filepath.Base(d.File)
@@ -342,6 +429,7 @@ func (l *loader) bindUse(m *module, d *ast.UseDecl) {
 	if !ok {
 		return
 	}
+	l.useTargets[d] = target
 	if d.As != "" {
 		l.bind(m, []string{d.As}, target, d.Sp)
 		return
@@ -483,6 +571,7 @@ func (l *loader) loadPackage(dir string) *module {
 		if member == nil {
 			continue
 		}
+		pkg.members = append(pkg.members, member)
 		for name, pub := range member.exports {
 			pkg.exports[name] = pkg.exports[name] || pub
 		}
@@ -530,9 +619,11 @@ func equalPath(a, b []string) bool {
 // finish rewrites qualified paths in every module and merges the resulting
 // items into the one program sema checks.
 func (l *loader) finish() {
+	l.buildSymbols()
+	l.resolveSymbolImports()
+	l.assignInternalNames()
 	for _, m := range l.order {
-		r := &rewriter{l: l, m: m}
-		r.items(m.file.Items)
+		newRewriter(l, m).items(m.file.Items)
 	}
 	for _, m := range l.order {
 		l.appendItems(m.file.Items)
@@ -558,13 +649,20 @@ func (l *loader) appendItems(items []ast.Item) {
 
 // --- qualified-path rewriting ---------------------------------------------
 
-// rewriter resolves module-qualified paths in one module. It leaves unqualified
-// names alone (sema still resolves those in the flat program), but rewrites
-// `prefix::rest` to `rest` once prefix is verified to name an imported module
-// that exports `rest`.
+// rewriter resolves module-qualified paths and module-level names in one
+// module. Local bindings are tracked so a parameter or `let` may shadow an
+// item without being renamed.
 type rewriter struct {
-	l *loader
-	m *module
+	l     *loader
+	m     *module
+	scope moduleScope
+
+	scopes     []map[string]bool
+	typeParams []map[string]bool
+}
+
+func newRewriter(l *loader, m *module) *rewriter {
+	return &rewriter{l: l, m: m, scope: moduleScope{l: l, m: m}}
 }
 
 func (r *rewriter) items(items []ast.Item) {
@@ -576,43 +674,149 @@ func (r *rewriter) items(items []ast.Item) {
 func (r *rewriter) item(it ast.Item) {
 	switch d := it.(type) {
 	case *ast.FnDecl:
-		for i := range d.Params {
-			r.typ(d.Params[i].Ty)
-			if d.Params[i].Default != nil {
-				r.expr(d.Params[i].Default)
-			}
-		}
-		r.typ(d.Ret)
-		if d.Body != nil {
-			r.block(d.Body)
-		}
+		r.fn(d, false)
 	case *ast.StructDecl:
+		if sym := r.m.symbols[d.Name]; sym != nil {
+			d.Name = sym.internal
+		}
+		r.pushTypeParams(genericNames(d.Generics))
 		for i := range d.Fields {
 			r.typ(d.Fields[i].Ty)
 		}
+		r.popTypeParams()
 	case *ast.EnumDecl:
+		if sym := r.m.symbols[d.Name]; sym != nil {
+			d.Name = sym.internal
+		}
+		r.pushTypeParams(genericNames(d.Generics))
 		for i := range d.Variants {
 			for j := range d.Variants[i].Fields {
 				r.typ(d.Variants[i].Fields[j].Ty)
 			}
 		}
+		r.popTypeParams()
 	case *ast.ConstDecl:
+		if sym := r.m.symbols[d.Name]; sym != nil {
+			d.Name = sym.internal
+		}
 		r.typ(d.Ty)
 		if d.Val != nil {
 			r.expr(d.Val)
 		}
 	case *ast.TypeAlias:
-		r.typ(d.Ty)
-	case *ast.ImplBlock:
-		r.typ(d.SelfTy)
-		for _, fn := range d.Fns {
-			r.item(fn)
+		if sym := r.m.symbols[d.Name]; sym != nil {
+			d.Name = sym.internal
 		}
+		r.pushTypeParams(genericNames(d.Generics))
+		r.typ(d.Ty)
+		r.popTypeParams()
+	case *ast.ImplBlock:
+		r.pushTypeParams(genericNames(d.Generics))
+		r.typ(d.SelfTy)
+		if d.Trait != nil {
+			r.typ(d.Trait)
+		}
+		for _, fn := range d.Fns {
+			r.fn(fn, true)
+		}
+		r.popTypeParams()
 	case *ast.ModDecl:
-		if d.Inline {
-			r.items(d.Items)
+		if !d.Inline {
+			return
+		}
+		if sub := r.m.submods[d.Name]; sub != nil {
+			newRewriter(r.l, sub).items(d.Items)
 		}
 	}
+}
+
+// fn rewrites one function or method body. A method's name is not a module
+// symbol; it is reached through its receiver type.
+func (r *rewriter) fn(d *ast.FnDecl, method bool) {
+	if !method {
+		if sym := r.m.symbols[d.Name]; sym != nil {
+			d.Name = sym.internal
+		}
+	}
+	r.pushTypeParams(genericNames(d.Generics))
+	r.pushScope()
+	for i := range d.Params {
+		p := &d.Params[i]
+		if p.Ty != nil {
+			r.typ(p.Ty)
+		}
+		if p.Default != nil {
+			r.expr(p.Default)
+		}
+		if p.Self {
+			r.bind("self")
+		} else if p.Name != "" {
+			r.bind(p.Name)
+		}
+	}
+	r.typ(d.Ret)
+	r.block(d.Body)
+	r.popScope()
+	r.popTypeParams()
+}
+
+func genericNames(gps []ast.GenericParam) []string {
+	if len(gps) == 0 {
+		return nil
+	}
+	out := make([]string, len(gps))
+	for i, gp := range gps {
+		out[i] = gp.Name
+	}
+	return out
+}
+
+func (r *rewriter) pushScope() {
+	r.scopes = append(r.scopes, map[string]bool{})
+}
+
+func (r *rewriter) popScope() {
+	r.scopes = r.scopes[:len(r.scopes)-1]
+}
+
+func (r *rewriter) bind(name string) {
+	if name == "" || len(r.scopes) == 0 {
+		return
+	}
+	r.scopes[len(r.scopes)-1][name] = true
+}
+
+func (r *rewriter) isLocal(name string) bool {
+	for i := len(r.scopes) - 1; i >= 0; i-- {
+		if r.scopes[i][name] {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *rewriter) pushTypeParams(names []string) {
+	r.typeParams = append(r.typeParams, map[string]bool{})
+	if len(names) == 0 {
+		return
+	}
+	top := r.typeParams[len(r.typeParams)-1]
+	for _, name := range names {
+		top[name] = true
+	}
+}
+
+func (r *rewriter) popTypeParams() {
+	r.typeParams = r.typeParams[:len(r.typeParams)-1]
+}
+
+func (r *rewriter) isTypeParam(name string) bool {
+	for i := len(r.typeParams) - 1; i >= 0; i-- {
+		if r.typeParams[i][name] {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *rewriter) typ(t ast.Type) {
@@ -620,9 +824,13 @@ func (r *rewriter) typ(t ast.Type) {
 	case nil:
 		return
 	case *ast.PathType:
-		nx := r.path(x.Segments, x.Sp)
-		if nx != nil {
-			x.Segments = nx
+		if len(x.Segments) > 0 && !r.isTypeParam(x.Segments[0]) {
+			if nx := r.scope.resolvePath(x.Segments, x); nx != nil {
+				x.Segments = nx
+			}
+		}
+		for _, a := range x.Args {
+			r.typ(a)
 		}
 	case *ast.RefType:
 		r.typ(x.Elem)
@@ -651,10 +859,10 @@ func (r *rewriter) stmt(s ast.Stmt) {
 	switch x := s.(type) {
 	case *ast.LetStmt:
 		r.typ(x.Ty)
-		r.pat(x.Pat)
 		if x.Val != nil {
 			r.expr(x.Val)
 		}
+		r.bindPattern(x.Pat)
 	case *ast.ExprStmt:
 		r.expr(x.X)
 	case *ast.DeferStmt:
@@ -666,12 +874,14 @@ func (r *rewriter) block(b *ast.Block) {
 	if b == nil {
 		return
 	}
+	r.pushScope()
 	for _, s := range b.Stmts {
 		r.stmt(s)
 	}
 	if b.Tail != nil {
 		r.expr(b.Tail)
 	}
+	r.popScope()
 }
 
 func (r *rewriter) expr(e ast.Expr) {
@@ -680,10 +890,22 @@ func (r *rewriter) expr(e ast.Expr) {
 		return
 	case *ast.Block:
 		r.block(x)
-	case *ast.IdentExpr, *ast.LiteralExpr:
-		// Bare names and literals carry no module qualification.
+	case *ast.IdentExpr:
+		for _, a := range x.TypeArgs {
+			r.typ(a)
+		}
+		if !r.isLocal(x.Name) {
+			if internal, ok := r.scope.resolveIdent(x.Name, x); ok {
+				x.Name = internal
+			}
+		}
+	case *ast.LiteralExpr:
+		// No names.
 	case *ast.PathExpr:
-		if nx := r.path(x.Segments, x.Sp); nx != nil {
+		for _, a := range x.TypeArgs {
+			r.typ(a)
+		}
+		if nx := r.scope.resolvePath(x.Segments, x); nx != nil {
 			x.Segments = nx
 		}
 	case *ast.BinExpr:
@@ -744,27 +966,36 @@ func (r *rewriter) expr(e ast.Expr) {
 	case *ast.MatchExpr:
 		r.expr(x.Scrutinee)
 		for i := range x.Arms {
+			r.pushScope()
 			r.pat(x.Arms[i].Pat)
+			r.bindPattern(x.Arms[i].Pat)
 			if x.Arms[i].Guard != nil {
 				r.expr(x.Arms[i].Guard)
 			}
 			r.expr(x.Arms[i].Body)
+			r.popScope()
 		}
 	case *ast.LoopExpr:
 		if x.Cond != nil {
 			r.expr(x.Cond)
 		}
-		r.pat(x.Pat)
 		if x.Iter != nil {
 			r.expr(x.Iter)
 		}
+		r.pushScope()
+		r.pat(x.Pat)
+		r.bindPattern(x.Pat)
 		r.block(x.Body)
+		r.popScope()
 	case *ast.JumpExpr:
 		if x.Val != nil {
 			r.expr(x.Val)
 		}
 	case *ast.StructLitExpr:
-		if nx := r.path(x.Path, x.Sp); nx != nil {
+		for _, a := range x.TypeArgs {
+			r.typ(a)
+		}
+		if nx := r.scope.resolvePath(x.Path, x); nx != nil {
 			x.Path = nx
 		}
 		for i := range x.Fields {
@@ -773,19 +1004,18 @@ func (r *rewriter) expr(e ast.Expr) {
 	}
 }
 
+// pat rewrites the module-qualified paths inside a pattern. Binding names are
+// handled by bindPattern.
 func (r *rewriter) pat(p ast.Pattern) {
 	switch x := p.(type) {
-	case nil:
+	case nil, *ast.BindPat, *ast.WildcardPat, *ast.LitPat, *ast.RangePat:
 		return
-	case *ast.BindPat:
-	case *ast.WildcardPat:
-	case *ast.LitPat:
 	case *ast.TuplePat:
 		for _, el := range x.Elems {
 			r.pat(el)
 		}
 	case *ast.PathPat:
-		if nx := r.path(x.Path, x.Sp); nx != nil {
+		if nx := r.scope.resolvePath(x.Path, x); nx != nil {
 			x.Path = nx
 		}
 		for _, s := range x.Sub {
@@ -798,44 +1028,30 @@ func (r *rewriter) pat(p ast.Pattern) {
 		for _, alt := range x.Alts {
 			r.pat(alt)
 		}
-	case *ast.RangePat:
 	}
 }
 
-// path resolves a possibly module-qualified path. It returns nil when the path
-// was already rewritten in place or is unqualified; callers only assign a
-// non-nil result. It reports a diagnostic when a path names a module but not an
-// exported item.
-func (r *rewriter) path(segs []string, sp token.Span) []string {
-	if len(segs) == 0 {
-		return nil
-	}
-	var bind *importBinding
-	best := 0
-	for i := range r.m.imports {
-		b := &r.m.imports[i]
-		if len(b.prefix) > best && len(segs) >= len(b.prefix) && equalPath(segs[:len(b.prefix)], b.prefix) {
-			best = len(b.prefix)
-			bind = b
+// bindPattern introduces every name a pattern binds into the current scope.
+func (r *rewriter) bindPattern(p ast.Pattern) {
+	switch x := p.(type) {
+	case nil, *ast.WildcardPat, *ast.LitPat, *ast.RangePat:
+		return
+	case *ast.BindPat:
+		r.bind(x.Name)
+	case *ast.TuplePat:
+		for _, el := range x.Elems {
+			r.bindPattern(el)
+		}
+	case *ast.PathPat:
+		for _, s := range x.Sub {
+			r.bindPattern(s)
+		}
+		for i := range x.Fields {
+			r.bindPattern(x.Fields[i].Pat)
+		}
+	case *ast.OrPat:
+		for _, alt := range x.Alts {
+			r.bindPattern(alt)
 		}
 	}
-	if bind == nil {
-		return nil // not module-qualified: an enum path or a local name
-	}
-	rest := segs[best:]
-	modName := strings.Join(bind.prefix, "::")
-	if len(rest) == 0 {
-		r.l.em.Report(diag.New("E0433", "`%s` is a module and cannot be used as a value or type", modName).WithSpan(sp))
-		return nil
-	}
-	pub, ok := bind.target.exports[rest[0]]
-	if !ok {
-		r.l.em.Report(diag.New("E0412", "module `%s` has no item named `%s`", modName, rest[0]).WithSpan(sp))
-		return nil
-	}
-	if !pub {
-		r.l.em.Report(diag.New("E0603", "item `%s::%s` is private", modName, rest[0]).WithSpan(sp))
-		return nil
-	}
-	return rest
 }

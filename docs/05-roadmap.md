@@ -9,9 +9,10 @@
 > resolved by the driver before checking. Project builds are convention-only:
 > pass a directory (`zexic run .`), the loader finds `main.zx` or `src/main.zx`,
 > searches the project root for named imports, and can load a whole folder for
-> one `use pkg;`. The merged program is still one flat
-> namespace (unqualified names stay visible and ignore `pub`); true per-module
-> isolation remains M1 work.
+> one `use pkg;`. Modules are isolated: private items stay private, only
+> public items are imported unqualified, and same-named declarations in two
+> modules are lowered under distinct internal names. Files named together on
+> the command line remain one flat program.
 > Implemented language surface: functions and recursion; `let`/`const`;
 > integer/float/bool/char/`str`; arithmetic, bitwise, comparison, and logical
 > operators; `as` casts; `if`/`else`; `while`/`loop`/`for i in a..b` and
@@ -40,11 +41,7 @@
 > `handle_get("/users/{id}", user)` plus `listen(":8080")`, `{name}` route
 > parameters, and `use_before`/`use_after` middleware.
 > Not yet implemented: traits and trait bounds (generic parameters are
-> unconstrained), `dyn Trait`, associated types, const generics, full
-> per-module **isolation**
-> (scoped qualified paths, `as` aliases, and `pub` checks are live, but the
-> loader still merges every module into one flat namespace, so unqualified
-> cross-module names remain visible and ignore `pub`), `Box`,
+> unconstrained), `dyn Trait`, associated types, const generics, `Box`,
 > user-defined `Drop`, borrow-lifetime analysis (so bound
 > `&`/`*` aliases are not tracked), nested patterns, and tuple values.
 > See `docs/06-backend-strategy.md` for the backend status.
@@ -61,7 +58,7 @@ M1/M2 are additive.
 | Types | primitives, tuples, arrays, slices, structs, enums | + generics, traits, `dyn`, `str`/`String` | + const eval, SIMD, niche opt |
 | Ownership | lexical scope, moves, explicit `drop` | full NLL borrow checker, lifetimes | escape analysis, drop elision |
 | Errors | `Result` + `?`, panic abort | + `Option` ergonomics, `?` in `main` | zero-cost error paths |
-| Modules | file imports + flat `mod`/`use`/`import` preview | scoped packages + `pub` enforcement | incremental + parallel builds |
+| Modules | file imports + `mod`/`use`/`import` preview | scoped packages, isolation, `pub` enforcement | incremental + parallel builds |
 | Runtime | panic+exit only | opt-in `alloc`/`fmt` | freestanding `no_std` tuned |
 | Backend | C11 | C11 (+ PGO passthrough) | native x86-64 (or Cranelift) |
 | Std | `core` skeleton | `alloc`, `Vec`, `String`, `Iterator` | `os`/`sys`, collections |
@@ -74,8 +71,9 @@ M1/M2 are additive.
   embedded stdlib modules, and `mod name;` loads `name.zx` or `name/mod.zx`.
   Imports create qualifiers (`import math as m;` → `m::sqrt(2.0)`,
   `mod util;` → `util::f`) and qualified lookup enforces `pub` (E0603/E0412/
-  E0433). The merged program is still flat, so unqualified names remain visible
-  and full isolation remains M1 work.
+  E0433). Per-module isolation is live: private items are module-local, plain
+  imports bring only public names into unqualified scope, and same-named
+  declarations in separate modules coexist under distinct internal names.
 
 **Types (M0)**
 - Primitives: `bool i8 i16 i32 i64 u8 u16 u32 u64 isize usize f32 f64 char`.
@@ -126,12 +124,11 @@ seam.
 
 ## 5.3 M1 — usability (the "worth using" set)
 
-- **Modules & packages:** finish the shipped loader into scoped packages.
-  Qualified lookup, `as` aliases, `pub` checks, directory entry points, and
-  whole-folder packages are live; what remains is real per-module isolation (so
-  unqualified cross-module names respect `pub` and same-named items coexist),
-  re-exports/glob imports, and a prelude. Manifests/package metadata are not
-  planned for the convention-only project model.
+- **Modules & packages:** scoped packages are live. Qualified lookup, `as`
+  aliases, `pub` checks, directory entry points, whole-folder packages,
+  per-module isolation, re-exports, and glob imports are implemented. A
+  prelude module remains, as do manifests/package metadata (not planned for the
+  convention-only project model).
 - **Generics + traits:** monomorphized user generics, operator traits,
   `Iterator`, `Clone`/`Copy`/`Drop`, `From`/`Into`, `dyn Trait` (M1 late).
 - **Real ownership checker:** NLL, lifetime elision + explicit lifetimes,
