@@ -1247,7 +1247,8 @@ fn main() -> i32 {
 
 // TestImportFacadesAndModLayout exercises the M1-oriented source organization
 // layer: package-shaped imports, a local module file, a directory module, and
-// an inline module all flatten into the current program namespace.
+// an inline module. Public module items are reached through their qualifier;
+// private ones stay in their own module.
 func TestImportFacadesAndModLayout(t *testing.T) {
 	if _, err := exec.LookPath("cc"); err != nil {
 		t.Skip("no C compiler available")
@@ -1257,9 +1258,9 @@ func TestImportFacadesAndModLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 	files := map[string]string{
-		"helper.zx": `fn triple(n: i32) -> i32 { n * 3 }
+		"helper.zx": `pub fn triple(n: i32) -> i32 { n * 3 }
 `,
-		"nested/mod.zx": `fn seven() -> i32 { 7 }
+		"nested/mod.zx": `pub fn seven() -> i32 { 7 }
 `,
 		"main.zx": `import math.basic;
 import text.ascii;
@@ -1271,10 +1272,10 @@ import net.tcp;
 import http.client;
 mod helper;
 mod nested;
-mod inline { fn add(a: i32, b: i32) -> i32 { a + b } }
+mod inline { pub fn add(a: i32, b: i32) -> i32 { a + b } }
 
 fn main() -> i32 {
-    println(triple(14), seven(), add(2, 3));
+    println(helper::triple(14), nested::seven(), inline::add(2, 3));
     println(abs(sin(PI / 2.0) - 1.0) < 0.00001);
     println(to_upper("zexi"));
     println(upper("hi"), lower("BYE"), strip("  zexi  "), contains("zexi", "ex"), is_blank(" \t"), is_match("[0-9]+", "v42"));
@@ -2037,6 +2038,85 @@ fn main() -> i32 { fac::secret() }
 	em.Render(&buf, em.FirstFileID())
 	if !strings.Contains(buf.String(), "E0412") {
 		t.Fatalf("expected E0412 for a non-re-exported item, got:\n%s", buf.String())
+	}
+}
+
+// TestModuleIsolation checks that two modules may declare the same private
+// helper (and even the same public type name) without colliding in the merged
+// program, while a private item from a `use`-imported module is not visible
+// unqualified in the importer.
+func TestModuleIsolation(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	files := map[string]string{
+		"a.zx": `fn helper() -> i32 { 1 }
+pub fn a() -> i32 { helper() }
+pub struct Pair { pub n: i32 }
+pub fn pair() -> Pair { Pair { n: 10 } }
+`,
+		"b.zx": `fn helper() -> i32 { 2 }
+pub fn b() -> i32 { helper() }
+pub struct Pair { pub n: i32 }
+pub fn pair() -> Pair { Pair { n: 20 } }
+`,
+		"main.zx": `use "a.zx" as a;
+use "b.zx" as b;
+fn main() -> i32 {
+    let pa: a::Pair = a::pair();
+    let pb: b::Pair = b::pair();
+    println(a::a(), b::b(), pa.n, pb.n);
+    0
+}
+`,
+		"bad.zx": `use "a.zx" as a;
+fn main() -> i32 { helper() }
+`,
+		"badmod.zx": `mod a;
+fn main() -> i32 { helper() }
+`,
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(filepath.Join(dir, "main.zx"), out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("isolated-module program failed to build")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running isolated-module program: %v", err)
+	}
+	if want := "1 2 10 20\n"; string(raw) != want {
+		t.Fatalf("output mismatch: got %q want %q", string(raw), want)
+	}
+
+	// A private item imported through `use` must not leak into the importer's
+	// unqualified namespace.
+	em = diag.NewEmitter()
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "bad.zx"), driver.Options{}, em); ok {
+		t.Fatal("expected a private used item to be unreachable unqualified")
+	}
+	var buf bytes.Buffer
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E0425") {
+		t.Fatalf("expected E0425 for the private unqualified name, got:\n%s", buf.String())
+	}
+
+	// The same is true for a module loaded with `mod name;`.
+	em = diag.NewEmitter()
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "badmod.zx"), driver.Options{}, em); ok {
+		t.Fatal("expected a private `mod` item to be unreachable unqualified")
+	}
+	buf.Reset()
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E0425") {
+		t.Fatalf("expected E0425 for the private mod name, got:\n%s", buf.String())
 	}
 }
 
