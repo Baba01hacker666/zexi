@@ -267,6 +267,9 @@ func (g *gen) emitMapRuntime(t *types.Type) {
 	g.w.indent++
 	g.w.line("%s zx_old = m->entries[idx].value;", vt)
 	g.w.line("m->entries[idx].value = value;")
+	if t.Key.NeedsDrop() {
+		g.w.line("zx_drop_%s(&key);", typeMangle(t.Key))
+	}
 	if !valCopy {
 		g.w.line("memset(&value, 0, sizeof(value));")
 	}
@@ -305,10 +308,23 @@ func (g *gen) emitMapRuntime(t *types.Type) {
 	g.w.line("    while (m->entries[idx].used && !%s(m->entries[idx].key, key)) idx = (idx + 1) %% m->cap;", eq)
 	g.w.line("    if (!m->entries[idx].used) return 0;")
 	g.w.line("    *out = m->entries[idx].value;")
+	if t.Key.NeedsDrop() {
+		g.w.line("    zx_drop_%s(&m->entries[idx].key);", typeMangle(t.Key))
+	}
 	g.w.line("    memset(&m->entries[idx].value, 0, sizeof(%s));", vt)
 	g.w.line("    memset(&m->entries[idx].key, 0, sizeof(%s));", kt)
 	g.w.line("    m->entries[idx].used = 0;")
 	g.w.line("    m->len--;")
+	g.w.line("    size_t hole = idx, j = (idx + 1) %% m->cap;")
+	g.w.line("    while (m->entries[j].used) {")
+	g.w.line("        size_t home = %s(m->entries[j].key) %% m->cap;", hk)
+	g.w.line("        if ((j > hole && (home <= hole || home > j)) || (j < hole && home <= hole && home > j)) {")
+	g.w.line("            m->entries[hole] = m->entries[j];")
+	g.w.line("            memset(&m->entries[j], 0, sizeof(m->entries[j]));")
+	g.w.line("            hole = j;")
+	g.w.line("        }")
+	g.w.line("        j = (j + 1) %% m->cap;")
+	g.w.line("    }")
 	g.w.line("    return 1;")
 	g.w.line("}")
 
@@ -386,6 +402,20 @@ func optionExpr(opt, elem *types.Type, cond, val string) string {
 	return b.String()
 }
 
+// mapKeyArg lowers a lookup key. Lookups borrow their key: a place is passed
+// as-is (the helper takes it by value and only hashes/compares it, so the
+// original keeps ownership), while a non-place owning temporary is bound to a
+// local and dropped after the helper returns.
+func (g *gen) mapKeyArg(e ast.Expr, key *types.Type) (prelude, expr, postlude string) {
+	if key != nil && key.NeedsDrop() && !isPlaceExpr(e) {
+		tm := g.tmpName()
+		return ctype(key) + " " + tm + " = " + g.value(e) + "; ",
+			tm,
+			" zx_drop_" + typeMangle(key) + "(&" + tm + ");"
+	}
+	return "", g.value(e), ""
+}
+
 // mapMethodCall lowers a builtin method call on a `HashMap<K, V>`.
 func (g *gen) mapMethodCall(x *ast.MethodCallExpr) string {
 	t := recvBase(g.info.TypeOf(x.Recv))
@@ -420,22 +450,26 @@ func (g *gen) mapMethodCall(x *ast.MethodCallExpr) string {
 	case "get":
 		rt := g.info.TypeOf(x)
 		res := g.tmpName()
-		expr := "({ " + prologue + ctype(rt) + " " + res + "; " + ctype(t.Val) + " *zx__p;" +
+		keyPre, keyExpr, keyPost := g.mapKeyArg(x.Args[0], t.Key)
+		expr := "({ " + prologue + keyPre + ctype(rt) + " " + res + "; " + ctype(t.Val) + " *zx__p;" +
 			" int zx__hit = zx_hashmap_get_" + mn + "(&" + recv + ", " +
-			g.consume(x.Args[0]) + ", &zx__p);" + epilogue +
+			keyExpr + ", &zx__p);" + keyPost + epilogue +
 			" " + optionExpr(rt, types.RefTo(t.Val, false), "zx__hit", "zx__p") + "; })"
 		return expr
 	case "remove":
 		rt := g.info.TypeOf(x)
 		res := g.tmpName()
-		expr := "({ " + prologue + ctype(rt) + " " + res + "; " + ctype(t.Val) + " zx__old;" +
+		keyPre, keyExpr, keyPost := g.mapKeyArg(x.Args[0], t.Key)
+		expr := "({ " + prologue + keyPre + ctype(rt) + " " + res + "; " + ctype(t.Val) + " zx__old;" +
 			" int zx__hit = zx_hashmap_remove_" + mn + "(&" + recv + ", " +
-			g.consume(x.Args[0]) + ", &zx__old);" + epilogue +
+			keyExpr + ", &zx__old);" + keyPost + epilogue +
 			" " + optionExpr(rt, t.Val, "zx__hit", "zx__old") + "; })"
 		return expr
 	case "contains_key":
-		return "({ " + prologue + "(bool)zx_hashmap_contains_" + mn + "(&" + recv + ", " +
-			g.consume(x.Args[0]) + ");" + epilogue + " })"
+		keyPre, keyExpr, keyPost := g.mapKeyArg(x.Args[0], t.Key)
+		res := g.tmpName()
+		return "({ " + prologue + keyPre + "bool " + res + " = (bool)zx_hashmap_contains_" + mn + "(&" + recv + ", " +
+			keyExpr + ");" + keyPost + epilogue + " " + res + "; })"
 	}
 	return "0 /* unhandled HashMap method */"
 }

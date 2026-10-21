@@ -516,10 +516,15 @@ func (p *parser) parseImportLike(start token.Pos, allowDots bool, vis ast.Visibi
 		// relative to this one. Keep parsing a following `as` clause too so
 		// the loader can give its deliberate M1-preview diagnostic uniformly.
 		d.File = p.bump().Lit
-		if p.at(token.KindStar) {
-			// `use "helpers.zx"::*;` — glob import of a file module.
+		if p.at(token.KindColonColon) || (allowDots && p.at(token.KindDot)) {
 			p.bump()
-			d.Glob = true
+			if p.at(token.KindStar) {
+				// `use "helpers.zx"::*;` — glob import of a file module.
+				p.bump()
+				d.Glob = true
+			} else {
+				p.errf(p.cur(), "E0202", "expected `*` after a file import path")
+			}
 		}
 	} else {
 		d.Path = append(d.Path, p.expectIdentPath("import path"))

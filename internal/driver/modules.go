@@ -273,7 +273,7 @@ func (l *loader) loadModule(key, display string, src []byte, dir string) *module
 	m.file = file
 	m.exports = computeExports(file.Items)
 	l.order = append(l.order, m)
-	l.collectImports(m, file.Items, nil)
+	l.collectImports(m, m, file.Items, nil)
 	return m
 }
 
@@ -309,38 +309,42 @@ func computeExports(items []ast.Item) map[string]bool {
 // Inline `mod { ... }` blocks become synthetic modules so `mod::item` is
 // checked against their exports too; prefix carries the enclosing inline-module
 // path so nested `mod outer { mod inner { .. } }` binds `outer::inner::item`.
-func (l *loader) collectImports(m *module, items []ast.Item, prefix []string) {
+// root is the file module whose flat namespace is being built; owner is the
+// inline module that directly contains items, so imports declared inside an
+// inline block bind in that block's scope.
+func (l *loader) collectImports(root, owner *module, items []ast.Item, prefix []string) {
 	for _, it := range items {
 		switch d := it.(type) {
 		case *ast.UseDecl:
-			l.bindUse(m, d)
+			l.bindUse(owner, d)
 		case *ast.ModDecl:
 			if d.Inline {
 				childPrefix := append(append([]string{}, prefix...), d.Name)
+				childItems := d.Items
+				if childItems == nil {
+					childItems = []ast.Item{}
+				}
 				sub := &module{
-					key:     m.key + "::" + strings.Join(childPrefix, "::"),
-					dir:     m.dir,
-					file:    m.file,
-					items:   d.Items,
-					exports: computeExports(d.Items),
+					key:     root.key + "::" + strings.Join(childPrefix, "::"),
+					dir:     owner.dir,
+					file:    owner.file,
+					items:   childItems,
+					exports: computeExports(childItems),
 				}
-				parent := m
-				if len(prefix) > 0 {
-					if p := l.mods[m.key+"::"+strings.Join(prefix, "::")]; p != nil {
-						parent = p
-					}
-				}
-				sub.parent = parent
+				sub.parent = owner
 				l.mods[sub.key] = sub
-				if parent.submods == nil {
-					parent.submods = map[string]*module{}
+				if owner.submods == nil {
+					owner.submods = map[string]*module{}
 				}
-				parent.submods[d.Name] = sub
-				m.imports = append(m.imports, importBinding{prefix: childPrefix, target: sub})
-				l.collectImports(m, d.Items, childPrefix)
+				owner.submods[d.Name] = sub
+				l.bind(owner, []string{d.Name}, sub, d.Sp)
+				if owner != root {
+					l.bind(root, childPrefix, sub, d.Sp)
+				}
+				l.collectImports(root, sub, childItems, childPrefix)
 				continue
 			}
-			l.bindMod(m, d, prefix)
+			l.bindMod(root, owner, d, prefix)
 		}
 	}
 }
@@ -350,32 +354,35 @@ func (l *loader) collectImports(m *module, items []ast.Item, prefix []string) {
 // files), searching next to the declaring file and at the project root. It
 // records the `name::` qualifier (respecting any enclosing inline-module
 // prefix).
-func (l *loader) bindMod(m *module, d *ast.ModDecl, prefix []string) {
+func (l *loader) bindMod(root, owner *module, d *ast.ModDecl, prefix []string) {
 	qual := append(append([]string{}, prefix...), d.Name)
-	for _, dir := range l.searchDirs(m.dir) {
+	bind := func(target *module) {
+		if target == nil {
+			return
+		}
+		l.bind(owner, []string{d.Name}, target, d.Sp)
+		if owner != root {
+			l.bind(root, qual, target, d.Sp)
+		}
+	}
+	for _, dir := range l.searchDirs(owner.dir) {
 		cand := filepath.Join(dir, d.Name+".zx")
 		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
-			if target := l.loadDisk(cand); target != nil {
-				l.bind(m, qual, target, d.Sp)
-			}
+			bind(l.loadDisk(cand))
 			return
 		}
 	}
-	for _, dir := range l.searchDirs(m.dir) {
+	for _, dir := range l.searchDirs(owner.dir) {
 		pkgDir := filepath.Join(dir, d.Name)
 		st, err := os.Stat(pkgDir)
 		if err != nil || !st.IsDir() {
 			continue
 		}
 		if modFile := filepath.Join(pkgDir, "mod.zx"); fileExists(modFile) {
-			if target := l.loadDisk(modFile); target != nil {
-				l.bind(m, qual, target, d.Sp)
-			}
+			bind(l.loadDisk(modFile))
 			return
 		}
-		if pkg := l.loadPackage(pkgDir); pkg != nil {
-			l.bind(m, qual, pkg, d.Sp)
-		}
+		bind(l.loadPackage(pkgDir))
 		return
 	}
 	l.em.Report(diag.New("E9023", "cannot find module `%s` (looked for %s.zx and %s/mod.zx)", d.Name, d.Name, d.Name).WithSpan(d.Sp))

@@ -52,11 +52,31 @@ fn main() -> i32 {
     println(a.len());
     println(unwrap_or(a.remove(100), -1));
 
+    // Collision cluster: these keys share the same home slot, so removing the
+    // first one exercises backward-shift deletion. The remaining keys must
+    // stay reachable, and re-inserting the removed keys must keep len right.
+    let mut cluster: HashMap<i64, i64> = HashMap::new();
+    cluster.insert(-9509, 1);
+    cluster.insert(-9321, 2);
+    cluster.insert(-9222, 3);
+    cluster.insert(-8960, 4);
+    println(cluster.len(), cluster.contains_key(-9509), cluster.contains_key(-9321), cluster.contains_key(-9222), cluster.contains_key(-8960));
+    println(unwrap_or(cluster.remove(-9509), -1), cluster.len());
+    println(cluster.contains_key(-9509), cluster.contains_key(-9321), cluster.contains_key(-9222), cluster.contains_key(-8960));
+    println(unwrap_or(cluster.remove(-9222), -1), cluster.len());
+    println(cluster.contains_key(-9321), cluster.contains_key(-8960));
+    cluster.insert(-9509, 9);
+    cluster.insert(-9222, 7);
+    println(cluster.len(), cluster.contains_key(-9509), cluster.contains_key(-9222));
+
     // String keys.
     let mut s: HashMap<String, i64> = HashMap::new();
     s.insert(String::from("x"), 1);
     s.insert(String::from("y"), 2);
     println(s.contains_key(String::from("x")), s.contains_key(String::from("z")));
+    // Lookups borrow a place key instead of moving it, so it is reusable.
+    let key = String::from("x");
+    println(s.contains_key(key), s.contains_key(key));
 
     // bool, char, and str keys.
     let mut b: HashMap<bool, i64> = HashMap::new();
@@ -89,6 +109,35 @@ fn main() -> i32 {
         j += 1;
     }
     println(found);
+
+    // Removing from a larger table must keep every surviving entry reachable
+    // and every removed entry absent.
+    let mut rem: HashMap<i64, i64> = HashMap::new();
+    let mut r: i64 = 0;
+    while r < 64 {
+        rem.insert(r, r);
+        r += 1;
+    }
+    r = 0;
+    while r < 64 {
+        if r % 3 == 0 {
+            rem.remove(r);
+        }
+        r += 1;
+    }
+    let mut still: i64 = 0;
+    r = 0;
+    while r < 64 {
+        if r % 3 == 0 {
+            if rem.contains_key(r) {
+                still += 1000;
+            }
+        } else if rem.contains_key(r) {
+            still += 1;
+        }
+        r += 1;
+    }
+    println(rem.len(), still);
 
     0
 }

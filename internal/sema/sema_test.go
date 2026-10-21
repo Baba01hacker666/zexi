@@ -1651,6 +1651,38 @@ fn main() -> i32 { let m: HashMap<Point, i32> = HashMap::new(); println(m.len())
 	}
 }
 
+// TestHashMapTemporaryGet checks that `get`, which returns `Option<&V>`, is
+// rejected on a temporary map that would be dropped at the end of the call.
+// Place and borrowed receivers stay valid.
+func TestHashMapTemporaryGet(t *testing.T) {
+	ok, codes := check(t, `fn make() -> HashMap<i32, i32> { HashMap::new() }
+fn first(m: &HashMap<i32, i32>) -> bool {
+    match m.get(1) {
+        Some(_) => true,
+        None => false,
+    }
+}
+fn main() -> i32 {
+    let mut m: HashMap<i32, i32> = HashMap::new();
+    m.insert(1, 2);
+    let _p = m.get(1);
+    println(first(&m));
+    0
+}`)
+	if !ok {
+		t.Fatalf("place/borrowed get: expected clean, got %v", codes)
+	}
+
+	ok, codes = check(t, `fn make() -> HashMap<i32, i32> { HashMap::new() }
+fn main() -> i32 {
+    let _p = make().get(1);
+    0
+}`)
+	if ok || !has(codes, "E0716") {
+		t.Fatalf("temporary get: expected E0716, got ok=%v codes=%v", ok, codes)
+	}
+}
+
 // TestPrintlnFormat checks `{}` interpolation in println/print: the literal
 // first argument becomes the format string, each placeholder is type-checked
 // as printable, and arity mismatches are diagnosed.

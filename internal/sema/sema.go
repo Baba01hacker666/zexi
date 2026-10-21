@@ -3816,6 +3816,9 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 		return c.inferVecMethod(x, base)
 	}
 	if base != nil && base.Kind == types.MapKind {
+		if x.Name == "get" && !c.isPlace(x.Recv) && (rt == nil || (rt.Kind != types.Ref && rt.Kind != types.Ptr)) {
+			c.errAt(x.Recv, "E0716", "temporary `HashMap` value dropped while borrowed; bind it to a variable first")
+		}
 		return c.inferMapMethod(x, base)
 	}
 	// `len()` is also available directly on arrays and `str` values.

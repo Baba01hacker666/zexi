@@ -135,8 +135,10 @@ func TestRunPrograms(t *testing.T) {
 			want: strings.Join([]string{
 				"2 false", "one", "one", "2", "two", "1 false", "0",
 				"11 0", "3", "-1",
-				"true false", "true true", "true false", "true false",
-				"200", "200", "",
+				"4 true true true true", "1 3", "false true true true",
+				"3 2", "true true", "4 true true",
+				"true false", "true true", "true true", "true false", "true false",
+				"200", "200", "42 42", "",
 			}, "\n"),
 		},
 		{
@@ -1990,10 +1992,9 @@ func TestModulePrivacy(t *testing.T) {
 	}
 }
 
-// TestGlobAndReexport checks the two self-contained module pieces that do not
-// require full isolation: a `pub use` re-exports the target's public items so
-// a downstream module can reach them, and `use foo::*;` parses (the flat
-// namespace already makes the items visible, so it is a no-op for resolution).
+// TestGlobAndReexport checks that `pub use` re-exports the target's public
+// items to a downstream module, that `use foo::*;` brings public items into
+// unqualified scope, and that private items are not re-exported.
 func TestGlobAndReexport(t *testing.T) {
 	if _, err := exec.LookPath("cc"); err != nil {
 		t.Skip("no C compiler available")
@@ -2038,6 +2039,79 @@ fn main() -> i32 { fac::secret() }
 	em.Render(&buf, em.FirstFileID())
 	if !strings.Contains(buf.String(), "E0412") {
 		t.Fatalf("expected E0412 for a non-re-exported item, got:\n%s", buf.String())
+	}
+}
+
+// TestInlineModuleImportsAndFileGlob checks that imports declared inside an
+// inline module bind in that module's scope, that `use "file.zx"::*;` parses,
+// that a dangling `::` is rejected, and that an empty inline module does not
+// inherit its enclosing file's items.
+func TestInlineModuleImportsAndFileGlob(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	files := map[string]string{
+		"helpers.zx": "pub fn triple(n: i32) -> i32 { n * 3 }\n",
+		"main.zx": `use "helpers.zx"::*;
+mod inline {
+    use math;
+    mod inner {
+        use math;
+        pub fn root2() -> f64 { math::sqrt(9.0) }
+    }
+    pub fn root() -> f64 { math::sqrt(4.0) }
+}
+fn main() -> i32 { println(inline::root(), inline::inner::root2(), triple(4)); 0 }
+`,
+		"empty.zx": `mod empty {}
+pub fn value() -> i32 { 7 }
+fn main() -> i32 { println(empty::value()); 0 }
+`,
+		"badglob.zx": `use "helpers.zx"::;
+fn main() -> i32 { 0 }
+`,
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(filepath.Join(dir, "main.zx"), out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("inline-import/file-glob program failed to build")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running inline-import/file-glob program: %v", err)
+	}
+	if want := "2 3 12\n"; string(raw) != want {
+		t.Fatalf("output mismatch: got %q want %q", string(raw), want)
+	}
+
+	// An empty inline module must not silently expose the enclosing file's
+	// declarations through its qualifier.
+	em = diag.NewEmitter()
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "empty.zx"), driver.Options{}, em); ok {
+		t.Fatal("expected empty::value to be rejected")
+	}
+	var buf bytes.Buffer
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E0412") {
+		t.Fatalf("expected E0412 for empty module lookup, got:\n%s", buf.String())
+	}
+
+	// A file glob must consume `::` before `*` and reject a dangling separator.
+	em = diag.NewEmitter()
+	if _, ok := driver.FrontEnd(filepath.Join(dir, "badglob.zx"), driver.Options{}, em); ok {
+		t.Fatal("expected a dangling file-import separator to be rejected")
+	}
+	buf.Reset()
+	em.Render(&buf, em.FirstFileID())
+	if !strings.Contains(buf.String(), "E0202") {
+		t.Fatalf("expected E0202 for a dangling file-import separator, got:\n%s", buf.String())
 	}
 }
 
