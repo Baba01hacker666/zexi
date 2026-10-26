@@ -1,0 +1,8 @@
+// `print`/`println` accept only printable types.
+struct S { x: i64 }
+
+fn main() -> i32 {
+    let s = S { x: 1 };
+    println(s); // error: E0277 `S` cannot be printed
+    0
+}

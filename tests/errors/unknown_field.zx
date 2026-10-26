@@ -1,0 +1,8 @@
+// A field that does not exist on the struct.
+struct P { x: i64 }
+
+fn main() -> i32 {
+    let p = P { x: 1 };
+    println(p.zz); // error: E0609 no field `zz` on type `P`
+    0
+}

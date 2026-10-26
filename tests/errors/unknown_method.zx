@@ -1,0 +1,6 @@
+// A method that does not exist on the receiver's type.
+fn main() -> i32 {
+    let n = 1;
+    println(n.frobnicate()); // error: E0599 no method `frobnicate` on type `i32`
+    0
+}

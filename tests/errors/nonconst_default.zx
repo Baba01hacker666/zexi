@@ -1,0 +1,8 @@
+// A parameter default must be a compile-time constant.
+fn g() -> i64 { return 1; }
+fn f(n: i64 = g()) -> i64 { return n; } // error: E0602 default value for parameter `n` is not a constant expression
+
+fn main() -> i32 {
+    println(f(2));
+    0
+}

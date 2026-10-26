@@ -1,0 +1,7 @@
+// Two items with the same name.
+struct T { x: i64 }
+struct T { y: i64 } // error: E0428 the struct `T` is defined multiple times
+
+fn main() -> i32 {
+    0
+}

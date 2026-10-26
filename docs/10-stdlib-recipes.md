@@ -17,6 +17,7 @@ Use `serve_local` during development when a server should be reachable only
 from the same machine. It binds `127.0.0.1`, unlike `serve`, whose default host
 is `0.0.0.0`.
 
+<!-- check-only -->
 ```zx
 import http.server;
 
@@ -41,6 +42,7 @@ readiness probes do not count.
 
 To serve a local directory without writing an accept loop:
 
+<!-- check-only -->
 ```zx
 import http.server;
 

@@ -1,0 +1,9 @@
+// An arm after a catch-all can never match.
+fn main() -> i32 {
+    let n = 5;
+    match n {
+        _ => println("any"),
+        5 => println("five"), // error: E0001 unreachable pattern: an earlier arm already matches everything
+    }
+    0
+}

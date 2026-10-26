@@ -1,0 +1,7 @@
+// A type name that is not in scope.
+fn f(x: Nope) -> i64 { return 1; } // error: E0412 cannot find type `Nope` in this scope
+
+fn main() -> i32 {
+    println(f(0));
+    0
+}

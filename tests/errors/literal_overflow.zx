@@ -1,0 +1,6 @@
+// The literal does not fit the declared integer type.
+fn main() -> i32 {
+    let x: i8 = 300; // error: E0080 integer literal `300` does not fit in `i8`
+    println(x as i64);
+    0
+}

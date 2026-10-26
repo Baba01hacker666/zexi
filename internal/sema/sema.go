@@ -245,7 +245,15 @@ type breakInfo struct {
 }
 
 func (c *checker) errf(sp token.Span, code, format string, args ...any) {
-	c.errs = append(c.errs, diag.New(code, format, args...).WithSpan(sp))
+	d := diag.New(code, format, args...)
+	// A message that mentions the invalid type is a cascade: some earlier
+	// error (an unknown name, an unresolved type) already reported the root
+	// cause and left `<invalid>` behind. Drop the follow-on so one mistake
+	// yields one diagnostic, as rustc does for its error types.
+	if strings.Contains(d.Message, "<invalid>") {
+		return
+	}
+	c.errs = append(c.errs, d.WithSpan(sp))
 }
 
 func (c *checker) errAt(e ast.Expr, code, format string, args ...any) {
@@ -1409,7 +1417,7 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		return c.inferUnary(x, expected)
 
 	case *ast.BinExpr:
-		return c.inferBinary(x)
+		return c.inferBinary(x, expected)
 
 	case *ast.AssignExpr:
 		return c.inferAssign(x)
@@ -1810,7 +1818,7 @@ func isComparison(op token.Kind) bool {
 	return false
 }
 
-func (c *checker) inferBinary(x *ast.BinExpr) *types.Type {
+func (c *checker) inferBinary(x *ast.BinExpr, expected *types.Type) *types.Type {
 	if x.Op == token.KindDotDot || x.Op == token.KindDotDotEq {
 		lt := c.checkExpr(x.L, nil)
 		rt := c.checkExpr(x.R, nil)
@@ -1825,8 +1833,16 @@ func (c *checker) inferBinary(x *ast.BinExpr) *types.Type {
 		return types.UnitT
 	}
 
-	lt := c.checkExpr(x.L, nil)
-	rt := c.checkExpr(x.R, nil)
+	// A tree of integer literals adopts a numeric type from context, so
+	// `let x: i64 = 5 ^ 3` is `i64`, not the `i32` bare literals default to.
+	var lt, rt *types.Type
+	if expected != nil && expected.Kind.IsNumeric() && intLiteralExpr(x.L) && intLiteralExpr(x.R) {
+		lt = c.checkExpr(x.L, expected)
+		rt = c.checkExpr(x.R, expected)
+	} else {
+		lt = c.checkExpr(x.L, nil)
+		rt = c.checkExpr(x.R, nil)
+	}
 	// String concatenation: `+` over any mix of `str`/`String` produces a
 	// fresh `String`. Both operands are borrowed (their bytes are copied), so
 	// they remain usable afterwards. A number, `bool`, or `char` on one side is
@@ -1844,12 +1860,19 @@ func (c *checker) inferBinary(x *ast.BinExpr) *types.Type {
 	if isComparison(x.Op) && isStrLike(lt) && isStrLike(rt) {
 		return types.BoolT
 	}
-	// Integer literals adopt the type of the other operand.
+	// Integer literals adopt the type of the other operand. A literal
+	// expression (`-7`, `1 + 2`) adopts only from a side that is not itself
+	// one, so `-9223372036854775807 - 1` keeps its natural `i64` and lets the
+	// bare `1` follow it, while `-7 + x` follows `x`'s type.
 	if !types.Equal(lt, rt) {
 		switch {
 		case isIntLiteral(x.L) && rt.Kind.IsNumeric():
 			lt = c.checkExpr(x.L, rt)
 		case isIntLiteral(x.R) && lt.Kind.IsNumeric():
+			rt = c.checkExpr(x.R, lt)
+		case intLiteralExpr(x.L) && !intLiteralExpr(x.R) && rt.Kind.IsNumeric():
+			lt = c.checkExpr(x.L, rt)
+		case intLiteralExpr(x.R) && !intLiteralExpr(x.L) && lt.Kind.IsNumeric():
 			rt = c.checkExpr(x.R, lt)
 		case c.adoptInt(lt, rt) != nil:
 			// A variable defaulted from a bare literal adopts the other
@@ -3311,6 +3334,28 @@ func isCatchAll(p ast.Pattern) bool {
 	return false
 }
 
+// coversAllVariants reports whether earlier arms cover every variant of an
+// enum scrutinee, so a later catch-all cannot match anything new. Coverage is
+// tracked per variant name: a payload pattern like `E::A(x)` matches the whole
+// variant, since nested patterns are not part of the language.
+func coversAllVariants(base *types.Type, covered map[string]bool) bool {
+	if base == nil || base.Kind != types.EnumKind || base.En == nil || len(base.En.Variants) == 0 {
+		return false
+	}
+	for _, v := range base.En.Variants {
+		if !covered[v.Name] {
+			return false
+		}
+	}
+	return true
+}
+
+// coversBothBools reports whether earlier literal arms match both `true` and
+// `false`, so a later catch-all cannot match anything new.
+func coversBothBools(base *types.Type, boolsCovered map[string]bool) bool {
+	return base != nil && base.Kind == types.Bool && boolsCovered["true"] && boolsCovered["false"]
+}
+
 // litPatKey canonicalises a literal pattern so duplicates can be rejected before
 // they become duplicate C `case` labels.
 func litPatKey(p *ast.LitPat) string {
@@ -3377,8 +3422,18 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 	catchAll := false
 	for _, arm := range x.Arms {
 		guarded := arm.Guard != nil
+		// dead marks an arm that can never match: an earlier catch-all
+		// already matches everything, or (for an enum/bool scrutinee) the
+		// earlier arms cover every case. Report it once at the top; the
+		// per-pattern checks below stay quiet for the same arm.
+		dead := false
+		if !guarded && catchAll {
+			dead = true
+			c.errf(arm.Pat.Span(), "E0001", "unreachable pattern: an earlier arm already matches everything")
+		}
 		if !guarded && isCatchAll(arm.Pat) {
-			if catchAll {
+			if !dead && (coversAllVariants(base, covered) || coversBothBools(base, boolsCovered)) {
+				dead = true
 				c.errf(arm.Pat.Span(), "E0001", "unreachable pattern: an earlier arm already matches everything")
 			}
 			catchAll = true
@@ -3387,7 +3442,7 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 			// Each literal becomes one C `case`, and duplicate cases are invalid
 			// C, so catch them here with a real diagnostic.
 			key := litPatKey(lp)
-			if litCovered[key] {
+			if !dead && litCovered[key] {
 				c.errf(lp.Sp, "E0001", "unreachable pattern: this value is already covered")
 			}
 			litCovered[key] = true
@@ -3406,7 +3461,7 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 			// alternative makes the whole arm a catch-all.
 			for _, alt := range op.Alts {
 				if isCatchAll(alt) {
-					if catchAll {
+					if !dead && catchAll {
 						c.errf(alt.Span(), "E0001", "unreachable pattern: an earlier arm already matches everything")
 					}
 					catchAll = true
@@ -3421,7 +3476,7 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 		c.checkPattern(arm.Pat, st, borrowed)
 		if pp, ok := arm.Pat.(*ast.PathPat); ok && !guarded {
 			if v := c.info.PatVariant[pp]; v != nil {
-				if covered[v.Name] {
+				if !dead && covered[v.Name] {
 					c.errf(arm.Pat.Span(), "E0001", "unreachable pattern: `%s` is already covered", v.Name)
 				}
 				covered[v.Name] = true
@@ -3436,7 +3491,7 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 				}
 				if v := c.info.PatVariant[pp]; v != nil && !seenHere[v.Name] {
 					seenHere[v.Name] = true
-					if covered[v.Name] {
+					if !dead && covered[v.Name] {
 						c.errf(alt.Span(), "E0001", "unreachable pattern: `%s` is already covered", v.Name)
 					}
 					covered[v.Name] = true
@@ -4636,6 +4691,22 @@ const maxArrayLen = 1 << 20
 func isIntLiteral(e ast.Expr) bool {
 	l, ok := e.(*ast.LiteralExpr)
 	return ok && l.Kind == token.KindInteger
+}
+
+// intLiteralExpr reports whether e is a pure integer-literal expression: an
+// integer literal, a unary minus on one, or two of them combined with a binary
+// operator. Only the value of such an expression is fixed; its type is still
+// pending, so it can adopt a numeric type from the surrounding context.
+func intLiteralExpr(e ast.Expr) bool {
+	switch n := e.(type) {
+	case *ast.LiteralExpr:
+		return n.Kind == token.KindInteger
+	case *ast.UnExpr:
+		return n.Op == token.KindMinus && intLiteralExpr(n.X)
+	case *ast.BinExpr:
+		return intLiteralExpr(n.L) && intLiteralExpr(n.R)
+	}
+	return false
 }
 
 // intValFits reports whether a folded integer constant fits in the integer type

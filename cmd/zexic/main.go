@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 
@@ -26,6 +27,53 @@ import (
 )
 
 const version = "zexi 0.1.0 (M0-alpha + M1 foundations: modules, projects, stdlib, native C)"
+
+// releaseVersion is stamped by a release build with
+// -ldflags "-X main.releaseVersion=zexi 0.2.0 (...)" and replaces the version
+// line; a source build instead appends the revision `go build` recorded.
+var releaseVersion string
+
+// versionString reports the compiler's version, from a release's build stamp
+// or, in a source build, beside the VCS revision the toolchain embedded in
+// the binary (`git describe` for a checkout, through `go build`'s VCS info).
+func versionString() string {
+	if releaseVersion != "" {
+		return releaseVersion
+	}
+	if rev := buildRevision(); rev != "" {
+		return version + " (built from " + rev + ")"
+	}
+	return version
+}
+
+// buildRevision reports the VCS revision `go build` recorded in the binary,
+// shortened and marked when the build tree was dirty. Empty when unknown.
+func buildRevision() string {
+	bi, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	var rev string
+	dirty := false
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			rev = s.Value
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	if rev == "" {
+		return ""
+	}
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	if dirty {
+		rev += "+dirty"
+	}
+	return rev
+}
 
 func main() { os.Exit(run(os.Args[1:])) }
 
@@ -47,6 +95,9 @@ type cli struct {
 	// jobs is how many C translation units to compile in parallel
 	// (0 = automatic, 1 = single file).
 	jobs int
+	// msgFormat selects how diagnostics are printed: "human" (default) or
+	// "json" (one JSON object per line).
+	msgFormat string
 }
 
 func parseArgs(args []string) cli {
@@ -70,6 +121,8 @@ func parseArgs(args []string) cli {
 			c.emit = strings.TrimPrefix(a, "--emit=")
 		case strings.HasPrefix(a, "--opt-level="):
 			c.optLevel = strings.TrimPrefix(a, "--opt-level=")
+		case strings.HasPrefix(a, "--message-format="):
+			c.msgFormat = strings.TrimPrefix(a, "--message-format=")
 		case strings.HasPrefix(a, "--cc="):
 			c.cc = strings.TrimPrefix(a, "--cc=")
 		case strings.HasPrefix(a, "--root="):
@@ -115,10 +168,16 @@ func run(args []string) int {
 	}
 	cmd := args[0]
 	c := parseArgs(args[1:])
+	switch c.msgFormat {
+	case "", "human", "json":
+	default:
+		fmt.Fprintf(os.Stderr, "zexic: unknown --message-format=%q (want human or json)\n", c.msgFormat)
+		return 2
+	}
 
 	switch cmd {
 	case "version", "--version", "-V":
-		fmt.Println(version)
+		fmt.Println(versionString())
 		return 0
 	case "help", "--help", "-h":
 		usage(os.Stdout)
@@ -150,6 +209,16 @@ func requireFile(c cli, cmd string) (string, bool) {
 	return c.positional[0], true
 }
 
+// renderDiags prints the collected diagnostics in the selected
+// --message-format: the human rustc-like form (default) or JSONL for tools.
+func renderDiags(c cli, em *diag.Emitter, fileID int) {
+	if c.msgFormat == "json" {
+		em.RenderJSON(os.Stderr, fileID)
+		return
+	}
+	em.Render(os.Stderr, fileID)
+}
+
 // resolveInputs resolves the first positional argument as a project entry: a
 // `.zx` file or a directory containing `main.zx`/`src/main.zx`. It returns the
 // entry plus any extra files and the project root to pass through Options.
@@ -175,7 +244,7 @@ func cmdTokenize(c cli) int {
 	em := diag.NewEmitter()
 	toks, fileID, ok := driver.Tokens(path, em)
 	if !ok {
-		em.Render(os.Stderr, fileID)
+		renderDiags(c, em, fileID)
 		return 1
 	}
 	for _, t := range toks {
@@ -197,7 +266,7 @@ func cmdCheck(c cli) int {
 	em := diag.NewEmitter()
 	art, ok := driver.FrontEndFiles(paths, c.opts(), em)
 	if !ok {
-		em.Render(os.Stderr, emFileID(em))
+		renderDiags(c, em, emFileID(em))
 		return 1
 	}
 	fmt.Printf("%s: ok (%d function(s), %d constant(s))\n", filepath.Base(paths[0]), len(art.Info.FnOrder), len(art.Info.Consts))
@@ -213,7 +282,7 @@ func cmdBuild(c cli) int {
 	em := diag.NewEmitter()
 	out, ok := driver.BuildFiles(paths, c.out, c.opts(), em)
 	if !ok {
-		em.Render(os.Stderr, emFileID(em))
+		renderDiags(c, em, emFileID(em))
 		return 1
 	}
 	fmt.Printf("built %s\n", out)
@@ -239,7 +308,7 @@ func cmdRun(c cli) int {
 
 	out := filepath.Join(dir, driver.DefaultOutput(paths[0]))
 	if _, ok := driver.BuildFiles(paths, out, c.opts(), em); !ok {
-		em.Render(os.Stderr, emFileID(em))
+		renderDiags(c, em, emFileID(em))
 		return 1
 	}
 
@@ -276,7 +345,7 @@ func cmdEmit(c cli) int {
 	opts.Jobs = 1 // emit prints one translation unit
 	art, ok := driver.FrontEndFiles(paths, opts, em)
 	if !ok {
-		em.Render(os.Stderr, emFileID(em))
+		renderDiags(c, em, emFileID(em))
 		return 1
 	}
 	fmt.Print(art.CSrc)
@@ -340,6 +409,9 @@ options:
   --cc=<path>                C compiler to use (default $CC or cc)
   --emit=<c>                 intermediate form to print
   --root=<dir>               project root for named imports and mod
+  --message-format=<human|json>
+                             diagnostic output: rustc-like (default) or one
+                             JSON object per line for tools
 
 C bridge options (build/run):
   --csrc=<file.c>            extra C source compiled and linked in (repeatable)

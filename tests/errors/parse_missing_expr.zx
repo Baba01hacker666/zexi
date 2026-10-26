@@ -1,0 +1,6 @@
+// A missing expression in the middle of a statement.
+fn main() -> i32 {
+    let x = ; // error: E0202 expected an expression
+    println(x);
+    0
+}

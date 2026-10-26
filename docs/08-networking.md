@@ -81,6 +81,7 @@ fn push_int(s: &mut String, n: i64)                      // decimal formatting
 
 A server:
 
+<!-- fragment -->
 ```zx
 fn route(req: &Request) -> Reply {
     if req.path.as_str() == "/" {
@@ -104,6 +105,7 @@ fn main() -> i32 {
 
 A client:
 
+<!-- fragment -->
 ```zx
 fn main() -> i32 {
     let raw = http_get("127.0.0.1", 9090, "/");
@@ -198,6 +200,7 @@ officially fail with `error` set, because the stack is plaintext HTTP only.
 A server can be as small as a few top-level registrations plus `listen` — the
 same shape as Go's `http.HandleFunc` + `http.ListenAndServe`:
 
+<!-- check-only -->
 ```zx
 import http.server;
 
@@ -222,6 +225,7 @@ default mux: a before hook may return a valid `Response` to short-circuit
 If you want the classic `Router` value and accept loop, everything is still
 there:
 
+<!-- fragment -->
 ```zx
 fn main() -> i32 {
     let mut app = new_app();
@@ -262,7 +266,10 @@ A route segment written `{name}` matches exactly one path segment and its value
 is available as `req.param("name")` (which checks the query string first, then
 route parameters) or `req.route_param("name")`:
 
+<!-- check-only -->
 ```zx
+import http;
+
 fn user(req: &Request) -> Response {
     return Response::text(200, req.param("id").as_str());
 }
@@ -284,6 +291,7 @@ explicit routers.
 
 A directory can be served in one call, much like Python's built-in file server:
 
+<!-- check-only -->
 ```zx
 import http.server;
 

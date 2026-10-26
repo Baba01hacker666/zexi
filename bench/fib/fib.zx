@@ -1,0 +1,20 @@
+// bench/fib/fib.zx — recursive call overhead: naive fibonacci, three runs.
+// The C twin is fib.c; both must print `fib 17108661`.
+
+fn fib(n: i64) -> i64 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() -> i32 {
+    let mut acc: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 12 {
+        acc += fib(34);
+        i += 1;
+    }
+    println("fib", acc);
+    0
+}

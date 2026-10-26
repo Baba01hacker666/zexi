@@ -53,6 +53,7 @@ fn dangling() -> &i32 {
 
 M1 introduces explicit lifetime parameters only when elision fails:
 
+<!-- fragment -->
 ```zexi
 fn longest<'a>(a: &'a str, b: &'a str) -> &'a str {
     if a.len() > b.len() { a } else { b }
@@ -131,6 +132,7 @@ only what the arm did not take. A guarded arm binds a shallow copy for the
 guard and takes ownership only once the guard passes, so a failing guard
 leaves the scrutinee intact for the next arm.
 
+<!-- fragment -->
 ```zexi
 enum Msg { Text(String), Ping }
 

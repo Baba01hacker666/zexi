@@ -1,0 +1,10 @@
+// A non-Copy value may be used only once.
+struct S { x: i64 }
+
+fn main() -> i32 {
+    let a = S { x: 1 };
+    let b = a;
+    println(b.x);
+    println(a.x); // error: E0382 use of moved value `a`
+    0
+}

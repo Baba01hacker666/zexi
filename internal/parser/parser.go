@@ -88,6 +88,12 @@ func (p *parser) expect(k token.Kind, context string) bool {
 }
 
 func (p *parser) errf(t token.Token, code, format string, args ...any) {
+	// An invalid token exists only because the lexer already reported the bad
+	// character at this spot. Complaining that we "found invalid" is a
+	// cascade; skip it and let the lexical error stand alone.
+	if t.Kind == token.KindInvalid {
+		return
+	}
 	span := token.Span{Start: t.Pos.Offset, End: t.End}
 	p.errs = append(p.errs, diag.New(code, format, args...).WithSpan(span))
 }

@@ -1,0 +1,17 @@
+// bench/loops/loops.zx — integer loop arithmetic with a running modulo.
+// The C twin is loops.c; both must print the same `loops <n>` line.
+
+fn main() -> i32 {
+    let mut acc: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 5000 {
+        let mut j: i64 = 0;
+        while j < 5000 {
+            acc = (acc + (i * 31 + j) % 1000003) % 1000003;
+            j += 1;
+        }
+        i += 1;
+    }
+    println("loops", acc);
+    0
+}

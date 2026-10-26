@@ -87,6 +87,17 @@ This repository contains the **initial design and specification** of Zexi: the v
 See [`workings.md`](workings.md) for a walkthrough of the compiler pipeline and
 runtime.
 
+## Benchmarks
+
+Zexi compiles to C, so the honest expectation is near-C speed — and the
+interesting question is what the language's guarantees cost. The
+[`bench/`](bench/) suite runs each workload as a Zexi program and as the same
+program in plain C (same compiler, same flags) and refuses to rank a pair
+whose checksums differ. On the first run, pure computation matches C within
+noise, and bounds-checked indexing and owning `String` growth cost about 10%
+where they show up at all. Numbers and methodology:
+[`bench/results.md`](bench/results.md), [`bench/README.md`](bench/README.md).
+
 ## Projects
 
 A program can be one file or a whole folder. Point `zexic` at a project
@@ -189,6 +200,9 @@ internal/
 docs/                 the specification
 examples/             sample Zexi source
 tests/                programs exercised by the test suite
+  errors/             rejected programs with their expected diagnostics
+scripts/              doc-example checker and other repo tooling
+bench/                benchmarks against plain C (see bench/README.md)
 ```
 
 ## Test
@@ -197,4 +211,13 @@ tests/                programs exercised by the test suite
 go test ./...                 # unit, fuzz-corpus, and end-to-end run tests
 go test -run xxx -fuzz FuzzParse ./internal/parser   # property-test the parser
 go test -run xxx -fuzz FuzzLexer ./internal/lexer    # property-test the lexer
+python3 scripts/check_doc_examples.py --run  # compile and run every doc example
+python3 bench/run_bench.py                  # benchmark against plain C
 ```
+
+Diagnostics are pinned by fixture programs in [`tests/errors/`](tests/errors/):
+each file declares the exact errors it must produce (`// error: E0382 ...`),
+and a mismatch — a missing, extra, or changed diagnostic — fails the suite.
+The documentation's fenced `zx` blocks are checked the same way the code is:
+`check_doc_examples.py` compiles each one (wrapping fragments as needed) so
+the docs cannot drift away from the compiler.

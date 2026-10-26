@@ -274,6 +274,7 @@ enum in a built-in `core` scope), so they are usable without an import — match
 `examples/result.zx`. They carry no compiler magic beyond being always in scope.
 `String`/`String::from` receive the same treatment today, so this is consistent.
 
+<!-- fragment -->
 ```zx
 enum Option<T> { Some(T), None }
 enum Result<T, E> { Ok(T), Err(E) }
@@ -286,6 +287,7 @@ enum Result<T, E> { Ok(T), Err(E) }
 bindings and early-return arm) is stored in `Info.TryMatches`, keyed by the
 `*ast.TryExpr`, and codegen emits it with the normal match path:
 
+<!-- fragment -->
 ```zx
 // in a function returning Result<..,..>
 let n = parse_u32(s)?;

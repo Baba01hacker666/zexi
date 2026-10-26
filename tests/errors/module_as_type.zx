@@ -1,0 +1,8 @@
+// A module name is not a type.
+use math as m;
+
+fn main() -> i32 {
+    let x: m = 0; // error: E0433 `m` is a module and cannot be used as a value or type
+    println(x);
+    0
+}

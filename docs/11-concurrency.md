@@ -34,6 +34,8 @@ result. Joining an unknown or already-joined handle returns `0` rather than
 misbehaving, so a double join is harmless.
 
 ```zx
+import thread;
+
 fn range_sum(lo: i64, hi: i64) -> i64 {
     let mut s: i64 = 0;
     let mut i: i64 = lo;

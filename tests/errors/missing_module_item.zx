@@ -1,0 +1,9 @@
+// Qualified access to a name the module does not export.
+mod m {
+    pub fn f() -> i64 { return 1; }
+}
+
+fn main() -> i32 {
+    println(m::g()); // error: E0412 module `m` has no item named `g`
+    0
+}

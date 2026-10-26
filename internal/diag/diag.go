@@ -4,6 +4,7 @@
 package diag
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
@@ -136,6 +137,16 @@ func (e *Emitter) Count(s Severity) int {
 	return n
 }
 
+// Diags returns the collected diagnostics in render order. It lets tests and
+// tooling (an LSP, a fixture runner) match on codes and messages without
+// re-parsing rendered text.
+func (e *Emitter) Diags() []Diagnostic {
+	e.sortBySpan()
+	out := make([]Diagnostic, len(e.diags))
+	copy(out, e.diags)
+	return out
+}
+
 func (e *Emitter) sortBySpan() {
 	if e.sorted {
 		return
@@ -155,6 +166,34 @@ func (e *Emitter) Render(w io.Writer, fileID int) {
 	e.sortBySpan()
 	for _, d := range e.diags {
 		e.renderOne(w, d, fileID)
+	}
+}
+
+// RenderJSON writes each diagnostic as one JSON object per line (JSONL) with
+// its code, severity, message, file/line/col, and notes/help. It is a view of
+// the same data Render prints — `--message-format=json` is a view change and
+// nothing more — for editors, CI, and other tools.
+func (e *Emitter) RenderJSON(w io.Writer, fileID int) {
+	e.sortBySpan()
+	enc := json.NewEncoder(w)
+	for _, d := range e.diags {
+		file := e.files[fileID]
+		line, col, _, _ := locate(file, d.Span)
+		out := map[string]any{
+			"severity": d.Severity.String(),
+			"code":     d.Code,
+			"message":  d.Message,
+			"file":     file.Name,
+			"line":     line,
+			"col":      col,
+		}
+		if len(d.Notes) > 0 {
+			out["notes"] = d.Notes
+		}
+		if d.Help != "" {
+			out["help"] = d.Help
+		}
+		_ = enc.Encode(out) // Encode appends the newline
 	}
 }
 
