@@ -51,6 +51,16 @@ type Options struct {
 	// Pthreads adds -pthread to the C compiler command line. The driver sets
 	// it automatically when the program imports `thread`.
 	Pthreads bool
+	// Overlay supplies in-memory file contents (for unsaved editor buffers),
+	// shadowing the disk for matching paths. Keys are cleaned to absolute,
+	// symlink-resolved form when FrontEnd runs; values may be nil to mean
+	// "deleted". The overlay is read-only from the driver's perspective.
+	Overlay map[string][]byte
+	// CheckOnly stops after type checking: no C is generated. The returned
+	// Artifacts carry the semantic Info when checking produced one, even when
+	// ok is false, so editor tooling can still answer queries over erroneous
+	// programs. The regular Compile path is unaffected.
+	CheckOnly bool
 }
 
 // Artifacts is the result of a successful front end + codegen run.
@@ -98,6 +108,7 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 		return nil, false
 	}
 	l := newLoader(em)
+	l.overlay = normalizeOverlay(opts.Overlay)
 	l.root = ProjectRoot(paths[0], opts.Root)
 	for i, path := range paths {
 		id := l.loadDiskFile(path)
@@ -106,10 +117,16 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 		}
 	}
 	if em.HasErrors() {
+		if opts.CheckOnly {
+			return &Artifacts{FileID: l.firstID}, false
+		}
 		return nil, false
 	}
 	l.finish()
 	if em.HasErrors() {
+		if opts.CheckOnly {
+			return &Artifacts{FileID: l.firstID}, false
+		}
 		return nil, false
 	}
 	merged := l.merged
@@ -117,7 +134,13 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 	info, semaDiags := sema.Check(merged)
 	em.Report(semaDiags...)
 	if em.HasErrors() {
+		if opts.CheckOnly {
+			return &Artifacts{Info: info, FileID: l.firstID}, false
+		}
 		return nil, false
+	}
+	if opts.CheckOnly {
+		return &Artifacts{Info: info, FileID: l.firstID}, true
 	}
 
 	art := &Artifacts{Info: info, FileID: l.firstID}
@@ -229,7 +252,7 @@ func Tokens(path string, em *diag.Emitter) ([]token.Token, int, bool) {
 		return nil, 0, false
 	}
 	fileID := em.AddFile(path, src)
-	lx := lexer.New(fileID, src)
+	lx := lexer.New(fileID, 0, src)
 	toks := lx.All()
 	em.Report(lx.Errors()...)
 	return toks, fileID, !em.HasErrors()

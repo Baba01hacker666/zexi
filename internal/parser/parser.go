@@ -31,8 +31,8 @@ type parser struct {
 
 // Parse lexes and parses src, returning the AST and diagnostics. A partial AST
 // is returned alongside errors so that tooling can keep working.
-func Parse(fileID int, src []byte) (*ast.File, []diag.Diagnostic) {
-	lx := lexer.New(fileID, src)
+func Parse(fileID, base int, src []byte) (*ast.File, []diag.Diagnostic) {
+	lx := lexer.New(fileID, base, src)
 	p := &parser{fileID: fileID, src: src, toks: lx.All()}
 	file := p.parseFile()
 	return file, append(lx.Errors(), p.errs...)
@@ -1105,7 +1105,9 @@ func matchingBrace(src string, i int) int {
 // parseInterpHole parses the inside of one `{...}` hole as an expression.
 // innerOff is the hole's byte offset within the f-string's inner text.
 func (p *parser) parseInterpHole(inner string, tok token.Token, innerOff int) ast.Expr {
-	lx := lexer.New(tok.Pos.FileID, []byte(inner))
+	// The sub-lexer works in hole-local offsets; the loop below shifts its
+	// tokens into the enclosing file's span space.
+	lx := lexer.New(tok.Pos.FileID, 0, []byte(inner))
 	toks := lx.All()
 	// Shift the sub-lexer tokens back into the enclosing file: the hole
 	// starts after `f"` plus innerOff bytes.

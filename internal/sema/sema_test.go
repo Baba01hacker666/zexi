@@ -14,7 +14,7 @@ import (
 // diagnostic codes that were produced.
 func check(t *testing.T, src string) (ok bool, codes []string) {
 	t.Helper()
-	file, pd := parser.Parse(0, []byte(src))
+	file, pd := parser.Parse(0, 0, []byte(src))
 	if file == nil {
 		t.Fatalf("parser returned nil for %q", src)
 	}
@@ -1206,7 +1206,7 @@ fn main() -> i32 {
     let o = Opt::Some(2);
     0
 }`
-	file, pd := parser.Parse(0, []byte(src))
+	file, pd := parser.Parse(0, 0, []byte(src))
 	if len(pd) > 0 {
 		t.Fatalf("unexpected parse diagnostics: %v", codesOf(pd))
 	}
@@ -1273,7 +1273,7 @@ fn main() -> i32 {
     println(p.get());
     0
 }`
-	file, pd := parser.Parse(0, []byte(src))
+	file, pd := parser.Parse(0, 0, []byte(src))
 	if len(pd) > 0 {
 		t.Fatalf("unexpected parse diagnostics: %v", codesOf(pd))
 	}
@@ -1319,7 +1319,7 @@ fn main() -> i32 {
     println(d);
     0
 }`
-	file, pd := parser.Parse(0, []byte(src))
+	file, pd := parser.Parse(0, 0, []byte(src))
 	if len(pd) > 0 {
 		t.Fatalf("unexpected parse diagnostics: %v", codesOf(pd))
 	}

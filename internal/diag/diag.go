@@ -71,10 +71,14 @@ func (d Diagnostic) WithNote(format string, args ...any) Diagnostic {
 	return d
 }
 
-// File is the minimal view of a source file the renderer needs.
+// File is the minimal view of a source file the renderer needs. Base is the
+// offset of the file's first byte in the shared span space: multi-file
+// programs assign each file a disjoint range, so one span identifies both its
+// file and the position inside it. Single-file programs use Base 0.
 type File struct {
 	Name string
 	Src  []byte
+	Base int
 }
 
 // Emitter collects diagnostics and renders them. Rendered output is a pure
@@ -91,11 +95,45 @@ func NewEmitter() *Emitter {
 	return &Emitter{files: map[int]File{}, sorted: true}
 }
 
-// AddFile registers a source file and returns its ID.
+// AddFile registers a source file at span offset 0 and returns its ID. It is
+// a convenience for single-file compilation; multi-file programs use
+// AddFileAt so every file gets its own span range.
 func (e *Emitter) AddFile(name string, src []byte) int {
+	return e.AddFileAt(name, src, 0)
+}
+
+// AddFileAt registers a source file whose first byte sits at base in the
+// shared span space and returns its ID.
+func (e *Emitter) AddFileAt(name string, src []byte, base int) int {
 	id := len(e.files)
-	e.files[id] = File{Name: name, Src: src}
+	e.files[id] = File{Name: name, Src: src, Base: base}
 	return id
+}
+
+// Resolve maps a span to its file and to 0-based byte offsets inside that
+// file's source. It reports ok=false when no registered file covers the span.
+func (e *Emitter) Resolve(s token.Span) (f File, start, end int, ok bool) {
+	off := int(s.Start)
+	for _, cand := range e.files {
+		if off >= cand.Base && off <= cand.Base+len(cand.Src) {
+			start = off - cand.Base
+			end = int(s.End) - cand.Base
+			if end < start {
+				end = start
+			}
+			return cand, start, end, true
+		}
+	}
+	return File{}, 0, 0, false
+}
+
+// Files returns the registered files in registration order (id order).
+func (e *Emitter) Files() []File {
+	out := make([]File, 0, len(e.files))
+	for i := 0; i < len(e.files); i++ {
+		out = append(out, e.files[i])
+	}
+	return out
 }
 
 // FirstFileID returns the id of the first registered file, or -1 if none has
@@ -177,8 +215,11 @@ func (e *Emitter) RenderJSON(w io.Writer, fileID int) {
 	e.sortBySpan()
 	enc := json.NewEncoder(w)
 	for _, d := range e.diags {
-		file := e.files[fileID]
-		line, col, _, _ := locate(file, d.Span)
+		file, start, _, ok := e.fileFor(d.Span, fileID)
+		if !ok {
+			continue
+		}
+		line, col, _, _ := locate(file, start, start)
 		out := map[string]any{
 			"severity": d.Severity.String(),
 			"code":     d.Code,
@@ -197,6 +238,22 @@ func (e *Emitter) RenderJSON(w io.Writer, fileID int) {
 	}
 }
 
+// fileFor resolves the file a span points into — the one whose base range
+// covers it — and returns the span's byte offsets inside that file. When the
+// span is unclaimed (an ad-hoc diagnostic with no location), it falls back to
+// the given file ID and treats the span as local to it.
+func (e *Emitter) fileFor(s token.Span, fileID int) (f File, start, end int, ok bool) {
+	if f, start, end, ok := e.Resolve(s); ok {
+		return f, start, end, true
+	}
+	if f, found := e.files[fileID]; found {
+		start = min(max(int(s.Start), 0), len(f.Src))
+		end = min(max(int(s.End), start), len(f.Src))
+		return f, start, end, true
+	}
+	return File{}, 0, 0, false
+}
+
 func (e *Emitter) renderOne(w io.Writer, d Diagnostic, fileID int) {
 	head := d.Severity.String()
 	if d.Code != "" {
@@ -205,13 +262,15 @@ func (e *Emitter) renderOne(w io.Writer, d Diagnostic, fileID int) {
 		_, _ = fmt.Fprintf(w, "%s: %s\n", head, d.Message)
 	}
 
-	file := e.files[fileID]
-	line, col, text, caret := locate(file, d.Span)
-	if text != "" {
-		_, _ = fmt.Fprintf(w, "  --> %s:%d:%d\n", file.Name, line, col)
-		_, _ = fmt.Fprintf(w, "   |\n")
-		_, _ = fmt.Fprintf(w, "%2d | %s\n", line, text)
-		_, _ = fmt.Fprintf(w, "   | %s%s\n", strings.Repeat(" ", col-1), caret)
+	file, start, end, ok := e.fileFor(d.Span, fileID)
+	if ok {
+		line, col, text, caret := locate(file, start, end)
+		if text != "" {
+			_, _ = fmt.Fprintf(w, "  --> %s:%d:%d\n", file.Name, line, col)
+			_, _ = fmt.Fprintf(w, "   |\n")
+			_, _ = fmt.Fprintf(w, "%2d | %s\n", line, text)
+			_, _ = fmt.Fprintf(w, "   | %s%s\n", strings.Repeat(" ", col-1), caret)
+		}
 	}
 
 	for _, n := range d.Notes {
@@ -223,13 +282,14 @@ func (e *Emitter) renderOne(w io.Writer, d Diagnostic, fileID int) {
 	_, _ = fmt.Fprintln(w)
 }
 
-// locate converts a span into a 1-based line/col plus the source line text and
-// a caret run. It is deliberately forgiving: a zero span yields no snippet.
-func locate(f File, s token.Span) (line, col int, text, caret string) {
-	if len(f.Src) == 0 || s.Start < 0 {
+// locate converts local byte offsets into a 1-based line/col plus the source
+// line text and a caret run. It is deliberately forgiving: a zero span yields
+// no snippet.
+func locate(f File, start, end int) (line, col int, text, caret string) {
+	if len(f.Src) == 0 || start < 0 {
 		return 0, 0, "", ""
 	}
-	start := min(int(s.Start), len(f.Src))
+	start = min(start, len(f.Src))
 	line, col = 1, 1
 	lineStart := 0
 	for i := range start {
@@ -247,7 +307,7 @@ func locate(f File, s token.Span) (line, col int, text, caret string) {
 	}
 	text = string(f.Src[lineStart:lineEnd])
 
-	n := max(int(s.End)-int(s.Start), 1)
+	n := max(end-start, 1)
 	// Do not run the caret past the end of the line (spans may cover a whole
 	// file), and cap absurdly long runs so output stays readable.
 	if avail := lineEnd - (lineStart + col - 1); avail > 0 && n > avail {

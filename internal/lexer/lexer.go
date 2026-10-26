@@ -12,6 +12,7 @@ import (
 // Lexer turns a source buffer into a stream of tokens.
 type Lexer struct {
 	fileID int
+	base   int // offset of src[0] in the shared span space (see diag.File.Base)
 	src    []byte
 	off    int // byte offset of the next unread byte
 	line   int // 1-based
@@ -20,9 +21,11 @@ type Lexer struct {
 	errs []diag.Diagnostic
 }
 
-// New returns a Lexer over src. fileID identifies the file for diagnostics.
-func New(fileID int, src []byte) *Lexer {
-	return &Lexer{fileID: fileID, src: src, line: 1, col: 1}
+// New returns a Lexer over src. fileID identifies the file for diagnostics;
+// base is the offset of src[0] in the shared span space, so tokens from
+// several files occupy disjoint offset ranges (0 for a single file).
+func New(fileID, base int, src []byte) *Lexer {
+	return &Lexer{fileID: fileID, base: base, src: src, line: 1, col: 1}
 }
 
 // Errors returns the lexical diagnostics collected so far.
@@ -47,7 +50,7 @@ func (l *Lexer) Next() token.Token {
 
 	startPos, startOff := l.pos(), l.off
 	if l.atEnd() {
-		return token.Token{Kind: token.KindEOF, Pos: startPos, End: token.Pos(startOff)}
+		return token.Token{Kind: token.KindEOF, Pos: startPos, End: token.Pos(startOff + l.base)}
 	}
 
 	c := l.peek()
@@ -116,7 +119,7 @@ func (l *Lexer) skipBlockComment() {
 	for depth > 0 {
 		if l.atEnd() {
 			l.errs = append(l.errs, diag.New("E0003", "unterminated block comment").
-				WithSpan(token.Span{Start: token.Pos(startOff), End: token.Pos(l.off)}))
+				WithSpan(token.Span{Start: token.Pos(startOff + l.base), End: token.Pos(l.off + l.base)}))
 			return
 		}
 		if l.peek() == '/' && l.peekAt(1) == '*' {
@@ -413,7 +416,7 @@ func (l *Lexer) scanOperator(startPos token.Position, startOff int) token.Token 
 
 	bad := l.advance()
 	l.errs = append(l.errs, diag.New("E0002", "unexpected character %q", string(bad)).
-		WithSpan(token.Span{Start: token.Pos(startOff), End: token.Pos(l.off)}))
+		WithSpan(token.Span{Start: token.Pos(startOff + l.base), End: token.Pos(l.off + l.base)}))
 	return l.tok(token.KindInvalid, string(bad), startPos)
 }
 
@@ -460,11 +463,11 @@ func (l *Lexer) advance() byte {
 }
 
 func (l *Lexer) pos() token.Position {
-	return token.Position{FileID: l.fileID, Line: l.line, Col: l.col, Offset: token.Pos(l.off)}
+	return token.Position{FileID: l.fileID, Line: l.line, Col: l.col, Offset: token.Pos(l.off + l.base)}
 }
 
 func (l *Lexer) tok(k token.Kind, lit string, start token.Position) token.Token {
-	return token.Token{Kind: k, Lit: lit, Pos: start, End: token.Pos(l.off)}
+	return token.Token{Kind: k, Lit: lit, Pos: start, End: token.Pos(l.off + l.base)}
 }
 
 func (l *Lexer) lit(startOff int) string { return string(l.src[startOff:l.off]) }
@@ -492,7 +495,7 @@ func (l *Lexer) safeSlice(lo, hi int) string {
 }
 
 func (l *Lexer) errorf(code string, pos token.Position, msg string) {
-	span := token.Span{Start: pos.Offset, End: token.Pos(l.off)}
+	span := token.Span{Start: pos.Offset, End: token.Pos(l.off + l.base)}
 	l.errs = append(l.errs, diag.New(code, "%s", msg).WithSpan(span))
 }
 

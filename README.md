@@ -115,6 +115,18 @@ project root, and in the root's `lib/`, before the embedded standard library.
 `use util;` where `util/` is a directory loads the **whole folder** (every `.zx`
 inside it) as one package; `--root=dir` pins the root explicitly.
 
+## Editor support (LSP)
+
+`zexic lsp` is a language server speaking JSON-RPC over stdio. It gives you
+diagnostics as you type (unsaved buffers included, multi-file errors landing on
+the file that actually has them), hover types and signatures, go-to-definition,
+completion — including `.`-triggered field/method/variant completion — and
+document symbols. Point your editor's LSP client at `zexic lsp` for the
+`zexi` language; an optional argument names the program entry (`zexic lsp
+main.zx`) so program-level diagnostics are exact, and without one each open
+document is analyzed on its own (libraries included — the "no main" error is
+suppressed for files that don't declare one).
+
 ## Try it
 
 ```sh

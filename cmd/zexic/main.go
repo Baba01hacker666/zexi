@@ -6,7 +6,7 @@
 //
 //	zexic <command> [options] <file.zx>
 //
-// Commands: check, build, run, emit, tokenize, bindgen, version.
+// Commands: check, build, run, emit, tokenize, bindgen, lsp, version.
 // See docs/04 §4.9 for the planned CLI surface.
 package main
 
@@ -23,6 +23,7 @@ import (
 	"zexi/internal/bindgen"
 	"zexi/internal/diag"
 	"zexi/internal/driver"
+	"zexi/internal/lsp"
 	"zexi/internal/token"
 )
 
@@ -194,6 +195,8 @@ func run(args []string) int {
 		return cmdRun(c)
 	case "emit":
 		return cmdEmit(c)
+	case "lsp":
+		return cmdLsp(c)
 	default:
 		fmt.Fprintf(os.Stderr, "zexic: unknown command %q\n", cmd)
 		usage(os.Stderr)
@@ -381,6 +384,18 @@ func cmdBindgen(c cli) int {
 // emFileID returns the id of the single source file registered with em, or 0.
 func emFileID(em *diag.Emitter) int { return em.FirstFileID() }
 
+// cmdLsp runs the language server over stdio. An optional argument names the
+// program entry (for example the project's main.zx); without one, each open
+// document is analyzed on its own and the "no main" error is suppressed for
+// documents that declare no main function.
+func cmdLsp(c cli) int {
+	root := ""
+	if len(c.positional) > 0 {
+		root = c.positional[0]
+	}
+	return lsp.Serve(os.Stdin, os.Stdout, lsp.Options{Root: root})
+}
+
 func usage(w *os.File) {
 	_, _ = fmt.Fprint(w, `zexi - the Zexi programming language compiler
 
@@ -394,6 +409,7 @@ commands:
   emit       print an intermediate form (--emit=c)
   tokenize   print the token stream
   bindgen    generate Zexi extern declarations from a C header
+  lsp        run the language server on stdio (optional argument: program entry)
   version    print the compiler version
 
 Project builds: the first argument may be a project directory. main.zx is
