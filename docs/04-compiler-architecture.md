@@ -100,10 +100,30 @@ formatting (`zexi fmt`), and the LSP.
 ### MIR (Mid-level IR)
 - Per-function **control-flow graph** of basic blocks.
 - SSA-like: unlimited virtual registers; `let` bindings become places.
-- Explicit `StorageLive/StorageDead`, `Borrow/Release`, `Drop`, `Call`.
+- Explicit `Drop`, `Call`, `Ref`, `Discriminant`, and bounds-checked `Index`
+  projections; every `move` transfers ownership and clears a drop flag.
 - All addresses/aggregates explicit; no method calls remain.
 - **This is where checks are optimized:** bounds-check elision, overflow-check
   removal, drop-elision after move, escape analysis for stack promotion.
+
+**Implemented** in `internal/mir` (`docs/13-mir.md`): the IR, a lowering from
+`sema.Info`, a validator, a textual dump (`--emit=mir`), and a reference
+interpreter used as a test oracle. It covers the computational core — 92% of the
+reachable functions in this repository lower today. Not yet on the production
+path: the C backend still walks the typed AST, so nothing consumes MIR outside
+the MIR tests. Deliberate deviations from the plan above, recorded so they are
+choices rather than drift:
+
+- **No separate HIR.** The checker's `sema.Info` is the typed, monomorphized,
+  desugared program (`?` and `if let` are already lowered; generics are already
+  instantiated), so MIR lowers from it directly.
+- **No `StorageLive`/`StorageDead` yet.** Locals are declared in the body's local
+  table and initialized by assignment; stack-slot lifetimes become a backend
+  concern when the native emitter lands, which is also when these statements earn
+  their place.
+- **The pass pipeline (`mir/opt`) does not exist yet.** Checks are represented so
+  they *can* be elided — a `ProjIndex` carries a `Checked` bit — but no pass
+  clears it yet.
 
 ### Backend input contract
 A backend consumes MIR + a type/layout table and must be able to emit: functions,
@@ -126,8 +146,8 @@ internal/
   check/                   typecheck + trait/bound solving
   borrowck/                ownership, move/borrow/lifetime checking
   hir/                     HIR nodes + lowering from AST
-  mir/                     MIR CFG + builder
-  mir/opt/                 inlining, DCE, const-fold, bounds elision
+  mir/                     MIR CFG + lowering + validator + test interpreter (done)
+  mir/opt/                 inlining, DCE, const-fold, bounds elision (future)
   layout/                  size/align/field offsets, ABI
   codegen/c/               MIR → C11 (M0 backend)
   codegen/x86_64/          native emitter (M2)
@@ -194,7 +214,7 @@ zexi run   [file.zx] [flags]      build to a temp path and execute
 zexi check [file.zx]              parse + typecheck + borrowck only
 zexi fmt   [file.zx]              format source
 zexi doc   ...                    generate docs (M2)
-zexi emit  --emit=<ast|hir|mir|c|asm|bin> file.zx
+zexi emit  --emit=<mir|c> file.zx     (ast/hir/asm/bin are planned)
 zexi lsp   [entry.zx]             language server on stdio (LSP)
 
 Options:

@@ -84,16 +84,28 @@ implementation of that contract.
 
 Work required to honor the plan:
 
-1. **Land MIR.** Today the C backend walks the typed AST directly (documented as
-   an M0 shortcut). M1 introduces MIR so backends are swappable and
-   ownership-driven optimizations (drop elision, bounds-check elision,
-   escape-to-stack) run *before* any backend.
+1. **Land MIR.** ✅ **Done, for the computational core.** `internal/mir` lowers a
+   checked program to a CFG of numbered locals and basic blocks, with explicit
+   moves, drops (guarded by drop flags), and bounds-checked index projections.
+   `zexic emit --emit=mir` prints it, and it is documented in
+   [`13-mir.md`](13-mir.md). 92% of the reachable functions in `tests/`,
+   `examples/`, and `bench/` lower today; the rest report *why* they do not
+   (interpolated strings, `defer`, indirect calls, ...). What has **not**
+   happened yet: the C backend still walks the typed AST, so MIR is a second
+   verified description of the program rather than the one the shipped compiler
+   consumes. Flipping that is the next step, and it is a separate piece of work
+   from producing the IR.
 2. **Add the backend interface** (`internal/codegen.Backend`) and a
    conformance suite that runs every backend against the same programs and
-   compares observable behavior. The C backend is tested by it first.
+   compares observable behavior. The C backend is tested by it first. The
+   differential harness in `internal/mir/interp_test.go` is a working
+   prototype of exactly this: it runs a program through the C backend and
+   through a MIR interpreter and compares output, which is how the lowering
+   itself is currently validated.
 3. **Grow the native emitter** target by target (start x86-64 SysV), keeping the
    C backend green as the reference.
 
-Until step 3 ships, `--cc` selects the C compiler and `--emit=c` remains the
-supported way to inspect lowering. After it ships, `--backend=native|c` selects
+Until step 2 ships, `--cc` selects the C compiler and `--emit=c` remains the
+supported way to inspect the C backend's lowering, with `--emit=mir` alongside
+it for the IR. After a native backend ships, `--backend=native|c` selects
 between them and the default flips to `native`.

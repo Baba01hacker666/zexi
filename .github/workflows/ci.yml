@@ -42,6 +42,9 @@ jobs:
       - name: Compile and run a program
         run: go run ./cmd/zexic run tests/tour.zx
 
+      - name: Lower to MIR
+        run: go run ./cmd/zexic emit --emit=mir tests/tour.zx > /dev/null
+
       - name: Check documentation examples
         run: python3 scripts/check_doc_examples.py --run
 

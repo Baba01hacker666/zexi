@@ -2,7 +2,12 @@
 
 > **Progress:** M0 is largely landed. Working today: lexer, parser, name
 > resolution, bidirectional type inference, constant folding, a flow-sensitive
-> move checker, and a C backend that produces a runnable native binary. The
+> move checker, and a C backend that produces a runnable native binary. A
+> second lowering now sits beside the C backend: `internal/mir` flattens the
+> checked program into a control-flow graph (`--emit=mir`), covering 92% of this
+> repository's reachable functions and checked against the C backend by
+> differential tests — the groundwork for a swappable backend
+> ([`13-mir.md`](13-mir.md)). The
 > first M1 usability foundations are also live: file `use`/`import`, dotted
 > standard-library facades (`import http.server;`), `mod` source layouts,
 > per-module `as` aliases, and path-qualified lookup with `pub` enforcement are

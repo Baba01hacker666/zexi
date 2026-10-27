@@ -87,6 +87,15 @@ This repository contains the **initial design and specification** of Zexi: the v
 See [`workings.md`](workings.md) for a walkthrough of the compiler pipeline and
 runtime.
 
+Two lowerings consume the checked program. The shipped one emits C. The other is
+**MIR**, a control-flow graph of numbered locals with explicit moves, drops, and
+bounds-checked indexes ([`docs/13-mir.md`](docs/13-mir.md)): `--emit=mir` prints
+it, it covers 92% of this repository's reachable functions today, and its
+semantics are diffed against the C backend by a test that compiles each program
+natively, runs it, interprets the MIR, and compares the output. It is not yet the
+path the compiler takes — that is the next step toward a swappable native
+backend.
+
 ## Benchmarks
 
 Zexi compiles to C, so the honest expectation is near-C speed — and the
@@ -157,6 +166,7 @@ go run ./cmd/zexic run examples/http_server.zx lib/http.zx
 go run ./cmd/zexic run examples/http_client.zx lib/http.zx   # an HTTP client (needs the server)
 go run ./cmd/zexic run examples/hello.zx
 go run ./cmd/zexic emit --emit=c tests/tour.zx   # inspect the generated C
+go run ./cmd/zexic emit --emit=mir tests/tour.zx # inspect the control-flow IR
 ```
 
 `hello.zx` links to a ~18 KB native ELF. The backend emits C and hands it to the
@@ -190,6 +200,8 @@ for why, its real costs, and the plan to replace it with a native backend.
 - [`docs/09-c-bridge.md`](docs/09-c-bridge.md) — calling C libraries through `extern "C"` and bindgen.
 - [`docs/10-stdlib-recipes.md`](docs/10-stdlib-recipes.md) — local networking, OS, filesystem, and regex recipes.
 - [`docs/11-concurrency.md`](docs/11-concurrency.md) — threads, `i64` channels, and atomics.
+- [`docs/12-generics.md`](docs/12-generics.md) — monomorphized generics, `Option`/`Result`, and `?`.
+- [`docs/13-mir.md`](docs/13-mir.md) — the mid-level IR: shape, instruction set, drops, lowering, and verification.
 - [`examples/`](examples/) — ready-to-run Zexi programs plus focused feature examples.
 - [`tests/tour.zx`](tests/tour.zx) — the end-to-end program the test suite compiles and runs.
 - [`tests/syntax.zx`](tests/syntax.zx) — a runnable syntax tour; [`tests/pi.zx`](tests/pi.zx) — 30 digits of π.
@@ -207,6 +219,7 @@ internal/
   sema/               name resolution, type inference, constant folding,
                       and the flow-sensitive move checker (own.go)
   codegen/c/          M0 backend: typed program -> C11
+  mir/                mid-level IR: CFG lowering, validator, dump, test oracle
   driver/             pipeline orchestration, imports/modules + C compiler invocation
   diag/               diagnostics + source spans
 docs/                 the specification
