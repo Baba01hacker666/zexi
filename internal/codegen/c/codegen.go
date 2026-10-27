@@ -3043,6 +3043,9 @@ func (g *gen) literal(x *ast.LiteralExpr) string {
 			}
 		}
 		if t := g.info.TypeOf(x); t != nil && t.Kind.IsFloat() {
+			if t.Kind == types.F32 {
+				return s + ".0f"
+			}
 			return s + ".0"
 		}
 		return s

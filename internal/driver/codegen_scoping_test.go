@@ -415,6 +415,23 @@ func TestStringBuilderGrowth(t *testing.T) {
 `, "300\nabcabc\nxyxyxyxyxyxyxyxyxyxy 20\n0\nrefilled\né! 3\n")
 }
 
+// TestF32LiteralRounding checks that integer literals typed as f32 are emitted
+// as float constants. Without the suffix, C evaluates the operation in double
+// and the final cast can change the result.
+func TestF32LiteralRounding(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	// -16777216f32 + 16777217f32 is 0f32 because 16777217 is not representable
+	// in f32 and rounds to 16777216. If the literal is emitted as an unsuffixed
+	// double, C computes the addition in double and the final cast gives 1.
+	wantOutput(t, "f32_literal_rounding", `fn main() -> i32 {
+    let x: f32 = -16777216;
+    println(x + 16777217);
+    0
+}
+`, "0\n")
+}
 // C promotes narrow integer operands to int and unsuffixed literals to double.
 // Expression results must still have Zexi's declared width, even when consumed
 // directly instead of first being assigned to a narrow local.

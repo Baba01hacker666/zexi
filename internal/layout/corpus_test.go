@@ -113,10 +113,11 @@ func corpusTypes(t *testing.T) []*types.Type {
 			if zeroSized(ty) {
 				continue
 			}
+			key := "struct " + s.Name
 			if _, err := layout.Default().Of(ty); err != nil {
+				t.Errorf("corpus %s: layout error: %v", key, err)
 				continue
 			}
-			key := "struct " + s.Name
 			if seen[key] {
 				continue
 			}
@@ -131,10 +132,11 @@ func corpusTypes(t *testing.T) []*types.Type {
 			if zeroSized(ty) {
 				continue
 			}
+			key := "enum " + e.Name
 			if _, err := layout.Default().Of(ty); err != nil {
+				t.Errorf("corpus %s: layout error: %v", key, err)
 				continue
 			}
-			key := "enum " + e.Name
 			if seen[key] {
 				continue
 			}
@@ -225,10 +227,14 @@ func TestCorpusLayoutMatchesTheCCompiler(t *testing.T) {
 			continue
 		}
 		name := typeLabel(ty)
-		if c, ok := got[key+" size"]; ok && c != want.Size {
+		if c, ok := got[key+" size"]; !ok {
+			t.Errorf("%s: cc reported no size", name)
+		} else if c != want.Size {
 			t.Errorf("%s: cc says size %d, table says %d", name, c, want.Size)
 		}
-		if c, ok := got[key+" align"]; ok && c != want.Align {
+		if c, ok := got[key+" align"]; !ok {
+			t.Errorf("%s: cc reported no align", name)
+		} else if c != want.Align {
 			t.Errorf("%s: cc says align %d, table says %d", name, c, want.Align)
 		}
 		switch ty.Kind {
@@ -239,7 +245,9 @@ func TestCorpusLayoutMatchesTheCCompiler(t *testing.T) {
 				continue
 			}
 			for _, f := range sl.Fields {
-				if c, ok := got[key+" off."+f.Name]; ok && c != f.Offset {
+				if c, ok := got[key+" off."+f.Name]; !ok {
+					t.Errorf("%s field %s: cc reported no offset", name, f.Name)
+				} else if c != f.Offset {
 					t.Errorf("%s field %s: cc says offset %d, table says %d", name, f.Name, c, f.Offset)
 				}
 			}
@@ -252,7 +260,9 @@ func TestCorpusLayoutMatchesTheCCompiler(t *testing.T) {
 			for _, v := range el.Variants {
 				for _, f := range v.Fields {
 					k := key + " off.v" + strconv.Itoa(v.Index) + "." + f.Name
-					if c, ok := got[k]; ok && c != v.Offset+f.Offset {
+					if c, ok := got[k]; !ok {
+						t.Errorf("%s::%s field %s: cc reported no offset", name, v.Name, f.Name)
+					} else if c != v.Offset+f.Offset {
 						t.Errorf("%s::%s field %s: cc says offset %d, table says %d",
 							name, v.Name, f.Name, c, v.Offset+f.Offset)
 					}
@@ -260,8 +270,11 @@ func TestCorpusLayoutMatchesTheCCompiler(t *testing.T) {
 			}
 		}
 		checked++
-	}
-	t.Logf("verified %d corpus types against %s", checked, cc)
+		}
+		if checked < 49 {
+		t.Errorf("verified %d corpus types, want at least 49", checked)
+		}
+		t.Logf("verified %d corpus types against %s", checked, cc)
 }
 
 // typeLabel names a type for a test failure message.

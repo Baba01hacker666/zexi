@@ -259,10 +259,7 @@ func TestLayoutMatchesTheCCompiler(t *testing.T) {
 	}
 
 	g := newCgen()
-	var probes []*types.Type
-	for _, ty := range probeTypes() {
-		probes = append(probes, ty)
-	}
+	probes := probeTypes()
 
 	// Emit one typedef per probe so sizeof can be taken without repeating
 	// the declarator.
@@ -347,11 +344,13 @@ func TestLayoutMatchesTheCCompiler(t *testing.T) {
 			}
 			for _, f := range sl.Fields {
 				k := key + " off." + f.Name
-				if c, ok := got[k]; ok && c != f.Offset {
+				if c, ok := got[k]; !ok {
+					t.Errorf("%s field %s: cc reported no offset", key, f.Name)
+				} else if c != f.Offset {
 					t.Errorf("%s field %s: cc says offset %d, table says %d", key, f.Name, c, f.Offset)
 				}
-			}
-		case types.EnumKind:
+		}
+	case types.EnumKind:
 			el, err := tgt.Enum(ty.En)
 			if err != nil {
 				t.Errorf("%s: Enum: %v", key, err)
@@ -361,7 +360,9 @@ func TestLayoutMatchesTheCCompiler(t *testing.T) {
 				for _, f := range v.Fields {
 					k := key + " off.v" + strconv.Itoa(v.Index) + "." + f.Name
 					wantOff := v.Offset + f.Offset
-					if c, ok := got[k]; ok && c != wantOff {
+					if c, ok := got[k]; !ok {
+						t.Errorf("%s variant %s field %s: cc reported no offset", key, v.Name, f.Name)
+					} else if c != wantOff {
 						t.Errorf("%s variant %s field %s: cc says offset %d, table says %d",
 							key, v.Name, f.Name, c, wantOff)
 					}

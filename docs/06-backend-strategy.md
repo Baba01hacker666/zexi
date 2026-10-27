@@ -100,9 +100,12 @@ Work required to honor the plan:
    answers size, alignment, field offsets, and enum tagging for every type the
    language can express. It exists because a non-C backend has no `sizeof` to
    lean on: it has to know the ABI itself. The rules are not invented — they
-   describe what `cc` does with the C the current backend emits, and a
-   differential test compiles that C, asks `cc` for `sizeof`, `_Alignof` and
-   `offsetof`, runs it, and requires the table to agree. It does so for a
+   describe what `cc` does with the C the current backend emits. A differential
+   test compiles declarations from a test-local `cgen`, asks `cc` for `sizeof`,
+   `_Alignof` and `offsetof`, and requires the table to agree. It does not
+   compile the backend's emitted C: `cgen` models `slice` as `{ const void
+   *ptr; size_t len; }`, while backend `ctype` emits `const void *`. It does so
+   for a
    hand-written matrix covering every type constructor *and* for all 49
    structs and enums in `tests/`, `examples/`, and `bench/`. The C backend
    still uses `sizeof` and does not consult the table; it becomes the shared
