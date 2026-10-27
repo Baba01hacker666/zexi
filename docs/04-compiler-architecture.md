@@ -108,7 +108,7 @@ formatting (`zexi fmt`), and the LSP.
 
 **Implemented** in `internal/mir` (`docs/13-mir.md`): the IR, a lowering from
 `sema.Info`, a validator, a textual dump (`--emit=mir`), and a reference
-interpreter used as a test oracle. It covers the computational core — 92% of the
+interpreter used as a test oracle. It covers the computational core — 93% of the
 reachable functions in this repository lower today. Not yet on the production
 path: the C backend still walks the typed AST, so nothing consumes MIR outside
 the MIR tests. Deliberate deviations from the plan above, recorded so they are

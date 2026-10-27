@@ -414,3 +414,38 @@ func TestStringBuilderGrowth(t *testing.T) {
 }
 `, "300\nabcabc\nxyxyxyxyxyxyxyxyxyxy 20\n0\nrefilled\né! 3\n")
 }
+
+// C promotes narrow integer operands to int and unsuffixed literals to double.
+// Expression results must still have Zexi's declared width, even when consumed
+// directly instead of first being assigned to a narrow local.
+func TestNarrowExpressionWidthInReleaseAndDebug(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	cases := []struct {
+		name, src, release, debug string
+	}{
+		{
+			"addition",
+			`fn main() -> i32 { let n: i8 = 127; println(n + 1); 0 }`,
+			"-128\n", "zexi panic: attempt to add with overflow\n",
+		},
+		{
+			"negation",
+			`fn main() -> i32 { let n: i8 = -128; println(-n); 0 }`,
+			"-128\n", "zexi panic: attempt to negate with overflow\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ee := buildAndRun(t, tc.name+"_release", tc.src, driver.Options{OptLevel: "2"})
+			if ee != nil || got != tc.release {
+				t.Errorf("release: output %q, exit %v; want %q and success", got, ee, tc.release)
+			}
+			got, ee = buildAndRun(t, tc.name+"_debug", tc.src, driver.Options{OptLevel: "0"})
+			if ee == nil || ee.ExitCode() != 101 || got != tc.debug {
+				t.Errorf("debug: output %q, exit %v; want %q and exit 101", got, ee, tc.debug)
+			}
+		})
+	}
+}

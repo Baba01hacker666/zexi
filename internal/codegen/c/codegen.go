@@ -1512,7 +1512,14 @@ func (g *gen) value(e ast.Expr) string {
 					return "(" + g.wantCheckedArith("neg", ctype(t)) + "(" + g.value(x.X) + "))"
 				}
 			}
-			return "(-" + g.value(x.X) + ")"
+			value := "(-" + g.value(x.X) + ")"
+			// C promotes i8/i16 and u8/u16 to int before negating. Restore
+			// the Zexi expression type so release-mode arithmetic wraps at
+			// its declared width even when the result is used directly.
+			if t := g.info.TypeOf(x); t != nil && t.Kind.IsNumeric() {
+				return "((" + ctype(t) + ")" + value + ")"
+			}
+			return value
 		case token.KindBang:
 			return "(!" + g.value(x.X) + ")"
 		case token.KindStar:
@@ -1764,7 +1771,14 @@ func (g *gen) binValue(x *ast.BinExpr) string {
 	if g.checkedInt(x) {
 		return g.checkedBinOp(x)
 	}
-	return "(" + g.value(x.L) + " " + x.Op.String() + " " + g.value(x.R) + ")"
+	value := "(" + g.value(x.L) + " " + x.Op.String() + " " + g.value(x.R) + ")"
+	// C integer promotions otherwise leave narrow results as int, changing
+	// overflow and subsequent operations when no assignment forces a cast.
+	// The cast also preserves f32 rounding at every typed expression boundary.
+	if t := g.info.TypeOf(x); t != nil && t.Kind.IsNumeric() {
+		return "((" + ctype(t) + ")" + value + ")"
+	}
+	return value
 }
 
 // checkedInt reports whether `x` is an integer operation that needs a run-time

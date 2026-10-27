@@ -88,12 +88,13 @@ Work required to honor the plan:
    checked program to a CFG of numbered locals and basic blocks, with explicit
    moves, drops (guarded by drop flags), and bounds-checked index projections.
    `zexic emit --emit=mir` prints it, and it is documented in
-   [`13-mir.md`](13-mir.md). 92% of the reachable functions in `tests/`,
+   [`13-mir.md`](13-mir.md). 93% of the reachable functions in `tests/`,
    `examples/`, and `bench/` lower today; the rest report *why* they do not
-   (interpolated strings, `defer`, indirect calls, ...). What has **not**
-   happened yet: the C backend still walks the typed AST, so MIR is a second
-   verified description of the program rather than the one the shipped compiler
-   consumes. Flipping that is the next step, and it is a separate piece of work
+   (`defer`, indirect calls, collection iteration, partial moves, ...).
+   Interpolated strings lower through typed String-building intrinsics. What has
+   **not** happened yet: the C backend still walks the typed AST, so MIR is a
+   second verified description of the program rather than the one the shipped
+   compiler consumes. Flipping that is the next step, and it is a separate piece of work
    from producing the IR.
 2. **Land the layout table.** ✅ **Done, verified against `cc`.** `internal/layout`
    answers size, alignment, field offsets, and enum tagging for every type the

@@ -95,6 +95,10 @@ checked against the C backend by the differential tests.
 - Ownership becomes instructions: `move` takes a value out of a place and clears
   its drop flag, and `drop(p) with flag` at scope exit releases what is still
   there. Drops are emitted on every exit path (`return`, `break`, `continue`).
+- Interpolated strings build a `String` through typed runtime intrinsics in
+  source order, borrowing owned inputs and dropping per-part temporaries.
+- Owning parameters and temporaries carry drop flags; projected owning moves
+  that need per-field flags are reported instead of silently double-dropping.
 - Constructs with no lowering yet are reported per function instead of failing
   the program, so coverage grows one feature at a time.
 - `Body.validate` checks the CFG and runs a definite-initialization pass;

@@ -90,7 +90,7 @@ runtime.
 Two lowerings consume the checked program. The shipped one emits C. The other is
 **MIR**, a control-flow graph of numbered locals with explicit moves, drops, and
 bounds-checked indexes ([`docs/13-mir.md`](docs/13-mir.md)): `--emit=mir` prints
-it, it covers 92% of this repository's reachable functions today, and its
+it, it covers 93% of this repository's reachable functions today, and its
 semantics are diffed against the C backend by a test that compiles each program
 natively, runs it, interprets the MIR, and compares the output. It is not yet the
 path the compiler takes — that is the next step toward a swappable native
