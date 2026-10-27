@@ -24,6 +24,7 @@ import (
 	"zexi/internal/diag"
 	"zexi/internal/driver"
 	"zexi/internal/lsp"
+	"zexi/internal/mir"
 	"zexi/internal/token"
 )
 
@@ -339,11 +340,14 @@ func cmdEmit(c cli) int {
 	if c.emit == "" {
 		c.emit = "c"
 	}
-	if c.emit != "c" {
-		fmt.Fprintf(os.Stderr, "zexic emit: --emit=%s is not supported yet (try `c`)\n", c.emit)
+	if c.emit != "c" && c.emit != "mir" {
+		fmt.Fprintf(os.Stderr, "zexic emit: --emit=%s is not supported yet (try `c` or `mir`)\n", c.emit)
 		return 2
 	}
 	em := diag.NewEmitter()
+	if c.emit == "mir" {
+		return emitMIR(paths, c, em)
+	}
 	opts := c.opts()
 	opts.Jobs = 1 // emit prints one translation unit
 	art, ok := driver.FrontEndFiles(paths, opts, em)
@@ -352,6 +356,42 @@ func cmdEmit(c cli) int {
 		return 1
 	}
 	fmt.Print(art.CSrc)
+	return 0
+}
+
+// emitMIR prints the program's mid-level IR: a control-flow graph per function,
+// with every value in a numbered local. MIR is the contract each backend
+// consumes (docs/04 §4.3), so this dump is the supported way to see what a
+// backend is handed before any of them exist.
+func emitMIR(paths []string, c cli, em *diag.Emitter) int {
+	opts := c.opts()
+	opts.CheckOnly = true // no C is generated
+	art, ok := driver.FrontEndFiles(paths, opts, em)
+	if !ok {
+		renderDiags(c, em, emFileID(em))
+		return 1
+	}
+	res := mir.Lower(art.Info)
+	// Validate before printing: a backend is entitled to assume these
+	// invariants, so a dump that violates them is a compiler bug worth
+	// reporting rather than handing to one.
+	if err := res.Prog.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "zexic emit: internal error: %v\n", err)
+		fmt.Fprint(os.Stderr, res.Prog.String())
+		return 3
+	}
+	fmt.Print(res.Prog.String())
+	if n := len(res.Unsupported); n > 0 {
+		fmt.Fprintf(os.Stderr, "zexic emit: MIR lowered %d/%d reachable functions; %d not lowered:\n",
+			res.Lowered, res.Total, n)
+		for i, u := range res.Unsupported {
+			if i == 10 {
+				fmt.Fprintf(os.Stderr, "  ... and %d more\n", n-10)
+				break
+			}
+			fmt.Fprintf(os.Stderr, "  %s: %s\n", u.Fn, u.Feature)
+		}
+	}
 	return 0
 }
 

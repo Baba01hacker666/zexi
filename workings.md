@@ -14,10 +14,18 @@ Go and lives under `internal/` and `cmd/zexic/`.
 
 ```
 .zx source ──► lexer ──► parser ──► AST ──► sema/type-check ──► codegen (C) ──► cc ──► native binary
+                                             │
+                                             └──────────────► mir (CFG)   [--emit=mir]
 ```
 
 The only runtime support is a tiny C helper library (`zx_*` functions) that
 handles strings, printing, arrays, and the standard library's C shims.
+
+Two lowerings consume the checked program. The shipped path is the C backend,
+which walks the typed AST. The other is `internal/mir`, which flattens each
+function into a control-flow graph of numbered locals (`docs/13-mir.md`); it is
+what a second backend will consume, and today it is printed by `--emit=mir` and
+checked against the C backend by the differential tests.
 
 ---
 
@@ -77,7 +85,22 @@ handles strings, printing, arrays, and the standard library's C shims.
 - `GenerateSplit` → shared header + N units (`CHeader` + `CUnits`) for
   parallel compilation of large programs.
 
-### 2.6 Compilation / linking (`driver.CompileC` / `CompileUnits`)
+### 2.6 MIR (`internal/mir`) — the backend contract
+
+- `mir.Lower(info)` walks the reachable functions and produces a `Program` of
+  `Fn`s, each with a `Body`: a local table and a list of basic blocks.
+- Expressions are flattened: every intermediate value lands in a local. Control
+  flow is explicit — `goto`, `switchInt`, `call ... -> [return: bbN]`, `return`,
+  `unreachable` — and a block always ends in exactly one of them.
+- Ownership becomes instructions: `move` takes a value out of a place and clears
+  its drop flag, and `drop(p) with flag` at scope exit releases what is still
+  there. Drops are emitted on every exit path (`return`, `break`, `continue`).
+- Constructs with no lowering yet are reported per function instead of failing
+  the program, so coverage grows one feature at a time.
+- `Body.validate` checks the CFG and runs a definite-initialization pass;
+  `interp.go` executes MIR so tests can compare it against the real binary.
+
+### 2.7 Compilation / linking (`driver.CompileC` / `CompileUnits`)
 - Writes generated C to temp files.
 - Invokes `cc` with `-std=gnu11`, optimization, `-fwrapv` (defined signed
   integer wrapping), `-ffunction-sections`, `-fdata-sections`, and include dirs.
@@ -184,6 +207,7 @@ Key flags: `--jobs N` (parallel units), `--opt-level`, `--include`, `--csrc`,
 | Types | `internal/types/` |
 | Sema / move check | `internal/sema/` |
 | Codegen | `internal/codegen/c/` |
+| MIR | `internal/mir/` |
 | Driver / build | `internal/driver/driver.go` |
 | Stdlib | `internal/driver/std/` |
 | C shims | `internal/driver/zxnet_c.txt`, `zxsys_c.txt`, `zxregex_c.txt`, `zxthread_c.txt` |
@@ -199,7 +223,7 @@ Key flags: `--jobs N` (parallel units), `--opt-level`, `--include`, `--csrc`,
 1. Source is parsed into an AST.
 2. `use` declarations pull in more files / embedded stdlib.
 3. Sema type-checks and determines reachable functions.
-4. Codegen emits C (one or many units).
+4. Codegen emits C (one or many units), or MIR is built for inspection/tests.
 5. `cc` compiles + links with runtime shims.
 6. `--gc-sections` drops unused code, keeping binaries small.
 
