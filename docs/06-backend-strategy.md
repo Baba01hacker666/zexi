@@ -95,17 +95,28 @@ Work required to honor the plan:
    verified description of the program rather than the one the shipped compiler
    consumes. Flipping that is the next step, and it is a separate piece of work
    from producing the IR.
-2. **Add the backend interface** (`internal/codegen.Backend`) and a
+2. **Land the layout table.** ✅ **Done, verified against `cc`.** `internal/layout`
+   answers size, alignment, field offsets, and enum tagging for every type the
+   language can express. It exists because a non-C backend has no `sizeof` to
+   lean on: it has to know the ABI itself. The rules are not invented — they
+   describe what `cc` does with the C the current backend emits, and a
+   differential test compiles that C, asks `cc` for `sizeof`, `_Alignof` and
+   `offsetof`, runs it, and requires the table to agree. It does so for a
+   hand-written matrix covering every type constructor *and* for all 49
+   structs and enums in `tests/`, `examples/`, and `bench/`. The C backend
+   still uses `sizeof` and does not consult the table; it becomes the shared
+   ABI the moment a second backend exists.
+3. **Add the backend interface** (`internal/codegen.Backend`) and a
    conformance suite that runs every backend against the same programs and
    compares observable behavior. The C backend is tested by it first. The
    differential harness in `internal/mir/interp_test.go` is a working
    prototype of exactly this: it runs a program through the C backend and
    through a MIR interpreter and compares output, which is how the lowering
    itself is currently validated.
-3. **Grow the native emitter** target by target (start x86-64 SysV), keeping the
+4. **Grow the native emitter** target by target (start x86-64 SysV), keeping the
    C backend green as the reference.
 
-Until step 2 ships, `--cc` selects the C compiler and `--emit=c` remains the
+Until step 3 ships, `--cc` selects the C compiler and `--emit=c` remains the
 supported way to inspect the C backend's lowering, with `--emit=mir` alongside
 it for the IR. After a native backend ships, `--backend=native|c` selects
 between them and the default flips to `native`.

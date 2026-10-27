@@ -220,6 +220,7 @@ internal/
                       and the flow-sensitive move checker (own.go)
   codegen/c/          M0 backend: typed program -> C11
   mir/                mid-level IR: CFG lowering, validator, dump, test oracle
+  layout/             ABI table: sizes, alignments, field offsets, enum tags
   driver/             pipeline orchestration, imports/modules + C compiler invocation
   diag/               diagnostics + source spans
 docs/                 the specification

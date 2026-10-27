@@ -148,7 +148,7 @@ internal/
   hir/                     HIR nodes + lowering from AST
   mir/                     MIR CFG + lowering + validator + test interpreter (done)
   mir/opt/                 inlining, DCE, const-fold, bounds elision (future)
-  layout/                  size/align/field offsets, ABI
+  layout/                  size/align/field offsets, ABI (done, verified vs cc)
   codegen/c/               MIR → C11 (M0 backend)
   codegen/x86_64/          native emitter (M2)
   link/                    toolchain invocation, LTO, static/dynamic
