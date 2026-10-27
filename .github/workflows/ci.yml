@@ -42,8 +42,24 @@ jobs:
       - name: Compile and run a program
         run: go run ./cmd/zexic run tests/tour.zx
 
+      - name: Lower to MIR
+        run: go run ./cmd/zexic emit --emit=mir tests/tour.zx > /dev/null
+
       - name: Check documentation examples
-        run: python3 scripts/check_doc_examples.py --run
+        # The checker prints one FAIL line per drifting block; surface them as
+        # annotations so a red run says *which* example broke without needing
+        # the raw log.
+        run: |
+          set +e
+          python3 scripts/check_doc_examples.py --run 2>&1 | tee /tmp/doc-examples.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            grep -E '^ *(FAIL|fail)' /tmp/doc-examples.log | head -20 | while IFS= read -r line; do
+              echo "::error::${line//\%/%25}"
+            done
+            tail -5 /tmp/doc-examples.log
+          fi
+          exit "$status"
 
       - name: Benchmark smoke test
         run: python3 bench/run_bench.py --only fib --reps 1 --out /tmp/bench-results.md
