@@ -88,24 +88,39 @@ Work required to honor the plan:
    checked program to a CFG of numbered locals and basic blocks, with explicit
    moves, drops (guarded by drop flags), and bounds-checked index projections.
    `zexic emit --emit=mir` prints it, and it is documented in
-   [`13-mir.md`](13-mir.md). 92% of the reachable functions in `tests/`,
+   [`13-mir.md`](13-mir.md). 93% of the reachable functions in `tests/`,
    `examples/`, and `bench/` lower today; the rest report *why* they do not
-   (interpolated strings, `defer`, indirect calls, ...). What has **not**
-   happened yet: the C backend still walks the typed AST, so MIR is a second
-   verified description of the program rather than the one the shipped compiler
-   consumes. Flipping that is the next step, and it is a separate piece of work
+   (`defer`, indirect calls, collection iteration, partial moves, ...).
+   Interpolated strings lower through typed String-building intrinsics. What has
+   **not** happened yet: the C backend still walks the typed AST, so MIR is a
+   second verified description of the program rather than the one the shipped
+   compiler consumes. Flipping that is the next step, and it is a separate piece of work
    from producing the IR.
-2. **Add the backend interface** (`internal/codegen.Backend`) and a
+2. **Land the layout table.** ✅ **Done, verified against `cc`.** `internal/layout`
+   answers size, alignment, field offsets, and enum tagging for every type the
+   language can express. It exists because a non-C backend has no `sizeof` to
+   lean on: it has to know the ABI itself. The rules are not invented — they
+   describe what `cc` does with the C the current backend emits. A differential
+   test compiles declarations from a test-local `cgen`, asks `cc` for `sizeof`,
+   `_Alignof` and `offsetof`, and requires the table to agree. It does not
+   compile the backend's emitted C: `cgen` models `slice` as `{ const void
+   *ptr; size_t len; }`, while backend `ctype` emits `const void *`. It does so
+   for a
+   hand-written matrix covering every type constructor *and* for all 49
+   structs and enums in `tests/`, `examples/`, and `bench/`. The C backend
+   still uses `sizeof` and does not consult the table; it becomes the shared
+   ABI the moment a second backend exists.
+3. **Add the backend interface** (`internal/codegen.Backend`) and a
    conformance suite that runs every backend against the same programs and
    compares observable behavior. The C backend is tested by it first. The
    differential harness in `internal/mir/interp_test.go` is a working
    prototype of exactly this: it runs a program through the C backend and
    through a MIR interpreter and compares output, which is how the lowering
    itself is currently validated.
-3. **Grow the native emitter** target by target (start x86-64 SysV), keeping the
+4. **Grow the native emitter** target by target (start x86-64 SysV), keeping the
    C backend green as the reference.
 
-Until step 2 ships, `--cc` selects the C compiler and `--emit=c` remains the
+Until step 3 ships, `--cc` selects the C compiler and `--emit=c` remains the
 supported way to inspect the C backend's lowering, with `--emit=mir` alongside
 it for the IR. After a native backend ships, `--backend=native|c` selects
 between them and the default flips to `native`.

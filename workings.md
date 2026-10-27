@@ -95,12 +95,31 @@ checked against the C backend by the differential tests.
 - Ownership becomes instructions: `move` takes a value out of a place and clears
   its drop flag, and `drop(p) with flag` at scope exit releases what is still
   there. Drops are emitted on every exit path (`return`, `break`, `continue`).
+- Interpolated strings build a `String` through typed runtime intrinsics in
+  source order, borrowing owned inputs and dropping per-part temporaries.
+- Owning parameters and temporaries carry drop flags; projected owning moves
+  that need per-field flags are reported instead of silently double-dropping.
 - Constructs with no lowering yet are reported per function instead of failing
   the program, so coverage grows one feature at a time.
 - `Body.validate` checks the CFG and runs a definite-initialization pass;
   `interp.go` executes MIR so tests can compare it against the real binary.
 
-### 2.7 Compilation / linking (`driver.CompileC` / `CompileUnits`)
+### 2.7 ABI layout (`internal/layout`) — sizes the backend cannot ask C for
+
+- `layout.Of(ty)` returns `{Size, Align}`; `Struct`/`Enum` additionally return
+  per-field and per-variant offsets, so an emitter can address a field without
+  a compiler to ask.
+- The rules describe what `cc` does with the C the current backend emits: a
+  scalar's alignment is its size, structs pad and round up, and an enum is an
+  `int32` tag followed by a union of per-variant payload structs.
+- This matters the moment a second backend exists. C can say `sizeof`; LLVM IR
+  and Cranelift cannot, so the compiler has to know its own ABI.
+- Verified by asking `cc` rather than by reasoning: the tests emit the C,
+  compile it, run it, and compare `sizeof`, `_Alignof` and `offsetof` against
+  the table — for a matrix of every type constructor and for all the structs
+  and enums in `tests/`, `examples/` and `bench/`.
+
+### 2.8 Compilation / linking (`driver.CompileC` / `CompileUnits`)
 - Writes generated C to temp files.
 - Invokes `cc` with `-std=gnu11`, optimization, `-fwrapv` (defined signed
   integer wrapping), `-ffunction-sections`, `-fdata-sections`, and include dirs.
@@ -208,6 +227,7 @@ Key flags: `--jobs N` (parallel units), `--opt-level`, `--include`, `--csrc`,
 | Sema / move check | `internal/sema/` |
 | Codegen | `internal/codegen/c/` |
 | MIR | `internal/mir/` |
+| ABI layout | `internal/layout/` |
 | Driver / build | `internal/driver/driver.go` |
 | Stdlib | `internal/driver/std/` |
 | C shims | `internal/driver/zxnet_c.txt`, `zxsys_c.txt`, `zxregex_c.txt`, `zxthread_c.txt` |

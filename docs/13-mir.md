@@ -5,7 +5,7 @@ front end produces and that backends are meant to consume (`docs/04 §4.3`,
 `docs/06 §6.5`).
 
 **Status: landed for the computational core, not yet on the production path.**
-`zexic emit --emit=mir` lowers and prints MIR for 92% of the reachable functions
+`zexic emit --emit=mir` lowers and prints MIR for 93% of the reachable functions
 in `tests/`, `examples/`, and `bench/`; every body it produces passes the
 invariants in `Validate`, and the subset it covers is checked for *semantic*
 equivalence against the C backend by a differential test. The C backend still
@@ -117,17 +117,37 @@ Calls name their callee as one of three things: a lowered Zexi function, an
 the built-in owning types; it names the operation and lets each backend map the
 name onto its runtime.
 
+Interpolation `f"..."` builds an owning `String` with these intrinsics, in
+source order:
+
+| Intrinsic | Contract |
+| --- | --- |
+| `String::new()` | Create an empty owning `String` |
+| `String::as_str(&String)` | Borrow a `str` view |
+| `String::push_str(&mut String, str)` | Append a string view |
+| `String::push(&mut String, char)` | Append a UTF-8 character |
+| `String::push_i64` / `push_u64` | Append a decimal `i64` / `u64` |
+| `String::push_f64` | Append an `f64` with C `printf`'s default `%g` precision |
+
+Numeric arguments are explicitly widened to the intrinsic's type, and booleans
+branch to append `"true"` or `"false"`. Interpolated `String` values are
+borrowed, not moved; a temporary source lives until its part is appended and is
+then dropped. The builder moves into the result after the last part. Normal
+`String`-to-`str` call arguments use the same borrowing operation.
+
 ## 13.4 Ownership and drops
 
-Every owning local gets a **drop flag**, a `bool` that starts `true` and is set
-to `false` at the point the value is moved out. At scope exit the body emits
-`drop(local) with flag`, which does nothing when the value has already moved
-away. This is what makes conditional moves safe without path analysis in the
-backend:
+Every owning local and by-value parameter gets a **drop flag**. It is `true`
+when the value is initialized and is set to `false` at the point the value is
+moved out. A borrowed temporary under construction has a false flag until its
+initializer completes, so an early exit does not drop uninitialized storage.
+At scope exit the body emits `drop(local) with flag`, which does nothing when
+the value has already moved away. This is what makes conditional moves safe
+without path analysis in the backend:
 
 ```
-    _3 = move _1;              // takes ownership of the argument
-    dropflag(_f1) = false;     // ... so _1 will not be dropped
+    dropflag(_f1) = false;     // _1 will not be dropped
+    _3 = move _1;              // transfers ownership of the argument
 ```
 
 Scope exits on `return`, `break`, and `continue` emit their own drops before
@@ -137,10 +157,11 @@ has to place the drops.
 
 **Known gap: partial moves.** Moving one field out of a struct or one payload out
 of a variant needs a flag per *path*, not per local. Since drop flags are per
-local today, lowering allows such a move only when it is the variant's single
-owning field (which transfers the whole obligation) and reports anything else as
-unsupported rather than risking a double free. This is the top item to fix when
-drop elaboration grows per-field flags.
+local today, lowering reports ordinary moves out of owning fields or elements
+as unsupported rather than risking a double free. Pattern binding has a narrow
+exception for a variant's single owning field, which transfers the whole
+drop obligation. This is the top item to fix when drop elaboration grows
+per-field flags.
 
 ## 13.5 Lowering
 
@@ -173,13 +194,14 @@ Three layers, in increasing strength:
    path where it may not have been written.
 2. **`TestValidateEveryBody` and the corpus test** — every body lowered from the
    repository's own programs is validated, so a lowering regression fails CI.
-3. **A reference interpreter, used as an oracle.** `interp.go` executes MIR
-   directly for the pure-computation subset, and `TestDifferentialAgainstCBackend`
-   compiles each program with the real C backend, runs it, interprets the MIR,
-   and compares stdout and exit codes. This is the only check in the project that
-   compares semantics rather than shape, and it has already caught several
-   lowering bugs (an index value applied to the wrong projection, boolean
-   `switchInt` reading a stale integer field).
+3. **A reference interpreter, used as an oracle.** `interp.go` executes MIR for
+   the computational subset and selected `String` operations. Differential
+   tests compile each program with the real C backend, run it, interpret the
+   MIR, and compare stdout and exit codes. The interpolation cases are
+   mandatory (they do not skip unsupported operations) and cover formatting,
+   borrowing, evaluation order, early exits, and numeric widths. The interpreter
+   does not model allocation or destruction; separate MIR path tests check
+   ownership flags, temporary drops, and drops on early returns.
 
 The interpreter is **not** an execution mode: Zexi's non-goals include no
 interpreter and no VM (`docs/01 §1.2`). It exists inside `internal/mir` for tests
@@ -187,13 +209,14 @@ only.
 
 ## 13.7 What is not lowered yet
 
-As of this writing, `tests/`+`examples/`+`bench/` lower 409 of 444 reachable
-functions. The remaining ones, by cause:
+As of this writing, `tests/`+`examples/`+`bench/` lower 413 of 444 reachable
+functions. Interpolation removed eight previous blockers; four functions that
+previously lowered are now reported because their partial moves could otherwise
+double-drop. The remaining causes include:
 
 | Cause | Notes |
 | --- | --- |
 | Indirect calls through function values | needs a callee *operand* in `Call`, not just a `FuncRef` |
-| Interpolated strings `f"..."` | needs either a runtime builder call sequence or a formatting intrinsic |
 | `defer` | needs scope-exit action lists ordered before drops |
 | `for x in collection` | needs an iterator protocol (or an index loop over `len`) |
 | Indexing `Vec`/`HashMap` | currently array-only; would become a runtime intrinsic |
@@ -205,9 +228,8 @@ functions. The remaining ones, by cause:
 
 A backend needs:
 
-1. **Layout.** Sizes and offsets for structs, enums, and arrays. `Types` already
-   gives field and variant order; layout is not yet a shared table, so the first
-   backend to land should factor one out into `internal/layout`.
+1. **Layout.** `internal/layout` provides sizes, alignments, field offsets,
+   and enum tags; its ABI rules are checked against the C compiler.
 2. **A translation for each statement, terminator, and rvalue** in §13.3 — this
    is a few hundred lines, not a language re-implementation.
 3. **Drop glue.** `drop(p)` for a struct or enum is a call to a generated helper

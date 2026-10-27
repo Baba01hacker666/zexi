@@ -216,18 +216,16 @@ func TestCorpusLowersEverythingItReports(t *testing.T) {
 func TestUnsupportedIsReported(t *testing.T) {
 	res := lowerString(t, `
 fn main() -> i32 {
-    let n = 3;
-    let s = f"hi {n}";
-    println(s);
+    defer println("later");
     0
 }`)
 	if len(res.Unsupported) == 0 {
-		t.Fatal("expected an interpolated string to be reported as unsupported")
+		t.Fatal("expected defer to be reported as unsupported")
 	}
 	if res.Prog.Main != nil {
 		t.Error("main should not be lowered when it uses an unsupported construct")
 	}
-	if !strings.Contains(res.Unsupported[0].Feature, "interpolated") {
+	if !strings.Contains(res.Unsupported[0].Feature, "defer") {
 		t.Errorf("report should name the construct, got %q", res.Unsupported[0].Feature)
 	}
 }
@@ -237,9 +235,7 @@ fn main() -> i32 {
 func TestPropagatesFailureToCallers(t *testing.T) {
 	res := lowerString(t, `
 fn helper() -> i64 {
-    let n = 2;
-    let msg = f"n = {n}";
-    println(msg);
+    defer println("later");
     1
 }
 fn main() -> i32 {
@@ -260,5 +256,31 @@ fn main() -> i32 {
 	}
 	if !mainReport || !helperReport {
 		t.Errorf("both functions should be reported, got %v", res.Unsupported)
+	}
+}
+
+// A field moved out of an owning aggregate cannot share the parent's drop
+// flag. Reporting this gap is safer than emitting a double drop; match-pattern
+// bindings have a separate, explicitly handled sole-owning-field exception.
+func TestOwningFieldMoveIsReported(t *testing.T) {
+	res := lowerString(t, `
+struct Pair { a: String, b: String }
+fn take(p: Pair) -> String { p.a }
+fn main() -> i32 {
+    let p = Pair { a: String::from("a"), b: String::from("b") };
+    println(take(p));
+    0
+}`)
+	if res.Prog.Main != nil {
+		t.Error("caller of an unsupported partial move should not be lowered")
+	}
+	found := false
+	for _, u := range res.Unsupported {
+		if u.Fn == "take" && strings.Contains(u.Feature, "partial move") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a partial-move report for take, got %v", res.Unsupported)
 	}
 }

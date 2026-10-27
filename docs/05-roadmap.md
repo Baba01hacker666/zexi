@@ -4,7 +4,7 @@
 > resolution, bidirectional type inference, constant folding, a flow-sensitive
 > move checker, and a C backend that produces a runnable native binary. A
 > second lowering now sits beside the C backend: `internal/mir` flattens the
-> checked program into a control-flow graph (`--emit=mir`), covering 92% of this
+> checked program into a control-flow graph (`--emit=mir`), covering 93% of this
 > repository's reachable functions and checked against the C backend by
 > differential tests — the groundwork for a swappable backend
 > ([`13-mir.md`](13-mir.md)). The

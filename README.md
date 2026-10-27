@@ -90,7 +90,7 @@ runtime.
 Two lowerings consume the checked program. The shipped one emits C. The other is
 **MIR**, a control-flow graph of numbered locals with explicit moves, drops, and
 bounds-checked indexes ([`docs/13-mir.md`](docs/13-mir.md)): `--emit=mir` prints
-it, it covers 92% of this repository's reachable functions today, and its
+it, it covers 93% of this repository's reachable functions today, and its
 semantics are diffed against the C backend by a test that compiles each program
 natively, runs it, interprets the MIR, and compares the output. It is not yet the
 path the compiler takes — that is the next step toward a swappable native
@@ -220,6 +220,7 @@ internal/
                       and the flow-sensitive move checker (own.go)
   codegen/c/          M0 backend: typed program -> C11
   mir/                mid-level IR: CFG lowering, validator, dump, test oracle
+  layout/             ABI table: sizes, alignments, field offsets, enum tags
   driver/             pipeline orchestration, imports/modules + C compiler invocation
   diag/               diagnostics + source spans
 docs/                 the specification

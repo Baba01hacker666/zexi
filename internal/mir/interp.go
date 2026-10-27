@@ -18,7 +18,9 @@ package mir
 import (
 	"fmt"
 	"io"
+	"math"
 	"strconv"
+	"strings"
 
 	"zexi/internal/token"
 	"zexi/internal/types"
@@ -36,8 +38,8 @@ type Interp struct {
 }
 
 // UnsupportedError reports a construct the interpreter does not model. It is
-// distinct from a program bug: a test that lowers a function using `String`
-// should skip, not fail.
+// distinct from a program bug: tests can skip constructs the oracle does not
+// model instead of mistaking that limitation for a lowering failure.
 type UnsupportedError struct{ What string }
 
 func (e *UnsupportedError) Error() string { return "interp: unsupported: " + e.What }
@@ -53,6 +55,7 @@ const (
 	vFloat
 	vBool
 	vStr
+	vString
 	vStruct
 	vEnum
 	vArray
@@ -75,9 +78,10 @@ type Value struct {
 	fn     *Fn
 }
 
+// A reference points to the resolved slot, not the expression that selected
+// it. In particular, an array index is evaluated when the borrow is created.
 type reference struct {
-	fr    *frame
-	place Place
+	target *Value
 }
 
 type frame struct {
@@ -88,6 +92,28 @@ type frame struct {
 func unitValue() Value { return Value{kind: vUnit} }
 
 func intValue(v uint64) Value { return Value{kind: vInt, i: v} }
+
+func floatValue(v float64, ty *types.Type) Value {
+	if ty != nil && ty.Kind == types.F32 {
+		v = float64(float32(v))
+	}
+	return Value{kind: vFloat, f: v}
+}
+
+// A typed MIR destination stores a value at its declared width. This matters
+// for intermediate i8/u8 arithmetic and f32 rounding, not only explicit casts.
+func normalizeValue(v Value, ty *types.Type) Value {
+	if ty == nil {
+		return v
+	}
+	switch {
+	case v.kind == vInt && (ty.Kind.IsInt() || ty.Kind == types.Char):
+		v.i = truncate(v.i, ty)
+	case v.kind == vFloat && ty.Kind == types.F32:
+		v.f = float64(float32(v.f))
+	}
+	return v
+}
 
 // boolValue keeps the integer bit pattern in step with the boolean, because a
 // SwitchInt reads the integer field: `if c { .. }` branches on 1 and 0.
@@ -156,7 +182,7 @@ func (in *Interp) call(fn *Fn, args []Value) (Value, error) {
 		if i >= len(args) {
 			break
 		}
-		fr.locals[id] = args[i]
+		fr.locals[id] = normalizeValue(args[i], fn.Body.Locals[id].Ty)
 	}
 	cur := BlockID(0)
 	for {
@@ -196,7 +222,7 @@ func (in *Interp) call(fn *Fn, args []Value) (Value, error) {
 				}
 				args = append(args, v)
 			}
-			res, err := in.invoke(t.Callee, args)
+			res, err := in.invoke(t.Callee, args, t.Args)
 			if err != nil {
 				return Value{}, err
 			}
@@ -205,7 +231,7 @@ func (in *Interp) call(fn *Fn, args []Value) (Value, error) {
 				if err != nil {
 					return Value{}, err
 				}
-				*slot = copyValue(res)
+				*slot = normalizeValue(copyValue(res), fr.fn.Body.Ty(*t.Dest))
 			}
 			cur = t.Target
 		case *Return:
@@ -218,7 +244,7 @@ func (in *Interp) call(fn *Fn, args []Value) (Value, error) {
 	}
 }
 
-func (in *Interp) invoke(ref FuncRef, args []Value) (Value, error) {
+func (in *Interp) invoke(ref FuncRef, args []Value, ops []Operand) (Value, error) {
 	switch {
 	case ref.Fn != nil:
 		return in.call(ref.Fn, args)
@@ -227,7 +253,11 @@ func (in *Interp) invoke(ref FuncRef, args []Value) (Value, error) {
 			if i > 0 {
 				fmt.Fprint(in.Out, " ")
 			}
-			fmt.Fprint(in.Out, formatValue(a))
+			text, err := printable(a, ops[i].Ty)
+			if err != nil {
+				return Value{}, err
+			}
+			fmt.Fprint(in.Out, text)
 		}
 		if ref.Builtin == BnPrintln {
 			fmt.Fprintln(in.Out)
@@ -236,11 +266,151 @@ func (in *Interp) invoke(ref FuncRef, args []Value) (Value, error) {
 	case ref.Builtin == BnPanic:
 		msg := "panic"
 		if len(args) > 0 {
-			msg = formatValue(args[0])
+			var err error
+			msg, err = printable(args[0], ops[0].Ty)
+			if err != nil {
+				return Value{}, err
+			}
 		}
 		return Value{}, fmt.Errorf("interp: panic: %s", msg)
 	}
-	return Value{}, &UnsupportedError{What: "call to " + ref.String()}
+	return stringBuiltin(ref.Builtin, args)
+}
+
+// printable mirrors the C runtime's printing of the scalar and string types.
+// String arguments to print are borrowed, so follow their reference first.
+func printable(v Value, ty *types.Type) (string, error) {
+	for v.kind == vRef {
+		if v.ref == nil || v.ref.target == nil {
+			return "", fmt.Errorf("interp: invalid printable reference")
+		}
+		v = *v.ref.target
+		if ty != nil && (ty.Kind == types.Ref || ty.Kind == types.Ptr) {
+			ty = ty.Elem
+		}
+	}
+	if ty != nil {
+		switch {
+		case ty.Kind == types.Char:
+			return encodeChar(uint32(v.i)), nil
+		case ty.Kind.IsSigned():
+			return strconv.FormatInt(int64(truncate(v.i, ty)), 10), nil
+		case ty.Kind.IsUnsigned():
+			return strconv.FormatUint(truncate(v.i, ty), 10), nil
+		case ty.Kind.IsFloat():
+			return formatFloat(floatValue(v.f, ty).f), nil
+		}
+	}
+	if v.kind == vStr || v.kind == vString {
+		return cString(v.s), nil
+	}
+	return formatValue(v), nil
+}
+
+// cString models the current C runtime's NUL-terminated str representation.
+func cString(s string) string {
+	if i := strings.IndexByte(s, 0); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// formatFloat is the runtime's snprintf("%g", value), whose default precision
+// is six significant digits. Go's default %g uses a different precision.
+func formatFloat(f float64) string {
+	if math.IsNaN(f) {
+		if math.Signbit(f) {
+			return "-nan"
+		}
+		return "nan"
+	}
+	if math.IsInf(f, 1) {
+		return "inf"
+	}
+	if math.IsInf(f, -1) {
+		return "-inf"
+	}
+	return strconv.FormatFloat(f, 'g', 6, 64)
+}
+
+// encodeChar matches zx_utf8_encode, including the C backend's handling of
+// integer-to-char casts outside the Unicode scalar range.
+func encodeChar(c uint32) string {
+	switch {
+	case c < 0x80:
+		return string([]byte{byte(c)})
+	case c < 0x800:
+		return string([]byte{byte(0xc0 | (c >> 6)), byte(0x80 | (c & 0x3f))})
+	case c < 0x10000:
+		return string([]byte{byte(0xe0 | (c >> 12)), byte(0x80 | ((c >> 6) & 0x3f)), byte(0x80 | (c & 0x3f))})
+	default:
+		return string([]byte{byte(0xf0 | (c >> 18)), byte(0x80 | ((c >> 12) & 0x3f)), byte(0x80 | ((c >> 6) & 0x3f)), byte(0x80 | (c & 0x3f))})
+	}
+}
+
+// stringBuiltin models just the String runtime operations that the interpreter
+// understands. Strings themselves are Go values; a reference mutates its
+// target slot. No allocation or destructor behavior is claimed by the oracle.
+func stringBuiltin(name string, args []Value) (Value, error) {
+	arity := -1
+	switch name {
+	case BnStringNew:
+		arity = 0
+	case "String::from", "String::with_capacity", BnStringAsStr,
+		"String::len", "String::is_empty", "String::clone", "String::clear":
+		arity = 1
+	case BnStringPushStr, BnStringPush, BnStringPushI64, BnStringPushU64, BnStringPushF64:
+		arity = 2
+	default:
+		return Value{}, &UnsupportedError{What: "call to " + name}
+	}
+	if len(args) != arity {
+		return Value{}, fmt.Errorf("interp: %s expects %d arguments, got %d", name, arity, len(args))
+	}
+	switch name {
+	case BnStringNew, "String::with_capacity":
+		return Value{kind: vString}, nil
+	case "String::from":
+		if args[0].kind != vStr {
+			return Value{}, fmt.Errorf("interp: String::from requires a str")
+		}
+		return Value{kind: vString, s: cString(args[0].s)}, nil
+	}
+	// Source methods can have a reference-to-reference receiver; peel all
+	// references, retaining a pointer to the owning String slot.
+	recv := &args[0]
+	for recv.kind == vRef && recv.ref != nil && recv.ref.target != nil {
+		recv = recv.ref.target
+	}
+	if recv.kind != vString {
+		return Value{}, fmt.Errorf("interp: %s requires a String receiver", name)
+	}
+	switch name {
+	case BnStringAsStr:
+		return Value{kind: vStr, s: cString(recv.s)}, nil
+	case "String::len":
+		return intValue(uint64(len(recv.s))), nil
+	case "String::is_empty":
+		return boolValue(len(recv.s) == 0), nil
+	case "String::clone":
+		return Value{kind: vString, s: recv.s}, nil
+	case "String::clear":
+		recv.s = ""
+	case BnStringPushStr:
+		if args[1].kind != vStr {
+			return Value{}, fmt.Errorf("interp: String::push_str requires a str")
+		}
+		recv.s += cString(args[1].s)
+	case BnStringPush:
+		recv.s += encodeChar(uint32(args[1].i))
+	case BnStringPushI64:
+		recv.s += strconv.FormatInt(int64(args[1].i), 10)
+	case BnStringPushU64:
+		recv.s += strconv.FormatUint(args[1].i, 10)
+	case BnStringPushF64:
+		recv.s += formatFloat(args[1].f)
+	}
+	return unitValue(), nil
 }
 
 func formatValue(v Value) string {
@@ -256,7 +426,7 @@ func formatValue(v Value) string {
 			return "true"
 		}
 		return "false"
-	case vStr:
+	case vStr, vString:
 		return v.s
 	}
 	return "<aggregate>"
@@ -273,7 +443,7 @@ func (in *Interp) execStmt(fr *frame, s Stmt) error {
 		if err != nil {
 			return err
 		}
-		*slot = copyValue(v)
+		*slot = normalizeValue(copyValue(v), fr.fn.Body.Ty(st.Place))
 	case *Drop:
 		// Nothing to release: the interpreter owns no heap.
 		if st.HasFlag {
@@ -315,7 +485,7 @@ func (in *Interp) rvalue(fr *frame, r Rvalue) (Value, error) {
 		switch rv.Op {
 		case token.KindMinus:
 			if rv.Ty != nil && rv.Ty.Kind.IsFloat() {
-				return Value{kind: vFloat, f: -x.f}, nil
+				return floatValue(-x.f, rv.Ty), nil
 			}
 			return intValue(-x.i), nil
 		case token.KindBang:
@@ -354,7 +524,11 @@ func (in *Interp) rvalue(fr *frame, r Rvalue) (Value, error) {
 		}
 		return Value{}, fmt.Errorf("interp: unknown aggregate kind")
 	case *Ref:
-		return Value{kind: vRef, ref: &reference{fr: fr, place: rv.Place}}, nil
+		slot, err := in.place(fr, rv.Place)
+		if err != nil {
+			return Value{}, err
+		}
+		return Value{kind: vRef, ref: &reference{target: slot}}, nil
 	case *Discriminant:
 		v, err := in.place(fr, rv.Place)
 		if err != nil {
@@ -373,6 +547,8 @@ func (in *Interp) rvalue(fr *frame, r Rvalue) (Value, error) {
 		case vArray:
 			return intValue(uint64(len(v.elems))), nil
 		case vStr:
+			return intValue(uint64(len(cString(v.s)))), nil
+		case vString:
 			return intValue(uint64(len(v.s))), nil
 		}
 		return Value{}, &UnsupportedError{What: "len of a non-array"}
@@ -414,7 +590,7 @@ func constValue(o Operand) Value {
 	case ConstInt:
 		return intValue(o.Const.Bits)
 	case ConstFloat:
-		return Value{kind: vFloat, f: o.Const.F}
+		return floatValue(o.Const.F, o.Ty)
 	case ConstBool:
 		return boolValue(o.Const.Bits != 0)
 	case ConstChar:
@@ -441,21 +617,17 @@ func (in *Interp) place(fr *frame, p Place) (*Value, error) {
 		}
 		idx[i] = v.i
 	}
-	return resolveProj(fr, &fr.locals[p.Local], p.Proj, idx, 0)
+	return resolveProj(&fr.locals[p.Local], p.Proj, idx)
 }
 
-func resolveProj(fr *frame, v *Value, projs []Proj, idx []uint64, off int) (*Value, error) {
+func resolveProj(v *Value, projs []Proj, idx []uint64) (*Value, error) {
 	for i, pr := range projs {
 		switch pr.Kind {
 		case ProjDeref:
-			if v.kind != vRef {
+			if v.kind != vRef || v.ref == nil || v.ref.target == nil {
 				return nil, fmt.Errorf("interp: deref of a non-reference")
 			}
-			target, err := resolveProj(v.ref.fr, &v.ref.fr.locals[v.ref.place.Local], v.ref.place.Proj, idx, off)
-			if err != nil {
-				return nil, err
-			}
-			return resolveProj(v.ref.fr, target, projs[i+1:], idx, off+i+1)
+			v = v.ref.target
 		case ProjField:
 			if v.kind != vStruct && v.kind != vEnum {
 				return nil, fmt.Errorf("interp: field access on a non-aggregate")
@@ -468,7 +640,7 @@ func resolveProj(fr *frame, v *Value, projs []Proj, idx []uint64, off int) (*Val
 			if v.kind != vArray {
 				return nil, fmt.Errorf("interp: index into a non-array")
 			}
-			n := idx[off+i]
+			n := idx[i]
 			if n >= uint64(len(v.elems)) {
 				return nil, fmt.Errorf("interp: index %d out of bounds (len %d)", n, len(v.elems))
 			}
@@ -501,16 +673,16 @@ func binop(op token.Kind, l, r Value, resTy, opTy *types.Type) (Value, error) {
 		a, b := l.f, r.f
 		switch op {
 		case token.KindPlus:
-			return Value{kind: vFloat, f: a + b}, nil
+			return floatValue(a+b, resTy), nil
 		case token.KindMinus:
-			return Value{kind: vFloat, f: a - b}, nil
+			return floatValue(a-b, resTy), nil
 		case token.KindStar:
-			return Value{kind: vFloat, f: a * b}, nil
+			return floatValue(a*b, resTy), nil
 		case token.KindSlash:
 			if b == 0 {
 				return Value{}, fmt.Errorf("interp: float division by zero")
 			}
-			return Value{kind: vFloat, f: a / b}, nil
+			return floatValue(a/b, resTy), nil
 		case token.KindLt:
 			return boolValue(a < b), nil
 		case token.KindLe:
@@ -526,8 +698,8 @@ func binop(op token.Kind, l, r Value, resTy, opTy *types.Type) (Value, error) {
 		}
 		return Value{}, &UnsupportedError{What: "float operator " + op.String()}
 	}
-	// Integers. Signedness comes from the operand type; widths do not matter
-	// here because a value is already truncated by the cast that produced it.
+	// Integers are stored at their declared width when assigned. Signedness
+	// determines comparison, division and right-shift semantics.
 	signed := opTy == nil || opTy.Kind.IsSigned() || opTy.Kind == types.Char
 	if opTy != nil && opTy.Kind == types.Char {
 		signed = false
@@ -601,17 +773,16 @@ func binop(op token.Kind, l, r Value, resTy, opTy *types.Type) (Value, error) {
 func castValue(c *Cast, x Value) (Value, error) {
 	switch c.Kind {
 	case CastInt:
-		if c.To != nil {
-			return intValue(truncate(x.i, c.To)), nil
-		}
-		return intValue(x.i), nil
+		// Normalize the source first, so widening a signed narrow value
+		// sign-extends instead of treating its bits as an unsigned number.
+		return intValue(truncate(truncate(x.i, c.From), c.To)), nil
 	case CastFloat:
-		return x, nil
+		return floatValue(floatValue(x.f, c.From).f, c.To), nil
 	case CastIntToFloat:
 		if c.From != nil && c.From.Kind.IsSigned() {
-			return Value{kind: vFloat, f: float64(int64(x.i))}, nil
+			return floatValue(float64(int64(truncate(x.i, c.From))), c.To), nil
 		}
-		return Value{kind: vFloat, f: float64(x.i)}, nil
+		return floatValue(float64(truncate(x.i, c.From)), c.To), nil
 	case CastFloatToInt:
 		return intValue(uint64(int64(x.f))), nil
 	case CastBoolInt:
@@ -640,11 +811,17 @@ func truncate(v uint64, t *types.Type) uint64 {
 		return v
 	}
 	switch t.Kind {
-	case types.I8, types.U8:
+	case types.I8:
+		return uint64(int64(int8(v)))
+	case types.U8:
 		return uint64(uint8(v))
-	case types.I16, types.U16:
+	case types.I16:
+		return uint64(int64(int16(v)))
+	case types.U16:
 		return uint64(uint16(v))
-	case types.I32, types.U32:
+	case types.I32:
+		return uint64(int64(int32(v)))
+	case types.U32, types.Char:
 		return uint64(uint32(v))
 	case types.Bool:
 		if v != 0 {
@@ -666,7 +843,10 @@ func (in *Interp) Supported() (bool, string) {
 		for _, blk := range fn.Body.Blocks {
 			if c, ok := blk.Term.(*Call); ok && c.Callee.Builtin != "" {
 				switch c.Callee.Builtin {
-				case BnPrint, BnPrintln, BnPanic:
+				case BnPrint, BnPrintln, BnPanic,
+					BnStringNew, "String::from", "String::with_capacity", BnStringAsStr,
+					"String::len", "String::is_empty", "String::clone", "String::clear",
+					BnStringPushStr, BnStringPush, BnStringPushI64, BnStringPushU64, BnStringPushF64:
 				default:
 					return false, "builtin " + c.Callee.Builtin
 				}

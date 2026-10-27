@@ -714,6 +714,19 @@ const (
 	BnPrintln = "println"
 	// BnPanic aborts with a message.
 	BnPanic = "panic"
+
+	// String intrinsics used by interpolation. Receivers are references;
+	// push_* mutates &mut String, while as_str borrows &String. The numeric
+	// operations append a decimal i64/u64 or a default-precision %g f64.
+	// Boolean interpolation branches to push_str("true"/"false"), and chars
+	// use the same String::push intrinsic as the source-level method.
+	BnStringNew     = "String::new"
+	BnStringPushStr = "String::push_str"
+	BnStringPush    = "String::push"
+	BnStringPushI64 = "String::push_i64"
+	BnStringPushU64 = "String::push_u64"
+	BnStringPushF64 = "String::push_f64"
+	BnStringAsStr   = "String::as_str"
 )
 
 // Fn is one lowered function.

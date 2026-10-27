@@ -321,6 +321,14 @@ func (l *lowerer) lowerFn(src *sema.Fn) (*Body, error) {
 			l.declare(name, id)
 		}
 	}
+	// By-value owning parameters arrive initialized and belong to the callee.
+	// Register them after allocating all arguments so argument IDs stay
+	// contiguous, and returning/moving one clears its flag just like a local.
+	for _, id := range l.body.Args {
+		if ty := l.body.Locals[id].Ty; ty.NeedsDrop() {
+			l.registerDrop(id, ty)
+		}
+	}
 
 	blk := src.Decl.Body
 	for _, s := range blk.Stmts {
@@ -586,9 +594,13 @@ func (l *lowerer) read(p Place, sp token.Span) (Operand, error) {
 		return Copy(p, t), nil
 	}
 	if !p.IsLocal() {
-		// Out of a field or element. Without a destructor this is an ordinary
-		// copy, so it is always safe; with one it is a partial move, which needs
-		// exactly one owning field to be attributable (see bindPattern).
+		// A projected owning value needs a per-field drop flag (or explicit
+		// drop-safe clearing). Moving it while retaining the parent's drop flag
+		// would release the same resource twice. Pattern bindings have their own
+		// narrow exception for a variant's sole owning field (moveBinding).
+		if t.NeedsDrop() {
+			return Operand{}, unsupportedf(sp, "partial move from `%s` requires per-field drop flags", p)
+		}
 		return Move(p, t), nil
 	}
 	if flag, ok := l.flagOf(p); ok {
@@ -633,10 +645,20 @@ func (l *lowerer) tempFor(e ast.Expr) (Place, error) {
 		return Place{}, unsupportedf(e.Span(), "value without a type")
 	}
 	tmp := l.temp(t)
-	if err := l.exprInto(e, Place{Local: tmp}); err != nil {
+	place := Place{Local: tmp}
+	// A borrowed temporary is not initialized until its expression finishes.
+	// If that expression returns or breaks, scope exit must not drop garbage.
+	flag, owning := l.flagOf(place)
+	if owning {
+		l.emit(&SetDropFlag{Flag: flag, Val: false, Sp: e.Span()})
+	}
+	if err := l.exprInto(e, place); err != nil {
 		return Place{}, err
 	}
-	return Place{Local: tmp}, nil
+	if owning && !l.terminated() {
+		l.emit(&SetDropFlag{Flag: flag, Val: true, Sp: e.Span()})
+	}
+	return place, nil
 }
 
 // discard evaluates e and drops its value at the end of the statement.
@@ -761,7 +783,7 @@ func (l *lowerer) exprInto(e ast.Expr, dest Place) error {
 		return l.jump(x)
 
 	case *ast.InterpStrExpr:
-		return unsupportedf(x.Sp, "interpolated strings")
+		return l.interpStrInto(x, dest)
 
 	case *ast.SliceExpr:
 		return unsupportedf(x.Sp, "slice expressions")
@@ -1496,9 +1518,15 @@ func (l *lowerer) callInto(x *ast.CallExpr, dest Place) error {
 			// `String::from(..)`, `Vec::new()`, `HashMap::new()`: a runtime
 			// intrinsic of the built-in owning type, not a Zexi function.
 			ops := make([]Operand, 0, len(x.Args))
-			for _, a := range x.Args {
-				op, err := l.expr(a)
-				if err != nil {
+			for i, a := range x.Args {
+				var op Operand
+				var err error
+				if p.Segments[0] == "String" && p.Segments[1] == "from" && i == 0 {
+					op, err = l.stringViewOperand(a)
+				} else {
+					op, err = l.expr(a)
+				}
+				if err != nil || l.terminated() {
 					return err
 				}
 				ops = append(ops, op)
@@ -1537,8 +1565,17 @@ func (l *lowerer) directCallInto(src *sema.Fn, args []ast.Expr, dest Place, sp t
 		ops = append(ops, *recv)
 	}
 	for _, a := range args {
-		op, err := l.expr(a)
-		if err != nil {
+		var op Operand
+		var err error
+		// The checker permits a String in a str argument position; this is a
+		// borrow, not a move of the String into a differently typed parameter.
+		i := len(ops)
+		if i < len(src.Params) && src.Params[i] != nil && src.Params[i].Kind == types.Str {
+			op, err = l.stringViewOperand(a)
+		} else {
+			op, err = l.expr(a)
+		}
+		if err != nil || l.terminated() {
 			return err
 		}
 		ops = append(ops, op)
@@ -1576,17 +1613,34 @@ func builtinTypeName(t *types.Type) string {
 // runtime. That keeps the IR free of any one backend's implementation.
 func (l *lowerer) builtinMethodInto(x *ast.MethodCallExpr, rt *types.Type, dest Place) error {
 	recv, err := l.placeForRef(x.Recv)
-	if err != nil {
+	if err != nil || l.terminated() {
 		return err
 	}
-	rtRef := types.RefTo(l.body.Ty(recv), true)
-	tmp := l.temp(rtRef)
-	l.emit(&Assign{Place: Place{Local: tmp}, RV: &Ref{Mut: true, Place: recv, Ty: rtRef}, Sp: x.Sp})
-	ops := make([]Operand, 0, len(x.Args)+1)
-	ops = append(ops, Copy(Place{Local: tmp}, rtRef))
-	for _, a := range x.Args {
-		op, err := l.expr(a)
+	mut := true
+	if rt.Kind == types.StringKind {
+		// A source receiver may itself be &String; the intrinsic always takes
+		// a reference to the String, not a reference to that reference.
+		recv, _, err = l.autoDeref(recv, x.Sp)
 		if err != nil {
+			return err
+		}
+		switch x.Name {
+		case "clear", "push", "push_str", "push_byte":
+			mut = true
+		default:
+			mut = false
+		}
+	}
+	ops := []Operand{l.refOperand(recv, mut, x.Sp)}
+	wants := sema.StringMethodParams(x.Name)
+	for i, a := range x.Args {
+		var op Operand
+		if rt.Kind == types.StringKind && i < len(wants) && wants[i] != nil && wants[i].Kind == types.Str {
+			op, err = l.stringViewOperand(a)
+		} else {
+			op, err = l.expr(a)
+		}
+		if err != nil || l.terminated() {
 			return err
 		}
 		ops = append(ops, op)
@@ -1594,8 +1648,149 @@ func (l *lowerer) builtinMethodInto(x *ast.MethodCallExpr, rt *types.Type, dest 
 	return l.emitBuiltin(builtinTypeName(rt)+"::"+x.Name, ops, dest, l.ty(x), x.Sp)
 }
 
+// stringViewOperand implements the checker's implicit String-to-str argument
+// coercion. A String place stays owned by its caller; a temporary is kept alive
+// for the call (or interpolation part) and is dropped in its enclosing scope.
+func (l *lowerer) stringViewOperand(e ast.Expr) (Operand, error) {
+	if t := l.ty(e); t == nil || t.Kind != types.StringKind {
+		return l.expr(e)
+	}
+	recv, err := l.borrowOrCopy(e)
+	if err != nil || l.terminated() {
+		return Operand{}, err
+	}
+	view := Place{Local: l.temp(types.StrT)}
+	if err := l.emitBuiltin(BnStringAsStr, []Operand{recv}, view, types.StrT, e.Span()); err != nil {
+		return Operand{}, err
+	}
+	return Copy(view, types.StrT), nil
+}
+
+// refOperand materializes a reference to a place in a non-owning temporary.
+func (l *lowerer) refOperand(place Place, mut bool, sp token.Span) Operand {
+	ty := types.RefTo(l.body.Ty(place), mut)
+	tmp := l.temp(ty)
+	l.emit(&Assign{Place: Place{Local: tmp}, RV: &Ref{Mut: mut, Place: place, Ty: ty}, Sp: sp})
+	return Copy(Place{Local: tmp}, ty)
+}
+
+// interpStrInto builds a String in evaluation order. The buffer has its own
+// drop flag so an early return in a part releases it; on success it is moved to
+// dest. Each part gets a short scope: a temporary String borrowed by that part
+// is dropped after its bytes have been appended, not after the enclosing block.
+func (l *lowerer) interpStrInto(x *ast.InterpStrExpr, dest Place) error {
+	// A temporary destination is not initialized until the result is ready.
+	// In particular, do not drop it if a part returns or breaks early.
+	destFlag, hasDestFlag := l.flagOf(dest)
+	if hasDestFlag {
+		l.emit(&SetDropFlag{Flag: destFlag, Val: false, Sp: x.Sp})
+	}
+	buf := Place{Local: l.temp(types.StringT)}
+	if err := l.emitBuiltin(BnStringNew, nil, buf, types.StringT, x.Sp); err != nil {
+		return err
+	}
+	for _, part := range x.Parts {
+		l.pushScope()
+		if err := l.interpPartInto(part, buf); err != nil {
+			return err
+		}
+		l.exitScope()
+		if l.terminated() {
+			return nil
+		}
+	}
+	op, err := l.read(buf, x.Sp)
+	if err != nil {
+		return err
+	}
+	l.assign(dest, op, x.Sp)
+	if hasDestFlag {
+		l.emit(&SetDropFlag{Flag: destFlag, Val: true, Sp: x.Sp})
+	}
+	return nil
+}
+
+// interpPartInto appends one literal or printable expression, borrowing owning
+// String operands instead of moving them out of their source places.
+func (l *lowerer) interpPartInto(part ast.Expr, buf Place) error {
+	if lit, ok := part.(*ast.LiteralExpr); ok && lit.Kind == token.KindString {
+		c, err := l.literal(lit)
+		if err != nil {
+			return err
+		}
+		return l.appendTo(buf, BnStringPushStr, Operand{Kind: OpConst, Const: c, Ty: types.StrT}, lit.Sp)
+	}
+
+	t := l.ty(part)
+	if t == nil || t.Kind == types.Invalid {
+		return unsupportedf(part.Span(), "interpolated value without a type")
+	}
+	if t.Kind == types.StringKind {
+		view, err := l.stringViewOperand(part)
+		if err != nil || l.terminated() {
+			return err
+		}
+		return l.appendTo(buf, BnStringPushStr, view, part.Span())
+	}
+	op, err := l.expr(part)
+	if err != nil || l.terminated() {
+		return err
+	}
+	switch {
+	case t.Kind == types.Str:
+		return l.appendTo(buf, BnStringPushStr, op, part.Span())
+	case t.Kind == types.Char:
+		return l.appendTo(buf, BnStringPush, op, part.Span())
+	case t.Kind == types.Bool:
+		return l.appendBool(buf, op, part.Span())
+	case t.Kind.IsInt() && t.Kind.IsSigned():
+		return l.appendNumber(buf, BnStringPushI64, op, types.I64T, part.Span())
+	case t.Kind.IsInt():
+		return l.appendNumber(buf, BnStringPushU64, op, types.Builtins["u64"], part.Span())
+	case t.Kind.IsFloat():
+		return l.appendNumber(buf, BnStringPushF64, op, types.F64T, part.Span())
+	}
+	return unsupportedf(part.Span(), "interpolating a value of type %s", t)
+}
+
+// appendNumber records the widening cast explicitly: changing an operand's
+// type alone would lose signed extension and f32-to-f64 conversion.
+func (l *lowerer) appendNumber(buf Place, builtin string, op Operand, to *types.Type, sp token.Span) error {
+	if !types.Equal(op.Ty, to) {
+		tmp := Place{Local: l.temp(to)}
+		l.emit(&Assign{Place: tmp, RV: &Cast{Kind: castKind(op.Ty, to), X: op, From: op.Ty, To: to}, Sp: sp})
+		op = Copy(tmp, to)
+	}
+	return l.appendTo(buf, builtin, op, sp)
+}
+
+func (l *lowerer) appendBool(buf Place, op Operand, sp token.Span) error {
+	yes, no, join := l.newBlock(), l.newBlock(), l.newBlock()
+	l.setTerm(&SwitchInt{Discr: op, Cases: []Case{{Val: 1, Target: yes}}, Otherwise: no, Sp: sp})
+	l.cur = yes
+	if err := l.appendTo(buf, BnStringPushStr, Operand{Kind: OpConst, Const: StrConst("true"), Ty: types.StrT}, sp); err != nil {
+		return err
+	}
+	l.gotoBlock(join, sp)
+	l.cur = no
+	if err := l.appendTo(buf, BnStringPushStr, Operand{Kind: OpConst, Const: StrConst("false"), Ty: types.StrT}, sp); err != nil {
+		return err
+	}
+	l.gotoBlock(join, sp)
+	l.cur = join
+	return nil
+}
+
+func (l *lowerer) appendTo(buf Place, builtin string, arg Operand, sp token.Span) error {
+	recv := l.refOperand(buf, true, sp)
+	return l.emitBuiltin(builtin, []Operand{recv, arg}, Place{}, types.UnitT, sp)
+}
+
 // emitBuiltin emits a call to a runtime intrinsic, continuing at a fresh block.
 func (l *lowerer) emitBuiltin(name string, ops []Operand, dest Place, retTy *types.Type, sp token.Span) error {
+	if l.terminated() {
+		return nil
+	}
 	var destPtr *Place
 	if !isUnit(retTy) && !isUnit(l.body.Ty(dest)) {
 		d := dest
@@ -1613,7 +1808,7 @@ func (l *lowerer) printInto(x *ast.CallExpr, newline bool) error {
 	ops := make([]Operand, 0, len(x.Args))
 	for _, a := range x.Args {
 		op, err := l.borrowOrCopy(a)
-		if err != nil {
+		if err != nil || l.terminated() {
 			return err
 		}
 		ops = append(ops, op)
