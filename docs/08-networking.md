@@ -162,6 +162,7 @@ full scoped module lookup is completed in M1.
 
 A client in the urllib/requests style:
 
+<!-- check-only -->
 ```zx
 import http.client;
 
