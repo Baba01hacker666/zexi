@@ -1,0 +1,2 @@
+// Every program needs a `main`.
+fn helper() -> i64 { return 1; } // error: E0601 no `main` function found

@@ -1,0 +1,8 @@
+// Struct literal fields must match the declared types.
+struct P { x: i64 }
+
+fn main() -> i32 {
+    let p = P { x: "hi" }; // error: E0308 mismatched types in field `x`: expected `i64`, found `str`
+    println(p.x);
+    0
+}

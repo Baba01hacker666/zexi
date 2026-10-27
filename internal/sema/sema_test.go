@@ -14,7 +14,7 @@ import (
 // diagnostic codes that were produced.
 func check(t *testing.T, src string) (ok bool, codes []string) {
 	t.Helper()
-	file, pd := parser.Parse(0, []byte(src))
+	file, pd := parser.Parse(0, 0, []byte(src))
 	if file == nil {
 		t.Fatalf("parser returned nil for %q", src)
 	}
@@ -69,6 +69,55 @@ fn main() -> i32 {
 }`
 	if ok, codes := check(t, src); !ok {
 		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestLiteralExprAdoptsContextType(t *testing.T) {
+	// A tree of integer literals adopts the annotated type instead of
+	// defaulting to i32: `let x: i64 = 5 ^ 3` is i64.
+	src := `fn main() -> i32 {
+    let x: i64 = 5 ^ 3;
+    let y: i64 = (1 + 2) * 3;
+    let z: i64 = -7 + x + y;
+    println(z);
+    0
+}`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
+func TestUnreachableArms(t *testing.T) {
+	cases := []struct{ name, src, want string }{
+		{"after-catchall", `fn main() -> i32 {
+    let n = 5;
+    match n {
+        _ => println("a"),
+        5 => println("b"),
+    }
+    0
+}`, "E0001"},
+		{"after-full-enum", `enum E { A, B }
+fn main() -> i32 {
+    let e = E::A;
+    match e {
+        E::A => println("a"),
+        E::B => println("b"),
+        _ => println("c"),
+    }
+    0
+}`, "E0001"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, codes := check(t, tc.src)
+			if ok {
+				t.Fatal("expected an unreachable-pattern error")
+			}
+			if !has(codes, tc.want) {
+				t.Fatalf("expected %s, got %v", tc.want, codes)
+			}
+		})
 	}
 }
 
@@ -1157,7 +1206,7 @@ fn main() -> i32 {
     let o = Opt::Some(2);
     0
 }`
-	file, pd := parser.Parse(0, []byte(src))
+	file, pd := parser.Parse(0, 0, []byte(src))
 	if len(pd) > 0 {
 		t.Fatalf("unexpected parse diagnostics: %v", codesOf(pd))
 	}
@@ -1224,7 +1273,7 @@ fn main() -> i32 {
     println(p.get());
     0
 }`
-	file, pd := parser.Parse(0, []byte(src))
+	file, pd := parser.Parse(0, 0, []byte(src))
 	if len(pd) > 0 {
 		t.Fatalf("unexpected parse diagnostics: %v", codesOf(pd))
 	}
@@ -1270,7 +1319,7 @@ fn main() -> i32 {
     println(d);
     0
 }`
-	file, pd := parser.Parse(0, []byte(src))
+	file, pd := parser.Parse(0, 0, []byte(src))
 	if len(pd) > 0 {
 		t.Fatalf("unexpected parse diagnostics: %v", codesOf(pd))
 	}

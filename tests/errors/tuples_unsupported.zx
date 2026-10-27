@@ -1,0 +1,5 @@
+// Tuples are on the roadmap (M1), not yet implemented.
+fn main() -> i32 {
+    let t = (1, 2); // error: E0900
+    0
+}

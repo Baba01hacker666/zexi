@@ -1,0 +1,22 @@
+// bench/strbuild/strbuild.zx — owning String growth: 200k formatted appends,
+// then a byte-by-byte hash of the result. The C twin is strbuild.c; both must
+// print the same `strbuild <len> <hash>` line.
+
+fn main() -> i32 {
+    let mut s = String::new();
+    let mut i: i64 = 0;
+    while i < 800000 {
+        s.push_str("item ");
+        s += i;
+        s.push('\n');
+        i += 1;
+    }
+    let mut h: i64 = 0;
+    let mut k: usize = 0;
+    while k < s.len() {
+        h = (h * 131 + s.byte_at(k)) % 2147483647;
+        k += 1;
+    }
+    println("strbuild", s.len(), h);
+    0
+}

@@ -1,0 +1,43 @@
+// bench/matmul/matmul.zx — 256x256 f64 matrix multiply, six rounds over one
+// flat array each. Values are multiples of 0.125, so the checksum is exact
+// integer arithmetic in both languages. The C twin is matmul.c.
+
+const N: usize = 256;
+
+fn main() -> i32 {
+    let mut a = [0.0; 65536];
+    let mut b = [0.0; 65536];
+    let mut c = [0.0; 65536];
+    let mut i: usize = 0;
+    while i < 65536 {
+        a[i] = ((i % 7) as f64) * 0.5;
+        b[i] = ((i % 13) as f64) * 0.25;
+        i += 1;
+    }
+    let mut round: i64 = 0;
+    while round < 20 {
+        let mut r: usize = 0;
+        while r < N {
+            let mut k: usize = 0;
+            while k < N {
+                let av = a[r * N + k];
+                let mut col: usize = 0;
+                while col < N {
+                    c[r * N + col] = c[r * N + col] + av * b[k * N + col];
+                    col += 1;
+                }
+                k += 1;
+            }
+            r += 1;
+        }
+        round += 1;
+    }
+    let mut sum: f64 = 0.0;
+    i = 0;
+    while i < 65536 {
+        sum = sum + c[i];
+        i += 1;
+    }
+    println("matmul", (sum * 8.0) as i64);
+    0
+}

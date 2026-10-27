@@ -10,7 +10,7 @@ import (
 // kinds lexes src and returns the token kinds, excluding the trailing EOF.
 func kinds(t *testing.T, src string) []token.Kind {
 	t.Helper()
-	lx := lexer.New(0, []byte(src))
+	lx := lexer.New(0, 0, []byte(src))
 	var out []token.Kind
 	for _, tok := range lx.All() {
 		if tok.Kind == token.KindEOF {
@@ -90,7 +90,7 @@ func TestErrors(t *testing.T) {
 		{"0o", "E0005"},
 	}
 	for _, c := range cases {
-		lx := lexer.New(0, []byte(c.src))
+		lx := lexer.New(0, 0, []byte(c.src))
 		lx.All()
 		errs := lx.Errors()
 		if len(errs) == 0 {
@@ -114,7 +114,7 @@ func FuzzLexer(f *testing.F) {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, src string) {
-		lx := lexer.New(0, []byte(src))
+		lx := lexer.New(0, 0, []byte(src))
 		sawEOF := false
 		for _, tok := range lx.All() {
 			if int(tok.End) > len(src) {
@@ -137,7 +137,7 @@ func TestNewKeywords(t *testing.T) {
 }
 
 func TestRawStringWithHashes(t *testing.T) {
-	lx := lexer.New(0, []byte(`r#"say "hi""# r##"a #" b"## r"plain"`))
+	lx := lexer.New(0, 0, []byte(`r#"say "hi""# r##"a #" b"## r"plain"`))
 	toks := lx.All()
 	if errs := lx.Errors(); len(errs) != 0 {
 		t.Fatalf("unexpected errors: %v", errs)
@@ -155,7 +155,7 @@ func TestRawStringWithHashes(t *testing.T) {
 
 func TestUnderscorePlacementErrors(t *testing.T) {
 	for _, src := range []string{"1__2", "1_", "0x_FF", "0b1__0"} {
-		lx := lexer.New(0, []byte(src))
+		lx := lexer.New(0, 0, []byte(src))
 		lx.All()
 		errs := lx.Errors()
 		if len(errs) == 0 || errs[0].Code != "E0005" {
@@ -166,7 +166,7 @@ func TestUnderscorePlacementErrors(t *testing.T) {
 }
 
 func TestHashCommentAndFStringTokens(t *testing.T) {
-	lx := lexer.New(0, []byte("# a comment\nlet x = f\"a {x} b\" # trailing\n#[copy]"))
+	lx := lexer.New(0, 0, []byte("# a comment\nlet x = f\"a {x} b\" # trailing\n#[copy]"))
 	var kinds []token.Kind
 	var fstr string
 	all := lx.All()

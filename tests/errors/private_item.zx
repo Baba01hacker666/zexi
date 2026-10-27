@@ -1,0 +1,11 @@
+// `pub` gates qualified access across modules.
+mod inner {
+    fn hidden() -> i64 { return 1; }
+    pub fn shown() -> i64 { return 2; }
+}
+
+fn main() -> i32 {
+    println(inner::hidden()); // error: E0603 item `inner::hidden` is private
+    println(inner::shown());
+    0
+}

@@ -1,0 +1,9 @@
+// A function body whose tail expression has the wrong type.
+fn f() -> i64 {
+    "hi" // error: E0308 function `f` returns `i64` but its body has type `str`
+}
+
+fn main() -> i32 {
+    println(f());
+    0
+}

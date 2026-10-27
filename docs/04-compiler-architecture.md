@@ -195,6 +195,7 @@ zexi check [file.zx]              parse + typecheck + borrowck only
 zexi fmt   [file.zx]              format source
 zexi doc   ...                    generate docs (M2)
 zexi emit  --emit=<ast|hir|mir|c|asm|bin> file.zx
+zexi lsp   [entry.zx]             language server on stdio (LSP)
 
 Options:
   -o <path>            output path
@@ -225,8 +226,11 @@ error[E0308]: mismatched types
    = help: use `let n: i32 = 42;` or convert explicitly with `parse::<i32>()`
 ```
 
-The rendering is shared by CLI and (future) LSP; the emitter is the only place
-that formats, so `--message-format` is a pure view change.
+The rendering is shared by CLI and the language server (`zexic lsp`); the
+emitter is the only place that formats, so `--message-format` is a pure view
+change. Spans live in one shared offset space across every file a program
+loads, so each diagnostic resolves to the file and position it came from even
+when the error is in an imported file.
 
 ## 4.11 Testing strategy
 

@@ -1,0 +1,12 @@
+// A catch-all after arms that already cover every variant.
+enum E { A, B }
+
+fn main() -> i32 {
+    let e = E::A;
+    match e {
+        E::A => println("a"),
+        E::B => println("b"),
+        _ => println("c"), // error: E0001 unreachable pattern: an earlier arm already matches everything
+    }
+    0
+}

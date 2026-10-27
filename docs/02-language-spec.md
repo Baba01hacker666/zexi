@@ -153,6 +153,7 @@ never               the type of `return`/`panic`; coerces to anything
 
 ### Composites
 
+<!-- fragment -->
 ```zexi
 [T; N]        fixed array, N a compile-time constant
 [T]           slice: (pointer, len) fat pointer, bounds-checked
@@ -334,6 +335,7 @@ omitted returns `()`. An interpolated string `f"...{expr}..."` evaluates to
 an owning `String`; interpolated values are borrowed (never moved) and must
 be printable (numbers, `bool`, `char`, `str`, `String`).
 
+<!-- fragment -->
 ```zexi
 let first = loop {
     if xs[i] > 100 { break xs[i]; }
@@ -344,6 +346,7 @@ let first = loop {
 
 ## 2.6 Ownership (summary — see docs/03)
 
+<!-- fragment -->
 ```zexi
 fn main() {
     let s = String::from("hello");   // s owns heap memory

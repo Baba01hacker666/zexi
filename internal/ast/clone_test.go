@@ -36,7 +36,7 @@ fn main() -> i32 {
     println(f(1));
     0
 }`
-	file, diags := parser.Parse(0, []byte(src))
+	file, diags := parser.Parse(0, 0, []byte(src))
 	if len(diags) != 0 {
 		t.Fatalf("parse diagnostics: %v", diags)
 	}

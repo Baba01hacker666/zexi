@@ -1,0 +1,24 @@
+// bench/match/match.zx — match dispatch: a state machine with eight arms,
+// stepped 50 million times. The C twin is match.c; both must print the same
+// `match <n>` line.
+
+fn main() -> i32 {
+    let mut acc: i64 = 1;
+    let mut k: i64 = 0;
+    while k < 50000000 {
+        let v = (k * 7 + 13) % 101;
+        match k & 7 {
+            0 => acc = acc + v,
+            1 => acc = acc - v,
+            2 => acc = acc * 3 + v,
+            3 => acc = acc ^ v,
+            4 => acc = (acc * 2) ^ v,
+            5 => acc = -acc + v,
+            6 => acc = acc + v * 2,
+            _ => acc = acc - v * 3,
+        }
+        k += 1;
+    }
+    println("match", acc);
+    0
+}

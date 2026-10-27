@@ -1,0 +1,7 @@
+// `as` only casts between types with a defined conversion.
+fn main() -> i32 {
+    let s = "hi";
+    let n = s as i64; // error: E0308 cannot cast `str` with `as`
+    println(n);
+    0
+}

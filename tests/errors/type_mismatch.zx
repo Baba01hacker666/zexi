@@ -1,0 +1,6 @@
+// A let binding whose initializer does not match the declared type.
+fn main() -> i32 {
+    let x: i64 = "hi"; // error: E0308 mismatched types: expected `i64`, found `str`
+    println(x);
+    0
+}

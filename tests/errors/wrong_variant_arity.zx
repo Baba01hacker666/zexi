@@ -1,0 +1,11 @@
+// Enum variants have fixed arity.
+enum E { A(i64), B }
+
+fn main() -> i32 {
+    let e = E::A(); // error: E0061 variant `E::A` takes 1 field(s) but 0 were supplied
+    match e {
+        E::A(n) => println(n),
+        E::B => println(0),
+    }
+    0
+}

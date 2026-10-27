@@ -1,0 +1,6 @@
+// A character the lexer does not accept.
+fn main() -> i32 {
+    let x = 1 $ 2; // error: E0002 unexpected character
+    println(x);
+    0
+}

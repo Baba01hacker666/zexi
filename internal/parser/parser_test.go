@@ -9,7 +9,7 @@ import (
 
 func parse(t *testing.T, src string) (*ast.File, int) {
 	t.Helper()
-	file, diags := parser.Parse(0, []byte(src))
+	file, diags := parser.Parse(0, 0, []byte(src))
 	if file == nil {
 		t.Fatalf("Parse(%q) returned nil file", src)
 	}
@@ -80,7 +80,7 @@ func FuzzParse(f *testing.F) {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, src string) {
-		file, _ := parser.Parse(0, []byte(src))
+		file, _ := parser.Parse(0, 0, []byte(src))
 		if file == nil {
 			t.Fatalf("Parse(%q) returned nil file", src)
 		}

@@ -1,0 +1,5 @@
+// An identifier that is not in scope.
+fn main() -> i32 {
+    println(nope); // error: E0425 cannot find `nope` in this scope
+    0
+}

@@ -1,0 +1,7 @@
+// Calling a function with the wrong number of arguments.
+fn add(a: i64, b: i64) -> i64 { return a + b; }
+
+fn main() -> i32 {
+    println(add(1)); // error: E0061 `add` takes 2 argument(s) but 1 were supplied
+    0
+}

@@ -29,3 +29,6 @@ coverage.out
 
 # Local tooling
 /tmp/
+
+# Python tooling cache
+__pycache__/

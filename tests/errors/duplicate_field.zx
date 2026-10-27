@@ -1,0 +1,8 @@
+// Duplicate fields in a struct literal.
+struct P { x: i64, y: i64 }
+
+fn main() -> i32 {
+    let p = P { x: 1, x: 2, y: 3 }; // error: E0062 field `x` specified more than once
+    println(p.x);
+    0
+}

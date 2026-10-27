@@ -169,6 +169,11 @@ type loader struct {
 	entry      *module                  // the program module (first input path)
 	useTargets map[*ast.UseDecl]*module // resolved target of each use/import
 	nextModID  int
+	nextBase   int // next free offset in the shared span space
+
+	// overlay shadows on-disk contents for unsaved editor buffers, keyed by
+	// cleaned absolute symlink-resolved paths (see normalizeOverlay).
+	overlay map[string][]byte
 
 	firstID int
 
@@ -218,12 +223,55 @@ func (l *loader) loadDisk(filePath string) *module {
 	if m, ok := l.mods[key]; ok {
 		return m
 	}
+	if src, ok := l.overlay[abs]; ok {
+		return l.loadModule(key, filePath, src, filepath.Dir(abs))
+	}
 	src, err := os.ReadFile(filePath)
 	if err != nil {
 		l.em.Report(diag.New("E9020", "cannot read %s: %v", filePath, err))
 		return nil
 	}
 	return l.loadModule(key, filePath, src, filepath.Dir(abs))
+}
+
+// probeFile reports whether path names a loadable regular file: either it
+// exists in the overlay (an unsaved editor buffer) or on disk. It is the
+// overlay-aware version of the stat probes used to resolve imports.
+func (l *loader) probeFile(path string) bool {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = filepath.Clean(path)
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	}
+	if _, ok := l.overlay[abs]; ok {
+		return true
+	}
+	if st, err := os.Stat(path); err == nil && !st.IsDir() {
+		return true
+	}
+	return false
+}
+
+// normalizeOverlay cleans overlay keys the same way loadDisk cleans paths:
+// absolute and, when the file resolves, symlink-resolved.
+func normalizeOverlay(overlay map[string][]byte) map[string][]byte {
+	if len(overlay) == 0 {
+		return nil
+	}
+	out := make(map[string][]byte, len(overlay))
+	for k, src := range overlay {
+		abs, err := filepath.Abs(k)
+		if err != nil {
+			abs = filepath.Clean(k)
+		}
+		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+			abs = resolved
+		}
+		out[abs] = src
+	}
+	return out
 }
 
 // loadStdFile loads one embedded standard-library file by base name (for
@@ -264,8 +312,13 @@ func (l *loader) loadModule(key, display string, src []byte, dir string) *module
 	}
 	m := &module{key: key, dir: dir}
 	l.mods[key] = m
-	m.fileID = l.em.AddFile(display, src)
-	file, parseDiags := parser.Parse(m.fileID, src)
+	// Each file gets a disjoint range of the shared span space, so any
+	// diagnostic span identifies both its file and its position in it (see
+	// diag.File.Base). The +1 leaves a gap so end-of-file spans are unique.
+	base := l.nextBase
+	l.nextBase += len(src) + 1
+	m.fileID = l.em.AddFileAt(display, src, base)
+	file, parseDiags := parser.Parse(m.fileID, base, src)
 	l.em.Report(parseDiags...)
 	if file == nil {
 		file = &ast.File{}
@@ -367,7 +420,7 @@ func (l *loader) bindMod(root, owner *module, d *ast.ModDecl, prefix []string) {
 	}
 	for _, dir := range l.searchDirs(owner.dir) {
 		cand := filepath.Join(dir, d.Name+".zx")
-		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+		if l.probeFile(cand) {
 			bind(l.loadDisk(cand))
 			return
 		}
@@ -378,7 +431,7 @@ func (l *loader) bindMod(root, owner *module, d *ast.ModDecl, prefix []string) {
 		if err != nil || !st.IsDir() {
 			continue
 		}
-		if modFile := filepath.Join(pkgDir, "mod.zx"); fileExists(modFile) {
+		if modFile := filepath.Join(pkgDir, "mod.zx"); l.probeFile(modFile) {
 			bind(l.loadDisk(modFile))
 			return
 		}
@@ -470,7 +523,7 @@ func (l *loader) resolveUse(m *module, d *ast.UseDecl) (*module, []string, bool)
 	name := filepath.Join(parts...) + ".zx"
 	for _, dir := range l.searchDirs(m.dir) {
 		cand := filepath.Join(dir, name)
-		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+		if l.probeFile(cand) {
 			if target := l.loadDisk(cand); target != nil {
 				return target, parts, true
 			}
@@ -486,7 +539,7 @@ func (l *loader) resolveUse(m *module, d *ast.UseDecl) (*module, []string, bool)
 		if err != nil || !st.IsDir() {
 			continue
 		}
-		if modFile := filepath.Join(pkgDir, "mod.zx"); fileExists(modFile) {
+		if modFile := filepath.Join(pkgDir, "mod.zx"); l.probeFile(modFile) {
 			target := l.loadDisk(modFile)
 			return target, parts, target != nil
 		}

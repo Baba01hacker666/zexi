@@ -87,6 +87,17 @@ This repository contains the **initial design and specification** of Zexi: the v
 See [`workings.md`](workings.md) for a walkthrough of the compiler pipeline and
 runtime.
 
+## Benchmarks
+
+Zexi compiles to C, so the honest expectation is near-C speed — and the
+interesting question is what the language's guarantees cost. The
+[`bench/`](bench/) suite runs each workload as a Zexi program and as the same
+program in plain C (same compiler, same flags) and refuses to rank a pair
+whose checksums differ. On the first run, pure computation matches C within
+noise, and bounds-checked indexing and owning `String` growth cost about 10%
+where they show up at all. Numbers and methodology:
+[`bench/results.md`](bench/results.md), [`bench/README.md`](bench/README.md).
+
 ## Projects
 
 A program can be one file or a whole folder. Point `zexic` at a project
@@ -103,6 +114,18 @@ Named imports are searched next to the importing file, in its `lib/`, at the
 project root, and in the root's `lib/`, before the embedded standard library.
 `use util;` where `util/` is a directory loads the **whole folder** (every `.zx`
 inside it) as one package; `--root=dir` pins the root explicitly.
+
+## Editor support (LSP)
+
+`zexic lsp` is a language server speaking JSON-RPC over stdio. It gives you
+diagnostics as you type (unsaved buffers included, multi-file errors landing on
+the file that actually has them), hover types and signatures, go-to-definition,
+completion — including `.`-triggered field/method/variant completion — and
+document symbols. Point your editor's LSP client at `zexic lsp` for the
+`zexi` language; an optional argument names the program entry (`zexic lsp
+main.zx`) so program-level diagnostics are exact, and without one each open
+document is analyzed on its own (libraries included — the "no main" error is
+suppressed for files that don't declare one).
 
 ## Try it
 
@@ -189,6 +212,9 @@ internal/
 docs/                 the specification
 examples/             sample Zexi source
 tests/                programs exercised by the test suite
+  errors/             rejected programs with their expected diagnostics
+scripts/              doc-example checker and other repo tooling
+bench/                benchmarks against plain C (see bench/README.md)
 ```
 
 ## Test
@@ -197,4 +223,13 @@ tests/                programs exercised by the test suite
 go test ./...                 # unit, fuzz-corpus, and end-to-end run tests
 go test -run xxx -fuzz FuzzParse ./internal/parser   # property-test the parser
 go test -run xxx -fuzz FuzzLexer ./internal/lexer    # property-test the lexer
+python3 scripts/check_doc_examples.py --run  # compile and run every doc example
+python3 bench/run_bench.py                  # benchmark against plain C
 ```
+
+Diagnostics are pinned by fixture programs in [`tests/errors/`](tests/errors/):
+each file declares the exact errors it must produce (`// error: E0382 ...`),
+and a mismatch — a missing, extra, or changed diagnostic — fails the suite.
+The documentation's fenced `zx` blocks are checked the same way the code is:
+`check_doc_examples.py` compiles each one (wrapping fragments as needed) so
+the docs cannot drift away from the compiler.

@@ -75,6 +75,7 @@ its Zexi name as its C symbol with external linkage, and it is emitted even when
 nothing in Zexi calls it. Paired with `extern "C"` declarations for the other
 direction, C and Zexi can call each other both ways:
 
+<!-- check-only -->
 ```zx
 #[export]
 fn zexi_add(a: i64, b: i64) -> i64 { return a + b; }
@@ -112,6 +113,7 @@ conversion.)
 
 ## 7.4 Literals
 
+<!-- fragment -->
 ```zx
 42  1_000  0xFF  0b1010  0o755     // integers
 3.14  1e9  2.5e-3                  // floats
@@ -145,6 +147,7 @@ Precedence (tightest first): unary `- ! & *` → `as` → `* / %` → `+ -` →
 
 ## 7.7 Control flow
 
+<!-- fragment -->
 ```zx
 // if / else if / else — as a statement ...
 if n < 0 {
@@ -192,6 +195,7 @@ fine. A block's value is its trailing expression (no `;`).
 keeps matching (the scrutinee is re-evaluated each iteration). Both are sugar
 over `match`, and take the same patterns:
 
+<!-- fragment -->
 ```zx
 if let Shape::Circle(r) = shape {
     println(r);
@@ -218,6 +222,7 @@ s.push_str("y");
 
 ## 7.8 `match`
 
+<!-- fragment -->
 ```zx
 match d {
     Direction::North => Direction::East,
@@ -232,6 +237,7 @@ An arm may carry a guard, `pat if cond => body`. When the pattern matches but
 the guard fails, the following arms are tried, so a variant may appear more than
 once. A guarded arm does not count towards exhaustiveness.
 
+<!-- fragment -->
 ```zx
 match n {
     0 => "zero",
@@ -250,6 +256,7 @@ Alternatives may be combined with `|` (or-patterns) and ranges. Or-pattern
 alternatives may not bind variables; a range must not be empty (`5..=1` is
 `E0080`), and ranges do not by themselves make a match exhaustive:
 
+<!-- fragment -->
 ```zx
 match n {
     0 => "zero",
@@ -285,6 +292,7 @@ match arg_at(1).as_str() {
 
 ## 7.9 Arrays
 
+<!-- fragment -->
 ```zx
 let xs: [i32; 3] = [10, 20, 30];
 let zeros = [0; 4];        // repeat form
@@ -364,6 +372,7 @@ struct may hold a `Vec` field. See `tests/vec.zx` for a full tour.
 
 ## 7.11 Printing
 
+<!-- fragment -->
 ```zx
 print("no newline");
 println("with newline");
@@ -374,6 +383,7 @@ println();            // just a newline
 
 ## 7.12 Casts
 
+<!-- fragment -->
 ```zx
 let n = 65 as char;    // 'A'
 let m = big as i32;    // truncating integer cast
