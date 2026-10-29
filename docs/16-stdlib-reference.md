@@ -52,6 +52,7 @@ fn main() -> i32 {
 | `app.fallback(handler)` | replace the 404 handler |
 | `app.before(mw)` / `app.after(mw)` | middleware around routing |
 | `app.pages(root)` | serve a folder as the site (`/` → `index.html`, `/x` → `x.html` or `x/index.html`) |
+| `http::project_path(path)` | resolve a relative folder against the entry directory; every folder argument in `web`/`http` goes through it, so `pages("public")` means *the project's* `public/`, not the shell's |
 | `app.files(prefix, root)` | serve a folder under a URL prefix (longest prefix wins) |
 | `app.views(dir)` | template folder used by `page` |
 | `app.workers(n)` | threads `serve` uses (0 = two per core) |
