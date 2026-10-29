@@ -489,6 +489,27 @@ impl Request {
         }
     }
 
+    // params_map copies the captured `{name}` segments into a new map.
+    pub fn params_map(&self) -> HashMap<String, String> {
+        let mut out: HashMap<String, String> = HashMap::new();
+        self.collect_params(&mut out);
+        return out;
+    }
+
+    // query_map copies the decoded query string into a new map.
+    pub fn query_map(&self) -> HashMap<String, String> {
+        let mut out: HashMap<String, String> = HashMap::new();
+        self.collect_query(&mut out);
+        return out;
+    }
+
+    // form_map copies an x-www-form-urlencoded body into a new map.
+    pub fn form_map(&self) -> HashMap<String, String> {
+        let mut out: HashMap<String, String> = HashMap::new();
+        self.collect_form(&mut out);
+        return out;
+    }
+
     // collect_query copies every decoded query value into `out`.
     pub fn collect_query(&self, out: &mut HashMap<String, String>) {
         let raw = self.raw_query();

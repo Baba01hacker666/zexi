@@ -500,7 +500,8 @@ func TestRunPrograms(t *testing.T) {
 		{
 			file: "../../tests/closures.zx",
 			want: strings.Join([]string{
-				"42", "42", "20", "101", "100", "42", "23", "n=9!", "14", "6", "8", "",
+				"42", "42", "20", "101", "100", "42", "23", "n=9!", "14", "6", "8",
+				"0", "1", "4", "9", "16", "3", "true", "true", "30", "1030", "",
 			}, "\n"),
 		},
 		{
@@ -512,10 +513,10 @@ func TestRunPrograms(t *testing.T) {
 				"400 {\"error\":\"bad input\"}",
 				"<b>zexi</b>",
 				"<p>&lt;b&gt;zexi&lt;/b&gt;</p>",
-				"127.0.0.1:8080",
 				"200 text/html; charset=utf-8",
 				"302 /next",
-				"400 {\"ok\":false,\"message\":\"nope\"}",
+				"{\"error\":\"nope\"}",
+				"127.0.0.1 8080",
 				"",
 			}, "\n"),
 		},
@@ -767,11 +768,11 @@ use json;
 fn home(req: &Request) -> Response {
     let mut v = html::vars();
     v.set("title", "Home <1>");
-    return web::render("index", &v);
+    return web::page("index", &v);
 }
 
 fn user(req: &Request) -> Response {
-    let p = web::path_params(req);
+    let p = web::params(req);
     let mut doc = json::object();
     doc.set_str("id", p.get("id"));
     return web::json_of(&doc);

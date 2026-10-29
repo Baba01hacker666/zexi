@@ -73,5 +73,20 @@ fn main() -> i32 {
     // A `fn` value is still an ordinary value: it can be rebound and passed on.
     let alias = double;
     println(apply(alias, 4));
+
+    // The builtin container methods take closures directly.
+    let mut squares: Vec<i64> = Vec::new();
+    let mut i: i64 = 0;
+    while i < 5 {
+        squares.push(i * i);
+        i += 1;
+    }
+    squares.each(|x| println(x));
+    println(squares.count(|x| x % 2 == 0));
+    println(squares.any(|x| x > 10));
+    println(squares.all(|x| x >= 0));
+    println(squares.fold(0, |acc, x| acc + x));
+    let offset = 1000;
+    println(squares.fold(offset, |acc, x| acc + x));
     0
 }

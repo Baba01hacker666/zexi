@@ -459,7 +459,34 @@ payloads move into the arm and are dropped once. A guarded arm copies for the
 guard and takes ownership only after it passes. Binding an owned payload out of
 a borrow is `E0507`.
 
-## 7.14 Writing it the easy way
+## 7.14 Closures
+
+```zx
+fn adder(n: i32) -> fn(i32) -> i32 { return |x| x + n; }   // escapes
+
+fn main() -> i32 {
+    let base = 100;
+    let shifted: fn(i32) -> i32 = |n| n + base; // captures `base` by copy
+    println(shifted(1));                        // 101
+    let add7 = adder(7);
+    println(add7(35));                          // 42
+
+    let mut v: Vec<i64> = Vec::new();
+    v.push(4);
+    v.push(9);
+    v.each(|x| println(x));                     // 4 9
+    println(v.count(|x| x > 5));                // 2
+    println(v.fold(0, |acc, x| acc + x));       // 13
+    0
+}
+```
+
+The target type supplies the signature, so annotate the binding when nothing
+else fixes it. `Copy` values are captured by copy; `String`/`Vec`/`HashMap`
+move into the closure (using the original afterwards is `E0382`). See
+[`15-closures.md`](15-closures.md).
+
+## 7.15 Writing it the easy way
 
 Zexi borrows Python's ergonomics where they cost nothing at run time:
 
@@ -600,10 +627,10 @@ is the program name) and `arg_at(i)` returns argument `i` as a `String`
 (`""` when out of range) — see `examples/args.zx`. For a complete small
 program that ties it all together, see `examples/guess.zx`.
 
-## 7.15 Not implemented yet (roadmap M1+)
+## 7.16 Not implemented yet (roadmap M1+)
 
 Traits (and trait bounds), `dyn Trait`, associated types, const generics,
-`Box`, user-defined `Drop`, tuple values (tuple *structs* exist; `(a, b)` values
+`Box`, user-defined `Drop`, closure environments are not freed yet, tuple values (tuple *structs* exist; `(a, b)` values
 and destructuring do not yet), borrow-lifetime (NLL) analysis, bindings inside
 or-patterns, and nested patterns. Pattern bindings in a `match` on a *borrowed*
 enum still cannot move an owned payload out (E0507), which is why `json::Value`

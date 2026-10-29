@@ -134,8 +134,8 @@ fn main() -> i32 {
     println(html::escape("<b>Tom & Jerry's</b>"));
     // &lt;b&gt;Tom &amp; Jerry&#39;s&lt;/b&gt;
 
-    let mut vars: HashMap<String, String> = HashMap::new();
-    vars.insert(String::from("name"), String::from("<script>alert(1)</script>"));
+    let mut vars = html::vars();
+    vars.set("name", "<script>alert(1)</script>");
     println(html::template("<p>Hello, {{name}}!</p>", &vars));
     // <p>Hello, &lt;script&gt;alert(1)&lt;/script&gt;!</p>
     0
@@ -149,7 +149,9 @@ fn main() -> i32 {
 | `html::url_query(s)` | percent-encode a query/path value |
 | `html::page(title, body)` | a complete HTML5 document (title escaped, body trusted) |
 | `html::page_with(title, head, body)` | the same with extra `<head>` markup |
-| `html::template(tpl, vars)` | `{{name}}` escaped, `{{name\|raw}}` verbatim, `{{{{` for a literal `{{` |
+| `html::vars()` | a `Vars` builder: `set`, `set_int`, `set_bool`, `get`, `has`, `len`, `from_map` |
+| `html::template(tpl, &vars)` | `{{name}}` escaped, `{{name\|raw}}` verbatim, `{{{{` for a literal `{{` |
+| `html::template_map(tpl, &map)` | the same with a `HashMap<String, String>` |
 | `html::template_pairs(tpl, pairs)` | the same with alternating key/value `Vec<String>` |
 | `html::tag(name, text)`, `heading(level, text)`, `link(href, text)` | one escaped element |
 | `html::list(items)`, `ordered_list(items)` | `<ul>`/`<ol>` of escaped items |
@@ -162,17 +164,55 @@ name that is missing from the map renders as nothing rather than as `{{name}}`.
 
 ## 14.5 A whole site
 
-[`examples/site.zx`](../examples/site.zx) puts the pieces together: a shared
-layout through `html::template`, three pages, an escaped `?name=` page, and a
-`/api/stats` endpoint that reports the worker pool's own counters as JSON. It is
-served with `listen_workers`, so several visitors are answered at once.
+[`examples/site/`](../examples/site) is a project, not a string-building
+exercise. Pages are files in `templates/`, the rest of the site is a folder
+(`public/`), and the handlers only choose values:
+
+```zx
+use web;
+use html;
+
+fn home(req: &Request) -> Response {
+    let mut v = html::vars();
+    v.set("title", "Zexi site");
+    v.set_int("requests", requests_served());
+    return web::page("index", &v);        // templates/index.html
+}
+
+fn greet(req: &Request) -> Response {
+    let mut v = web::query(req);          // ?name=…
+    v.set("name", "stranger");            // escapes on the way in
+    return web::page("greeting", &v);
+}
+```
+
+served by
+
+<!-- fragment -->
+```zx
+fn main() -> i32 {
+    let mut app = web::new_app();
+    app.get("/", home);
+    app.get("/greet", greet);
+    app.views("templates");
+    app.pages("public");                  // /about -> public/about.html
+    app.files("/static", "public");       // /static/style.css
+    app.workers(4);
+    return app.serve_local(8090);
+}
+```
 
 ```sh
-zexic run examples/site.zx
+zexic run examples/site
 curl http://127.0.0.1:8090/
-curl 'http://127.0.0.1:8090/hello?name=world'
+curl 'http://127.0.0.1:8090/greet?name=world'
+curl http://127.0.0.1:8090/about
+curl http://127.0.0.1:8090/static/style.css
 curl http://127.0.0.1:8090/api/stats
 ```
+
+The rest of the standard library is catalogued in
+[`16-stdlib-reference.md`](16-stdlib-reference.md).
 
 Tests for both modules live in [`tests/json_lib.zx`](../tests/json_lib.zx) and
 [`tests/html_lib.zx`](../tests/html_lib.zx); they assert exact output, including

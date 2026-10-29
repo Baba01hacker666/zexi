@@ -76,10 +76,18 @@ This repository contains the **initial design and specification** of Zexi: the v
 > **Websites:** two dependency-free modules make server-rendered pages and JSON
 > APIs easy. `json` (`parse`, `stringify`, `pretty`, `object`, `array`, `Value`)
 > keeps integers exact, round-trips doubles exactly, and preserves member order;
-> `html` (`escape`, `attr`, `page`, `list`, `table`, `template`) escapes by
-> default, so a `{{name}}` taken from a query string cannot inject markup. See
-> [`docs/14-json-and-html.md`](docs/14-json-and-html.md) and
-> [`examples/site.zx`](examples/site.zx).
+> `html` (`escape`, `attr`, `tag`, `list`, `table`, `vars`, `template`) escapes
+> by default, so a `{{name}}` taken from a query string cannot inject markup,
+> and `web` ties the three together in the FastAPI shape: `web::get("/x", h)`,
+> `web::page("index", &vars)` reading `templates/index.html`, `web::pages("public")`
+> serving a folder of files, `web::params(req)`, `web::json_pair(k, v)`. See
+> [`docs/14-json-and-html.md`](docs/14-json-and-html.md),
+> [`docs/16-stdlib-reference.md`](docs/16-stdlib-reference.md) and
+> [`examples/site/`](examples/site).
+>
+> **Closures:** `|x| x + 1` captures its surroundings by value, nests, escapes
+> from the function that made it, and is what `Vec::each/count/any/all/fold`
+> take. See [`docs/15-closures.md`](docs/15-closures.md).
 >
 > Embedded `math`, `text`,
 > `io`, `fs`, `os`, `regex`, `fmt`, `codec`, and `thread` also provide dependency-free
@@ -187,7 +195,7 @@ go run ./cmd/zexic run tests/easy.zx      # the easy way: no semicolons, f-strin
 go run ./cmd/zexic run examples/easy.zx   # same ideas, as a small standalone demo
 go run ./cmd/zexic run tests/sugar.zx     # break-with-value, Type::new(..), print/format sugar
 go run ./cmd/zexic run tests/pi.zx        # 30 digits of π: big-int + Machin's formula
-go run ./cmd/zexic run examples/site.zx                      # a worker-pool site: HTML + JSON API
+go run ./cmd/zexic run examples/site                        # a pooled site: templates, folders, JSON API
 go run ./cmd/zexic run examples/http_app.zx                  # Go-style default mux: handle_get + listen
 go run ./cmd/zexic run examples/static_server.zx -- .         # one-call static server
 go run ./cmd/zexic run examples/local_tools.zx -- release-42  # local os + regex helpers

@@ -7,21 +7,21 @@ fn home(req: &Request) -> Response {
     let mut v = html::vars();
     v.set("title", "Zexi site");
     v.set_int("requests", requests_served());
-    return web::render("index", &v);
+    return web::page("index", &v);
 }
 
 // /greet?name=… renders a template with a query value (escaped for you).
 fn greet(req: &Request) -> Response {
-    let mut v = web::query_vars(req);
+    let mut v = web::query(req);
     if v.get("name").len() == 0 {
         v.set("name", "stranger");
     }
-    return web::render("greeting", &v);
+    return web::page("greeting", &v);
 }
 
 // /users/{id} answers JSON with the captured path parameter.
 fn user(req: &Request) -> Response {
-    let p = web::path_params(req);
+    let p = web::params(req);
     let mut doc = json::object();
     doc.set_str("id", p.get("id"));
     doc.set_str("lang", "zexi");
