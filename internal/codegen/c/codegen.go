@@ -2217,6 +2217,22 @@ func (g *gen) identValue(name string, _ token.Span) string {
 	return "0 /* unresolved " + name + " */"
 }
 
+// isCalleePlace reports whether a callee expression can be repeated without
+// side effects (a local or a repeated field/index chain over locals).
+func isCalleePlace(e ast.Expr) bool {
+	switch x := e.(type) {
+	case *ast.IdentExpr:
+		return true
+	case *ast.FieldExpr:
+		return isCalleePlace(x.Recv)
+	case *ast.IndexExpr:
+		return isCalleePlace(x.Recv)
+	case *ast.UnExpr:
+		return x.Op == token.KindStar && isCalleePlace(x.X)
+	}
+	return false
+}
+
 func (g *gen) callValue(x *ast.CallExpr) string {
 	if p, ok := x.Callee.(*ast.PathExpr); ok && len(p.Segments) == 2 && p.Segments[0] == "String" {
 		return g.stringCtorValue(x, p.Segments[1])
@@ -2240,9 +2256,19 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 		}
 		sig += ")"
 		callee := g.value(x.Callee)
+		// A callee that is not a plain name is evaluated once into a temporary,
+		// so `f()(x)` and `handlers[i](req)` cannot run the sub-expression twice.
+		once := callee
+		if !isCalleePlace(x.Callee) {
+			once = g.tmpName()
+		}
 		return g.withArgs(x.Args, ft.Params, g.exprStmtType(x), func(ps []string) string {
-			args := append([]string{"(void *)" + callee}, ps...)
-			return "((" + sig + ")(((zx_Closure *)" + callee + ")->fn))(" + strings.Join(args, ", ") + ")"
+			args := append([]string{"(void *)" + once}, ps...)
+			call := "((" + sig + ")(((zx_Closure *)" + once + ")->fn))(" + strings.Join(args, ", ") + ")"
+			if once == callee {
+				return call
+			}
+			return "({ void *" + once + " = " + callee + "; " + call + "; })"
 		})
 	}
 	if ctor := g.info.Ctors[x]; ctor != nil {

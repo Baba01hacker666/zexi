@@ -2106,6 +2106,45 @@ func (c *checker) isPlace(e ast.Expr) bool {
 	return false
 }
 
+// isCallableName reports whether the callee is a plain name (identifier or
+// path), which the other branches of inferCall handle.
+func isCallableName(e ast.Expr) bool {
+	switch e.(type) {
+	case *ast.IdentExpr, *ast.PathExpr:
+		return true
+	}
+	return false
+}
+
+// exprOfFnType checks a callee expression that is not a name and returns its
+// `fn(..)` type, or nil when it is not a function value.
+func (c *checker) exprOfFnType(e ast.Expr) *types.Type {
+	t := c.checkExpr(e, nil)
+	if t != nil && t.Kind == types.Fn {
+		return t
+	}
+	return nil
+}
+
+// checkIndirectCall type-checks a call through a computed function value.
+func (c *checker) checkIndirectCall(x *ast.CallExpr, ft *types.Type) *types.Type {
+	c.info.Indirect[x] = ft
+	if len(x.Args) != len(ft.Params) {
+		c.errAt(x, "E0061", "function value takes %d argument(s) but %d were supplied", len(ft.Params), len(x.Args))
+	}
+	for i, a := range x.Args {
+		var want *types.Type
+		if i < len(ft.Params) {
+			want = ft.Params[i]
+		}
+		at := c.checkExpr(a, want)
+		if want != nil && !c.argAssignable(want, at, false) {
+			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
+		}
+	}
+	return ft.Ret
+}
+
 func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 	// `Enum::Variant(args)` is a variant constructor, and `String::new()` /
 	// `String::from(..)` are builtin constructors.
@@ -2141,6 +2180,19 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 			return c.checkCallArgs(x, m, fmt.Sprintf("function `%s::%s`", p.Segments[0], p.Segments[1]))
 		}
 		return c.inferVariantCtor(x, p, expected)
+	}
+	// Any expression of function type is callable, not just a name: the result
+	// of a call that returns a `fn(..)` (`make_adder(3)(x)`), an indexed slot
+	// (`handlers[i](req)`), or a field (`self.on_click(req)`).
+	if !isCallableName(x.Callee) {
+		if ft := c.exprOfFnType(x.Callee); ft != nil {
+			return c.checkIndirectCall(x, ft)
+		}
+		c.errAt(x.Callee, "E0618", "expression is not callable")
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return nil
 	}
 	name, ok := calleeName(x.Callee)
 	if !ok {
