@@ -384,3 +384,654 @@ impl Pool {
         zxt_pool_free(self.id);
     }
 }
+
+// Threads, mutexes, channels, and the worker pool are C. It travels with this
+// file, so `use thread;` links it (and `-pthread`) with no driver-side list.
+#[link("pthread")]
+c """
+#include <pthread.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sched.h>
+#include <unistd.h>
+
+#define ZXT_SLOTS 256
+#define ZXT_HANDLE(slot, gen) (((int64_t)((uint64_t)(gen) << 8)) | (int64_t)(slot))
+
+/* A Zexi function value is a pointer to a closure record whose first fields
+ * are the reference count and the C function to run; the function receives the
+ * record itself as its first argument (see codegen's closureRuntime). */
+typedef struct { long rc; void *fn; } zxt_closure;
+
+typedef int64_t (*zxt_fn1)(void *, int64_t);
+typedef int64_t (*zxt_fn2)(void *, int64_t, int64_t);
+typedef void (*zxt_fn0)(void *);
+
+#define ZXT_CALL0(p) (((zxt_fn0)((zxt_closure *)(p))->fn)((void *)(p)))
+#define ZXT_CALL1(p, a) (((zxt_fn1)((zxt_closure *)(p))->fn)((void *)(p), (a)))
+#define ZXT_CALL2(p, a, b) (((zxt_fn2)((zxt_closure *)(p))->fn)((void *)(p), (a), (b)))
+
+/* ---- threads -------------------------------------------------------------- */
+
+typedef struct {
+    int used;
+    int joined;
+    int joining;
+    uint32_t gen;
+    pthread_t tid;
+    int kind; /* 0 void, 1 fn1, 2 fn2 */
+    void *entry;
+    int64_t a, b, result;
+} zxt_thread_t;
+
+static zxt_thread_t g_threads[ZXT_SLOTS];
+static pthread_mutex_t g_threads_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void *zxt_thread_main(void *p) {
+    zxt_thread_t *t = (zxt_thread_t *)p;
+    if (t->kind == 0) {
+        ZXT_CALL0(t->entry);
+    } else if (t->kind == 1) {
+        t->result = ZXT_CALL1(t->entry, t->a);
+    } else {
+        t->result = ZXT_CALL2(t->entry, t->a, t->b);
+    }
+    return NULL;
+}
+
+static int64_t zxt_thread_start(int kind, void *entry, int64_t a, int64_t b) {
+    pthread_mutex_lock(&g_threads_mu);
+    int slot = -1;
+    for (int i = 0; i < ZXT_SLOTS; i++) {
+        if (!g_threads[i].used || g_threads[i].joined) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_threads_mu);
+        return 0; /* too many live threads */
+    }
+    zxt_thread_t *t = &g_threads[slot];
+    t->gen++;
+    t->used = 1;
+    t->joined = 0;
+    t->joining = 0;
+    t->kind = kind;
+    t->entry = entry;
+    t->a = a;
+    t->b = b;
+    t->result = 0;
+    if (pthread_create(&t->tid, NULL, zxt_thread_main, t) != 0) {
+        t->used = 0;
+        pthread_mutex_unlock(&g_threads_mu);
+        return 0;
+    }
+    int64_t h = ZXT_HANDLE(slot, t->gen);
+    pthread_mutex_unlock(&g_threads_mu);
+    return h;
+}
+
+int64_t zxt_spawn(void *entry, int64_t arg) {
+    return zxt_thread_start(1, entry, arg, 0);
+}
+
+int64_t zxt_spawn2(void *entry, int64_t a, int64_t b) {
+    return zxt_thread_start(2, entry, a, b);
+}
+
+int64_t zxt_spawn_void(void *entry) {
+    return zxt_thread_start(0, entry, 0, 0);
+}
+
+/* zxt_join waits for the thread named by h and returns its i64 result. A stale
+ * or already-joined handle returns the stored result (0 for void threads or an
+ * unknown handle), so joining twice is harmless. */
+int64_t zxt_join(int64_t h) {
+    uint64_t slot = (uint64_t)h & 0xff;
+    uint32_t gen = (uint32_t)((uint64_t)h >> 8);
+    if (slot >= ZXT_SLOTS) {
+        return 0;
+    }
+    pthread_mutex_lock(&g_threads_mu);
+    zxt_thread_t *t = &g_threads[slot];
+    if (!t->used || t->gen != gen) {
+        pthread_mutex_unlock(&g_threads_mu);
+        return 0;
+    }
+    while (t->joining) {
+        pthread_mutex_unlock(&g_threads_mu);
+        sched_yield();
+        pthread_mutex_lock(&g_threads_mu);
+        if (t->gen != gen) {
+            pthread_mutex_unlock(&g_threads_mu);
+            return 0;
+        }
+    }
+    if (t->joined) {
+        int64_t r = t->result;
+        pthread_mutex_unlock(&g_threads_mu);
+        return r;
+    }
+    t->joining = 1;
+    pthread_t tid = t->tid;
+    pthread_mutex_unlock(&g_threads_mu);
+
+    pthread_join(tid, NULL);
+
+    pthread_mutex_lock(&g_threads_mu);
+    t->joined = 1;
+    t->joining = 0;
+    int64_t r = t->result;
+    pthread_mutex_unlock(&g_threads_mu);
+    return r;
+}
+
+/* ---- channels (i64) ------------------------------------------------------- */
+
+typedef struct {
+    int used;
+    uint32_t gen;
+    int cap;
+    int count;
+    int head;
+    int closed;
+    int64_t *buf;
+    pthread_mutex_t mu;
+    pthread_cond_t not_full;
+    pthread_cond_t not_empty;
+} zxt_chan_t;
+
+static zxt_chan_t g_chans[ZXT_SLOTS];
+static pthread_mutex_t g_chans_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static zxt_chan_t *zxt_chan_resolve(int64_t h) {
+    uint64_t slot = (uint64_t)h & 0xff;
+    uint32_t gen = (uint32_t)((uint64_t)h >> 8);
+    if (slot >= ZXT_SLOTS) {
+        return NULL;
+    }
+    zxt_chan_t *c = &g_chans[slot];
+    if (!c->used || c->gen != gen) {
+        return NULL;
+    }
+    return c;
+}
+
+/* zxt_chan_new creates a bounded channel with room for cap values (cap is
+ * clamped to 1..65536). It returns 0 when the channel table is full. */
+int64_t zxt_chan_new(int64_t cap) {
+    if (cap < 1) {
+        cap = 1;
+    }
+    if (cap > 65536) {
+        cap = 65536;
+    }
+    pthread_mutex_lock(&g_chans_mu);
+    int slot = -1;
+    for (int i = 0; i < ZXT_SLOTS; i++) {
+        if (!g_chans[i].used) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_chans_mu);
+        return 0;
+    }
+    zxt_chan_t *c = &g_chans[slot];
+    c->buf = (int64_t *)malloc((size_t)cap * sizeof(int64_t));
+    if (!c->buf) {
+        pthread_mutex_unlock(&g_chans_mu);
+        return 0;
+    }
+    c->gen++;
+    c->used = 1;
+    c->cap = (int)cap;
+    c->count = 0;
+    c->head = 0;
+    c->closed = 0;
+    pthread_mutex_init(&c->mu, NULL);
+    pthread_cond_init(&c->not_full, NULL);
+    pthread_cond_init(&c->not_empty, NULL);
+    int64_t h = ZXT_HANDLE(slot, c->gen);
+    pthread_mutex_unlock(&g_chans_mu);
+    return h;
+}
+
+/* zxt_chan_send blocks until there is room, then enqueues v. Returns 1 on
+ * success and 0 if the channel is (or becomes) closed. */
+int zxt_chan_send(int64_t h, int64_t v) {
+    zxt_chan_t *c = zxt_chan_resolve(h);
+    if (!c) {
+        return 0;
+    }
+    pthread_mutex_lock(&c->mu);
+    while (c->count == c->cap && !c->closed) {
+        pthread_cond_wait(&c->not_full, &c->mu);
+    }
+    if (c->closed) {
+        pthread_mutex_unlock(&c->mu);
+        return 0;
+    }
+    int tail = (c->head + c->count) % c->cap;
+    c->buf[tail] = v;
+    c->count++;
+    pthread_cond_signal(&c->not_empty);
+    pthread_mutex_unlock(&c->mu);
+    return 1;
+}
+
+/* zxt_chan_recv blocks until a value is available. It writes the value to out
+ * and returns 1, or returns 0 when the channel is closed and drained. */
+int zxt_chan_recv(int64_t h, int64_t *out) {
+    zxt_chan_t *c = zxt_chan_resolve(h);
+    if (!c) {
+        return 0;
+    }
+    pthread_mutex_lock(&c->mu);
+    while (c->count == 0 && !c->closed) {
+        pthread_cond_wait(&c->not_empty, &c->mu);
+    }
+    if (c->count == 0) {
+        pthread_mutex_unlock(&c->mu);
+        return 0;
+    }
+    int64_t v = c->buf[c->head];
+    c->head = (c->head + 1) % c->cap;
+    c->count--;
+    pthread_cond_signal(&c->not_full);
+    pthread_mutex_unlock(&c->mu);
+    *out = v;
+    return 1;
+}
+
+/* zxt_chan_try_recv returns 1 with a value, or 0 when empty/closed/invalid. */
+int zxt_chan_try_recv(int64_t h, int64_t *out) {
+    zxt_chan_t *c = zxt_chan_resolve(h);
+    if (!c) {
+        return 0;
+    }
+    pthread_mutex_lock(&c->mu);
+    if (c->count == 0) {
+        pthread_mutex_unlock(&c->mu);
+        return 0;
+    }
+    int64_t v = c->buf[c->head];
+    c->head = (c->head + 1) % c->cap;
+    c->count--;
+    pthread_cond_signal(&c->not_full);
+    pthread_mutex_unlock(&c->mu);
+    *out = v;
+    return 1;
+}
+
+/* zxt_chan_close marks the channel closed and wakes every waiter. Buffered
+ * values remain available to recv. Returns 1 if this call closed it. */
+int zxt_chan_close(int64_t h) {
+    zxt_chan_t *c = zxt_chan_resolve(h);
+    if (!c) {
+        return 0;
+    }
+    pthread_mutex_lock(&c->mu);
+    int first = !c->closed;
+    c->closed = 1;
+    pthread_cond_broadcast(&c->not_empty);
+    pthread_cond_broadcast(&c->not_full);
+    pthread_mutex_unlock(&c->mu);
+    return first;
+}
+
+int64_t zxt_chan_len(int64_t h) {
+    zxt_chan_t *c = zxt_chan_resolve(h);
+    if (!c) {
+        return 0;
+    }
+    pthread_mutex_lock(&c->mu);
+    int64_t n = c->count;
+    pthread_mutex_unlock(&c->mu);
+    return n;
+}
+
+int zxt_chan_closed(int64_t h) {
+    zxt_chan_t *c = zxt_chan_resolve(h);
+    if (!c) {
+        return 1;
+    }
+    pthread_mutex_lock(&c->mu);
+    int v = c->closed;
+    pthread_mutex_unlock(&c->mu);
+    return v;
+}
+
+/* ---- atomics (i64) -------------------------------------------------------- */
+
+typedef struct {
+    int used;
+    uint32_t gen;
+    _Atomic int64_t v;
+} zxt_atom_t;
+
+static zxt_atom_t g_atoms[ZXT_SLOTS];
+static pthread_mutex_t g_atoms_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static zxt_atom_t *zxt_atom_resolve(int64_t h) {
+    uint64_t slot = (uint64_t)h & 0xff;
+    uint32_t gen = (uint32_t)((uint64_t)h >> 8);
+    if (slot >= ZXT_SLOTS) {
+        return NULL;
+    }
+    zxt_atom_t *a = &g_atoms[slot];
+    if (!a->used || a->gen != gen) {
+        return NULL;
+    }
+    return a;
+}
+
+int64_t zxt_atomic_new(int64_t v) {
+    pthread_mutex_lock(&g_atoms_mu);
+    int slot = -1;
+    for (int i = 0; i < ZXT_SLOTS; i++) {
+        if (!g_atoms[i].used) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_atoms_mu);
+        return 0;
+    }
+    zxt_atom_t *a = &g_atoms[slot];
+    a->gen++;
+    a->used = 1;
+    atomic_store(&a->v, v);
+    int64_t h = ZXT_HANDLE(slot, a->gen);
+    pthread_mutex_unlock(&g_atoms_mu);
+    return h;
+}
+
+int64_t zxt_atomic_add(int64_t h, int64_t d) {
+    zxt_atom_t *a = zxt_atom_resolve(h);
+    if (!a) {
+        return 0;
+    }
+    return atomic_fetch_add(&a->v, d) + d; /* returns the new value */
+}
+
+int64_t zxt_atomic_get(int64_t h) {
+    zxt_atom_t *a = zxt_atom_resolve(h);
+    if (!a) {
+        return 0;
+    }
+    return atomic_load(&a->v);
+}
+
+void zxt_atomic_set(int64_t h, int64_t v) {
+    zxt_atom_t *a = zxt_atom_resolve(h);
+    if (!a) {
+        return;
+    }
+    atomic_store(&a->v, v);
+}
+
+/* ---- task pools -----------------------------------------------------------
+ * A pool is N long-lived worker threads draining a shared job queue. Jobs are
+ * `fn(i64) -> i64` plus one argument, which is what Zexi can pass across a
+ * thread boundary today. Submitting is non-blocking; `wait` blocks until every
+ * submitted job has finished, and each job keeps its result so a caller can
+ * collect them in submission order — the usual map-over-a-range shape.
+ *
+ * Pools are named by the same slot+generation handle as threads, channels, and
+ * atomics, so a stale handle fails cleanly instead of aliasing a new pool.
+ */
+
+#define ZXT_MAX_JOBS 4096
+
+typedef struct {
+    void *entry;
+    int64_t arg;
+    int64_t result;
+    int done;
+    int claimed;
+    uint64_t seq;
+} zxt_job_t;
+
+typedef struct {
+    int used;
+    uint32_t gen;
+    pthread_t *threads;
+    int workers;
+    int stop;
+    uint64_t next_seq;
+    uint64_t done_count;
+    zxt_job_t *jobs;
+    int njobs;
+    int cap;
+    pthread_mutex_t mu;
+    pthread_cond_t work;   /* signalled when a job arrives or the pool stops */
+    pthread_cond_t idle;   /* signalled when a job finishes */
+} zxt_pool_t;
+
+static zxt_pool_t g_pools[ZXT_SLOTS];
+static pthread_mutex_t g_pools_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static zxt_pool_t *zxt_pool_resolve(int64_t h) {
+    uint64_t slot = (uint64_t)h & 0xff;
+    uint32_t gen = (uint32_t)((uint64_t)h >> 8);
+    if (slot >= ZXT_SLOTS) {
+        return NULL;
+    }
+    zxt_pool_t *p = &g_pools[slot];
+    if (!p->used || p->gen != gen) {
+        return NULL;
+    }
+    return p;
+}
+
+static int zxt_pool_next_job(zxt_pool_t *p, zxt_job_t *out) {
+    /* Returns 1 when a job was taken, 0 when the pool is stopping. Caller
+     * holds the mutex. */
+    for (;;) {
+        for (int i = 0; i < p->njobs; i++) {
+            zxt_job_t *j = &p->jobs[i];
+            if (!j->done && !j->claimed && j->entry) {
+                j->claimed = 1;
+                *out = *j;
+                return 1;
+            }
+        }
+        if (p->stop) {
+            return 0;
+        }
+        pthread_cond_wait(&p->work, &p->mu);
+    }
+}
+
+static void *zxt_pool_main(void *arg) {
+    zxt_pool_t *p = (zxt_pool_t *)arg;
+    pthread_mutex_lock(&p->mu);
+    for (;;) {
+        zxt_job_t job;
+        if (!zxt_pool_next_job(p, &job)) {
+            break;
+        }
+        pthread_mutex_unlock(&p->mu);
+        int64_t result = ZXT_CALL1(job.entry, job.arg);
+        pthread_mutex_lock(&p->mu);
+        for (int i = 0; i < p->njobs; i++) {
+            if (p->jobs[i].seq == job.seq) {
+                p->jobs[i].result = result;
+                p->jobs[i].done = 1;
+                break;
+            }
+        }
+        p->done_count++;
+        pthread_cond_broadcast(&p->idle);
+    }
+    pthread_mutex_unlock(&p->mu);
+    return NULL;
+}
+
+int64_t zxt_pool_new(int workers) {
+    if (workers < 1) workers = 1;
+    if (workers > 256) workers = 256;
+    pthread_mutex_lock(&g_pools_mu);
+    int slot = -1;
+    for (int i = 0; i < ZXT_SLOTS; i++) {
+        if (!g_pools[i].used) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_pools_mu);
+        return 0;
+    }
+    zxt_pool_t *p = &g_pools[slot];
+    memset(p, 0, sizeof *p);
+    p->gen++;
+    p->used = 1;
+    p->workers = workers;
+    p->jobs = (zxt_job_t *)calloc(ZXT_MAX_JOBS, sizeof(zxt_job_t));
+    p->threads = (pthread_t *)calloc((size_t)workers, sizeof(pthread_t));
+    if (!p->jobs || !p->threads) {
+        free(p->jobs);
+        free(p->threads);
+        p->used = 0;
+        pthread_mutex_unlock(&g_pools_mu);
+        return 0;
+    }
+    p->cap = ZXT_MAX_JOBS;
+    pthread_mutex_init(&p->mu, NULL);
+    pthread_cond_init(&p->work, NULL);
+    pthread_cond_init(&p->idle, NULL);
+    int started = 0;
+    for (int i = 0; i < workers; i++) {
+        if (pthread_create(&p->threads[i], NULL, zxt_pool_main, p) != 0) break;
+        started++;
+    }
+    p->workers = started;
+    if (started == 0) {
+        free(p->jobs);
+        free(p->threads);
+        p->used = 0;
+        pthread_mutex_unlock(&g_pools_mu);
+        return 0;
+    }
+    int64_t h = ZXT_HANDLE(slot, p->gen);
+    pthread_mutex_unlock(&g_pools_mu);
+    return h;
+}
+
+int zxt_pool_workers(int64_t h) {
+    zxt_pool_t *p = zxt_pool_resolve(h);
+    return p ? p->workers : 0;
+}
+
+/* zxt_pool_submit queues one job and returns its index (>= 0), or -1 when the
+ * pool is full or the handle is stale. */
+int64_t zxt_pool_submit(int64_t h, void *entry, int64_t arg) {
+    zxt_pool_t *p = zxt_pool_resolve(h);
+    if (!p) return -1;
+    pthread_mutex_lock(&p->mu);
+    if (p->njobs >= p->cap) {
+        /* Make room by recycling the queue once every job has finished. A
+         * caller that still needs an old result must collect it before
+         * submitting another full queue's worth of work. */
+        if (p->done_count == (uint64_t)p->njobs) {
+            p->njobs = 0;
+            p->done_count = 0;
+        } else {
+            pthread_mutex_unlock(&p->mu);
+            return -1;
+        }
+    }
+    int idx = p->njobs++;
+    p->jobs[idx].entry = entry;
+    p->jobs[idx].arg = arg;
+    p->jobs[idx].result = 0;
+    p->jobs[idx].done = 0;
+    p->jobs[idx].claimed = 0;
+    p->jobs[idx].seq = ++p->next_seq;
+    int64_t out = p->jobs[idx].seq;
+    pthread_cond_signal(&p->work);
+    pthread_mutex_unlock(&p->mu);
+    return out;
+}
+
+/* zxt_pool_wait blocks until every submitted job has finished. Returns the
+ * number of jobs completed. */
+int zxt_pool_wait(int64_t h) {
+    zxt_pool_t *p = zxt_pool_resolve(h);
+    if (!p) return 0;
+    pthread_mutex_lock(&p->mu);
+    while (p->done_count < (uint64_t)p->njobs) {
+        pthread_cond_wait(&p->idle, &p->mu);
+    }
+    int n = (int)p->done_count;
+    pthread_mutex_unlock(&p->mu);
+    return n;
+}
+
+/* zxt_pool_result returns the result of the job with sequence number seq, or 0
+ * when it has not finished (use wait first to avoid that). */
+int64_t zxt_pool_result(int64_t h, int64_t seq) {
+    zxt_pool_t *p = zxt_pool_resolve(h);
+    if (!p) return 0;
+    pthread_mutex_lock(&p->mu);
+    int64_t out = 0;
+    for (int i = 0; i < p->njobs; i++) {
+        if (p->jobs[i].seq == (uint64_t)seq && p->jobs[i].done) {
+            out = p->jobs[i].result;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&p->mu);
+    return out;
+}
+
+int zxt_pool_done_count(int64_t h) {
+    zxt_pool_t *p = zxt_pool_resolve(h);
+    if (!p) return 0;
+    pthread_mutex_lock(&p->mu);
+    int n = (int)p->done_count;
+    pthread_mutex_unlock(&p->mu);
+    return n;
+}
+
+/* zxt_pool_free stops the workers, joins them, and releases the pool. It waits
+ * for running jobs to finish so no thread keeps using the slot afterwards. */
+int zxt_pool_free(int64_t h) {
+    zxt_pool_t *p = zxt_pool_resolve(h);
+    if (!p) return -1;
+    pthread_mutex_lock(&g_pools_mu);
+    pthread_mutex_lock(&p->mu);
+    p->stop = 1;
+    pthread_cond_broadcast(&p->work);
+    pthread_mutex_unlock(&p->mu);
+    for (int i = 0; i < p->workers; i++) {
+        pthread_join(p->threads[i], NULL);
+    }
+    free(p->jobs);
+    free(p->threads);
+    pthread_cond_destroy(&p->work);
+    pthread_cond_destroy(&p->idle);
+    pthread_mutex_destroy(&p->mu);
+    p->jobs = NULL;
+    p->threads = NULL;
+    p->used = 0;
+    pthread_mutex_unlock(&g_pools_mu);
+    return 0;
+}
+
+/* zxt_cpu_count is the number of processors this process may run on. */
+int zxt_cpu_count(void) {
+#ifdef _SC_NPROCESSORS_ONLN
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n > 0 && n < 4096) return (int)n;
+#endif
+    return 1;
+}
+"""

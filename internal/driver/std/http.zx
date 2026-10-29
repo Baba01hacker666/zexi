@@ -2626,3 +2626,89 @@ fn push_int(s: &mut String, n: i64) {
         s.push_byte(digits[i]);
     }
 }
+
+// The worker-side state — the pinned-router slots, the pool-wide counters, and
+// the cooperative stop flag — is C. It lives here rather than in a driver-side
+// shim because the block is compiled into the same translation unit as the
+// generated code, so it can name `zx_Router` and store real Routers instead of
+// an oversized byte buffer. Worker threads receive integers only, so a Router
+// travels into a thread as a slot number.
+c """
+#include <stdatomic.h>
+#include <stdint.h>
+
+#define ZXH_MUX_SLOTS 4
+
+/* Slots are written once, when a router is pinned, then read-only; 64-byte
+ * alignment keeps the default mux off a pinned slot's cache line. */
+_Alignas(64) static zx_Router zxh_mux_base;
+_Alignas(64) static zx_Router zxh_mux_extra[ZXH_MUX_SLOTS];
+static _Atomic int zxh_mux_pinned[ZXH_MUX_SLOTS];
+static int zxh_mux_ready = 0;
+
+zx_Router *zxh_default_mux(void) { return &zxh_mux_base; }
+
+int32_t zxh_default_mux_ready(void) {
+    if (!zxh_mux_ready) {
+        zxh_mux_ready = 1;
+        return 1;
+    }
+    return 0;
+}
+
+zx_Router *zxh_mux_slot(int32_t slot) {
+    if (slot <= 0 || slot >= ZXH_MUX_SLOTS) return &zxh_mux_base;
+    return &zxh_mux_extra[slot];
+}
+
+int32_t zxh_mux_claim(void) {
+    for (int i = 1; i < ZXH_MUX_SLOTS; i++) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong(&zxh_mux_pinned[i], &expected, 1))
+            return i;
+    }
+    return -1;
+}
+
+void zxh_mux_release(int32_t slot) {
+    if (slot > 0 && slot < ZXH_MUX_SLOTS) atomic_store(&zxh_mux_pinned[slot], 0);
+}
+
+int32_t zxh_mux_slot_count(void) { return ZXH_MUX_SLOTS; }
+
+/* A worker pool needs to know how much work the whole pool has done, not just
+ * its own share, so the counters live here (C11 atomics, no mutex). */
+static _Atomic int64_t zxh_conns = 0;
+static _Atomic int64_t zxh_requests = 0;
+static _Atomic int zxh_stop_flag = 0;
+
+void zxh_stats_reset(void) {
+    atomic_store(&zxh_conns, 0);
+    atomic_store(&zxh_requests, 0);
+    atomic_store(&zxh_stop_flag, 0);
+}
+
+void zxh_count_conn(void) { atomic_fetch_add(&zxh_conns, 1); }
+
+void zxh_count_request(void) { atomic_fetch_add(&zxh_requests, 1); }
+
+int64_t zxh_conns_served(void) { return atomic_load(&zxh_conns); }
+
+int64_t zxh_requests_served(void) { return atomic_load(&zxh_requests); }
+
+void zxh_stop(void) { atomic_store(&zxh_stop_flag, 1); }
+
+void zxh_clear_stop(void) { atomic_store(&zxh_stop_flag, 0); }
+
+int32_t zxh_stopping(void) { return atomic_load(&zxh_stop_flag) != 0; }
+
+/* zxh_set_budget caps how many requests a worker pool serves before the
+ * workers ask each other to stop; 0 means "serve forever". A bounded pool is
+ * what tests and one-shot tools use, and it makes shutdown deterministic
+ * instead of racing against a signal. */
+static _Atomic int64_t zxh_budget_requests = 0;
+
+void zxh_set_budget(int64_t n) { atomic_store(&zxh_budget_requests, n); }
+
+int64_t zxh_budget(void) { return atomic_load(&zxh_budget_requests); }
+"""

@@ -895,3 +895,98 @@ pub fn valid(raw: str) -> bool {
         Err(_) => false,
     }
 }
+
+// Number conversion is the one place JSON needs libc: `%.17g`-style output
+// round-trips and `strtod`/`strtoll` validate a complete token, neither of
+// which the language runtime provides. The C travels with this file, so
+// importing `json` is all a program has to do.
+c """
+#define ZXJ_BYTES(buf) ((char *)((buf)->e))
+
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* zxj_format_double writes a compact round-tripping form of v into buf.
+ * Returns the length written, or -1 when the buffer is too small. */
+int32_t zxj_format_double(double v, zx_arr64_u8 *buf, int32_t cap) {
+    if (!buf || cap <= 0) return -1;
+    char *out = ZXJ_BYTES(buf);
+    char tmp[64];
+    int n = -1;
+    for (int prec = 1; prec <= 17; prec++) {
+        snprintf(tmp, sizeof tmp, "%.*g", prec, v);
+        char *end = NULL;
+        double back = strtod(tmp, &end);
+        if (end && *end == '\0' && back == v) {
+            n = (int)strlen(tmp);
+            break;
+        }
+    }
+    if (n < 0) {
+        snprintf(tmp, sizeof tmp, "%.17g", v);
+        n = (int)strlen(tmp);
+    }
+    if (n >= cap) return -1;
+    memcpy(out, tmp, (size_t)n);
+    out[n] = '\0';
+    return n;
+}
+
+/* zxj_parse_double parses a whole number token. Returns 0 on success. */
+int32_t zxj_parse_double(const char *s, double *out) {
+    if (!s || !out) return -1;
+    errno = 0;
+    char *end = NULL;
+    double v = strtod(s, &end);
+    if (end == s || (end && *end != '\0')) return -1;
+    if (errno == ERANGE) return -1;
+    *out = v;
+    return 0;
+}
+
+/* zxj_parse_int parses a whole integer token into an int64. Returns 0 on
+ * success, -1 on syntax error, -2 when it does not fit. */
+int32_t zxj_parse_int(const char *s, int64_t *out) {
+    if (!s || !out) return -1;
+    errno = 0;
+    char *end = NULL;
+    long long v = strtoll(s, &end, 10);
+    if (end == s || (end && *end != '\0')) return -1;
+    if (errno == ERANGE) return -2;
+    *out = (int64_t)v;
+    return 0;
+}
+
+/* zxj_utf8_encode writes the UTF-8 form of code point cp into buf and returns
+ * its length (1..4), or 0 when cp is not a valid scalar value. Used for JSON
+ * \uXXXX escapes. */
+int32_t zxj_utf8_encode(int32_t cp, zx_arr4_u8 *buf) {
+    if (!buf) return 0;
+    char *out = ZXJ_BYTES(buf);
+    if (cp < 0 || cp > 0x10FFFF) return 0;
+    if (cp >= 0xD800 && cp <= 0xDFFF) return 0; /* surrogate half */
+    if (cp < 0x80) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+"""

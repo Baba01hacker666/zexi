@@ -93,8 +93,10 @@ This repository contains the **initial design and specification** of Zexi: the v
 > change. `extern "C" fn sqrt(x: f64) -> f64;` with `#[link("m")]` calls a system
 > library, `c """ ... """` compiles C with the program (in the same translation
 > unit, so it sees `String`, the `Vec` helpers, and `#[no_mangle]` functions), and
-> `#[no_mangle]` lets C call back. `sys` and `regex` carry their own C this way.
-> See [`docs/17-extending.md`](docs/17-extending.md).
+> `#[no_mangle]` lets C call back. Every module of the standard library that
+> needs C — `sys`, `regex`, `json`, `net`, `http`, `thread` — carries it this way,
+> so the compiler holds no library C at all. See
+> [`docs/17-extending.md`](docs/17-extending.md).
 >
 > Embedded `math`, `text`,
 > `io`, `fs`, `os`, `regex`, `fmt`, `codec`, and `thread` also provide dependency-free

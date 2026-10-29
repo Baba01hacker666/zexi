@@ -174,16 +174,6 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 		}
 		art.CSrc = csrc
 	}
-	if l.usesNet {
-		art.CExtra = append(art.CExtra, string(netCSource))
-	}
-	if l.usesThread {
-		art.CExtra = append(art.CExtra, string(threadCSource))
-		art.NeedsPthread = true
-	}
-	if l.usesJSON {
-		art.CExtra = append(art.CExtra, string(jsonCSource))
-	}
 
 	// Native code and libraries the program names in its own source. Appending
 	// the text to the generated translation unit (rather than compiling it as a
@@ -292,27 +282,6 @@ func splitJobs(opts Options, fns int) int {
 //
 //go:embed std/*.zx
 var stdFS embed.FS
-
-// netCSource is the shared socket/file C runtime compiled into programs that
-// select embedded net/http/fs helpers. Embedded so it needs no installation and
-// stays in sync with the Zexi bindings.
-//
-//go:embed zxnet_c.txt
-var netCSource []byte
-
-// threadCSource is the opt-in pthread bridge for the `thread` module (threads,
-// i64 channels, and i64 atomics). Programs that import `thread` also link with
-// -pthread.
-//
-//go:embed zxthread_c.txt
-var threadCSource []byte
-
-// jsonCSource is the opt-in number-conversion shim for the `json` module
-// (shortest round-tripping doubles, strict number parsing, UTF-8 encoding for
-// \uXXXX escapes).
-//
-//go:embed zxjson_c.txt
-var jsonCSource []byte
 
 // Tokens returns the token stream for a file, for the `tokenize` command.
 func Tokens(path string, em *diag.Emitter) ([]token.Token, int, bool) {

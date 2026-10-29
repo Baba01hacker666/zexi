@@ -1,11 +1,10 @@
 # 16. Standard library reference
 
 Every module below is built into the compiler: `use <module>;` needs no project
-setup, no package download, and no extra C file. The modules whose work is done
-in C (`json`, `net`, `thread`) link their runtime automatically when imported;
-`sys` and `regex` carry their C inside their own `.zx` file as a `c """..."""`
-block, which is the pattern any library can use — see
-[`17-extending.md`](17-extending.md).
+setup, no package download, and no extra C file. A module whose work is done in
+C (`sys`, `regex`, `json`, `net`, `http`, `thread`) carries that C inside its own
+`.zx` file as a `c """..."""` block, so importing the module is all it takes to
+link it. Any library can do the same — see [`17-extending.md`](17-extending.md).
 
 Signatures are written as they are declared in `internal/driver/std/<module>.zx`
 — that file *is* the implementation, so it is also the place to look for the

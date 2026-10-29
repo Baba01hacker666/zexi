@@ -480,7 +480,7 @@ Two items let a module reach outside the language:
 
 `#[link("m")]` on either item adds `-lname` to the link step (`"pthread"` also
 adds `-pthread`). Together they are how a library adds native code without a
-change to the compiler — see [`17-extending.md`](17-extending.md).
+change to the compiler; the standard library's C is shipped entirely this way — see [`17-extending.md`](17-extending.md).
 
 ## 2.10 Standard library scope (M0)
 

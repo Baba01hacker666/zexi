@@ -145,8 +145,17 @@ fn main() -> i32 {
 
 ## 17.4 What the standard library does
 
-`sys` and `regex` carry their C in their own `.zx` files, so the compiler has no
-embed for them any more:
+Every standard module that needs C now carries it in its own `.zx` file, so the
+compiler holds no C for the library at all:
+
+| module | C it ships | why it needs C |
+| --- | --- | --- |
+| `sys` | POSIX environment, paths, clocks | `getenv`, `getcwd`, `clock_gettime` |
+| `regex` | a small backtracking matcher | pointer-level scanning |
+| `json` | `strtod`/`strtoll`, `%.17g` printing, UTF-8 encoding | exact number round-trips |
+| `net` | sockets, HTTP plumbing, file I/O | the socket API |
+| `http` | router slots, request counters, stop flag | typed `Router` storage and C11 atomics |
+| `thread` | threads, mutexes, channels, worker pool | `pthread` |
 
 ```zx
 // internal/driver/std/sys.zx
@@ -157,10 +166,27 @@ int64_t zxs_time_ms(void) { ... }
 """
 ```
 
-The larger runtimes (`net`, `thread`, `json`) are still separate C files because
-they are thousands of lines and are shared by several modules; the mechanism
-above is how they can move over, one module at a time, without a new compiler
-feature.
+Because the block is compiled with the generated code, `http` stores real
+`zx_Router` values in its pinned slots — no `void *`, no guessed byte size:
+
+```c
+_Alignas(64) static zx_Router zxh_mux_extra[ZXH_MUX_SLOTS];
+zx_Router *zxh_mux_slot(int32_t slot) { return &zxh_mux_extra[slot]; }
+```
+
+Two rules follow from that shared translation unit:
+
+* a block must be self-contained — include the headers it uses, because nothing
+  in front of it provides them;
+* a block is compiled after the generated code, so it can call it freely but not
+  the other way round, except through `#[no_mangle]` functions declared
+  `extern "C"` on the Zexi side.
+
+Moving C out of the driver also *fixed* real bugs: `sys` and `json` had `char *`
+parameters where the language passes `struct zx_arrN_u8 *`, and `net` declared
+`void *` returns for what the language types as `*Router`. A separate C file
+never saw the prototypes and compiled anyway; a block in the generated unit sees
+them and refuses.
 
 ## 17.5 Limits
 

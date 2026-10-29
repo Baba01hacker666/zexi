@@ -2954,3 +2954,50 @@ fn main() -> i32 {
 		t.Fatalf("output = %q, want %q", got, want)
 	}
 }
+
+// TestStandardLibraryNeedsNoCompilerC keeps the extension promise honest:
+// library C lives in the module that uses it, as a `c """..."""` block, so
+// adding a module never means adding an embedded blob and a flag in the driver.
+// The check is structural — no C file under internal/driver, and every standard
+// module that ships C ships it in a self-contained block.
+func TestStandardLibraryNeedsNoCompilerC(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "zx") || !strings.HasSuffix(name, "_c.txt") {
+			continue
+		}
+		t.Errorf("internal/driver/%s is driver-side library C; move it into its module's `c \"\"\"` block", name)
+	}
+
+	drv, err := os.ReadFile("driver.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(drv), "go:embed zx") {
+		t.Error("driver.go embeds a library C file again; the module should carry its own C")
+	}
+
+	shippingC := []string{"http.zx", "json.zx", "net.zx", "regex.zx", "sys.zx", "thread.zx"}
+	for _, name := range shippingC {
+		src, err := os.ReadFile(filepath.Join("std", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(src)
+		block := strings.Index(text, "c \"\"\"")
+		if block < 0 {
+			t.Errorf("std/%s ships C but has no `c \"\"\"` block", name)
+			continue
+		}
+		if !strings.Contains(text[block:], "#include") && !strings.Contains(text[:block], "#include") {
+			t.Errorf("std/%s block includes no header; a block must be self-contained", name)
+		}
+		if !strings.Contains(text, `extern "C" fn`) {
+			t.Errorf("std/%s ships C but declares no extern fn", name)
+		}
+	}
+}

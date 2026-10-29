@@ -180,9 +180,6 @@ type loader struct {
 
 	firstID int
 
-	usesNet    bool // program imports net/http/fs (needs the shared C runtime)
-	usesThread bool // program imports thread (needs the pthread shim and -pthread)
-	usesJSON   bool // program imports json (needs the number-conversion shim)
 	// loadingStd is set while a standard-library module (and its imports) are
 	// being loaded.
 	loadingStd bool
@@ -290,12 +287,6 @@ func (l *loader) loadStdFile(name string) *module {
 	// functions, but linking it is still opt-in and dead-code elimination keeps
 	// unused socket helpers out of the binary.
 	switch name {
-	case "net", "http", "fs":
-		l.usesNet = true
-	case "thread":
-		l.usesThread = true
-	case "json":
-		l.usesJSON = true
 	}
 	display := "std/" + name + ".zx"
 	src, err := fs.ReadFile(stdFS, display)
@@ -479,12 +470,6 @@ func (l *loader) bindUse(m *module, d *ast.UseDecl) {
 	// Preserve the historical convenience for local modules named net/http/sys
 	// (and regex): their ABI calls can use the embedded runtime too.
 	switch d.Path[len(d.Path)-1] {
-	case "net", "http", "fs":
-		l.usesNet = true
-	case "thread":
-		l.usesThread = true
-	case "json":
-		l.usesJSON = true
 	}
 
 	target, parts, ok := l.resolveUse(m, d)
