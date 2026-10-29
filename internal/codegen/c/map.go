@@ -124,7 +124,10 @@ func (g *gen) mapForwardDecls() {
 	}
 }
 
-// mapDefs emits the slot and handle structs.
+// mapDefs emits the handle structs. A handle stores its slots behind a
+// pointer, so its definition is order-independent and can precede the nominal
+// types that embed it by value. The slot struct itself embeds the key and value
+// by value, so it is emitted later, by mapPairDefs.
 func (g *gen) mapDefs() {
 	if len(g.mapOrder) == 0 {
 		return
@@ -133,18 +136,31 @@ func (g *gen) mapDefs() {
 	for _, name := range g.mapOrder {
 		t := g.maps[name]
 		pn, mn := hashPairName(t), mapTypeName(t)
-		g.w.line("struct %s {", pn)
-		g.w.indent++
-		g.w.line("%s key;", ctype(t.Key))
-		g.w.line("%s value;", ctype(t.Val))
-		g.w.line("int used;")
-		g.w.indent--
-		g.w.line("};")
 		g.w.line("struct %s {", mn)
 		g.w.indent++
 		g.w.line("%s *entries;", pn)
 		g.w.line("size_t len;")
 		g.w.line("size_t cap;")
+		g.w.indent--
+		g.w.line("};")
+	}
+}
+
+// mapPairDefs emits one open-addressing slot struct per map instantiation. The
+// slot holds its key and value inline, so every nominal type reachable from
+// them must already be complete: call this after the ordered type definitions.
+func (g *gen) mapPairDefs() {
+	if len(g.mapOrder) == 0 {
+		return
+	}
+	for _, name := range g.mapOrder {
+		t := g.maps[name]
+		pn := hashPairName(t)
+		g.w.line("struct %s {", pn)
+		g.w.indent++
+		g.w.line("%s key;", ctype(t.Key))
+		g.w.line("%s value;", ctype(t.Val))
+		g.w.line("int used;")
 		g.w.indent--
 		g.w.line("};")
 	}

@@ -32,10 +32,26 @@
 // (`new_app()`, `app.get`, `app.listen`) is available when a program holds
 // several servers.
 //
+// Many users at once: the single-threaded `listen` handles one request at a
+// time, which is fine for a laptop demo and wrong for a real site. A worker
+// pool serves several connections in parallel:
+//
+//     import http.server;
+//     fn main() -> i32 {
+//         handle_get("/", hello);
+//         listen_workers(":8080", 8)   // eight OS threads accepting together
+//     }
+//
+// `listen_workers`, `listen_workers_n`, and the `Router` methods of the same
+// name pin the router, spawn OS threads that accept on one shared listener,
+// and join them. `stop_serving()` asks the pool to wind down, and
+// `requests_served()` / `connections_served()` report what the whole pool did.
+//
 // Bodies are framed by Content-Length or chunked encoding (responses) and
 // Content-Length (requests); reads are bounded and client I/O has a timeout.
 
 use net;
+use thread;
 
 // File helpers are declared by `net`, which owns the shared opt-in C shim.
 
@@ -443,6 +459,45 @@ impl Request {
             pos = pos + (next as usize);
         }
         return String::new();
+    }
+
+    // collect_params copies every captured `{name}` segment into `out`.
+    pub fn collect_params(&self, out: &mut HashMap<String, String>) {
+        let mut pos: usize = 0;
+        while pos < self.params.len() {
+            let rest = self.params.substr(pos, 4294967295);
+            let lead = rest.find("\x1f");
+            if lead < 0 {
+                break;
+            }
+            pos = pos + (lead as usize) + 1;
+            let rest2 = self.params.substr(pos, 4294967295);
+            let mid = rest2.find("\x1f");
+            if mid < 0 {
+                break;
+            }
+            let key = rest2.substr(0, mid as usize);
+            pos = pos + (mid as usize) + 1;
+            let rest3 = self.params.substr(pos, 4294967295);
+            let next = rest3.find("\x1f");
+            let val = if next < 0 { rest3 } else { rest3.substr(0, next as usize) };
+            out.insert(key, val);
+            if next < 0 {
+                break;
+            }
+            pos = pos + (next as usize);
+        }
+    }
+
+    // collect_query copies every decoded query value into `out`.
+    pub fn collect_query(&self, out: &mut HashMap<String, String>) {
+        let raw = self.raw_query();
+        collect_query_into(&raw, out);
+    }
+
+    // collect_form copies an x-www-form-urlencoded body into `out`.
+    pub fn collect_form(&self, out: &mut HashMap<String, String>) {
+        collect_query_into(&self.body, out);
     }
 
     // wants_keep_alive reports whether the client asked to reuse the socket.
@@ -1082,9 +1137,11 @@ fn dir_prefix(path: &String) -> String {
 
 // --- routing ---------------------------------------------------------------
 
-// MAX_ROUTES is how many handlers a Router can hold (fixed-size tables: the
-// language has no dynamic arrays yet).
+// MAX_ROUTES is how many handlers a Router can hold.
 const MAX_ROUTES: i32 = 32;
+
+// MAX_MOUNTS is how many folders one router can serve.
+const MAX_MOUNTS: i32 = 4;
 
 // MAX_MIDDLEWARE is the number of before/after hooks a Router can hold.
 const MAX_MIDDLEWARE: i32 = 8;
@@ -1137,6 +1194,12 @@ pub struct Router {
     before_count: i32,
     after_count: i32,
     count: i32,
+    // Mounted folders for unmatched paths (`files`/`pages`), in registration
+    // order; `views` names the template folder `web` renders from.
+    mounts: [str; MAX_MOUNTS],
+    roots: [str; MAX_MOUNTS],
+    mount_count: i32,
+    views: str,
 }
 
 impl Router {
@@ -1151,6 +1214,10 @@ impl Router {
             before_count: 0,
             after_count: 0,
             count: 0,
+            mounts: [""; MAX_MOUNTS],
+            roots: [""; MAX_MOUNTS],
+            mount_count: 0,
+            views: "",
         };
     }
 
@@ -1168,6 +1235,30 @@ impl Router {
 
     pub fn delete(&mut self, path: str, handler: fn(&Request) -> Response) {
         self.add("DELETE", path, handler);
+    }
+
+    // files serves a folder for URLs under `prefix`, with index.html for
+    // directory URLs and a ".html" fallback for extension-less ones:
+    //
+    //     app.files("/assets", "public/assets");
+    pub fn files(&mut self, prefix: str, root: str) {
+        if self.mount_count >= MAX_MOUNTS {
+            return;
+        }
+        let i = self.mount_count as usize;
+        self.mounts[i] = prefix;
+        self.roots[i] = root;
+        self.mount_count = self.mount_count + 1;
+    }
+
+    // pages serves a folder as the whole site (`prefix` is "/").
+    pub fn pages(&mut self, root: str) {
+        self.files("/", root);
+    }
+
+    // views names the template folder that `web::template` reads from.
+    pub fn views(&mut self, dir: str) {
+        self.views = dir;
     }
 
     // set_fallback replaces the 404 handler.
@@ -1222,6 +1313,25 @@ impl Router {
         return serve_n(self, max_requests, a.port, a.host.as_str());
     }
 
+    // listen_workers serves this router with a thread pool, so several users
+    // are handled at once instead of one after another.
+    pub fn listen_workers(&self, addr: str = "0.0.0.0:8000", workers: i32 = 0) -> i32 {
+        let a = parse_addr(addr);
+        if !a.ok {
+            return 2;
+        }
+        return serve_workers(self, workers, a.port, a.host.as_str());
+    }
+
+    // listen_workers_n is listen_workers with a pool-wide request budget.
+    pub fn listen_workers_n(&self, addr: str, workers: i32, max_requests: i32) -> i32 {
+        let a = parse_addr(addr);
+        if !a.ok {
+            return 2;
+        }
+        return serve_workers_n(self, workers, max_requests, a.port, a.host.as_str());
+    }
+
     pub fn add(&mut self, method: str, path: str, handler: fn(&Request) -> Response) {
         if self.count >= MAX_ROUTES {
             return;
@@ -1268,6 +1378,26 @@ impl Router {
                 }
             }
             i += 1;
+        }
+        if !matched {
+            // The longest matching prefix wins, so `/static` beats a `/` mount
+            // no matter which was registered first.
+            let mut best: i64 = -1;
+            let mut best_len: usize = 0;
+            let mut m: usize = 0;
+            while m < (self.mount_count as usize) {
+                let prefix = self.mounts[m];
+                if path.starts_with(prefix) && (best < 0 || prefix.len() > best_len) {
+                    best = m as i64;
+                    best_len = prefix.len();
+                }
+                m += 1;
+            }
+            if best >= 0 {
+                let rest = path.substr(best_len, 4294967295);
+                res = serve_page(self.roots[best as usize], rest.as_str());
+                matched = true;
+            }
         }
         if !matched {
             let fallback = self.fallback;
@@ -1440,6 +1570,393 @@ pub fn serve_n(router: &Router, max_requests: i32, port: i32 = 8000, host: str =
 // tools and tests.
 pub fn serve_local_n(router: &Router, max_requests: i32, port: i32 = 8000) -> i32 {
     return serve_n(router, max_requests, port, "127.0.0.1");
+}
+
+// --- serving many users at once --------------------------------------------
+
+// A worker pool is how one process serves many users: the single-threaded
+// `listen` accepts, serves, and closes one connection before looking at the
+// next, so a slow request stalls everyone behind it. Here N OS threads accept
+// on one shared listener (the kernel hands each connection to whichever thread
+// is idle), dispatch it, and go back for more. Handlers stay ordinary
+// functions; each thread has its own stack and its own request/response
+// values.
+
+// The worker-side state — the pinned-router slots, the pool-wide counters, and
+// the cooperative stop flag — lives in the networking C shim as C11 atomics.
+// Worker threads receive integers only (the language has no closures yet), so
+// a Router travels into a thread as a slot number.
+extern "C" fn zxh_mux_slot(slot: i32) -> *Router;
+extern "C" fn zxh_mux_claim() -> i32;
+extern "C" fn zxh_mux_release(slot: i32);
+extern "C" fn zxh_count_conn();
+extern "C" fn zxh_count_request();
+extern "C" fn zxh_stats_reset();
+extern "C" fn zxh_conns_served() -> i64;
+extern "C" fn zxh_requests_served() -> i64;
+extern "C" fn zxh_set_budget(n: i64);
+extern "C" fn zxh_budget() -> i64;
+extern "C" fn zxh_stop();
+extern "C" fn zxh_clear_stop();
+extern "C" fn zxh_stopping() -> i32;
+
+// WORKER_POLL_MS bounds how long a worker waits on an idle listener before it
+// re-checks the stop flag, so a pool shuts down promptly instead of hanging on
+// a blocking accept.
+const WORKER_POLL_MS: i32 = 100;
+
+// MAX_WORKERS caps a pool: past a few hundred threads the kernel, not the CPU,
+// becomes the bottleneck, and each worker needs its own stack.
+const MAX_WORKERS: i32 = 64;
+
+// DEFAULT_WORKERS is the pool size when a program does not choose one (and the
+// processor count cannot be read).
+const DEFAULT_WORKERS: i32 = 8;
+
+// pin_router copies a router into a fixed slot so worker threads can reach it
+// through an integer handle. The copy is field by field because the language
+// has no raw-pointer reinterpret of a borrowed value.
+fn pin_router(src: &Router, dst: *Router) {
+    let mut i: usize = 0;
+    while i < 32 {
+        let method = src.methods[i];
+        (*dst).methods[i] = method;
+        let path = src.paths[i];
+        (*dst).paths[i] = path;
+        let handler = src.handlers[i];
+        (*dst).handlers[i] = handler;
+        i += 1;
+    }
+    let mut b: usize = 0;
+    while b < 8 {
+        let before = src.before[b];
+        (*dst).before[b] = before;
+        let after = src.after[b];
+        (*dst).after[b] = after;
+        b += 1;
+    }
+    let mut m: usize = 0;
+    while m < (MAX_MOUNTS as usize) {
+        let prefix = src.mounts[m];
+        (*dst).mounts[m] = prefix;
+        let root = src.roots[m];
+        (*dst).roots[m] = root;
+        m += 1;
+    }
+    (*dst).mount_count = src.mount_count;
+    (*dst).views = src.views;
+    (*dst).fallback = src.fallback;
+    (*dst).before_count = src.before_count;
+    (*dst).after_count = src.after_count;
+    (*dst).count = src.count;
+}
+
+// drain is the worker loop: accept bounded so the stop flag is noticed, serve
+// one request per connection, count it, and repeat. It returns how many
+// requests this worker served.
+fn drain(mux: *Router, listener_fd: i64) -> i64 {
+    let mut server = Server::from_fd(listener_fd as i32);
+    let mut served: i64 = 0;
+    loop {
+        if zxh_stopping() == 1 {
+            break;
+        }
+        let mut conn = server.accept_timeout(WORKER_POLL_MS);
+        if !conn.is_open() {
+            continue;
+        }
+        zxh_count_conn();
+        if mux.serve(&conn) {
+            zxh_count_request();
+            served += 1;
+            let budget = zxh_budget();
+            if budget > 0 && zxh_requests_served() >= budget {
+                zxh_stop();
+            }
+        }
+        conn.close();
+    }
+    return served;
+}
+
+// worker_slot serves a router that was pinned into a slot.
+fn worker_slot(listener_fd: i64, slot: i64) -> i64 {
+    return drain(zxh_mux_slot(slot as i32), listener_fd);
+}
+
+// worker_default serves the process-wide default mux, which lives in a fixed
+// slot already, so nothing needs pinning.
+fn worker_default(listener_fd: i64, slot: i64) -> i64 {
+    return drain(default_router(), listener_fd);
+}
+
+// run_pool starts `workers` threads on one listener and joins them. A
+// max_requests of 0 means "serve until stopped".
+fn run_pool(fd: i64, workers: i32, max_requests: i64, entry: fn(i64, i64) -> i64, slot: i32) -> i32 {
+    let mut n = workers;
+    if n <= 0 {
+        // Two threads per core covers the common case where a handler waits on
+        // I/O; a CPU-bound handler still runs close to one core per thread.
+        n = net::cpu_count() * 2;
+        if n < 2 {
+            n = DEFAULT_WORKERS;
+        }
+    }
+    if n > MAX_WORKERS {
+        n = MAX_WORKERS;
+    }
+    zxh_set_budget(max_requests);
+    let mut handles: [i64; 64] = [0; 64];
+    let mut started: i32 = 0;
+    let mut i: i32 = 0;
+    while i < n {
+        let h = thread::spawn2(entry, fd, slot as i64);
+        if h == 0 {
+            break;
+        }
+        handles[i as usize] = h;
+        started += 1;
+        i += 1;
+    }
+    if started == 0 {
+        // The thread table is full or pthread_create failed: serve inline so
+        // the program still makes progress.
+        let mux = zxh_mux_slot(slot);
+        drain_until_budget(mux, fd, max_requests);
+        zxh_set_budget(0);
+        zxh_clear_stop();
+        return 0;
+    }
+    let mut j: i32 = 0;
+    while j < started {
+        thread::join(handles[j as usize]);
+        j += 1;
+    }
+    zxh_set_budget(0);
+    zxh_clear_stop();
+    return 0;
+}
+
+// drain_until_budget is the no-thread fallback: serve on this thread, honouring
+// the request budget, so a pool that cannot start still answers.
+fn drain_until_budget(mux: *Router, listener_fd: i64, max_requests: i64) {
+    let mut server = Server::from_fd(listener_fd as i32);
+    let mut served: i64 = 0;
+    while max_requests == 0 || served < max_requests {
+        let mut conn = server.accept_timeout(WORKER_POLL_MS);
+        if !conn.is_open() {
+            if zxh_stopping() == 1 {
+                break;
+            }
+            continue;
+        }
+        zxh_count_conn();
+        if mux.serve(&conn) {
+            zxh_count_request();
+            served += 1;
+        }
+        conn.close();
+    }
+}
+
+// serve_workers serves an explicit Router with a thread pool. `workers` 0
+// picks DEFAULT_WORKERS; the pool runs until the process stops or
+// `stop_serving()` is called. A non-zero return means the address could not be
+// bound.
+pub fn serve_workers(router: &Router, workers: i32 = 0, port: i32 = 8000, host: str = "0.0.0.0") -> i32 {
+    return serve_workers_n(router, workers, 0, port, host);
+}
+
+// serve_workers_n is serve_workers with a total request budget across the
+// whole pool: after max_requests (0 = unlimited) the workers stop and the call
+// returns. Tests and one-shot tools use it for a deterministic exit.
+pub fn serve_workers_n(router: &Router, workers: i32, max_requests: i32, port: i32 = 8000, host: str = "0.0.0.0") -> i32 {
+    let mut listener = listen_tcp(host, port);
+    if !listener.ok() {
+        return 1;
+    }
+    // A pooled server polls the listener from several threads. Without a
+    // non-blocking listener two workers can wake for one connection, the first
+    // accepts it, and the second blocks in accept() forever, so a bounded
+    // pool never shuts down. The accepted sockets stay blocking.
+    listener.set_nonblocking(true);
+    let slot = zxh_mux_claim();
+    if slot < 0 {
+        // Every slot is in use: fall back to serving on this thread rather
+        // than failing a server that is already running.
+        zxh_stats_reset();
+        drain_until_budget(default_router(), listener.fd() as i64, max_requests as i64);
+        listener.close();
+        return 0;
+    }
+    pin_router(router, zxh_mux_slot(slot));
+    zxh_stats_reset();
+    let rc = run_pool(listener.fd() as i64, workers, max_requests as i64, worker_slot, slot);
+    listener.close();
+    zxh_mux_release(slot);
+    return rc;
+}
+
+// serve_local_workers is serve_workers bound to loopback, the safe choice for
+// development servers.
+pub fn serve_local_workers(router: &Router, workers: i32 = 0, port: i32 = 8000) -> i32 {
+    return serve_workers(router, workers, port, "127.0.0.1");
+}
+
+// serve_local_workers_n is serve_workers_n bound to loopback.
+pub fn serve_local_workers_n(router: &Router, workers: i32, max_requests: i32, port: i32 = 8000) -> i32 {
+    return serve_workers_n(router, workers, max_requests, port, "127.0.0.1");
+}
+
+// files serves a folder for URLs under `prefix` on the default mux.
+pub fn files(prefix: str, root: str) {
+    let mux = default_router();
+    mux.files(prefix, root);
+}
+
+// pages serves a folder as the whole site on the default mux.
+pub fn pages(root: str) {
+    let mux = default_router();
+    mux.pages(root);
+}
+
+// views_dir names the template folder `web::template` reads from.
+pub fn views_dir(dir: str) {
+    let mux = default_router();
+    mux.views(dir);
+}
+
+// views_path is the configured template folder ("templates" by default).
+pub fn views_path() -> String {
+    let mux = default_router();
+    if mux.views.len() == 0 {
+        return project_path("templates");
+    }
+    return project_path(mux.views);
+}
+
+// serve_page serves one file from a folder, trying the exact path, then
+// "<path>.html", then "<path>/index.html" — so /about can be about.html.
+pub fn serve_page(root: str, url_path: str) -> Response {
+    let mut result = serve_static(root, url_path);
+    if result.status == 404 {
+        let raw = String::from(url_path);
+        let q = raw.find("?");
+        let bare = if q < 0 { raw.clone() } else { raw.substr(0, q as usize) };
+        if bare.len() > 0 && !bare.ends_with("/") {
+            let mut html_path = bare.clone();
+            html_path.push_str(".html");
+            result = serve_static(root, html_path.as_str());
+            if result.status == 404 {
+                let mut index_path = bare.clone();
+                index_path.push_byte(47);
+                index_path.push_str("index.html");
+                result = serve_static(root, index_path.as_str());
+            }
+        }
+    }
+    return result;
+}
+
+// collect_query_into decodes `a=1&b=2` into `out` (first value wins).
+pub fn collect_query_into(raw: &String, out: &mut HashMap<String, String>) {
+    let mut pos: usize = 0;
+    while pos <= raw.len() {
+        let rest = raw.substr(pos, 4294967295);
+        let amp = rest.find("&");
+        let piece = if amp < 0 { rest.clone() } else { rest.substr(0, amp as usize) };
+        if piece.len() > 0 {
+            let eq = piece.find("=");
+            if eq >= 0 {
+                let key = url_decode(piece.substr(0, eq as usize).as_str());
+                let value = url_decode(piece.substr((eq + 1) as usize, 4294967295).as_str());
+                if !out.contains_key(key.clone()) {
+                    out.insert(key, value);
+                }
+            }
+        }
+        if amp < 0 {
+            break;
+        }
+        pos = pos + (amp as usize) + 1;
+    }
+}
+
+// last_slash is the index of the final "/" in s, or -1.
+fn last_slash(s: &String) -> i64 {
+    let mut i: usize = 0;
+    let mut found: i64 = -1;
+    while i < s.len() {
+        if s.byte_at(i) == 47 {
+            found = i as i64;
+        }
+        i += 1;
+    }
+    return found;
+}
+
+// listen_workers serves the process-wide default mux with a worker pool, so a
+// Go-style program scales to many users by changing one call:
+//
+//     handle_get("/", home);
+//     listen_workers(":8080", 8)
+pub fn listen_workers(addr: str = "0.0.0.0:8000", workers: i32 = 0) -> i32 {
+    let a = parse_addr(addr);
+    if !a.ok {
+        return 2;
+    }
+    let mux = default_router();
+    let mut listener = listen_tcp(a.host.as_str(), a.port);
+    if !listener.ok() {
+        return 1;
+    }
+    zxh_stats_reset();
+    let rc = run_pool(listener.fd() as i64, workers, 0, worker_default, 0);
+    listener.close();
+    return rc;
+}
+
+// listen_workers_n is listen_workers with a request budget (0 = unlimited).
+pub fn listen_workers_n(addr: str, workers: i32, max_requests: i32) -> i32 {
+    let a = parse_addr(addr);
+    if !a.ok {
+        return 2;
+    }
+    let mut listener = listen_tcp(a.host.as_str(), a.port);
+    if !listener.ok() {
+        return 1;
+    }
+    zxh_stats_reset();
+    let rc = run_pool(listener.fd() as i64, workers, max_requests as i64, worker_default, 0);
+    listener.close();
+    return rc;
+}
+
+// requests_served is how many requests the pool has answered in total; every
+// worker counts into the same cell.
+pub fn requests_served() -> i64 {
+    return zxh_requests_served();
+}
+
+// connections_served is how many connections the pool has accepted.
+pub fn connections_served() -> i64 {
+    return zxh_conns_served();
+}
+
+// stop_serving asks every worker to wind down after its current request. The
+// pool's `serve_workers` call returns once they all have.
+pub fn stop_serving() {
+    zxh_stop();
+}
+
+// serving_stopped reports whether stop_serving has been called.
+pub fn serving_stopped() -> bool {
+    return zxh_stopping() == 1;
+}
+
+// reset_stats clears the pool-wide counters (and the stop flag).
+pub fn reset_stats() {
+    zxh_stats_reset();
 }
 
 // path_matches supports exact routes and a trailing "/*" prefix; the bare
@@ -1664,10 +2181,30 @@ pub fn serve_file(path: str) -> Response {
     return r;
 }
 
+// project_path resolves a folder or file named relative to the program's
+// entry directory (the value of `project_dir()`), so `pages("public")` means
+// the same folder no matter which directory the binary is started from. An
+// absolute path, or a build with no project directory, is returned unchanged.
+pub fn project_path(path: str) -> String {
+    let p = String::from(path);
+    let absolute = p.starts_with("/");
+    let base = project_dir();
+    if absolute || p.len() == 0 || base.len() == 0 {
+        return String::from(path);
+    }
+    let mut out = base.clone();
+    if !out.ends_with("/") {
+        out.push_byte(47);
+    }
+    out.push_str(p.as_str());
+    return out;
+}
+
 // serve_static maps a URL path onto a directory. "/" serves index.html;
-// traversal ("..", backslashes, NUL) is refused with 403.
+// traversal ("..", backslashes, NUL) is refused with 403. A relative `root` is
+// resolved against the program's entry directory.
 pub fn serve_static(root: str, url_path: str) -> Response {
-    let root_s = String::from(root);
+    let root_s = project_path(root);
     let raw = String::from(url_path);
     let q = raw.find("?");
     let p0 = if q < 0 { raw.clone() } else { raw.substr(0, q as usize) };

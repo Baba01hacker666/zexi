@@ -1,0 +1,75 @@
+// tests/web_lib.zx
+// In-process coverage for the `web` layer: route dispatch with `{name}`
+// parameters, JSON and HTML responses, redirects, and error bodies. No socket
+// is opened, so the output is deterministic.
+
+use http;
+use web;
+use html;
+use json;
+
+fn user(req: &Request) -> Response {
+    let p = web::path_params(req);
+    let mut doc = json::object();
+    doc.set_str("id", p.get("id"));
+    doc.set_bool("found", true);
+    return web::json_of(&doc);
+}
+
+fn post(req: &Request) -> Response {
+    let p = web::path_params(req);
+    return web::text(web::addr_of("item", p.get("n").parse_i64() as i32).as_str());
+}
+
+fn missing(req: &Request) -> Response {
+    return web::not_found();
+}
+
+fn boom(req: &Request) -> Response {
+    return web::error(400, "bad input");
+}
+
+fn main() -> i32 {
+    let mut app = web::new_app();
+    app.get("/users/{id}", user);
+    app.get("/items/{n}", post);
+    app.get("/missing", missing);
+    app.get("/boom", boom);
+
+    let mut raw = String::from("GET /users/42 HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut req = parse_request(&raw);
+    let res = app.dispatch(&mut req);
+    println(res.status, res.content_type.as_str(), res.body);
+
+    raw = String::from("GET /items/7 HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut req2 = parse_request(&raw);
+    let res2 = app.dispatch(&mut req2);
+    println(res2.status, res2.body);
+
+    let mut raw3 = String::from("GET /missing HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut req3 = parse_request(&raw3);
+    let res3 = app.dispatch(&mut req3);
+    println(res3.status, res3.body);
+
+    let mut raw4 = String::from("GET /boom HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut req4 = parse_request(&raw4);
+    let res4 = app.dispatch(&mut req4);
+    println(res4.status, res4.body);
+
+    // Query values become template values, and templates escape them.
+    let mut raw5 = String::from("GET /q?name=%3Cb%3Ezexi%3C/b%3E HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut req5 = parse_request(&raw5);
+    let q = web::query_vars(&req5);
+    println(q.get("name"));
+    println(html::template("<p>{{name}}</p>", &q));
+
+    // Helpers that do not need a server.
+    println(web::addr_of("127.0.0.1", 8080));
+    let ok = web::html_page("<h1>hi</h1>");
+    println(ok.status, ok.content_type.as_str());
+    let redir = web::redirect("/next");
+    println(redir.status, redir.header("location"));
+    let msg = web::json_message(false, "nope");
+    println(msg.status, msg.body);
+    0
+}

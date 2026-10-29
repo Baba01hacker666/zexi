@@ -1,0 +1,55 @@
+use web;
+use html;
+use json;
+
+// Pages come from templates/index.html; files come from public/.
+fn home(req: &Request) -> Response {
+    let mut v = html::vars();
+    v.set("title", "Zexi site");
+    v.set_int("requests", requests_served());
+    return web::render("index", &v);
+}
+
+// /greet?name=… renders a template with a query value (escaped for you).
+fn greet(req: &Request) -> Response {
+    let mut v = web::query_vars(req);
+    if v.get("name").len() == 0 {
+        v.set("name", "stranger");
+    }
+    return web::render("greeting", &v);
+}
+
+// /users/{id} answers JSON with the captured path parameter.
+fn user(req: &Request) -> Response {
+    let p = web::path_params(req);
+    let mut doc = json::object();
+    doc.set_str("id", p.get("id"));
+    doc.set_str("lang", "zexi");
+    doc.set_bool("found", true);
+    return web::json_of(&doc);
+}
+
+fn stats(req: &Request) -> Response {
+    let mut doc = json::object();
+    doc.set_int("requests", requests_served());
+    doc.set_int("connections", connections_served());
+    let mut tags = json::array();
+    tags.push_str("json");
+    tags.push_str("threads");
+    doc.set("tags", tags);
+    return web::json_of(&doc);
+}
+
+fn main() -> i32 {
+    let mut app = web::new_app();
+    app.get("/", home);
+    app.get("/greet", greet);
+    app.get("/users/{id}", user);
+    app.get("/api/stats", stats);
+    app.views("templates");
+    app.pages("public");
+    app.files("/static", "public");
+    app.workers(4);
+    println("listening on http://127.0.0.1:8090/");
+    return app.serve_local(8090);
+}

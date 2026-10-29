@@ -1762,3 +1762,46 @@ fn main() -> i32 { println("p {}", P { x: 1 }); 0 }`)
 		t.Fatalf("space separated: expected clean, got %v", codes)
 	}
 }
+
+func TestClosuresCaptureAndMove(t *testing.T) {
+	// A closure over a Copy value leaves the binding usable.
+	ok, codes := check(t, `fn main() -> i32 {
+    let base = 2;
+    let f: fn(i32) -> i32 = |n| n + base;
+    println(f(base));
+    0
+}`)
+	if !ok {
+		t.Fatalf("unexpected errors for a Copy capture: %v", codes)
+	}
+
+	// A closure over an owning value moves it into the environment.
+	ok, codes = check(t, `fn main() -> i32 {
+    let s = String::from("x");
+    let f: fn() -> String = || s.clone();
+    println(f().as_str());
+    println(s.as_str());
+    0
+}`)
+	if ok || !has(codes, "E0382") {
+		t.Fatalf("expected E0382 for a use after moving a String into a closure, got %v", codes)
+	}
+
+	// Without a target type the parameter types cannot be inferred.
+	ok, codes = check(t, `fn main() -> i32 {
+    let f = |n| n + 1;
+    0
+}`)
+	if ok || !has(codes, "E0282") {
+		t.Fatalf("expected E0282 for an unannotated closure, got %v", codes)
+	}
+
+	// The arity has to match the target type.
+	ok, codes = check(t, `fn main() -> i32 {
+    let f: fn(i32) -> i32 = |a, b| a + b;
+    0
+}`)
+	if ok || !has(codes, "E0057") {
+		t.Fatalf("expected E0057 for a closure with the wrong arity, got %v", codes)
+	}
+}

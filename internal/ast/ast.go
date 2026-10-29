@@ -497,6 +497,17 @@ type SliceExpr struct {
 func (*SliceExpr) exprNode()          {}
 func (e *SliceExpr) Span() token.Span { return e.Sp }
 
+// LambdaExpr is a closure: `|a, b| expr` or `|a: i32| { stmts }`. The
+// parameter list may be empty (`|| expr`).
+type LambdaExpr struct {
+	Params []Param
+	Body   Expr // a Block, or any expression
+	Sp     token.Span
+}
+
+func (*LambdaExpr) exprNode()          {}
+func (e *LambdaExpr) Span() token.Span { return e.Sp }
+
 // TryExpr is postfix `?`.
 type TryExpr struct {
 	X  Expr

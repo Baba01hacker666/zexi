@@ -1,0 +1,60 @@
+// tests/net_local.zx
+// Coverage for the low-level `net` module over loopback only: name resolution,
+// ephemeral ports, bounded accept/poll, peer identity, half-close, and UDP
+// datagrams. Nothing here leaves the machine and every port is chosen by the
+// kernel, so the test is safe to run anywhere.
+
+use net;
+
+fn main() -> i32 {
+    // Name resolution: a literal address comes back unchanged.
+    println(resolve("127.0.0.1"));
+    println(resolve("no-such-host.invalid").len());
+
+    // Bind an ephemeral port, then discover which one the kernel chose.
+    let mut server = listen_local(0);
+    println(server.ok(), server.port() > 0, server.is_open());
+    let port = server.port();
+
+    // A quiet listener: poll times out and accept_timeout reports "nothing".
+    println(server.wait_readable(1));
+    let mut idle = server.accept_timeout(1);
+    println(idle.is_open());
+
+    // Connect, accept, exchange bytes, and learn both endpoints.
+    let mut client = connect_local(port, 2000);
+    println(client.ok(), client.local_port() > 0);
+    let mut conn = server.accept_timeout(2000);
+    println(conn.is_open(), conn.peer().ends_with(port_text(client.local_port())));
+
+    // Half-close sends EOF while the reply direction stays open.
+    client.write("ping");
+    println(conn.read_exact(4));
+    client.shutdown_write();
+    conn.write("pong");
+    println(client.read_some(16));
+    client.close();
+    conn.close();
+
+    // UDP: send a datagram to ourselves and read it back with its sender.
+    let mut udp = udp_bind_local(0);
+    println(udp.ok(), udp.port() > 0);
+    let sent = udp.send_to("127.0.0.1", udp.port(), "datagram");
+    println(sent);
+    let got = udp.recv_from();
+    println(got.data, got.host, got.port == udp.port());
+    udp.close();
+    server.close();
+
+    // Error text for a bad descriptor is human readable.
+    println(error_string(9).len() > 0);
+    0
+}
+
+// port_text renders a port number as text so a test can assert that a peer
+// address mentions the client's port.
+fn port_text(port: i32) -> String {
+    let mut out = String::new();
+    out += port;
+    return out;
+}

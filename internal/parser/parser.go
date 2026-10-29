@@ -974,6 +974,18 @@ func (p *parser) parseUnary() ast.Expr {
 func (p *parser) parsePostfix() ast.Expr {
 	e := p.parsePrimary()
 	for {
+		// A block-shaped expression (`if`, `match`, `while`, `loop`, `for`)
+		// ends at its closing brace, so a `(` or `[` on the next line starts a
+		// new statement rather than a call or index on the block:
+		//
+		//     while i < 2 { i += 1; }
+		//     (*ptr).field = 5;      // not `while ... { }(*ptr)`
+		//
+		// Without this, such a statement was parsed as a call of the loop,
+		// which then failed with "expression is not callable".
+		if (p.at(token.KindLParen) || p.at(token.KindLBracket)) && isBlockExpr(e) && p.newlineBeforeCur() {
+			return e
+		}
 		switch p.cur().Kind {
 		case token.KindDot:
 			p.bump()
@@ -1031,6 +1043,17 @@ func (p *parser) parsePostfix() ast.Expr {
 // are literal braces. Each hole is parsed by a fresh sub-parser over its
 // source text (with token offsets shifted back into the enclosing file,
 // so diagnostics keep pointing at the right place).
+// isBlockExpr reports whether e is an expression whose body is a braced block.
+// Such an expression is a complete statement on its own, so postfix syntax on
+// the following line belongs to the next statement.
+func isBlockExpr(e ast.Expr) bool {
+	switch e.(type) {
+	case *ast.LoopExpr, *ast.IfExpr, *ast.MatchExpr:
+		return true
+	}
+	return false
+}
+
 func (p *parser) parseFString() ast.Expr {
 	tok := p.bump() // f"..."
 	src := tok.Lit
@@ -1182,6 +1205,38 @@ func (p *parser) parseArgs() []ast.Expr {
 	return args
 }
 
+// parseLambda parses a closure: `|a, b| expr`, `|a: i32| { .. }`, or `|| expr`.
+// Parameter types are optional; an unannotated parameter takes its type from
+// the target type the closure is checked against.
+func (p *parser) parseLambda(start token.Pos) ast.Expr {
+	params := []ast.Param{}
+	if p.at(token.KindPipePipe) {
+		p.bump() // an empty parameter list, written `||`
+	} else {
+		p.expect(token.KindPipe, " to open a closure")
+		for !p.at(token.KindPipe) {
+			sp := p.spanFrom(p.cur().Pos.Offset)
+			name := p.expectIdentPath("closure parameter")
+			pr := ast.Param{Name: name, Sp: sp}
+			if p.accept(token.KindColon) {
+				pr.Ty = p.parseType()
+			}
+			params = append(params, pr)
+			if !p.accept(token.KindComma) {
+				break
+			}
+		}
+		p.expect(token.KindPipe, " to close the closure parameter list")
+	}
+	// A struct literal is legal in the body even when the closure appears in
+	// condition position, where `{` would otherwise be taken for a block.
+	saved := p.noStructLit
+	p.noStructLit = 0
+	body := p.parseExpr()
+	p.noStructLit = saved
+	return &ast.LambdaExpr{Params: params, Body: body, Sp: p.spanFrom(start)}
+}
+
 func (p *parser) parsePrimary() ast.Expr {
 	t := p.cur()
 	start := t.Pos.Offset
@@ -1212,6 +1267,9 @@ func (p *parser) parsePrimary() ast.Expr {
 			return &ast.IdentExpr{Name: path[0], TypeArgs: typeArgs, Sp: p.spanFrom(start)}
 		}
 		return &ast.PathExpr{Segments: path, TypeArgs: typeArgs, Sp: p.spanFrom(start)}
+
+	case token.KindPipe, token.KindPipePipe:
+		return p.parseLambda(start)
 
 	case token.KindLParen:
 		p.bump()

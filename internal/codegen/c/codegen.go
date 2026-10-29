@@ -16,6 +16,7 @@ package c
 import (
 	"fmt"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -34,6 +35,10 @@ type Options struct {
 	// Division and modulo by zero always panic, in every profile, because
 	// they are not a performance choice — they are undefined behaviour.
 	DebugChecks bool
+	// ProjectDir is the absolute directory of the program's entry file, baked
+	// into the binary for the `project_dir()` builtin. Empty means "unknown",
+	// and `project_dir()` then yields "".
+	ProjectDir string
 }
 
 type gen struct {
@@ -65,9 +70,11 @@ type gen struct {
 	// that can fail, so `zx_panicf` must be defined in the unit.
 	hasPanic bool
 	// externNames is the set of C-visible function names (`extern "C"`
-	// declarations and `main`): locals mangle to `zx_<name>`, which must
-	// never shadow one of these (a local `motto` would hide the C
-	// function `zx_motto` it may need to call).
+	// declarations, `main`, and every ordinary function): locals mangle to
+	// `zx_<name>`, which must never shadow one of these. A local `motto` would
+	// otherwise hide the C function `zx_motto` it may need to call, so
+	// `let motto = motto(x)` failed to compile with "called object is not a
+	// function or function pointer".
 	externNames map[string]bool
 	// used is the set of functions reachable from `main`; unreachable
 	// functions are omitted from the output entirely.
@@ -80,6 +87,8 @@ type gen struct {
 	// pendingMoves tracks owned pattern bindings that were copied out for a
 	// guard and must be taken (moved) once the guard succeeds.
 	pendingMoves []pendingMove
+	// lambdas maps each closure to its emission index, in source order.
+	lambdas map[*ast.LambdaExpr]int
 }
 
 // pendingMove is an owned pattern binding whose move out of the scrutinee is
@@ -195,10 +204,12 @@ func GenerateSplit(info *sema.Info, opts Options, n int) (string, []string, erro
 func newGen(info *sema.Info, opts Options) *gen {
 	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}, arrays: map[string]*types.Type{}, arrSeen: map[string]bool{}, vecs: map[string]*types.Type{}, vecSeen: map[string]bool{}, maps: map[string]*types.Type{}, mapSeen: map[string]bool{}, hashSeen: map[string]bool{}, dropSeen: map[string]bool{}, externNames: map[string]bool{}}
 	g.used = usedFns(info)
+	g.lambdas = map[*ast.LambdaExpr]int{}
+	for i, l := range info.ClosureOrd {
+		g.lambdas[l] = i
+	}
 	for _, fn := range info.FnOrder {
-		if fn.Extern || fn.Name == "main" || fn.NoMangle {
-			g.externNames[funcName(fn)] = true
-		}
+		g.externNames[funcName(fn)] = true
 	}
 	return g
 }
@@ -221,6 +232,8 @@ func (g *gen) emitPrefix() {
 	g.mapRuntime()
 	g.constants()
 	g.prototypes()
+	g.closureRecords()
+	g.closureDefs()
 }
 
 // reachableFns returns the emitted function bodies, in declaration order.
@@ -405,6 +418,7 @@ func (g *gen) runtime() {
 	// and C requires a declaration before the first use, so a debug build
 	// emits the whole (tiny) family here. Unused helpers are dropped by the
 	// linker's section GC.
+	g.closureRuntime()
 	if g.opts.DebugChecks {
 		for _, ct := range intCTypes {
 			for _, op := range []string{"add", "sub", "mul"} {
@@ -415,6 +429,29 @@ func (g *gen) runtime() {
 			}
 		}
 	}
+}
+
+// closureRuntime defines the value behind `fn(..) -> ..`: a pointer to a
+// record holding the C function to run and, for a closure, the captured
+// values. Named functions share a static record with a negative count, so a
+// call through a value never needs a null or ownership check.
+func (g *gen) closureRuntime() {
+	g.w.line("")
+	g.w.line("// A function value is a pointer to one of these. Named functions point at a")
+	g.w.line("// static record (rc = -1, never freed); a closure points at a heap record")
+	g.w.line("// whose captured values follow the header.")
+	g.w.line("typedef struct { long rc; void *fn; } zx_Closure;")
+	g.w.line("")
+	g.w.line("static void *zx_clo_alloc(void *fn, size_t size) {")
+	g.w.line("    zx_Closure *c = (zx_Closure *)calloc(1, size);")
+	g.w.line("    if (c == NULL) {")
+	g.w.line("        fputs(\"zexi: out of memory\\n\", stderr);")
+	g.w.line("        exit(70);")
+	g.w.line("    }")
+	g.w.line("    c->rc = 1;")
+	g.w.line("    c->fn = fn;")
+	g.w.line("    return (void *)c;")
+	g.w.line("}")
 }
 
 // lateRuntime emits the helpers whose need is only discovered while lowering
@@ -570,6 +607,10 @@ func (g *gen) typeDefs() {
 			g.emitArrayDef(name, g.arrays[name])
 		}
 	}
+	// Hash map slots embed their key and value by value, so they come after
+	// every nominal type they can reach (a map of enums, an enum holding a
+	// map, and deeper cycles through Vec all work).
+	g.mapPairDefs()
 	g.w.line("")
 }
 
@@ -1468,6 +1509,210 @@ func (g *gen) loopJump(kw, which string) string {
 	return "goto " + l.cont + ";"
 }
 
+// --- function values and closures ------------------------------------------
+
+// closureRecords emits, for every function used as a value, an adapter with the
+// closure calling convention plus the static record a value points at. The
+// adapter only drops the environment argument, so a named function can be
+// stored in the same `fn(..)` slot as a closure.
+func (g *gen) closureRecords() {
+	fns := make([]*sema.Fn, 0, len(g.info.FnValues))
+	seen := map[*sema.Fn]bool{}
+	add := func(fn *sema.Fn) {
+		if fn == nil || seen[fn] || fn.Name == "main" || fn.Decl == nil {
+			return
+		}
+		seen[fn] = true
+		fns = append(fns, fn)
+	}
+	// Every reachable function gets a record, because a bare function name is
+	// a value wherever the type checker expects a `fn(..)`; unreferenced
+	// records are dropped by the linker's section GC.
+	for _, fn := range g.info.FnOrder {
+		if g.used[fn] {
+			add(fn)
+		}
+	}
+	for _, fn := range g.info.FnValues {
+		add(fn)
+	}
+	sort.Slice(fns, func(i, j int) bool { return funcName(fns[i]) < funcName(fns[j]) })
+	for _, fn := range fns {
+		base := "zx_ad_" + funcName(fn)
+		ret := ctype(fn.Ret)
+		params := []string{"void *zx_envp"}
+		args := make([]string, len(fn.Params))
+		for i, p := range fn.Params {
+			params = append(params, ctype(p)+" zx_p"+strconv.Itoa(i))
+			args[i] = "zx_p" + strconv.Itoa(i)
+		}
+		sig := strings.Join(params, ", ")
+		call := funcName(fn) + "(" + strings.Join(args, ", ") + ")"
+		g.w.line("// Adapter and record that let `%s` be stored in a `fn(..)` value.", fn.Name)
+		g.w.line("static %s %s(%s) {", ret, base, sig)
+		g.w.line("    (void)zx_envp;")
+		if fn.Ret == nil || fn.Ret.Kind == types.Unit {
+			g.w.line("    %s;", call)
+			g.w.line("    return;")
+		} else {
+			g.w.line("    return %s;", call)
+		}
+		g.w.line("}")
+		g.w.line("static zx_Closure zx_rec_%s = { -1, (void *)%s };", funcName(fn), base)
+		g.w.line("")
+	}
+}
+
+// closureDefs emits every lambda as a lifted C function plus the constructor
+// that allocates its environment.
+func (g *gen) closureDefs() {
+	for i, l := range g.info.ClosureOrd {
+		cl := g.info.Closures[l]
+		if cl == nil {
+			continue
+		}
+		env := "zx_env_" + strconv.Itoa(i)
+		impl := "zx_lam_" + strconv.Itoa(i)
+		mk := "zx_mk_" + strconv.Itoa(i)
+
+		g.w.line("// Closure #%d: takes %d parameter(s), captures %d value(s).", i, len(cl.Params), len(cl.Captures))
+		g.w.line("typedef struct { long rc; void *fn; %s } %s;", g.envFields(cl), env)
+		params := []string{"void *zx_envp"}
+		for j, p := range cl.Params {
+			params = append(params, ctype(p)+" zx_p"+strconv.Itoa(j))
+		}
+		g.w.line("static %s %s(%s);", ctype(cl.Ret), impl, strings.Join(params, ", "))
+		if len(cl.Captures) > 0 {
+			caps := make([]string, len(cl.Captures))
+			for j, c := range cl.Captures {
+				caps[j] = ctype(c.Ty) + " zx_c" + strconv.Itoa(j)
+			}
+			g.w.line("static void *%s(%s);", mk, strings.Join(caps, ", "))
+		} else {
+			g.w.line("static zx_Closure %s = { -1, (void *)%s };", env+"_rec", impl)
+		}
+		g.w.line("")
+	}
+
+	for i, l := range g.info.ClosureOrd {
+		cl := g.info.Closures[l]
+		if cl == nil {
+			continue
+		}
+		env := "zx_env_" + strconv.Itoa(i)
+		impl := "zx_lam_" + strconv.Itoa(i)
+		mk := "zx_mk_" + strconv.Itoa(i)
+		g.w.line("static %s %s(void *zx_envp%s) {", ctype(cl.Ret), impl, g.lambdaParamDecls(cl))
+		g.w.indent++
+		g.w.line("%s *zx_env = (%s *)zx_envp;", env, env)
+		g.w.line("(void)zx_env;")
+		g.lambdaBody(l, cl)
+		g.w.indent--
+		g.w.line("}")
+		g.w.line("")
+
+		if len(cl.Captures) == 0 {
+			continue
+		}
+		caps := make([]string, len(cl.Captures))
+		for j, c := range cl.Captures {
+			caps[j] = ctype(c.Ty) + " zx_c" + strconv.Itoa(j)
+		}
+		g.w.line("static void *%s(%s) {", mk, strings.Join(caps, ", "))
+		g.w.indent++
+		g.w.line("%s *e = (%s *)zx_clo_alloc((void *)%s, sizeof(%s));", env, env, impl, env)
+		for j, c := range cl.Captures {
+			g.w.line("e->%s = zx_c%d;", fieldName(c.Name), j)
+		}
+		g.w.line("return (void *)e;")
+		g.w.indent--
+		g.w.line("}")
+		g.w.line("")
+	}
+}
+
+// envFields is the captured-value part of a closure's environment struct.
+func (g *gen) envFields(cl *sema.Closure) string {
+	if len(cl.Captures) == 0 {
+		return ""
+	}
+	parts := make([]string, len(cl.Captures))
+	for i, c := range cl.Captures {
+		parts[i] = ctype(c.Ty) + " " + fieldName(c.Name) + ";"
+	}
+	return strings.Join(parts, " ")
+}
+
+// lambdaParamDecls renders the trailing parameters of a lifted closure.
+func (g *gen) lambdaParamDecls(cl *sema.Closure) string {
+	if len(cl.Params) == 0 {
+		return ""
+	}
+	parts := make([]string, len(cl.Params))
+	for i, p := range cl.Params {
+		parts[i] = ", " + ctype(p) + " zx_p" + strconv.Itoa(i)
+	}
+	return strings.Join(parts, "")
+}
+
+// lambdaBody emits a closure's body with its parameters bound as locals and
+// each captured name bound to the environment slot it lives in.
+func (g *gen) lambdaBody(l *ast.LambdaExpr, cl *sema.Closure) {
+	g.counts = map[string]int{}
+	g.pushScope()
+	g.openDropFrame()
+	for i, p := range l.Params {
+		cn := "zx_p" + strconv.Itoa(i)
+		g.scopes[len(g.scopes)-1][p.Name] = cn
+		if i < len(cl.Params) {
+			g.registerDrop(cn, cl.Params[i])
+		}
+	}
+	g.pushScope()
+	for _, c := range cl.Captures {
+		g.counts[c.Name]++
+		g.scopes[len(g.scopes)-1][c.Name] = "zx_env->" + fieldName(c.Name)
+	}
+	// A closure body is its own function: `break`/`continue` cannot reach the
+	// loops around the closure literal.
+	savedLoops, savedLabels := g.loopFrames, g.loopLabels
+	savedTrap := g.trapDepth
+	g.loopFrames, g.loopLabels, g.trapDepth = nil, nil, 0
+
+	g.openDropFrame()
+	if blk, ok := l.Body.(*ast.Block); ok {
+		g.blockStmts(blk, cl.Ret)
+	} else if cl.Ret != nil && cl.Ret.Kind != types.Unit {
+		g.w.line("return %s;", g.value(l.Body))
+	} else {
+		g.w.line("%s;", g.value(l.Body))
+	}
+	g.closeDropFrame()
+	g.closeDropFrame()
+
+	g.loopFrames, g.loopLabels, g.trapDepth = savedLoops, savedLabels, savedTrap
+	g.popScope()
+	g.popScope()
+}
+
+// lambdaValue is the expression that builds a closure value: a shared static
+// record when nothing is captured, otherwise a fresh environment.
+func (g *gen) lambdaValue(x *ast.LambdaExpr) string {
+	i, ok := g.lambdas[x]
+	if !ok {
+		return "0 /* unknown closure */"
+	}
+	cl := g.info.Closures[x]
+	if cl == nil || len(cl.Captures) == 0 {
+		return "(void *)&zx_env_" + strconv.Itoa(i) + "_rec"
+	}
+	args := make([]string, len(cl.Captures))
+	for j, c := range cl.Captures {
+		args[j] = g.identValue(c.Name, x.Sp)
+	}
+	return "zx_mk_" + strconv.Itoa(i) + "(" + strings.Join(args, ", ") + ")"
+}
+
 // --- expressions ----------------------------------------------------------
 
 // value emits e as a C expression. Compound expressions that contain
@@ -1477,9 +1722,12 @@ func (g *gen) value(e ast.Expr) string {
 	case *ast.LiteralExpr:
 		return g.literal(x)
 
+	case *ast.LambdaExpr:
+		return g.lambdaValue(x)
+
 	case *ast.IdentExpr:
 		if fn := g.info.FnValues[x]; fn != nil {
-			return funcName(fn)
+			return "(void *)&zx_rec_" + funcName(fn)
 		}
 		if ctor := g.info.Ctors[x]; ctor != nil {
 			return g.enumConstruct(ctor, nil)
@@ -1962,7 +2210,9 @@ func (g *gen) identValue(name string, _ token.Span) string {
 		return cname(name)
 	}
 	if fn, ok := g.info.Fns[name]; ok {
-		return funcName(fn)
+		// A bare function name in value position is the shared record that
+		// carries its closure calling convention.
+		return "(void *)&zx_rec_" + funcName(fn)
 	}
 	return "0 /* unresolved " + name + " */"
 }
@@ -1984,16 +2234,15 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 		for i, p := range ft.Params {
 			params[i] = ctype(p)
 		}
-		sig := ctype(ft.Ret) + " (*)("
-		if len(params) == 0 {
-			sig += "void"
-		} else {
-			sig += strings.Join(params, ", ")
+		sig := ctype(ft.Ret) + " (*)(void *"
+		if len(params) > 0 {
+			sig += ", " + strings.Join(params, ", ")
 		}
 		sig += ")"
 		callee := g.value(x.Callee)
 		return g.withArgs(x.Args, ft.Params, g.exprStmtType(x), func(ps []string) string {
-			return "((" + sig + ")" + callee + ")(" + strings.Join(ps, ", ") + ")"
+			args := append([]string{"(void *)" + callee}, ps...)
+			return "((" + sig + ")(((zx_Closure *)" + callee + ")->fn))(" + strings.Join(args, ", ") + ")"
 		})
 	}
 	if ctor := g.info.Ctors[x]; ctor != nil {
@@ -2047,6 +2296,9 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 	if name == "arg_count" {
 		return "zx_arg_count()"
 	}
+	if name == "project_dir" {
+		return "zx_string_from(" + cQuote(g.opts.ProjectDir) + ")"
+	}
 	if name == "arg_at" {
 		if len(x.Args) != 1 {
 			return "zx_string_from(\"\")"
@@ -2060,6 +2312,31 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 	return g.withArgs(x.Args, fn.Params, g.exprStmtType(x), func(ps []string) string {
 		return funcName(fn) + "(" + strings.Join(ps, ", ") + ")"
 	})
+}
+
+// cQuote renders s as a C string literal.
+func cQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '"':
+			b.WriteString("\\\"")
+		case '\\':
+			b.WriteString("\\\\")
+		case '\n':
+			b.WriteString("\\n")
+		default:
+			if c < 32 || c > 126 {
+				fmt.Fprintf(&b, "\\%03o", c)
+				continue
+			}
+			b.WriteByte(c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // stringCtorValue emits the builtin `String` constructors.

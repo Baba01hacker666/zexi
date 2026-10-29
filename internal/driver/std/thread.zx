@@ -43,8 +43,27 @@
 // three primitives are handle-based; a handle is a small integer, and a stale
 // handle fails cleanly rather than aliasing a reused slot.
 //
-// Limits: 256 live threads, 256 channels, and 256 atomics per process; channel
-// capacity is clamped to 1..65536. There is no `Send`/`Sync` checking yet, but
+// Spreading work across threads: `Pool` keeps N worker threads alive and feeds
+// them jobs, which is the cheap way to use more than one core without spawning
+// a thread per item. A job is `fn(i64) -> i64` plus one argument, and `map`
+// wraps the common case (run f over a range, sum the results):
+//
+//     fn square(x: i64) -> i64 { return x * x; }
+//
+//     fn main() -> i32 {
+//         let pool = Pool::new();          // one worker per core
+//         println(pool.map(square, 1, 10_001));   // 333_383_350_000
+//         pool.free();
+//         0
+//     }
+//
+// Submit more than one job at a time and collect results in submission order:
+// `let a = pool.submit(f, 1); let b = pool.submit(f, 2); pool.wait();
+// pool.result(a) + pool.result(b)`.
+//
+// Limits: 256 live threads, 256 channels, 256 atomics, and 256 pools per
+// process; a pool holds up to 4096 jobs and 256 workers; channel capacity is
+// clamped to 1..65536. There is no `Send`/`Sync` checking yet, but
 // no Zexi value (String, struct, reference) can cross a thread boundary — only
 // i64 handles and i64 arguments/return values do — so the primitives here are
 // data-race-free for the types they accept.
@@ -233,5 +252,135 @@ impl Atomic {
 
     pub fn set(&self, value: i64) {
         zxt_atomic_set(self.id, value);
+    }
+}
+
+// --- task pools ------------------------------------------------------------
+
+extern "C" fn zxt_cpu_count() -> i32;
+extern "C" fn zxt_pool_new(workers: i32) -> i64;
+extern "C" fn zxt_pool_submit(handle: i64, entry: fn(i64) -> i64, arg: i64) -> i64;
+extern "C" fn zxt_pool_wait(handle: i64) -> i32;
+extern "C" fn zxt_pool_result(handle: i64, seq: i64) -> i64;
+extern "C" fn zxt_pool_done_count(handle: i64) -> i32;
+extern "C" fn zxt_pool_workers(handle: i64) -> i32;
+extern "C" fn zxt_pool_free(handle: i64) -> i32;
+
+// cpu_count reports how many processors this process may run on.
+pub fn cpu_count() -> i32 {
+    return zxt_cpu_count();
+}
+
+// MAX_POOL_JOBS is how many jobs one pool can queue before submit fails.
+const MAX_POOL_JOBS: i32 = 4096;
+
+// Pool is a set of long-lived worker threads draining a job queue. Create it
+// once, submit work, `wait` for it, then `free` the pool. Jobs may be submitted
+// from several threads; results are collected by the sequence number `submit`
+// returns, in submission order.
+pub struct Pool {
+    id: i64,
+}
+
+impl Pool {
+    // new starts a pool of `workers` threads. 0 means "one per processor"
+    // (at least two, at most 64).
+    pub fn new(workers: i32 = 0) -> Pool {
+        let mut n = workers;
+        if n <= 0 {
+            n = zxt_cpu_count();
+            if n < 2 {
+                n = 2;
+            }
+        }
+        if n > 64 {
+            n = 64;
+        }
+        return Pool { id: zxt_pool_new(n) };
+    }
+
+    // ok reports whether the pool started.
+    pub fn ok(&self) -> bool {
+        return self.id != 0;
+    }
+
+    // id exposes the integer handle, for passing to free functions.
+    pub fn id(&self) -> i64 {
+        return self.id;
+    }
+
+    // workers is how many worker threads are actually running.
+    pub fn workers(&self) -> i32 {
+        return zxt_pool_workers(self.id);
+    }
+
+    // submit queues `f(arg)` and returns its sequence number, or -1 when the
+    // queue is full (call `wait` to drain it) or the pool is invalid.
+    pub fn submit(&self, f: fn(i64) -> i64, arg: i64) -> i64 {
+        return zxt_pool_submit(self.id, f, arg);
+    }
+
+    // wait blocks until every submitted job has finished and returns how many
+    // ran.
+    pub fn wait(&self) -> i32 {
+        return zxt_pool_wait(self.id);
+    }
+
+    // result is the value a finished job returned (0 if it has not finished,
+    // so call wait first).
+    pub fn result(&self, seq: i64) -> i64 {
+        return zxt_pool_result(self.id, seq);
+    }
+
+    // done is how many jobs have finished so far.
+    pub fn done(&self) -> i32 {
+        return zxt_pool_done_count(self.id);
+    }
+
+    // map runs `f(i)` for every i in lo..hi across the pool and returns the sum
+    // of the results — the shortest way to parallelise a loop. Ranges larger
+    // than the job queue work too: when the queue fills, map collects the
+    // finished results and carries on, so nothing is lost.
+    pub fn map(&self, f: fn(i64) -> i64, lo: i64, hi: i64) -> i64 {
+        let mut total: i64 = 0;
+        let mut base: i64 = -1;
+        let mut submitted: i64 = 0;
+        let mut i = lo;
+        while i < hi {
+            let mut seq = zxt_pool_submit(self.id, f, i);
+            if seq < 0 {
+                // Queue full: wait for it to drain, bank those results, and
+                // submit the job again.
+                self.wait();
+                let mut k: i64 = 0;
+                while k < submitted {
+                    total += zxt_pool_result(self.id, base + k);
+                    k += 1;
+                }
+                submitted = 0;
+                base = -1;
+                seq = zxt_pool_submit(self.id, f, i);
+            }
+            if seq < 0 {
+                break;
+            }
+            if base < 0 {
+                base = seq;
+            }
+            submitted += 1;
+            i += 1;
+        }
+        self.wait();
+        let mut k: i64 = 0;
+        while k < submitted {
+            total += zxt_pool_result(self.id, base + k);
+            k += 1;
+        }
+        return total;
+    }
+
+    // free stops the workers and releases the pool. No job may be running.
+    pub fn free(&self) {
+        zxt_pool_free(self.id);
     }
 }

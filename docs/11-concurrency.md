@@ -138,10 +138,77 @@ fn main() -> i32 {
 `add` returns the **new** value. `add`/`get`/`set` are atomic; a sequence of
 them is not, so read-modify-write across two calls is still a race.
 
-## 11.4 What can cross a thread boundary
+## 11.4 Task pools: spreading work across threads
+
+`Thread::spawn` is fork–join: one thread per unit of work, joined once. That is
+the wrong shape for "run this function over ten thousand inputs" — creating ten
+thousand threads costs more than the work. A `Pool` keeps a fixed set of worker
+threads alive and feeds them jobs:
+
+<!-- check-only -->
+```zx
+use thread;
+
+fn square(x: i64) -> i64 {
+    return x * x;
+}
+
+fn main() -> i32 {
+    let pool = Pool::new();            // 0 = one worker per processor
+    println(pool.map(square, 1, 101)); // sum of 1^2..100^2
+    pool.free();
+    0
+}
+```
+
+A job is `fn(i64) -> i64` plus one argument, because a worker cannot capture any
+Zexi value yet. For bigger fan-out, submit several jobs and collect their
+results by the sequence number `submit` returns:
+
+<!-- check-only -->
+```zx
+use thread;
+
+fn work(x: i64) -> i64 { return x * 2; }
+
+fn main() -> i32 {
+    let pool = Pool::new(4);
+    let a = pool.submit(work, 20);
+    let b = pool.submit(work, 21);
+    pool.wait();
+    println(pool.result(a) + pool.result(b));  // 82
+    pool.free();
+    0
+}
+```
+
+| Method | Purpose |
+| --- | --- |
+| `Pool::new(workers = 0)` | start a pool; 0 means one worker per `cpu_count()`, at least two |
+| `pool.ok()`, `pool.workers()`, `pool.id()` | did it start, how many workers, raw handle |
+| `pool.submit(f, arg) -> i64` | queue a job; returns its sequence number, or -1 when the queue is full |
+| `pool.wait() -> i32` | block until every submitted job finished |
+| `pool.result(seq) -> i64` | a finished job's return value (0 until it finishes) |
+| `pool.done() -> i32` | jobs finished so far |
+| `pool.map(f, lo, hi) -> i64` | run `f(i)` for every `i` in `lo..hi`, sum the results |
+| `pool.free()` | stop the workers and release the pool |
+| `cpu_count()`, `MAX_POOL_JOBS`, `MAX_WORKERS` | processor count and limits |
+
+`map` is the one-liner for a parallel loop, and it also handles ranges bigger
+than the job queue: when the queue fills it waits for it to drain, banks the
+finished results, and carries on, so nothing is lost and nothing grows without
+bound. Results are order-independent by construction (a sum), which is what
+keeps parallel code deterministic and testable.
+
+A pool holds up to **4096 queued jobs** and 256 workers. When the queue is full
+but every job has finished, the next `submit` recycles it — collect any results
+you still need before submitting a queue's worth of new work.
+
+## 11.5 What can cross a thread boundary
 
 Only **i64 values** — arguments, return values, channel payloads, atomic cells,
-and the handles to threads/channels/atomics themselves. No `String`, struct,
+pool jobs (`fn(i64) -> i64` plus an argument), and the handles to
+threads/channels/atomics/pools themselves. No `String`, struct,
 enum, or reference can be passed to or from a thread yet. That restriction is
 what makes the primitives here data-race-free: there is no shared Zexi memory to
 race on, and the C-side tables are mutex- or atomic-guarded.
@@ -155,22 +222,27 @@ borrow-checked safety. Until then:
 - Use atomics for counters, not for coordinating complex state.
 - Sleep with `sleep_ms` from the `sys` module if a worker needs to yield.
 
-## 11.5 Limits and lifetime
+## 11.6 Limits and lifetime
 
-- At most **256 live threads**, **256 channels**, and **256 atomics** per
-  process. Thread slots are reused after `join`; channel and atomic slots are
-  not reclaimed, so long-running programs should create a bounded number of
-  them (channels and atomics are meant to be long-lived).
+- At most **256 live threads**, **256 channels**, **256 atomics**, and **256
+  pools** per process. Thread slots are reused after `join`; channel, atomic,
+  and pool slots are not reclaimed, so long-running programs should create a
+  bounded number of them (these are meant to be long-lived). A pool releases its
+  workers and job memory in `free`, but its slot stays marked used.
+- A pool holds up to **4096 jobs** and **256 workers**; `Pool::new` caps the
+  request at 64. Channel capacity is clamped to `1..65536` values.
 - Channel capacity is clamped to `1..65536` values.
 - Handles are packed `(generation, slot)`, so a stale handle from a reused slot
   fails cleanly (returns `0`/`false`) instead of aliasing the new object.
 - There is no thread-local storage, no cancellation, and no `join_all`; join
   handles explicitly.
 
-## 11.6 Runnable example
+## 11.7 Runnable example
 
-[`tests/threads.zx`](../tests/threads.zx) exercises all three primitives and is
-compiled and run by the test suite. A minimal fork–join program:
+[`tests/threads.zx`](../tests/threads.zx) exercises threads, channels, and
+atomics; [`tests/pool.zx`](../tests/pool.zx) exercises the pool. Both are
+compiled and run by the test suite, and both print the same output on every run.
+A minimal fork–join program:
 
 ```sh
 zexic run tests/threads.zx

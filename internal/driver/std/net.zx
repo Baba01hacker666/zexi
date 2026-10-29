@@ -1,15 +1,42 @@
-// net — TCP sockets over POSIX, part of the Zexi standard library.
+// net — TCP and UDP sockets, name resolution, and socket readiness over POSIX.
 // Import with `use net;`, `use std::net;`, or `import net.tcp;`.
+//
+//     use net;
+//
+//     fn main() -> i32 {
+//         let mut server = listen_tcp("127.0.0.1", 9000);
+//         let conn = server.accept();
+//         conn.write("hello\n");
+//         conn.close();
+//         server.close();
+//         0
+//     }
 //
 // The low-level calls live in the embedded C runtime, linked in only
 // when this module is used. The linker prunes anything the program does not
 // call, so pulling in `use net;` costs nothing unless you open a socket.
+//
+// Everything here is bounded on purpose: reads have caps, `accept_timeout` and
+// `set_timeout` make blocking calls interruptible, and `poll_read` lets a loop
+// serve several descriptors without a thread per socket.
 
 extern "C" fn zxn_socket(domain: i32, typ: i32, protocol: i32) -> i32;
 extern "C" fn zxn_connect(fd: i32, host: str, port: i32, timeout_ms: i32) -> i32;
 extern "C" fn zxn_bind(fd: i32, host: str, port: i32) -> i32;
 extern "C" fn zxn_listen(fd: i32, backlog: i32) -> i32;
 extern "C" fn zxn_accept(fd: i32) -> i32;
+// zxn_accept_timeout waits up to ms milliseconds for a connection: it returns
+// the new descriptor, -2 when nothing arrived in time, and -1 on error.
+extern "C" fn zxn_accept_timeout(fd: i32, ms: i32) -> i32;
+extern "C" fn zxn_poll_read(fd: i32, ms: i32) -> i32;
+extern "C" fn zxn_set_nonblocking(fd: i32, on: i32) -> i32;
+extern "C" fn zxn_local_port(fd: i32) -> i32;
+extern "C" fn zxn_peer_addr(fd: i32, buf: &mut [u8; 256], cap: i32) -> i32;
+extern "C" fn zxn_shutdown_write(fd: i32) -> i32;
+extern "C" fn zxn_resolve(host: str, buf: &mut [u8; 256], cap: i32) -> i32;
+extern "C" fn zxn_strerror_string(err: i32, buf: &mut [u8; 256], cap: i32) -> i32;
+extern "C" fn zxn_last_error() -> i32;
+extern "C" fn zxn_cpu_count() -> i32;
 // zxn_accept_retryable classifies the errno left by a failed zxn_accept: 1 for
 // transient failures worth retrying, 0 for persistent ones (for example,
 // EMFILE/ENFILE when the process is out of file descriptors).
@@ -28,12 +55,17 @@ extern "C" fn zxn_file_read(handle: i64, buf: &mut [u8; 8192], cap: i32) -> i32;
 extern "C" fn zxn_file_close(handle: i64) -> i32;
 extern "C" fn zxn_file_size(path: str) -> i64;
 extern "C" fn zxn_write_file(path: str, buf: str, n: i32) -> i32;
+// UDP sockets: connectionless datagrams.
+extern "C" fn zxn_udp_bind(host: str, port: i32) -> i32;
+extern "C" fn zxn_udp_send_to(fd: i32, host: str, port: i32, buf: str, n: i32) -> i32;
+extern "C" fn zxn_udp_recv_from(fd: i32, buf: &mut [u8; 8192], cap: i32, hostbuf: &mut [u8; 256], hostcap: i32, port_out: &mut i32) -> i32;
 // zxn_realpath resolves symlinks and returns the canonical absolute path in
 // buf (NUL-terminated), or -1 when path cannot be resolved.
 extern "C" fn zxn_realpath(path: str, buf: &mut [u8; 4096], cap: i32) -> i32;
 
 const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;
+const SOCK_DGRAM: i32 = 2;
 const RECV_BUF: usize = 8192;
 // MAX_READ caps read_all so a hostile or broken peer cannot exhaust memory.
 const MAX_READ: usize = 67108864;
@@ -91,7 +123,95 @@ pub fn listen_local(port: i32) -> Server {
     return listen_tcp("127.0.0.1", port);
 }
 
+// --- helpers ---------------------------------------------------------------
+
+// buf_str copies the first n bytes of a fixed buffer into an owning String.
+// It is the shared bridge between the C shims (which fill byte buffers) and
+// Zexi's owning text type.
+fn buf_str(buf: [u8; 256], n: i32) -> String {
+    let mut out = String::new();
+    let mut i: usize = 0;
+    while i < (n as usize) && i < 256 {
+        out.push_byte(buf[i]);
+        i += 1;
+    }
+    return out;
+}
+
+// resolve turns a host name into its first IPv4 address ("example.com" ->
+// "93.184.216.34"). A literal address is returned unchanged, and a name that
+// does not resolve yields "".
+pub fn resolve(host: str) -> String {
+    let mut buf: [u8; 256] = [0; 256];
+    let n = zxn_resolve(host, &mut buf, 256);
+    if n != 0 {
+        return String::new();
+    }
+    let mut i: usize = 0;
+    while i < 256 && buf[i] != 0 {
+        i += 1;
+    }
+    return buf_str(buf, i as i32);
+}
+
+// cpu_count reports how many processors this process may run on, which is how
+// a program sizes a worker pool or splits a computation across threads.
+pub fn cpu_count() -> i32 {
+    return zxn_cpu_count();
+}
+
+// poll_read waits up to ms milliseconds for fd to become readable: 1 ready,
+// 0 timed out, -1 error. Passing -1 samples without waiting and 0 waits
+// forever (POSIX select semantics are remapped to something safer here).
+pub fn poll_read(fd: i32, ms: i32) -> i32 {
+    if fd < 0 {
+        return -1;
+    }
+    if ms < 0 {
+        return zxn_poll_read(fd, 0);
+    }
+    if ms == 0 {
+        return zxn_poll_read(fd, 1 << 30);
+    }
+    return zxn_poll_read(fd, ms);
+}
+
+// last_error is the errno of the most recent failed system call, as text.
+pub fn last_error() -> String {
+    let code = zxn_last_error();
+    let mut buf: [u8; 256] = [0; 256];
+    let n = zxn_strerror_string(code, &mut buf, 256);
+    if n <= 0 {
+        return String::from("unknown error");
+    }
+    let mut i: usize = 0;
+    while i < (n as usize) && buf[i] != 0 {
+        i += 1;
+    }
+    return buf_str(buf, i as i32);
+}
+
+// error_string renders an errno value as text.
+pub fn error_string(code: i32) -> String {
+    let mut buf: [u8; 256] = [0; 256];
+    let n = zxn_strerror_string(code, &mut buf, 256);
+    if n <= 0 {
+        return String::from("unknown error");
+    }
+    let mut i: usize = 0;
+    while i < (n as usize) && buf[i] != 0 {
+        i += 1;
+    }
+    return buf_str(buf, i as i32);
+}
+
 impl Conn {
+    // from_fd adopts an existing descriptor, which is how a worker thread
+    // turns the integer it was given into a Conn.
+    pub fn from_fd(fd: i32) -> Conn {
+        return Conn { fd: fd };
+    }
+
     // ok reports whether the connection was opened successfully.
     pub fn ok(&self) -> bool {
         return self.fd >= 0;
@@ -127,6 +247,58 @@ impl Conn {
             return -1;
         }
         return zxn_send_all(self.fd, data, n as i32) as i64;
+    }
+
+    // fd exposes the raw descriptor, for select/poll loops.
+    pub fn fd(&self) -> i32 {
+        return self.fd;
+    }
+
+    // is_open reports whether the connection holds a live descriptor.
+    pub fn is_open(&self) -> bool {
+        return self.fd >= 0;
+    }
+
+    // peer reports the remote "ip:port" endpoint, or "" when unavailable.
+    pub fn peer(&self) -> String {
+        let mut buf: [u8; 256] = [0; 256];
+        let n = zxn_peer_addr(self.fd, &mut buf, 256);
+        if n <= 0 {
+            return String::new();
+        }
+        return buf_str(buf, n);
+    }
+
+    // local_port reports the local port, which is how a connection made from
+    // an ephemeral port learns its own identity.
+    pub fn local_port(&self) -> i32 {
+        return zxn_local_port(self.fd);
+    }
+
+    // wait_readable blocks up to ms milliseconds for input to arrive.
+    pub fn wait_readable(&self, ms: i32) -> bool {
+        return poll_read(self.fd, ms) == 1;
+    }
+
+    // read_some reads at most max bytes, returning as soon as something
+    // arrives ("" at end of stream, on timeout, or on error).
+    pub fn read_some(&self, max: usize) -> String {
+        let cap = if max < RECV_BUF { max } else { RECV_BUF };
+        let mut out = String::new();
+        let mut buf: [u8; 8192] = [0; 8192];
+        let n = zxn_recv(self.fd, &mut buf, cap);
+        let mut i: usize = 0;
+        while n > 0 && i < (n as usize) {
+            out.push_byte(buf[i]);
+            i += 1;
+        }
+        return out;
+    }
+
+    // shutdown_write sends EOF to the peer while keeping the socket readable
+    // (the half-close protocol some servers use to end a request).
+    pub fn shutdown_write(&self) -> i32 {
+        return zxn_shutdown_write(self.fd);
     }
 
     // read_line reads one newline-terminated line (without the "\n").
@@ -222,6 +394,11 @@ impl Conn {
 }
 
 impl Server {
+    // from_fd adopts an existing listening descriptor.
+    pub fn from_fd(fd: i32) -> Server {
+        return Server { fd: fd };
+    }
+
     // ok reports whether the listener was opened successfully.
     pub fn ok(&self) -> bool {
         return self.fd >= 0;
@@ -231,6 +408,130 @@ impl Server {
     pub fn accept(&self) -> Conn {
         let cfd = zxn_accept(self.fd);
         return Conn { fd: cfd };
+    }
+
+    // accept_timeout waits at most ms milliseconds: on a quiet listener it
+    // returns a closed connection (fd < 0), so a serving loop can check a
+    // shutdown flag and exit instead of blocking forever.
+    pub fn accept_timeout(&self, ms: i32) -> Conn {
+        return Conn { fd: zxn_accept_timeout(self.fd, ms) };
+    }
+
+    // port reports the bound port, which is how a server started on port 0
+    // discovers the port the kernel chose.
+    pub fn port(&self) -> i32 {
+        return zxn_local_port(self.fd);
+    }
+
+    // fd exposes the raw listening descriptor.
+    pub fn fd(&self) -> i32 {
+        return self.fd;
+    }
+
+    // is_open reports whether the listener holds a live descriptor.
+    pub fn is_open(&self) -> bool {
+        return self.fd >= 0;
+    }
+
+    // set_nonblocking toggles O_NONBLOCK on the listener (accept then fails
+    // immediately when nothing is pending).
+    pub fn set_nonblocking(&self, on: bool) -> i32 {
+        let flag = if on { 1 } else { 0 };
+        return zxn_set_nonblocking(self.fd, flag);
+    }
+
+    // wait_readable blocks up to ms milliseconds for a pending connection.
+    pub fn wait_readable(&self, ms: i32) -> bool {
+        return poll_read(self.fd, ms) == 1;
+    }
+
+    pub fn close(&mut self) {
+        if self.fd >= 0 {
+            zxn_close(self.fd);
+            self.fd = -1;
+        }
+    }
+}
+
+// --- UDP -------------------------------------------------------------------
+
+// Datagram is one received UDP packet with its sender.
+pub struct Datagram {
+    pub data: String,
+    pub host: String,
+    pub port: i32,
+}
+
+// Udp is an unconnected UDP socket (a datagram endpoint). Datagrams are
+// connectionless: each send names its destination and each receive reports
+// where it came from. It owns the file descriptor; call close.
+pub struct Udp {
+    pub fd: i32,
+}
+
+// udp_bind opens a datagram socket on host:port. Binding port 0 lets the
+// kernel choose, and `port()` reports the choice.
+pub fn udp_bind(host: str, port: i32) -> Udp {
+    return Udp { fd: zxn_udp_bind(host, port) };
+}
+
+// udp_bind_local is udp_bind on the loopback interface — the safe default for
+// local tools, metrics, and tests.
+pub fn udp_bind_local(port: i32) -> Udp {
+    return udp_bind("127.0.0.1", port);
+}
+
+impl Udp {
+    // ok reports whether the socket was opened.
+    pub fn ok(&self) -> bool {
+        return self.fd >= 0;
+    }
+
+    // port reports the bound port.
+    pub fn port(&self) -> i32 {
+        return zxn_local_port(self.fd);
+    }
+
+    // set_timeout bounds blocking receive calls, in milliseconds.
+    pub fn set_timeout(&self, ms: i32) -> i32 {
+        return zxn_set_timeout(self.fd, ms);
+    }
+
+    // send_to sends one datagram and returns the bytes written, or -1.
+    pub fn send_to(&self, host: str, port: i32, data: str) -> i64 {
+        if len(data) > 65507 {
+            return -1;
+        }
+        return zxn_udp_send_to(self.fd, host, port, data, len(data) as i32) as i64;
+    }
+
+    // recv_from waits for one datagram and reports its payload and sender.
+    // An empty `data` with port 0 means timeout or error.
+    pub fn recv_from(&self) -> Datagram {
+        let mut buf: [u8; 8192] = [0; 8192];
+        let mut host: [u8; 256] = [0; 256];
+        let mut port: i32 = 0;
+        let n = zxn_udp_recv_from(self.fd, &mut buf, 8192, &mut host, 256, &mut port);
+        if n <= 0 {
+            return Datagram { data: String::new(), host: String::new(), port: 0 };
+        }
+        let mut data = String::with_capacity(n as usize);
+        let mut i: usize = 0;
+        while i < (n as usize) {
+            data.push_byte(buf[i]);
+            i += 1;
+        }
+        let mut j: usize = 0;
+        while j < 256 && host[j] != 0 {
+            j += 1;
+        }
+        return Datagram { data: data, host: buf_str(host, j as i32), port: port };
+    }
+
+    // recv_text is recv_from when only the payload matters.
+    pub fn recv_text(&self) -> String {
+        let d = self.recv_from();
+        return d.data;
     }
 
     pub fn close(&mut self) {

@@ -367,3 +367,39 @@ fn main() -> i32 {
 		t.Fatalf("unexpected qualified ctor: %#v", ctor.Callee)
 	}
 }
+
+// TestParenStatementAfterBlock parses a statement that starts with a
+// parenthesised expression right after a loop or if block. Such a statement
+// used to be swallowed as a call of the block (`while ... { }(*p)`), which then
+// failed with "expression is not callable" and a bogus "cannot assign" error.
+func TestParenStatementAfterBlock(t *testing.T) {
+	src := `fn main() -> i32 {
+    let mut i = 0;
+    while i < 2 { i += 1; }
+    (*p).field = 5;
+    loop { break; }
+    (i) = 7;
+    if true { i += 1; }
+    (i) += 2;
+    i
+}`
+	file, n := parse(t, src)
+	if n != 0 {
+		t.Fatalf("unexpected diagnostics: %d", n)
+	}
+	fn, ok := file.Items[0].(*ast.FnDecl)
+	if !ok {
+		t.Fatalf("expected fn main, got %#v", file.Items[0])
+	}
+	// The `let`, the two loops, the three assignments after the blocks, and the
+	// trailing `i`.
+	if got := len(fn.Body.Stmts); got != 7 {
+		t.Fatalf("expected 7 statements, got %d", got)
+	}
+
+	// A block-shaped expression still accepts postfix syntax on the same line,
+	// which is what `let x = if c { f } else { g }(1);` relies on.
+	if _, n := parse(t, `fn main() -> i32 { let x = if true { 1 } else { 2 }; x }`); n != 0 {
+		t.Fatalf("unexpected diagnostics for same-line postfix: %d", n)
+	}
+}

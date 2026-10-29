@@ -1,0 +1,77 @@
+// tests/closures.zx
+// Closures: anonymous functions that capture values from the enclosing scope.
+
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(x);
+}
+
+fn twice(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(f(x));
+}
+
+// A closure can outlive the call that created it: its captured values live in
+// the environment the closure carries.
+fn adder(n: i32) -> fn(i32) -> i32 {
+    return |x| x + n;
+}
+
+// Parameters may be annotated (or not) and the body may be a block.
+fn annotated() -> i32 {
+    let f: fn(i32, i32) -> i32 = |a: i32, b: i32| {
+        let sum = a + b;
+        sum * 2
+    };
+    return f(3, 4);
+}
+
+struct Counter {
+    step: i32,
+}
+
+fn main() -> i32 {
+    // No captures: the value is a shared, immutable record.
+    let double: fn(i32) -> i32 = |n| n * 2;
+    println(double(21));
+    println(apply(|n| n + 1, 41));
+    println(twice(double, 5));
+
+    // Capture by value: `base` is copied into the environment.
+    let base = 100;
+    let shifted: fn(i32) -> i32 = |n| n + base;
+    println(shifted(1));
+    println(base);
+
+    // A closure returned from a function keeps its captured value alive.
+    let add7 = adder(7);
+    println(add7(35));
+
+    // Closures nest, and the inner body sees both scopes.
+    let step = 2;
+    let outer: fn(i32) -> i32 = |n| {
+        let inner: fn(i32) -> i32 = |m| m * step + n;
+        return inner(10);
+    };
+    println(outer(3));
+
+    // Owned values move into the environment, so nothing is freed twice.
+    let suffix = String::from("!");
+    let shout: fn(i32) -> String = |n| {
+        let mut s = String::from("n=");
+        s += n;
+        s += suffix.as_str();
+        s
+    };
+    println(shout(9).as_str());
+
+    println(annotated());
+
+    // A method's body can build a closure over its own fields.
+    let c = Counter { step: 5 };
+    let bump: fn(i32) -> i32 = |n| n + c.step;
+    println(bump(1));
+
+    // A `fn` value is still an ordinary value: it can be rebound and passed on.
+    let alias = double;
+    println(apply(alias, 4));
+    0
+}

@@ -194,6 +194,25 @@ func (m *mover) use(e ast.Expr) {
 		for _, el := range x.Elems {
 			m.use(el)
 		}
+	case *ast.LambdaExpr:
+		// The body can read anything the closure captured; a capture of an
+		// owning value then moves that value into the environment, so the
+		// enclosing function cannot use it afterwards.
+		m.use(x.Body)
+		if cl := m.c.info.Closures[x]; cl != nil {
+			for _, cap := range cl.Captures {
+				// Only the closure that reads the variable moves it; the
+				// enclosing ones carry a copy so they can build the inner one.
+				if !cap.Direct || cap.Ty == nil || cap.Ty.IsCopy() {
+					continue
+				}
+				if m.moved[cap.Name] {
+					m.c.errf(x.Sp, "E0382", "use of moved value `%s`", cap.Name)
+					continue
+				}
+				m.moved[cap.Name] = true
+			}
+		}
 	case *ast.StructLitExpr:
 		for _, fi := range x.Fields {
 			m.use(fi.Val)

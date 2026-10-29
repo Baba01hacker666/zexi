@@ -92,9 +92,32 @@ type Info struct {
 	PatVariant map[ast.Pattern]*types.Variant
 	// TryMatches maps a `?` expression to the ordinary `match` it desugars to.
 	TryMatches map[*ast.TryExpr]*ast.MatchExpr
+	// Closures maps each lambda expression to its resolved signature and the
+	// variables it captures from the enclosing function.
+	Closures map[*ast.LambdaExpr]*Closure
+	// ClosureOrd is every lambda in source order, so codegen can emit the
+	// lifted functions deterministically.
+	ClosureOrd []*ast.LambdaExpr
 	Types      map[ast.Expr]*types.Type
 	DeclTypes  map[ast.Stmt]*types.Type
 	Main       *Fn
+}
+
+// Closure is the resolved shape of a lambda: its parameter and return types
+// plus the enclosing bindings it captures (by value).
+type Closure struct {
+	Params   []*types.Type
+	Ret      *types.Type
+	Captures []Capture
+}
+
+// Capture is one variable a closure copies into its environment. Direct marks
+// the closure whose body actually reads the variable; enclosing closures carry
+// it too (they must hand the value down when the inner closure is built).
+type Capture struct {
+	Name   string
+	Ty     *types.Type
+	Direct bool
 }
 
 // Ctor is a resolved enum-variant constructor.
@@ -152,6 +175,7 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 			Aliases:    map[string]*types.Type{},
 			PatVariant: map[ast.Pattern]*types.Variant{},
 			TryMatches: map[*ast.TryExpr]*ast.MatchExpr{},
+			Closures:   map[*ast.LambdaExpr]*Closure{},
 			Types:      map[ast.Expr]*types.Type{},
 			DeclTypes:  map[ast.Stmt]*types.Type{},
 		},
@@ -227,7 +251,18 @@ type checker struct {
 	typeEnv   map[string]*types.Type   // in-scope type parameters (name -> type)
 	cur       *Fn
 	loopDepth int
-	breaks    []*breakInfo // one entry per enclosing loop, innermost last
+	// lambdas is the stack of closures being checked, innermost last. Each
+	// frame remembers the scope depth it opened at, so resolving a name below
+	// that depth is a capture.
+	lambdas []*lambdaFrame
+	breaks  []*breakInfo // one entry per enclosing loop, innermost last
+}
+
+// lambdaFrame is one closure being checked.
+type lambdaFrame struct {
+	node     *ast.LambdaExpr
+	base     int // scope depth of the enclosing function at the `|`
+	captures []Capture
 }
 
 // pendingInt is a defaulted integer literal awaiting a concrete integer type.
@@ -1365,6 +1400,7 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 	case *ast.PathExpr:
 		if len(x.Segments) == 1 {
 			if t := c.lookupScope(x.Segments[0]); t != nil {
+				c.noteCapture(x.Segments[0], t)
 				c.adoptInt(t, expected)
 			}
 			return c.inferIdent(x.Segments[0], x.Sp)
@@ -1412,6 +1448,9 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 
 	case *ast.Block:
 		return c.checkBlockWith(x, expected)
+
+	case *ast.LambdaExpr:
+		return c.inferLambda(x, expected)
 
 	case *ast.UnExpr:
 		return c.inferUnary(x, expected)
@@ -1652,9 +1691,111 @@ func (c *checker) adoptInt(t, want *types.Type) *types.Type {
 // inferIdentExpr types a bare name used as a value. A generic function is
 // instantiated when explicit type arguments (`f::<i64>`) or an expected
 // function type determine its parameters.
+// inferLambda checks a closure against the type it is expected to have. The
+// target type supplies any parameter or return type the closure leaves out,
+// which is why a closure has to appear where its signature is known:
+//
+//	let f: fn(i32) -> i32 = |n| n * 2;
+//	vec.each(|x| println(x));            // the parameter type comes from `each`
+func (c *checker) inferLambda(x *ast.LambdaExpr, expected *types.Type) *types.Type {
+	if expected == nil || expected.Kind != types.Fn {
+		c.errf(x.Sp, "E0282", "cannot infer the type of this closure; give it a target type, as in `let f: fn(i32) -> i32 = |n| n;`")
+		return &types.Type{Kind: types.Invalid}
+	}
+	if len(expected.Params) != len(x.Params) {
+		c.errf(x.Sp, "E0057", "this closure takes %d parameter(s) but `%s` expects %d", len(x.Params), expected.String(), len(expected.Params))
+		return &types.Type{Kind: types.Invalid}
+	}
+	params := make([]*types.Type, len(expected.Params))
+	copy(params, expected.Params)
+	for i, p := range x.Params {
+		if p.Ty == nil {
+			continue
+		}
+		want := c.resolveType(p.Ty)
+		if want == nil {
+			return &types.Type{Kind: types.Invalid}
+		}
+		if !c.assignable(want, params[i]) {
+			c.errf(p.Sp, "E0308", "closure parameter `%s` has type `%s`, but `%s` expects `%s`", p.Name, want.String(), expected.String(), params[i].String())
+			return &types.Type{Kind: types.Invalid}
+		}
+	}
+
+	cl := &Closure{Params: params, Ret: expected.Ret}
+	frame := &lambdaFrame{node: x, base: len(c.scope)}
+
+	// Parameters are bindings like any other, so the body resolves them
+	// normally; `base` is above them, which keeps them out of the captures.
+	c.pushScope()
+	for i, p := range x.Params {
+		c.declare(p.Name, params[i])
+	}
+	c.lambdas = append(c.lambdas, frame)
+	body := c.checkExpr(x.Body, expected.Ret)
+	c.lambdas = c.lambdas[:len(c.lambdas)-1]
+	c.popScope()
+
+	switch body.Kind {
+	case types.Unit, types.Never, types.Invalid:
+	default:
+		if !c.assignable(body, expected.Ret) {
+			c.errf(x.Body.Span(), "E0308", "this closure returns `%s`, but `%s` expects `%s`", body.String(), expected.String(), expected.Ret.String())
+		}
+	}
+
+	cl.Captures = frame.captures
+	c.info.Closures[x] = cl
+	c.info.ClosureOrd = append(c.info.ClosureOrd, x)
+	return expected
+}
+
+// noteCapture records that the innermost closure reads a binding from the
+// enclosing function. Variables declared inside the closure (parameters and
+// locals) are not captures.
+func (c *checker) noteCapture(name string, ty *types.Type) {
+	if len(c.lambdas) == 0 || ty == nil {
+		return
+	}
+	depth := c.lookupScopeDepth(name)
+	if depth < 0 {
+		return
+	}
+	// The innermost closure reads the value and owns the move; each enclosing
+	// closure only carries it so it can build the inner one.
+	for i := len(c.lambdas) - 1; i >= 0; i-- {
+		frame := c.lambdas[i]
+		if depth >= frame.base {
+			break // bound inside this closure, so not a capture of it or of any outer one
+		}
+		found := false
+		for _, cap := range frame.captures {
+			if cap.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			frame.captures = append(frame.captures, Capture{Name: name, Ty: ty, Direct: i == len(c.lambdas)-1})
+		}
+	}
+}
+
+// lookupScopeDepth is lookupScope, but it also reports the scope the binding
+// was found in (-1 when it is not a local).
+func (c *checker) lookupScopeDepth(name string) int {
+	for i := len(c.scope) - 1; i >= 0; i-- {
+		if _, ok := c.scope[i][name]; ok {
+			return i
+		}
+	}
+	return -1
+}
+
 func (c *checker) inferIdentExpr(x *ast.IdentExpr, expected *types.Type) *types.Type {
 	// A local binding or constant shadows a function of the same name.
 	if t := c.lookupScope(x.Name); t != nil {
+		c.noteCapture(x.Name, t)
 		c.adoptInt(t, expected)
 		return c.inferIdent(x.Name, x.Sp)
 	}
@@ -2024,6 +2165,14 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 	if name == "arg_count" {
 		return c.inferArgCount(x)
 	}
+	if name == "project_dir" {
+		if len(x.Args) != 0 {
+			c.errAt(x, "E0061", "`project_dir` takes no arguments but %d were supplied", len(x.Args))
+		}
+		// An owning String, like `arg_at`: the directory is baked into the
+		// binary and handed to the program, so it needs a real value.
+		return types.StringT
+	}
 	if name == "arg_at" {
 		return c.inferArgAt(x)
 	}
@@ -2125,7 +2274,7 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		if t := c.inferBareVariantCtor(x, name, expected); t != nil {
 			return t
 		}
-		cands := []string{"print", "println", "len", "cstr", "from_cstr", "arg_count", "arg_at"}
+		cands := []string{"print", "println", "len", "cstr", "from_cstr", "arg_count", "arg_at", "project_dir"}
 		for n := range c.info.Fns {
 			cands = append(cands, n)
 		}

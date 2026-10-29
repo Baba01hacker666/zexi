@@ -1,0 +1,364 @@
+// web — a small, FastAPI-flavoured layer over `http`, `html`, and `json`.
+//
+// Routes, request values, templates from a folder, files from a folder, JSON in
+// and out, and a pooled server, without ceremony:
+//
+//     use web;
+//
+//     fn home(req: &Request) -> Response {
+//         let mut v = html::vars();
+//         v.set("title", "Home");
+//         return web::render("index", &v);
+//     }
+//
+//     fn user(req: &Request) -> Response {
+//         let p = web::path_params(req);     // {id} -> p.id
+//         return web::json_object(&[("id", p.id)]);
+//     }
+//
+//     fn main() -> i32 {
+//         let mut app = web::new_app();
+//         app.get("/", home);
+//         app.get("/users/{id}", user);
+//         app.pages("public");               // static site + .html fallback
+//         app.files("/static", "public/assets");
+//         return app.serve(8000);
+//     }
+//
+// Handlers keep the ordinary `fn(&Request) -> Response` shape (there are no
+// closures yet), so path parameters are read with `path_params`/`param` instead
+// of arriving as arguments.
+
+use http;
+use html;
+use json;
+
+// --- responses -------------------------------------------------------------
+
+// html_page answers 200 with HTML.
+pub fn html_page(body: str) -> Response {
+    return Response::html(200, body);
+}
+
+// html_status answers with an explicit status and HTML.
+pub fn html_status(status: i32, body: str) -> Response {
+    return Response::html(status, body);
+}
+
+// text answers 200 with plain text.
+pub fn text(body: str) -> Response {
+    return Response::text(200, body);
+}
+
+// json_of answers 200 with a JSON value.
+pub fn json_of(value: &json::Value) -> Response {
+    let body = json::stringify(value);
+    return Response::json(200, body.as_str());
+}
+
+// json_status answers with an explicit status and a JSON value.
+pub fn json_status(status: i32, value: &json::Value) -> Response {
+    let body = json::stringify(value);
+    return Response::json(status, body.as_str());
+}
+
+// json_message answers with `{"ok": true|false, "message": "..."}`.
+pub fn json_message(ok: bool, message: str) -> Response {
+    let mut doc = json::object();
+    doc.set_bool("ok", ok);
+    doc.set_str("message", message);
+    let status = if ok { 200 } else { 400 };
+    return json_status(status, &doc);
+}
+
+// json_ok is `{"ok": true}`.
+pub fn json_ok() -> Response {
+    let mut doc = json::object();
+    doc.set_bool("ok", true);
+    return json_of(&doc);
+}
+
+// error answers with a JSON error body and the given status:
+// `{"error": "not found"}`.
+pub fn error(status: i32, message: str) -> Response {
+    let mut doc = json::object();
+    doc.set_str("error", message);
+    return json_status(status, &doc);
+}
+
+// not_found is error(404, "not found").
+pub fn not_found() -> Response {
+    return error(404, "not found");
+}
+
+// redirect answers 302 with a Location header.
+pub fn redirect(to: str) -> Response {
+    return Response::redirect(to);
+}
+
+// send_file serves one file from disk, with its MIME type.
+pub fn send_file(path: str) -> Response {
+    return http::serve_file(path);
+}
+
+// --- request values --------------------------------------------------------
+
+// path_params returns the `{name}` segments that matched the route, ready for
+// `render`:
+//
+//     app.get("/users/{id}", user);
+//     fn user(req: &Request) -> Response {
+//         let p = web::path_params(req);
+//         ... p.get("id")
+//     }
+pub fn path_params(req: &Request) -> html::Vars {
+    let mut m: HashMap<String, String> = HashMap::new();
+    req.collect_params(&mut m);
+    return html::Vars::from_map(m);
+}
+
+// query_vars returns the decoded query string as template values.
+pub fn query_vars(req: &Request) -> html::Vars {
+    let mut m: HashMap<String, String> = HashMap::new();
+    req.collect_query(&mut m);
+    return html::Vars::from_map(m);
+}
+
+// form_vars returns an application/x-www-form-urlencoded body as values.
+pub fn form_vars(req: &Request) -> html::Vars {
+    let mut m: HashMap<String, String> = HashMap::new();
+    req.collect_form(&mut m);
+    return html::Vars::from_map(m);
+}
+
+// form_value reads one form or query value: query first, then the body.
+pub fn form_value(req: &Request, name: str) -> String {
+    return req.param(name);
+}
+
+// json_body parses the request body as JSON (null when it is not JSON).
+pub fn json_body(req: &Request) -> json::Value {
+    match json::parse(req.body.as_str()) {
+        Ok(v) => return v,
+        Err(_) => return json::null(),
+    }
+}
+
+// --- templates -------------------------------------------------------------
+
+// views names the folder templates are read from ("templates" by default), so
+// `render("index", ..)` reads `templates/index.html`.
+pub fn views(dir: str) {
+    http::views_dir(dir);
+}
+
+// render fills `templates/<name>.html` with values and answers 200.
+pub fn render(name: str, values: &html::Vars) -> Response {
+    return render_status(200, name, values);
+}
+
+// render_status is render with an explicit status.
+pub fn render_status(status: i32, name: str, values: &html::Vars) -> Response {
+    let text = template_text(name);
+    if text.len() == 0 {
+        let mut msg = String::from("template not found: ");
+        msg.push_str(template_file(name).as_str());
+        return error(500, msg.as_str());
+    }
+    let page = html::template(text.as_str(), values);
+    return Response::html(status, page.as_str());
+}
+
+// template_text is the raw text of `templates/<name>.html` ("" when missing).
+pub fn template_text(name: str) -> String {
+    return http::read_file(template_file(name).as_str());
+}
+
+// template_file is the absolute path a template name resolves to.
+pub fn template_file(name: str) -> String {
+    let mut path = http::views_path();
+    if !path.ends_with("/") {
+        path.push_byte(47);
+    }
+    let name_s = String::from(name);
+    path.push_str(name_s.as_str());
+    if !name_s.ends_with(".html") {
+        path.push_str(".html");
+    }
+    return path;
+}
+
+// --- app -------------------------------------------------------------------
+
+// App is a router plus the site conventions: views for templates, mounts for
+// static folders, and the pool settings used by `serve`.
+pub struct App {
+    router: Router,
+    workers: i32,
+}
+
+// new_app makes an empty app. Handlers are registered with `get`/`post`/...;
+// `serve` starts it.
+pub fn new_app() -> App {
+    return App { router: Router::new(), workers: 0 };
+}
+
+impl App {
+    // get registers a GET handler for a path with optional `{name}` segments.
+    pub fn get(&mut self, path: str, handler: fn(&Request) -> Response) {
+        self.router.get(path, handler);
+    }
+
+    pub fn post(&mut self, path: str, handler: fn(&Request) -> Response) {
+        self.router.post(path, handler);
+    }
+
+    pub fn put(&mut self, path: str, handler: fn(&Request) -> Response) {
+        self.router.put(path, handler);
+    }
+
+    pub fn delete(&mut self, path: str, handler: fn(&Request) -> Response) {
+        self.router.delete(path, handler);
+    }
+
+    // route registers any method ("PATCH", "OPTIONS", ...).
+    pub fn route(&mut self, method: str, path: str, handler: fn(&Request) -> Response) {
+        self.router.add(method, path, handler);
+    }
+
+    // fallback replaces the 404 handler.
+    pub fn fallback(&mut self, handler: fn(&Request) -> Response) {
+        self.router.set_fallback(handler);
+    }
+
+    // before runs a middleware before routing; returning a valid response
+    // short-circuits the request.
+    pub fn before(&mut self, mw: fn(&Request) -> Response) {
+        self.router.use_before(mw);
+    }
+
+    // after runs a middleware after the handler (headers, CORS, timing).
+    pub fn after(&mut self, mw: fn(&Request, &mut Response)) {
+        self.router.use_after(mw);
+    }
+
+    // pages serves a folder as the site: `/` maps to index.html and an
+    // extension-less URL falls back to `<path>.html` or `<path>/index.html`.
+    pub fn pages(&mut self, root: str) {
+        self.router.pages(root);
+    }
+
+    // files serves a folder under a URL prefix (`/static/style.css`).
+    pub fn files(&mut self, prefix: str, root: str) {
+        self.router.files(prefix, root);
+    }
+
+    // views chooses the template folder used by `render`.
+    pub fn views(&mut self, dir: str) {
+        self.router.views(dir);
+        http::views_dir(dir);
+    }
+
+    // dispatch routes one already-parsed request without a socket, which is
+    // how a handler chain can be exercised in a test.
+    pub fn dispatch(&self, req: &mut Request) -> Response {
+        return self.router.dispatch(req);
+    }
+
+    // workers sets how many threads `serve` uses (0 = two per core).
+    pub fn workers(&mut self, n: i32) {
+        self.workers = n;
+    }
+
+    // serve runs the app with a worker pool until the process stops. A
+    // non-zero return means the address could not be bound.
+    pub fn serve(&self, port: i32 = 8000) -> i32 {
+        return self.serve_at("0.0.0.0", port);
+    }
+
+    // serve_at is serve on a specific host ("127.0.0.1" for a local server).
+    pub fn serve_at(&self, host: str, port: i32) -> i32 {
+        return http::serve_workers(&self.router, self.workers, port, host);
+    }
+
+    // serve_local is serve bound to loopback.
+    pub fn serve_local(&self, port: i32 = 8000) -> i32 {
+        return self.serve_at("127.0.0.1", port);
+    }
+
+    // serve_addr is serve on an address string (":8080", "127.0.0.1:8080").
+    pub fn serve_addr(&self, addr: str = ":8000") -> i32 {
+        let a = http::parse_addr(addr);
+        if !a.ok {
+            return 2;
+        }
+        return http::serve_workers(&self.router, self.workers, a.port, a.host.as_str());
+    }
+
+    // serve_n serves `max_requests` requests and returns, which is how tests
+    // and one-shot tools stop deterministically.
+    pub fn serve_n(&self, port: i32, max_requests: i32) -> i32 {
+        return http::serve_workers_n(&self.router, self.workers, max_requests, port, "127.0.0.1");
+    }
+
+}
+
+// --- default-mux style -----------------------------------------------------
+
+// get/post/put/delete register on the process-wide default mux, for programs
+// that do not want an App value:
+//
+//     web::get("/", home);
+//     web::serve(8000);
+pub fn get(path: str, handler: fn(&Request) -> Response) {
+    http::handle_get(path, handler);
+}
+
+pub fn post(path: str, handler: fn(&Request) -> Response) {
+    http::handle_post(path, handler);
+}
+
+pub fn put(path: str, handler: fn(&Request) -> Response) {
+    http::handle_put(path, handler);
+}
+
+pub fn delete(path: str, handler: fn(&Request) -> Response) {
+    http::handle_delete(path, handler);
+}
+
+// files/pages attach folders to the default mux.
+pub fn files(prefix: str, root: str) {
+    http::files(prefix, root);
+}
+
+pub fn pages(root: str) {
+    http::pages(root);
+}
+
+// serve runs the default mux with a worker pool (0 = two per core).
+pub fn serve(port: i32 = 8000) -> i32 {
+    return http::listen_workers(addr_of("0.0.0.0", port), 0);
+}
+
+// serve_local is serve bound to loopback.
+pub fn serve_local(port: i32 = 8000) -> i32 {
+    return http::listen_workers(addr_of("127.0.0.1", port), 0);
+}
+
+// serve_workers is serve with an explicit thread count.
+pub fn serve_workers(workers: i32, host: str, port: i32) -> i32 {
+    return http::listen_workers(addr_of(host, port), workers);
+}
+
+// serve_n is serve with a request budget, for tests and one-shot tools.
+pub fn serve_n(port: i32, max_requests: i32) -> i32 {
+    return http::listen_workers_n(addr_of("127.0.0.1", port), 0, max_requests);
+}
+
+// addr_of renders "host:port" for the address-string entry points.
+pub fn addr_of(host: str, port: i32) -> String {
+    let mut out = String::from(host);
+    out.push_byte(58); // ':'
+    out += port;
+    return out;
+}

@@ -85,8 +85,11 @@ func stdModule(parts []string) (string, bool) {
 // tracking. Items are still flattened into the program for sema, but a module
 // knows which of its names other modules may reach and under what paths.
 type module struct {
-	key    string // canonical load key (file:<abs>, std:<name>, <parent>::<mod>)
-	dir    string // directory relative file imports resolve against
+	key string // canonical load key (file:<abs>, std:<name>, <parent>::<mod>)
+	dir string // directory relative file imports resolve against
+	// std marks a module embedded in the compiler; its own `use` declarations
+	// name other standard-library modules, never files on disk.
+	std    bool
 	fileID int
 	file   *ast.File
 
@@ -181,6 +184,10 @@ type loader struct {
 	usesSys    bool // program imports sys (needs the C shim)
 	usesRegex  bool // program imports regex (needs the POSIX ERE shim)
 	usesThread bool // program imports thread (needs the pthread shim and -pthread)
+	usesJSON   bool // program imports json (needs the number-conversion shim)
+	// loadingStd is set while a standard-library module (and its imports) are
+	// being loaded.
+	loadingStd bool
 }
 
 func newLoader(em *diag.Emitter) *loader {
@@ -293,6 +300,8 @@ func (l *loader) loadStdFile(name string) *module {
 		l.usesRegex = true
 	case "thread":
 		l.usesThread = true
+	case "json":
+		l.usesJSON = true
 	}
 	display := "std/" + name + ".zx"
 	src, err := fs.ReadFile(stdFS, display)
@@ -300,7 +309,15 @@ func (l *loader) loadStdFile(name string) *module {
 		l.em.Report(diag.New("E9022", "there is no standard library module named `%s`", name))
 		return nil
 	}
-	return l.loadModule(key, display, src, "")
+	// A standard-library module resolves its own imports inside the standard
+	// library. Without this, `use http;` written in std/web.zx would pick up a
+	// `lib/http.zx` sitting in the directory the compiler happened to be
+	// started from, so the same program compiled or failed depending on the
+	// working directory.
+	l.loadingStd = true
+	m := l.loadModule(key, display, src, "")
+	l.loadingStd = false
+	return m
 }
 
 // loadModule parses one already-read source into a module and follows its
@@ -310,7 +327,7 @@ func (l *loader) loadModule(key, display string, src []byte, dir string) *module
 	if m, ok := l.mods[key]; ok {
 		return m
 	}
-	m := &module{key: key, dir: dir}
+	m := &module{key: key, dir: dir, std: l.loadingStd}
 	l.mods[key] = m
 	// Each file gets a disjoint range of the shared span space, so any
 	// diagnostic span identifies both its file and its position in it (see
@@ -476,6 +493,8 @@ func (l *loader) bindUse(m *module, d *ast.UseDecl) {
 		l.usesRegex = true
 	case "thread":
 		l.usesThread = true
+	case "json":
+		l.usesJSON = true
 	}
 
 	target, parts, ok := l.resolveUse(m, d)
@@ -521,7 +540,11 @@ func (l *loader) resolveUse(m *module, d *ast.UseDecl) (*module, []string, bool)
 	// `use a::b;` / `import a.b;` names a/b.zx: local modules win over
 	// embedded ones so applications can provide their own package trees.
 	name := filepath.Join(parts...) + ".zx"
-	for _, dir := range l.searchDirs(m.dir) {
+	dirs := l.searchDirs(m.dir)
+	if m.std {
+		dirs = nil // a standard-library module imports only other stdlib modules
+	}
+	for _, dir := range dirs {
 		cand := filepath.Join(dir, name)
 		if l.probeFile(cand) {
 			if target := l.loadDisk(cand); target != nil {
@@ -533,7 +556,7 @@ func (l *loader) resolveUse(m *module, d *ast.UseDecl) (*module, []string, bool)
 	// A directory package: `use util;` loads every `.zx` file in `util/` (or
 	// its `mod.zx` facade if present). This is the "many files, one import"
 	// part of a convention-only project.
-	for _, dir := range l.searchDirs(m.dir) {
+	for _, dir := range dirs {
 		pkgDir := filepath.Join(dir, filepath.Join(parts...))
 		st, err := os.Stat(pkgDir)
 		if err != nil || !st.IsDir() {

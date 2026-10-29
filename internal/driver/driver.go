@@ -146,7 +146,7 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 	art := &Artifacts{Info: info, FileID: l.firstID}
 	// Debug builds check integer overflow; release builds wrap (see
 	// docs/03-memory-model.md). Division by zero panics in both.
-	cgOpts := zenc.Options{DebugChecks: opts.OptLevel == "0"}
+	cgOpts := zenc.Options{DebugChecks: opts.OptLevel == "0", ProjectDir: l.root}
 	if jobs := splitJobs(opts, len(info.FnOrder)); jobs > 1 {
 		header, units, cerr := zenc.GenerateSplit(info, cgOpts, jobs)
 		if cerr != nil {
@@ -181,6 +181,9 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 	if l.usesThread {
 		art.CExtra = append(art.CExtra, string(threadCSource))
 		art.NeedsPthread = true
+	}
+	if l.usesJSON {
+		art.CExtra = append(art.CExtra, string(jsonCSource))
 	}
 	return art, true
 }
@@ -243,6 +246,13 @@ var regexCSource []byte
 //
 //go:embed zxthread_c.txt
 var threadCSource []byte
+
+// jsonCSource is the opt-in number-conversion shim for the `json` module
+// (shortest round-tripping doubles, strict number parsing, UTF-8 encoding for
+// \uXXXX escapes).
+//
+//go:embed zxjson_c.txt
+var jsonCSource []byte
 
 // Tokens returns the token stream for a file, for the `tokenize` command.
 func Tokens(path string, em *diag.Emitter) ([]token.Token, int, bool) {

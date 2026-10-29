@@ -1,0 +1,51 @@
+// tests/pool.zx
+// Coverage for `thread::Pool`: a worker pool that spreads jobs over OS
+// threads. Every number here is order-independent (a sum, or a result keyed by
+// the sequence number submit returned), so the output is deterministic even
+// though the work runs in parallel.
+
+use thread;
+
+fn square(x: i64) -> i64 {
+    return x * x;
+}
+
+fn negate(x: i64) -> i64 {
+    return -x;
+}
+
+fn main() -> i32 {
+    // A pool of four threads: start it, submit one job, collect the result.
+    let pool = Pool::new(4);
+    println(pool.ok(), pool.workers());
+    let one = pool.submit(square, 21);
+    println(pool.wait(), pool.result(one));
+
+    // Several jobs at once, results in submission order.
+    let a = pool.submit(square, 3);
+    let b = pool.submit(square, 4);
+    let c = pool.submit(negate, 5);
+    pool.wait();
+    println(pool.result(a), pool.result(b), pool.result(c));
+
+    // map runs f over a range and sums the results: 1^2 + ... + 10^2 = 385.
+    println(pool.map(square, 1, 11));
+    // ...and over far more jobs than the queue can hold at once: the queue is
+    // recycled as it drains, and no result is lost across that boundary.
+    println(pool.map(square, 1, 20001));
+    // An empty range yields 0.
+    println(pool.map(square, 5, 5));
+
+    // A single-worker pool runs the same jobs, just not in parallel.
+    let serial = Pool::new(1);
+    println(serial.workers(), serial.map(square, 1, 11));
+    serial.free();
+
+    // done() counts finished jobs in the current queue.
+    println(pool.done() > 0);
+    pool.free();
+
+    // A stale handle (after free) fails cleanly instead of crashing.
+    println(pool.submit(square, 2) < 0);
+    0
+}

@@ -24,13 +24,25 @@ import (
 )
 
 // cgen accumulates C declarations and hands out a name for each type.
+//
+// Types are keyed structurally (by their label) rather than by pointer: a
+// recursive type such as `enum Tree { Leaf(i64), Node(Vec<Tree>) }` reaches the
+// same declaration through freshly-built `*types.Type` values, and keying by
+// pointer would recurse forever. Struct and enum names are registered *before*
+// their fields are emitted and forward-declared as `typedef struct n n;`, which
+// is what makes a cycle through `Vec`/`HashMap` terminate — a by-value cycle is
+// still impossible, exactly as the C back end requires.
 type cgen struct {
 	defs []string
-	seen map[*types.Type]string
+	// late holds declarations that must follow every named type: a hash map
+	// slot embeds its key and value by value, so its body can only be emitted
+	// once those types are complete (the same rule the C back end follows).
+	late []string
+	seen map[string]string
 	n    int
 }
 
-func newCgen() *cgen { return &cgen{seen: map[*types.Type]string{}} }
+func newCgen() *cgen { return &cgen{seen: map[string]string{}} }
 
 // cField mirrors the C back end's fieldName: a field the language allows but
 // C does not (a tuple element named "0") is prefixed, and anything else that
@@ -63,7 +75,8 @@ func (c *cgen) fresh(prefix string) string {
 // name returns a C type name usable in a typedef for ty, emitting whatever
 // supporting declarations it needs first.
 func (c *cgen) name(ty *types.Type) string {
-	if got, ok := c.seen[ty]; ok {
+	key := typeLabel(ty)
+	if got, ok := c.seen[key]; ok {
 		return got
 	}
 	var out string
@@ -129,8 +142,9 @@ func (c *cgen) name(ty *types.Type) string {
 		key, val := c.name(ty.Key), c.name(ty.Val)
 		id := c.fresh("t_map")
 		pair := id + "_pair"
-		c.defs = append(c.defs, fmt.Sprintf("typedef struct { %s key; %s value; int used; } %s;", key, val, pair))
+		c.defs = append(c.defs, fmt.Sprintf("typedef struct %s %s;", pair, pair))
 		c.defs = append(c.defs, fmt.Sprintf("typedef struct { %s *entries; size_t len; size_t cap; } %s;", pair, id))
+		c.late = append(c.late, fmt.Sprintf("struct %s { %s key; %s value; int used; };", pair, key, val))
 		out = id
 	case types.Tuple:
 		fields := make([]string, len(ty.Elems))
@@ -142,15 +156,21 @@ func (c *cgen) name(ty *types.Type) string {
 		out = id
 	case types.StructKind:
 		id := c.fresh("t_struct")
+		// Register the name (and forward-declare it) before the fields are
+		// named: a field may reach back to this struct through a Vec or
+		// HashMap, and that reference is legal only once the name exists.
+		c.seen[key] = id
+		c.defs = append(c.defs, fmt.Sprintf("typedef struct %s %s;", id, id))
 		fields := make([]string, len(ty.St.Fields))
 		for i, f := range ty.St.Fields {
-			// Named first so their definitions land before this one.
 			fields[i] = fmt.Sprintf("%s %s;", c.name(f.Ty), cField(f.Name))
 		}
-		c.defs = append(c.defs, fmt.Sprintf("typedef struct { %s } %s;", strings.Join(fields, " "), id))
-		out = id
+		c.defs = append(c.defs, fmt.Sprintf("struct %s { %s };", id, strings.Join(fields, " ")))
+		return id
 	case types.EnumKind:
 		id := c.fresh("t_enum")
+		c.seen[key] = id
+		c.defs = append(c.defs, fmt.Sprintf("typedef struct %s %s;", id, id))
 		var members []string
 		for _, v := range ty.En.Variants {
 			if len(v.Fields) == 0 {
@@ -166,13 +186,13 @@ func (c *cgen) name(ty *types.Type) string {
 		if len(members) > 0 {
 			def += " union { " + strings.Join(members, " ") + " } u;"
 		}
-		def += fmt.Sprintf(" } %s;", id)
-		c.defs = append(c.defs, def)
-		out = id
+		def += " };"
+		c.defs = append(c.defs, fmt.Sprintf("struct %s {%s", id, strings.TrimPrefix(def, "typedef struct {")))
+		return id
 	default:
 		panic("cgen: unsupported kind " + fmt.Sprint(ty.Kind))
 	}
-	c.seen[ty] = out
+	c.seen[key] = out
 	return out
 }
 
@@ -274,6 +294,7 @@ func TestLayoutMatchesTheCCompiler(t *testing.T) {
 	sb.WriteString("#include <stdio.h>\n#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n")
 	sb.WriteString("typedef struct { char _unused; } zx_unit;\n")
 	sb.WriteString("typedef struct { char *ptr; size_t len; size_t cap; } zx_String;\n")
+	g.defs = append(g.defs, g.late...)
 	for _, d := range g.defs {
 		sb.WriteString(d + "\n")
 	}

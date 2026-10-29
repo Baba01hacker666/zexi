@@ -23,6 +23,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 int zxn_htons(int hostshort) { return (int)htons((unsigned short)hostshort); }
 
@@ -185,6 +186,174 @@ int zxn_recv(int fd, char *buf, int cap) {
 
 int zxn_close(int fd) { return close(fd); }
 
+/* zxn_poll_read waits up to ms milliseconds for fd to become readable.
+ * Returns 1 when readable, 0 on timeout, -1 on error/closed descriptor. */
+int zxn_poll_read(int fd, int ms) {
+    if (fd < 0) return -1;
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    struct timeval tv;
+    if (ms < 0) ms = 0;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    for (;;) {
+        int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (rc >= 0) return rc > 0 ? 1 : 0;
+        if (errno != EINTR) return -1;
+        /* Rebuild the set: select may clear it on interruption. */
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+    }
+}
+
+/* zxn_accept_timeout accepts with a bound, so a worker thread can check a
+ * shutdown flag instead of blocking forever. Returns the new descriptor, -2 on
+ * timeout, -1 on error. */
+int zxn_accept_timeout(int fd, int ms) {
+    int ready = zxn_poll_read(fd, ms);
+    if (ready == 0) return -2;
+    if (ready < 0) return -1;
+    for (;;) {
+        int c = accept(fd, NULL, NULL);
+        if (c >= 0) return c;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
+        return -1;
+    }
+}
+
+int zxn_set_nonblocking(int fd, int on) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (on) flags |= O_NONBLOCK;
+    else flags &= ~O_NONBLOCK;
+    return fcntl(fd, F_SETFL, flags);
+}
+
+/* zxn_resolve turns a host name into its first IPv4 address in dotted form.
+ * Returns 0 on success, -1 when the name does not resolve. A literal address
+ * is copied through unchanged. */
+int zxn_resolve(const char *host, char *buf, int cap) {
+    if (!host || cap <= 0) return -1;
+    struct in_addr literal;
+    if (inet_pton(AF_INET, host, &literal) == 1) {
+        const char *p = inet_ntop(AF_INET, &literal, buf, (socklen_t)cap);
+        return p ? 0 : -1;
+    }
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL) return -1;
+    struct in_addr a = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+    return inet_ntop(AF_INET, &a, buf, (socklen_t)cap) ? 0 : -1;
+}
+
+/* zxn_local_port reports the local port of a bound socket (useful after
+ * binding port 0), or -1. */
+/* zxn_cpu_count is the number of processors available to this process, used
+ * to size a default worker pool. */
+int zxn_cpu_count(void) {
+#ifdef _SC_NPROCESSORS_ONLN
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n > 0 && n < 4096) return (int)n;
+#endif
+    return 1;
+}
+
+int zxn_local_port(int fd) {
+    struct sockaddr_in sa;
+    socklen_t len = sizeof sa;
+    if (getsockname(fd, (struct sockaddr *)&sa, &len) != 0) return -1;
+    return (int)ntohs(sa.sin_port);
+}
+
+/* zxn_peer_addr writes "ip:port" for the peer of a connected socket. */
+int zxn_peer_addr(int fd, char *buf, int cap) {
+    struct sockaddr_in sa;
+    socklen_t len = sizeof sa;
+    if (cap <= 0 || getpeername(fd, (struct sockaddr *)&sa, &len) != 0) return -1;
+    char ip[64];
+    if (!inet_ntop(AF_INET, &sa.sin_addr, ip, sizeof ip)) return -1;
+    int n = snprintf(buf, (size_t)cap, "%s:%d", ip, (int)ntohs(sa.sin_port));
+    return (n > 0 && n < cap) ? n : -1;
+}
+
+int zxn_shutdown_write(int fd) {
+    return shutdown(fd, SHUT_WR);
+}
+
+/* zxn_strerror_string copies the text for an errno value into buf. */
+int zxn_strerror_string(int err, char *buf, int cap) {
+    if (cap <= 0) return -1;
+    const char *msg = strerror(err);
+    if (!msg) msg = "unknown error";
+    int n = snprintf(buf, (size_t)cap, "%s", msg);
+    return (n > 0 && n < cap) ? n : -1;
+}
+
+int zxn_last_error(void) { return errno; }
+
+/* --- UDP ------------------------------------------------------------------ */
+
+int zxn_udp_bind(const char *host, int port) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((unsigned short)port);
+    if (host == NULL || strcmp(host, "0.0.0.0") == 0 || strcmp(host, "*") == 0) {
+        sa.sin_addr.s_addr = INADDR_ANY;
+    } else if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
+        close(fd);
+        return -1;
+    }
+    if (bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+int zxn_udp_send_to(int fd, const char *host, int port, const char *buf, int n) {
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((unsigned short)port);
+    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL) return -1;
+        memcpy(&sa.sin_addr, &((struct sockaddr_in *)res->ai_addr)->sin_addr, sizeof sa.sin_addr);
+        freeaddrinfo(res);
+    }
+    ssize_t r = sendto(fd, buf, (size_t)n, 0, (struct sockaddr *)&sa, sizeof sa);
+    return (int)r;
+}
+
+/* zxn_udp_recv_from receives one datagram into buf and records the sender. The
+ * source address is written to hostbuf as "ip" and the port through port_out. */
+int zxn_udp_recv_from(int fd, char *buf, int cap, char *hostbuf, int hostcap, int *port_out) {
+    struct sockaddr_in sa;
+    socklen_t len = sizeof sa;
+    ssize_t r = recvfrom(fd, buf, (size_t)cap, 0, (struct sockaddr *)&sa, &len);
+    if (r < 0) {
+        if (errno == EINTR) return 0;
+        return -1;
+    }
+    if (hostbuf && hostcap > 0) {
+        if (!inet_ntop(AF_INET, &sa.sin_addr, hostbuf, (socklen_t)hostcap))
+            hostbuf[0] = '\0';
+    }
+    if (port_out) *port_out = (int)ntohs(sa.sin_port);
+    return (int)r;
+}
+
 /* --- file helpers (static files and downloads) ---------------------------
  * Handles are FILE* pointers as integers, so binary data can be streamed
  * through the same byte-buffer path as sockets without NUL truncation. */
@@ -301,7 +470,7 @@ char *zxn_http_get(const char *host, int port, const char *path) {
 /* zxh_default_mux backs std/http's top-level handler registry (the Go-style
  * default mux). The shim cannot see the generated zx_Router layout, so the
  * storage is an oversized, over-aligned buffer; the Router is copied into it
- * once, on first use, by Zexi code. A process only ever has one. */
+ * once, on first use, by Zexi code. */
 _Alignas(64) static unsigned char zxh_mux_storage[16384];
 static int zxh_mux_ready = 0;
 
@@ -314,3 +483,74 @@ int zxh_default_mux_ready(void) {
     }
     return 0;
 }
+
+/* --- router slots (thread-safe serving) -----------------------------------
+ * A worker thread receives only integers, so an explicit Router cannot be
+ * passed to one directly. Instead a Router is copied ("pinned") into one of a
+ * few fixed, over-aligned slots and the worker is handed the slot number,
+ * which zxh_mux_slot turns back into a Router pointer. Slot 0 is the default
+ * mux above; slots 1..3 are handed out by zxh_mux_claim for explicit routers
+ * served by a worker pool. */
+#define ZXH_MUX_SLOTS 4
+#define ZXH_MUX_BYTES 16384
+
+_Alignas(64) static unsigned char zxh_mux_extra[ZXH_MUX_SLOTS][ZXH_MUX_BYTES];
+static _Atomic int zxh_mux_pinned[ZXH_MUX_SLOTS];
+
+void *zxh_mux_slot(int slot) {
+    if (slot <= 0 || slot >= ZXH_MUX_SLOTS) return zxh_mux_storage;
+    return zxh_mux_extra[slot];
+}
+
+int zxh_mux_claim(void) {
+    for (int i = 1; i < ZXH_MUX_SLOTS; i++) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong(&zxh_mux_pinned[i], &expected, 1))
+            return i;
+    }
+    return -1;
+}
+
+void zxh_mux_release(int slot) {
+    if (slot > 0 && slot < ZXH_MUX_SLOTS) atomic_store(&zxh_mux_pinned[slot], 0);
+}
+
+int zxh_mux_slot_count(void) { return ZXH_MUX_SLOTS; }
+
+/* --- server statistics and cooperative shutdown ---------------------------
+ * A worker pool needs to know how much work the whole pool has done, not just
+ * its own share, so the counters live here (C11 atomics, no mutex, no
+ * pthread dependency) and zexi code reads them through thin wrappers. */
+static _Atomic long zxh_conns = 0;
+static _Atomic long zxh_requests = 0;
+static _Atomic int zxh_stop_flag = 0;
+
+void zxh_stats_reset(void) {
+    atomic_store(&zxh_conns, 0);
+    atomic_store(&zxh_requests, 0);
+    atomic_store(&zxh_stop_flag, 0);
+}
+
+void zxh_count_conn(void) { atomic_fetch_add(&zxh_conns, 1); }
+
+void zxh_count_request(void) { atomic_fetch_add(&zxh_requests, 1); }
+
+long zxh_conns_served(void) { return atomic_load(&zxh_conns); }
+
+long zxh_requests_served(void) { return atomic_load(&zxh_requests); }
+
+void zxh_stop(void) { atomic_store(&zxh_stop_flag, 1); }
+
+void zxh_clear_stop(void) { atomic_store(&zxh_stop_flag, 0); }
+
+int zxh_stopping(void) { return atomic_load(&zxh_stop_flag) != 0; }
+
+/* zxh_set_budget caps how many requests a worker pool serves before the
+ * workers ask each other to stop; 0 means "serve forever". A bounded pool is
+ * what tests and one-shot tools use, and it makes shutdown deterministic
+ * instead of racing against a signal. */
+static _Atomic long zxh_budget_requests = 0;
+
+void zxh_set_budget(long n) { atomic_store(&zxh_budget_requests, n); }
+
+long zxh_budget(void) { return atomic_load(&zxh_budget_requests); }

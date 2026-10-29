@@ -173,6 +173,7 @@ func TestCorpusLayoutMatchesTheCCompiler(t *testing.T) {
 	var sb strings.Builder
 	sb.WriteString("#include <stdio.h>\n#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n")
 	sb.WriteString("typedef struct { char *ptr; size_t len; size_t cap; } zx_String;\n")
+	g.defs = append(g.defs, g.late...)
 	for _, d := range g.defs {
 		sb.WriteString(d + "\n")
 	}

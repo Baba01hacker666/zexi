@@ -567,16 +567,30 @@ The embedded standard library (sources in `internal/driver/std/`) includes:
   `write_bytes(path, &String)` (reads, writes, and copies cap at 32 MiB);
   environment, cwd/hostname, local non-recursive directory/file operations,
   clocks/sleep; and deterministic or libc-backed random numbers.
-- `net` and `http`: TCP and a high-level HTTP client/server. `Client`, `get`,
-  `do`, `fetch`, `request`, `post_form_url`, `Router`, `new_app`, the Go-style
+- `net` and `http`: TCP and UDP sockets, name resolution, readiness polling, and
+  a high-level HTTP client/server. `Client`, `get`, `do`, `fetch`, `request`,
+  `post_form_url`, `Router`, `new_app`, the Go-style
   `handle_get`/`handle_post`/`use_before`/`use_after` + `listen(":8080")`
   default mux with `{name}` route parameters, `serve_local`, `serve_n`,
-  `serve_dir`, and static-file helpers are documented in
+  `serve_dir`, and static-file helpers; `listen_workers`/`serve_workers*` serve
+  with a pool of OS threads, and `requests_served()`/`stop_serving()` report and
+  stop it; `udp_bind`/`send_to`/`recv_from`, `resolve`, `poll_read`,
+  `accept_timeout`, and `cpu_count` sit underneath. Documented in
   [`08-networking.md`](08-networking.md).
 - `thread`: OS threads (`Thread::spawn`/`spawn2`/`spawn_void`, `join`), blocking
-  `i64` channels (`Chan`, `chan_send`/`chan_recv`/`chan_close`), and lock-free
-  `i64` atomics (`Atomic`, `atomic_add`/`get`/`set`). Only `i64` values cross a
-  thread boundary; see [`11-concurrency.md`](11-concurrency.md).
+  `i64` channels (`Chan`, `chan_send`/`chan_recv`/`chan_close`), lock-free
+  `i64` atomics (`Atomic`, `atomic_add`/`get`/`set`), and a task pool
+  (`Pool::new`, `submit`/`wait`/`result`, `map` over a range, `free`). Only
+  `i64` values cross a thread boundary; see
+  [`11-concurrency.md`](11-concurrency.md).
+- `json`: parse, build, and print JSON with exact integers, round-tripping
+  doubles, insertion-ordered objects, and errors that name a byte offset
+  (`parse`, `stringify`, `pretty`, `Value`, `object`, `array`, `of_*`,
+  `quote`, `valid`). See [`14-json-and-html.md`](14-json-and-html.md).
+- `html`: safe server-rendered markup — `escape`/`attr`/`url_query`,
+  `page`/`page_with`, `tag`/`heading`/`link`/`list`/`table`, `json_script`, and
+  `template` with `{{name}}` (escaped) and `{{name|raw}}`. See
+  [`14-json-and-html.md`](14-json-and-html.md).
 
 See [`10-stdlib-recipes.md`](10-stdlib-recipes.md) for runnable local HTTP,
 filesystem, OS, and regex patterns.
@@ -589,9 +603,12 @@ program that ties it all together, see `examples/guess.zx`.
 ## 7.15 Not implemented yet (roadmap M1+)
 
 Traits (and trait bounds), `dyn Trait`, associated types, const generics,
-`HashMap`, `Box`, user-defined `Drop`, tuple values (tuple *structs* exist;
-`(a, b)` values and destructuring do not yet), borrow-lifetime (NLL) analysis,
-bindings inside or-patterns, and nested patterns. Scoped modules have landed for
+`Box`, user-defined `Drop`, tuple values (tuple *structs* exist; `(a, b)` values
+and destructuring do not yet), borrow-lifetime (NLL) analysis, bindings inside
+or-patterns, and nested patterns. Pattern bindings in a `match` on a *borrowed*
+enum still cannot move an owned payload out (E0507), which is why `json::Value`
+is a tagged struct rather than an enum; `ref` bindings / match ergonomics are
+the missing piece. Scoped modules have landed for
 *qualified* access (imports, `as` aliases, `mod::item`, `pub` checks), but the
 merged program is still one flat namespace: unqualified cross-module names
 remain visible and ignore `pub`, so full isolation and package metadata are

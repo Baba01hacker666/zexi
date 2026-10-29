@@ -1,0 +1,106 @@
+// tests/recursive.zx
+// Recursive data built through indirection: an enum holding a `Vec` of itself,
+// a struct holding a `Vec` of itself, and an enum holding a `HashMap` of
+// itself. Each shape needs the generated C types in dependency order, so this
+// test is what keeps the "declare slots after the types they embed" rule
+// honest.
+
+// Tree is a leaf or an interior node with children.
+enum Tree {
+    Leaf(i64),
+    Node(Vec<Tree>),
+}
+
+// Comment is a thread of replies: a struct that holds a Vec of itself.
+struct Comment {
+    text: String,
+    replies: Vec<Comment>,
+}
+
+// Doc is a tiny document model: an object maps names to other documents.
+enum Doc {
+    Num(i64),
+    Obj(HashMap<String, Doc>),
+}
+
+fn sum_tree(t: Tree) -> i64 {
+    match t {
+        Tree::Leaf(n) => n,
+        Tree::Node(mut kids) => {
+            let mut total: i64 = 0;
+            while kids.len() > 0 {
+                let kid = kids.remove(0);
+                total += sum_tree(kid);
+            }
+            total
+        }
+    }
+}
+
+fn count_comments(c: &Comment) -> i64 {
+    let mut total: i64 = 1;
+    let mut i: usize = 0;
+    while i < c.replies.len() {
+        total += count_comments(&c.replies[i]);
+        i += 1;
+    }
+    return total;
+}
+
+fn sum_doc(d: Doc) -> i64 {
+    match d {
+        Doc::Num(n) => n,
+        Doc::Obj(m) => {
+            let mut total: i64 = 0;
+            let mut keys: Vec<String> = Vec::new();
+            keys.push(String::from("a"));
+            keys.push(String::from("b"));
+            let mut i: usize = 0;
+            while i < keys.len() {
+                let key = keys[i].clone();
+                match m.remove(key) {
+                    Some(inner) => total += sum_doc(inner),
+                    None => {}
+                }
+                i += 1;
+            }
+            total
+        }
+    }
+}
+
+fn leaf(n: i64) -> Tree {
+    return Tree::Leaf(n);
+}
+
+fn main() -> i32 {
+    // Tree: Node([Leaf(1), Node([Leaf(2), Leaf(3)]), Leaf(4)]) = 10
+    let mut inner: Vec<Tree> = Vec::new();
+    inner.push(leaf(2));
+    inner.push(leaf(3));
+    let mut kids: Vec<Tree> = Vec::new();
+    kids.push(leaf(1));
+    kids.push(Tree::Node(inner));
+    kids.push(leaf(4));
+    let tree = Tree::Node(kids);
+    println(sum_tree(tree));
+
+    // Comments nest three deep: one root plus two replies plus a reply.
+    let mut grandchild: Vec<Comment> = Vec::new();
+    grandchild.push(Comment { text: String::from("hi"), replies: Vec::new() });
+    let mut replies: Vec<Comment> = Vec::new();
+    replies.push(Comment { text: String::from("first"), replies: grandchild });
+    replies.push(Comment { text: String::from("second"), replies: Vec::new() });
+    let root = Comment { text: String::from("root"), replies: replies };
+    println(count_comments(&root));
+    println(root.replies.len(), root.replies[0].replies[0].text);
+
+    // Doc: an object holding numbers and another object.
+    let mut inner_obj: HashMap<String, Doc> = HashMap::new();
+    inner_obj.insert(String::from("a"), Doc::Num(5));
+    let mut doc: HashMap<String, Doc> = HashMap::new();
+    doc.insert(String::from("b"), Doc::Num(7));
+    doc.insert(String::from("a"), Doc::Obj(inner_obj));
+    println(sum_doc(Doc::Obj(doc)));
+    0
+}
