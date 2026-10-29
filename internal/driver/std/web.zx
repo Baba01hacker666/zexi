@@ -258,6 +258,13 @@ impl App {
         self.workers = n;
     }
 
+    // header_timeout bounds how long a connection may take to send a complete
+    // request head (milliseconds). Lower it behind an untrusted network, where
+    // half-sent heads would otherwise hold a worker for the full timeout.
+    pub fn header_timeout(&mut self, ms: i32) {
+        self.router.header_timeout(ms);
+    }
+
     // dispatch routes one already-parsed request without a socket.
     pub fn dispatch(&self, req: &mut Request) -> Response {
         return self.router.dispatch(req);

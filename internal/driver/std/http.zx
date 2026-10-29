@@ -63,6 +63,24 @@ const MAX_BODY: usize = 16777216;
 const MAX_FILE: usize = 33554432;
 // DEFAULT_TIMEOUT_MS bounds blocking I/O on client connections.
 const DEFAULT_TIMEOUT_MS: i32 = 30000;
+// HEAD_TIMEOUT_MS bounds how long a peer may take to send a complete request
+// head. It is deliberately short: a connection that trickles a head, or opens
+// and sends nothing, occupies a worker for the whole timeout, so a handful of
+// slow peers is enough to stall a small pool. Raise it per router with
+// `header_timeout` when clients are expected to be slow.
+const HEAD_TIMEOUT_MS: i32 = 1000;
+// MAX_HEAD is how much of a request head a worker buffers (net's receive
+// buffer). A head that does not end within this many bytes is refused with
+// 431 instead of being parsed as a truncated request line.
+const MAX_HEAD: usize = 8192;
+// FIRST_BYTE_MS is how long an accepted connection gets to send its first
+// byte before it is dropped. A connected client sends the request line
+// immediately, so a socket that stays quiet is a probe or a deliberate stall
+// and should not hold a worker for the full head timeout.
+const FIRST_BYTE_MS: i32 = 250;
+// DRAIN_MS bounds the pre-close drain, which keeps a reset from destroying the
+// response the peer has not read yet.
+const DRAIN_MS: i32 = 100;
 // DEFAULT_MAX_REDIRECTS is how many redirect hops a client follows.
 const DEFAULT_MAX_REDIRECTS: i32 = 5;
 
@@ -311,6 +329,11 @@ pub struct Request {
     // params holds values captured by `{name}` route segments. It is encoded
     // as `\x1fname\x1fvalue` pairs and is filled in by Router.dispatch.
     params: String,
+    // head_bytes is how many bytes of head arrived, so a server can tell a
+    // silent probe (answer nothing) from a malformed request (answer 400).
+    head_bytes: usize,
+    // head_overflow reports a head that did not end within MAX_HEAD bytes.
+    head_overflow: bool,
 }
 
 pub struct Response {
@@ -337,6 +360,15 @@ impl Request {
     pub fn content_length(&self) -> i64 {
         let value = header_value(&self.headers, "Content-Length");
         return parse_dec(&value);
+    }
+
+    // chunked reports a request whose body uses chunked transfer encoding.
+    // Such a body is read until its terminator, and a malformed one leaves
+    // unread bytes behind, so the server drains before it closes.
+    pub fn chunked(&self) -> bool {
+        let value = header_value(&self.headers, "Transfer-Encoding");
+        let enc = http_lower(&value);
+        return enc.contains("chunked");
     }
 
     // body_complete reports whether the whole declared body was read.
@@ -743,6 +775,7 @@ pub fn parse_request(raw: &String) -> Request {
         return Request {
             method: String::new(), path: String::new(), version: String::new(),
             headers: String::new(), body: String::new(), params: String::new(),
+            head_bytes: raw.len(), head_overflow: false,
         };
     }
     let line = raw.substr(0, end as usize);
@@ -756,7 +789,10 @@ pub fn parse_request(raw: &String) -> Request {
     let headers = header_block(raw);
     let he = head_end(raw);
     let body = if he < 0 { String::new() } else { raw.substr(he as usize, 4294967295) };
-    return Request { method: method, path: path, version: version, headers: headers, body: body, params: String::new() };
+    return Request {
+        method: method, path: path, version: version, headers: headers, body: body,
+        params: String::new(), head_bytes: raw.len(), head_overflow: false,
+    };
 }
 
 // read_request reads a request head and then its body, using Content-Length
@@ -765,6 +801,13 @@ pub fn parse_request(raw: &String) -> Request {
 pub fn read_request(c: &Conn) -> Request {
     let head = c.read_head();
     let mut req = parse_request(&head);
+    req.head_bytes = head.len();
+    // read_head stops one byte short of its buffer, so the last possible
+    // length is MAX_HEAD - 1.
+    req.head_overflow = head.len() >= MAX_HEAD - 1 && head_end(&head) < 0;
+    // The head deadline is short; a body is being sent by a client that already
+    // spoke, so it gets the ordinary I/O timeout.
+    c.set_timeout(DEFAULT_TIMEOUT_MS);
     let want = req.content_length();
     if want > 0 && want <= MAX_BODY as i64 {
         let have = req.body.len() as i64;
@@ -1221,6 +1264,8 @@ pub struct Router {
     roots: [str; MAX_MOUNTS],
     mount_count: i32,
     views: str,
+    // header_timeout_ms bounds how long a peer may take to send a head.
+    header_timeout_ms: i32,
 }
 
 impl Router {
@@ -1239,6 +1284,7 @@ impl Router {
             roots: [""; MAX_MOUNTS],
             mount_count: 0,
             views: "",
+            header_timeout_ms: HEAD_TIMEOUT_MS,
         };
     }
 
@@ -1256,6 +1302,15 @@ impl Router {
 
     pub fn delete(&mut self, path: str, handler: fn(&Request) -> Response) {
         self.add("DELETE", path, handler);
+    }
+
+    // header_timeout sets how long a connection may take to send a complete
+    // request head, in milliseconds. It is the knob that bounds how long a slow
+    // or silent peer can hold a worker.
+    pub fn header_timeout(&mut self, ms: i32) {
+        if ms > 0 {
+            self.header_timeout_ms = ms;
+        }
     }
 
     // files serves a folder for URLs under `prefix`, with index.html for
@@ -1437,10 +1492,27 @@ impl Router {
     // serve reads one request from c, dispatches it, and writes the response.
     // It returns false when the peer sent nothing usable (a probe or EOF).
     pub fn serve(&self, c: &Conn) -> bool {
-        c.set_timeout(DEFAULT_TIMEOUT_MS);
-        let mut req = read_request(c);
-        if !req.valid() {
+        if !c.wait_readable(FIRST_BYTE_MS) {
             return false;
+        }
+        c.set_timeout(self.header_timeout_ms);
+        let mut req = read_request(c);
+        if req.head_overflow {
+            let too_big = Response::empty(431);
+            send_response(c, &too_big);
+            c.drain(DRAIN_MS);
+            return true;
+        }
+        if !req.valid() {
+            // Nothing arrived: a readiness probe or an immediate EOF, so there
+            // is nobody to answer. A peer that did send bytes gets a 400.
+            if req.head_bytes == 0 {
+                return false;
+            }
+            let bad = Response::empty(400);
+            send_response(c, &bad);
+            c.drain(DRAIN_MS);
+            return true;
         }
         if req.body_too_large() {
             let too_large = Response::empty(413);
@@ -1454,6 +1526,11 @@ impl Router {
         }
         let res = self.dispatch(&mut req);
         send_response(c, &res);
+        if req.chunked() {
+            // A malformed chunked body can leave bytes in the socket; draining
+            // makes close() send FIN, so the status line survives.
+            c.drain(DRAIN_MS);
+        }
         return true;
     }
 }
@@ -1636,7 +1713,9 @@ const DEFAULT_WORKERS: i32 = 8;
 
 // pin_router copies a router into a fixed slot so worker threads can reach it
 // through an integer handle. The copy is field by field because the language
-// has no raw-pointer reinterpret of a borrowed value.
+// has no raw-pointer reinterpret of a borrowed value — adding a field here is
+// easy to forget, and forgetting one (the header timeout, once) leaves the
+// worker with a zeroed setting.
 fn pin_router(src: &Router, dst: *Router) {
     let mut i: usize = 0;
     while i < 32 {
@@ -1670,6 +1749,7 @@ fn pin_router(src: &Router, dst: *Router) {
     (*dst).before_count = src.before_count;
     (*dst).after_count = src.after_count;
     (*dst).count = src.count;
+    (*dst).header_timeout_ms = src.header_timeout_ms;
 }
 
 // drain is the worker loop: accept bounded so the stop flag is noticed, serve
@@ -2298,10 +2378,25 @@ fn path_within_root(root: &String, full: &String) -> bool {
 // serve_dir_connection handles one static-file request. It intentionally uses
 // the same request-size and malformed-request rules as Router.serve.
 fn serve_dir_connection(c: &Conn, root: str) -> bool {
-    c.set_timeout(DEFAULT_TIMEOUT_MS);
-    let req = read_request(c);
-    if !req.valid() {
+    if !c.wait_readable(FIRST_BYTE_MS) {
         return false;
+    }
+    c.set_timeout(HEAD_TIMEOUT_MS);
+    let req = read_request(c);
+    if req.head_overflow {
+        let too_big = Response::empty(431);
+        send_response(c, &too_big);
+        c.drain(DRAIN_MS);
+        return true;
+    }
+    if !req.valid() {
+        if req.head_bytes == 0 {
+            return false;
+        }
+        let bad = Response::empty(400);
+        send_response(c, &bad);
+        c.drain(DRAIN_MS);
+        return true;
     }
     if req.body_too_large() {
         let too_large = Response::empty(413);
@@ -2316,6 +2411,9 @@ fn serve_dir_connection(c: &Conn, root: str) -> bool {
     let request_path = req.path_only();
     let res = serve_static(root, request_path.as_str());
     send_response(c, &res);
+    if req.chunked() {
+        c.drain(DRAIN_MS);
+    }
     return true;
 }
 

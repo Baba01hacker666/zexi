@@ -378,6 +378,36 @@ response are per-thread values, and the router is read-only once the pool
 starts. Anything shared between requests must be shared explicitly (an
 `Atomic` from `thread`, or a channel).
 
+### What a hostile client costs
+
+A worker pool bounds, but does not remove, the cost of a client that misbehaves,
+so every accepted connection carries deadlines:
+
+| Deadline | Default | What it stops |
+| --- | --- | --- |
+| first byte | 250 ms (`FIRST_BYTE_MS`) | a socket that connects and sends nothing |
+| request head | 1 s (`HEAD_TIMEOUT_MS`), `app.header_timeout(ms)` | a head sent a byte at a time |
+| body and I/O | 30 s (`DEFAULT_TIMEOUT_MS`) | a client that stalls mid-body or stops reading |
+
+| Bad input | Answer |
+| --- | --- |
+| head larger than 8 KiB without its blank line | `431 Request Header Fields Too Large` |
+| bytes but no parseable request line | `400 Bad Request` |
+| `Content-Length` above `MAX_BODY` | `413 Payload Too Large` |
+| chunked body that does not parse | the normal `404`/`400`, drained first so the reset cannot eat it |
+
+The last column matters for the same reason the timeouts do: closing a socket
+that still has unread bytes makes the kernel send RST, which can destroy the
+response the client has not read yet. The server drains before it closes.
+
+One limit remains honest: a client that sends *part* of a head occupies a worker
+until the head deadline expires. Twenty-four such clients against four workers
+delay a new request by roughly `24 / 4 × 1 s`. Raise `workers`, lower
+`header_timeout`, or put a real edge in front when that matters. A single
+thread-per-connection or event-loop server is the next step, and the pieces it
+needs (`poll_read`, `wait_readable`, per-connection buffers) are already in
+`net`.
+
 ## 8.8 UDP, name resolution, and readiness
 
 The same module covers the rest of a small server's needs.

@@ -3001,3 +3001,111 @@ func TestStandardLibraryNeedsNoCompilerC(t *testing.T) {
 		}
 	}
 }
+
+// TestServerRejectsBadRequests is the hostile-client test: a server must answer
+// a malformed, slow, or oversized request with a status line instead of holding
+// a worker forever, and it must keep serving normal traffic throughout.
+func TestServerRejectsBadRequests(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end network test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "server.zx")
+	program := `use web;
+use http;
+
+fn home(req: &Request) -> Response {
+    return Response::text(200, "ok");
+}
+
+fn main() -> i32 {
+    let mut app = web::new_app();
+    app.get("/", home);
+    app.workers(2);
+    app.header_timeout(700);
+    return app.serve_local(18090);
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "server")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(src, bin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build the hostile-client server")
+	}
+	var log bytes.Buffer
+	server := exec.Command(bin)
+	server.Stdout = &log
+	server.Stderr = &log
+	if err := server.Start(); err != nil {
+		t.Fatalf("starting server: %v", err)
+	}
+	defer func() { _ = server.Process.Kill() }()
+
+	// exchange sends payload and returns whatever the server wrote before it
+	// closed the connection, waiting at most `wait`.
+	exchange := func(payload []byte, wait time.Duration) string {
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:18090", 2*time.Second)
+		if err != nil {
+			return ""
+		}
+		defer conn.Close()
+		if len(payload) > 0 {
+			if _, err := conn.Write(payload); err != nil {
+				return ""
+			}
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(wait))
+		data, _ := io.ReadAll(conn)
+		return string(data)
+	}
+
+	// The server needs a moment to bind.
+	status := ""
+	for i := 0; i < 50 && status == ""; i++ {
+		status = exchange([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"), time.Second)
+		if status == "" {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	if !strings.Contains(status, "200 OK") {
+		t.Fatalf("server did not answer a valid request: %q (%s)", status, log.String())
+	}
+
+	cases := []struct {
+		name    string
+		payload []byte
+		want    string
+	}{
+		{"half-head", []byte("GET / HTT"), "400"},
+		{"no-terminator", []byte(strings.Repeat("A", 9000)), "431"},
+		{"empty-request-line", []byte("\r\n\r\n"), "400"},
+	}
+	for _, tc := range cases {
+		got := exchange(tc.payload, 5*time.Second)
+		if !strings.Contains(got, tc.want) {
+			t.Errorf("%s: expected a %s response, got %q", tc.name, tc.want, got)
+		}
+	}
+
+	// A connection that sends nothing must be dropped, not parked.
+	start := time.Now()
+	silent := exchange([]byte{}, 4*time.Second)
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("silent connection held for %v, expected it to be dropped quickly", elapsed)
+	}
+	if strings.Contains(silent, "200") {
+		t.Errorf("silent connection got a response: %q", silent)
+	}
+
+	// After all that, the server must still answer.
+	final := exchange([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"), 3*time.Second)
+	if !strings.Contains(final, "200 OK") {
+		t.Fatalf("server stopped serving after hostile input: %q (%s)", final, log.String())
+	}
+}

@@ -223,6 +223,23 @@ impl Conn {
         return zxn_set_timeout(self.fd, ms);
     }
 
+    // drain discards up to 64 KiB of already-sent request bytes, waiting at
+    // most `ms` for each read. Closing a socket with unread data makes the
+    // kernel send RST, which can destroy a response the peer has not read yet,
+    // so the server drains before it closes.
+    pub fn drain(&self, ms: i32) {
+        let mut buf: [u8; 8192] = [0; 8192];
+        let mut total: usize = 0;
+        self.set_timeout(ms);
+        while total < 65536 {
+            let n = zxn_recv(self.fd, &mut buf, 8192);
+            if n <= 0 {
+                break;
+            }
+            total = total + (n as usize);
+        }
+    }
+
     // write sends the whole string. Returns bytes sent, or -1 on error.
     pub fn write(&self, data: str) -> i64 {
         return zxn_send_all(self.fd, data, len(data) as i32) as i64;
@@ -960,15 +977,36 @@ int zxn_write_file(const char *path, const char *buf, int n) {
 int32_t zxn_read_head(int32_t fd, zx_arr8192_u8 *bp, int32_t cap) {
     char *buf = ZXN_BYTES(bp);
     int total = 0;
+    if (cap < 5) return 0;
     while (total < cap - 1) {
-        ssize_t r = recv(fd, buf + total, 1, 0);
-        if (r <= 0) {
-            if (r < 0 && errno == EINTR) continue;
+        int room = cap - 1 - total;
+        /* Peek first, then read exactly up to the blank line. A byte-at-a-time
+         * loop costs one syscall per header byte (a 600-byte head is 600
+         * syscalls) and a plain chunked read would swallow body bytes that the
+         * caller has no way to put back. */
+        ssize_t avail = recv(fd, buf + total, (size_t)room, MSG_PEEK);
+        if (avail < 0) {
+            if (errno == EINTR) continue;
+            break;                       /* timeout or error: keep what we have */
+        }
+        if (avail == 0) break;            /* peer closed */
+        int want = (int)avail;
+        int end = 0;
+        for (int i = 0; i + 3 < want; i++) {
+            if (buf[total + i] == '\r' && buf[total + i + 1] == '\n' &&
+                buf[total + i + 2] == '\r' && buf[total + i + 3] == '\n') {
+                end = i + 4;
+                break;
+            }
+        }
+        if (end > 0) want = end;
+        ssize_t got = recv(fd, buf + total, (size_t)want, 0);
+        if (got <= 0) {
+            if (got < 0 && errno == EINTR) continue;
             break;
         }
-        total++;
-        if (total >= 4 && memcmp(buf + total - 4, "\r\n\r\n", 4) == 0)
-            break;
+        total += (int)got;
+        if (end > 0 && got == want) break;
     }
     buf[total] = '\0';
     return total;
