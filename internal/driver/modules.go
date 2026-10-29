@@ -181,8 +181,6 @@ type loader struct {
 	firstID int
 
 	usesNet    bool // program imports net/http/fs (needs the shared C runtime)
-	usesSys    bool // program imports sys (needs the C shim)
-	usesRegex  bool // program imports regex (needs the POSIX ERE shim)
 	usesThread bool // program imports thread (needs the pthread shim and -pthread)
 	usesJSON   bool // program imports json (needs the number-conversion shim)
 	// loadingStd is set while a standard-library module (and its imports) are
@@ -294,10 +292,6 @@ func (l *loader) loadStdFile(name string) *module {
 	switch name {
 	case "net", "http", "fs":
 		l.usesNet = true
-	case "sys":
-		l.usesSys = true
-	case "regex":
-		l.usesRegex = true
 	case "thread":
 		l.usesThread = true
 	case "json":
@@ -487,10 +481,6 @@ func (l *loader) bindUse(m *module, d *ast.UseDecl) {
 	switch d.Path[len(d.Path)-1] {
 	case "net", "http", "fs":
 		l.usesNet = true
-	case "sys":
-		l.usesSys = true
-	case "regex":
-		l.usesRegex = true
 	case "thread":
 		l.usesThread = true
 	case "json":

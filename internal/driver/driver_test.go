@@ -66,6 +66,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/recursive.zx",
 		"../../tests/web_lib.zx",
 		"../../tests/closures.zx",
+		"../../tests/cinline.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -495,6 +496,12 @@ func TestRunPrograms(t *testing.T) {
 				"2 hi",
 				"12",
 				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/cinline.zx",
+			want: strings.Join([]string{
+				`raw "quoted" text`, "42", "3", "hello, zexi (42)", "",
 			}, "\n"),
 		},
 		{
@@ -2860,5 +2867,90 @@ func TestBuiltinTypeNamesAreReserved(t *testing.T) {
 				t.Fatalf("%s: expected E0428, got:\n%s", tc.name, buf.String())
 			}
 		})
+	}
+}
+
+// TestLibraryShipsItsOwnC covers the "extend the language from a library"
+// path: a module brings a `c """..."""` block and an `extern "C"` declaration,
+// and the program that imports it links and runs with no compiler change and no
+// extra C file on the command line.
+func TestLibraryShipsItsOwnC(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	files := map[string]string{
+		"lib/fastmath.zx": `// A library that brings its own C.
+pub extern "C" fn fm_cube(n: i64) -> i64;
+
+c """
+int64_t fm_cube(int64_t n) { return n * n * n; }
+"""
+`,
+		"main.zx": `use fastmath;
+
+fn main() -> i32 {
+    println(fastmath::fm_cube(3));
+    println(fastmath::fm_cube(-2));
+    0
+}
+`,
+	}
+	for name, src := range files {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	bin := filepath.Join(dir, "app")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(filepath.Join(dir, "main.zx"), bin, driver.Options{Root: dir}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build a program whose library ships C")
+	}
+	out, err := exec.Command(bin).CombinedOutput()
+	if err != nil {
+		t.Fatalf("running: %v\n%s", err, out)
+	}
+	if got, want := string(out), "27\n-8\n"; got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+// TestInlineCLinkLibs checks that `#[link("m")]` reaches the C compiler: the
+// program calls libm's `sqrt` without Options.LinkLibs being set by the caller.
+func TestInlineCLinkLibs(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	src := `#[link("m")]
+extern "C" fn sqrt(x: f64) -> f64;
+
+fn main() -> i32 {
+    println(sqrt(81.0));
+    0
+}
+`
+	entry := filepath.Join(dir, "main.zx")
+	if err := os.WriteFile(entry, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "app")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(entry, bin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build the libm program")
+	}
+	out, err := exec.Command(bin).CombinedOutput()
+	if err != nil {
+		t.Fatalf("running: %v\n%s", err, out)
+	}
+	if got, want := string(out), "9\n"; got != want {
+		t.Fatalf("output = %q, want %q", got, want)
 	}
 }

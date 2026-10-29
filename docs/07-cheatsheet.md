@@ -627,7 +627,36 @@ is the program name) and `arg_at(i)` returns argument `i` as a `String`
 (`""` when out of range) — see `examples/args.zx`. For a complete small
 program that ties it all together, see `examples/guess.zx`.
 
-## 7.16 Not implemented yet (roadmap M1+)
+## 7.16 Adding native code from a library
+
+<!-- check-only -->
+```zx
+#[link("m")]
+extern "C" fn sqrt(x: f64) -> f64;        // call into a system library
+
+#[no_mangle]
+fn zx_half(n: i64) -> i64 { return n / 2; }   // ... and let C call back
+
+extern "C" fn zx_quarter(n: i64) -> i64;
+
+c """
+int64_t zx_quarter(int64_t n) { return zx_half(n); }
+"""
+
+fn main() -> i32 {
+    println(sqrt(256.0));      // 16
+    println(zx_quarter(10));   // 5
+    0
+}
+```
+
+`c """..."""` compiles C with the program, in the same translation unit, so it
+can use `String`, the `Vec`/`HashMap` helpers, generated structs, and any
+`#[no_mangle]` function. That is how a library adds a syscall wrapper or a
+vendored helper without a compiler change: `sys` and `regex` ship their C this
+way. See [`17-extending.md`](17-extending.md).
+
+## 7.17 Not implemented yet (roadmap M1+)
 
 Traits (and trait bounds), `dyn Trait`, associated types, const generics,
 `Box`, user-defined `Drop`, closure environments are not freed yet, tuple values (tuple *structs* exist; `(a, b)` values

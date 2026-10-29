@@ -15,11 +15,13 @@ import (
 	"strings"
 	"sync"
 
+	"zexi/internal/ast"
 	zenc "zexi/internal/codegen/c"
 	"zexi/internal/diag"
 	"zexi/internal/lexer"
 	"zexi/internal/sema"
 	"zexi/internal/token"
+	"zexi/internal/types"
 )
 
 // Options controls a compilation.
@@ -80,6 +82,9 @@ type Artifacts struct {
 	// NeedsPthread is set when the program uses the `thread` module, so the
 	// C compiler is invoked with -pthread.
 	NeedsPthread bool
+	// LinkLibs are libraries the program itself asked for with
+	// `#[link("name")]`, in source order, appended to Options.LinkLibs.
+	LinkLibs []string
 }
 
 // FrontEnd runs lexing, parsing, type checking, and C generation. It returns
@@ -172,12 +177,6 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 	if l.usesNet {
 		art.CExtra = append(art.CExtra, string(netCSource))
 	}
-	if l.usesSys {
-		art.CExtra = append(art.CExtra, string(sysCSource))
-	}
-	if l.usesRegex {
-		art.CExtra = append(art.CExtra, string(regexCSource))
-	}
 	if l.usesThread {
 		art.CExtra = append(art.CExtra, string(threadCSource))
 		art.NeedsPthread = true
@@ -185,7 +184,79 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 	if l.usesJSON {
 		art.CExtra = append(art.CExtra, string(jsonCSource))
 	}
+
+	// Native code and libraries the program names in its own source. Appending
+	// the text to the generated translation unit (rather than compiling it as a
+	// separate file) means inline C can use the runtime helpers the generated
+	// code already defines: `zx_String`, the Vec/hash helpers, and anything a
+	// `#[no_mangle]` function exposes.
+	blocks, libs, pthread := collectNative(merged.Items)
+	if len(blocks) > 0 {
+		text := "\n// --- C source included from Zexi (`c r\"...\"` blocks) ---\n" + strings.Join(blocks, "\n")
+		if len(art.CUnits) > 1 {
+			art.CUnits[0] += text
+		} else {
+			art.CSrc += text
+		}
+	}
+	art.LinkLibs = libs
+	if pthread {
+		art.NeedsPthread = true
+	}
 	return art, true
+}
+
+// collectNative returns the `c r"..."` blocks, the libraries named by
+// `#[link("name")]`, and whether pthread was asked for. Both are declarations
+// in source, so a library can extend the program (a new syscall wrapper, a
+// vendored C helper, a system library) without the compiler knowing about it.
+func collectNative(items []ast.Item) (blocks, libs []string, pthread bool) {
+	seenLib := map[string]bool{}
+	seenBlock := map[string]bool{}
+	var links func(attrs []string)
+	links = func(attrs []string) {
+		for _, a := range attrs {
+			if types.AttrName(a) != "link" {
+				continue
+			}
+			name := strings.Trim(types.AttrArg(a), " \t\"'")
+			if name == "" {
+				continue
+			}
+			if name == "pthread" {
+				pthread = true
+				continue
+			}
+			if seenLib[name] {
+				continue
+			}
+			seenLib[name] = true
+			libs = append(libs, name)
+		}
+	}
+	for _, it := range items {
+		switch d := it.(type) {
+		case *ast.CBlock:
+			links(d.Attrs)
+			body := strings.TrimSpace(d.Body)
+			if body == "" || seenBlock[body] {
+				continue
+			}
+			seenBlock[body] = true
+			blocks = append(blocks, body)
+		case *ast.FnDecl:
+			links(d.Attrs)
+		case *ast.StructDecl:
+			links(d.Attrs)
+		case *ast.EnumDecl:
+			links(d.Attrs)
+		case *ast.ImplBlock:
+			for _, f := range d.Fns {
+				links(f.Attrs)
+			}
+		}
+	}
+	return blocks, libs, pthread
 }
 
 // splitJobs decides how many translation units to compile in parallel: one
@@ -228,17 +299,6 @@ var stdFS embed.FS
 //
 //go:embed zxnet_c.txt
 var netCSource []byte
-
-// sysCSource is the C shim for the `sys` module (environment, local paths,
-// clocks, and process helpers), embedded like the networking runtime.
-//
-//go:embed zxsys_c.txt
-var sysCSource []byte
-
-// regexCSource is the opt-in POSIX ERE bridge for the `regex` module.
-//
-//go:embed zxregex_c.txt
-var regexCSource []byte
 
 // threadCSource is the opt-in pthread bridge for the `thread` module (threads,
 // i64 channels, and i64 atomics). Programs that import `thread` also link with
@@ -305,6 +365,9 @@ func BuildFiles(paths []string, outPath string, opts Options, em *diag.Emitter) 
 	}
 	if art.NeedsPthread {
 		opts.Pthreads = true
+	}
+	if len(art.LinkLibs) > 0 {
+		opts.LinkLibs = append(opts.LinkLibs, art.LinkLibs...)
 	}
 	if len(art.CUnits) > 1 {
 		if err := CompileUnits(art.CHeader, art.CUnits, outPath, opts); err != nil {

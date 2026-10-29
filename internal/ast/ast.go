@@ -175,6 +175,26 @@ type UseDecl struct {
 func (*UseDecl) itemNode()          {}
 func (d *UseDecl) Span() token.Span { return d.Sp }
 
+// CBlock is `c r"..."`: raw C source compiled with the program. It is the
+// escape hatch that lets a library add a native helper without the compiler
+// knowing anything about it, so extending the language rarely means editing
+// the compiler (or writing a shim file the driver has to embed).
+//
+//	#[link("m")]
+//	c r"
+//	static double zx_half(double x) { return x / 2.0; }
+//	"
+type CBlock struct {
+	// Attrs holds `#[...]` attributes; `#[link("name")]` adds `-lname`.
+	Attrs []string
+	// Body is the C source exactly as written inside the raw string.
+	Body string
+	Sp   token.Span
+}
+
+func (*CBlock) itemNode()          {}
+func (d *CBlock) Span() token.Span { return d.Sp }
+
 // ImplBlock is `impl Type { .. }` or `impl Trait for Type { .. }`.
 type ImplBlock struct {
 	Generics []GenericParam

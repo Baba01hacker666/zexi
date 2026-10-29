@@ -160,10 +160,37 @@ func (p *parser) parseItem() ast.Item {
 		return p.parseMod(vis, start)
 	case token.KindUse:
 		return p.parseUse(start, vis)
+	case token.KindIdentifier:
+		// `c r"..."` / `c_source r"..."` is raw C compiled with the program.
+		if p.cur().Lit == "c" || p.cur().Lit == "c_source" {
+			return p.parseCBlock(attrs, start)
+		}
+		fallthrough
 	default:
-		p.errf(p.cur(), "E0202", "expected an item (fn, struct, enum, const, type, impl, mod, use, import), found %s", p.cur().Kind)
+		p.errf(p.cur(), "E0202", "expected an item (fn, struct, enum, const, type, impl, mod, use, import, c), found %s", p.cur().Kind)
 		return nil
 	}
+}
+
+// parseCBlock parses `c r"..."`: a raw string holding C source that is compiled
+// together with the generated code. The body is taken verbatim, so it can hold
+// preprocessor directives, string literals, and braces without escaping; a
+// plain string is rejected because every backslash in it would need doubling.
+func (p *parser) parseCBlock(attrs []string, start token.Pos) ast.Item {
+	word := p.bump().Lit // `c` or `c_source`
+	if !p.at(token.KindRawString) {
+		if p.at(token.KindString) {
+			p.errf(p.cur(), "E0202", "write C source in a raw string (`%s r\"...\"`), so backslashes and quotes stay as written", word)
+			p.bump()
+			p.accept(token.KindSemicolon)
+			return nil
+		}
+		p.errf(p.cur(), "E0202", "expected a raw string of C source after `%s`, as in `%s r\"...\"`", word, word)
+		return nil
+	}
+	body := p.bump().Lit
+	p.accept(token.KindSemicolon)
+	return &ast.CBlock{Attrs: attrs, Body: body, Sp: p.spanFrom(start)}
 }
 
 // parseAttributes consumes `#[...]` attribute lists and returns one string per

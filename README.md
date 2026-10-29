@@ -89,6 +89,13 @@ This repository contains the **initial design and specification** of Zexi: the v
 > from the function that made it, and is what `Vec::each/count/any/all/fold`
 > take. See [`docs/15-closures.md`](docs/15-closures.md).
 >
+> **Self-extension:** adding a capability is a library change, not a compiler
+> change. `extern "C" fn sqrt(x: f64) -> f64;` with `#[link("m")]` calls a system
+> library, `c """ ... """` compiles C with the program (in the same translation
+> unit, so it sees `String`, the `Vec` helpers, and `#[no_mangle]` functions), and
+> `#[no_mangle]` lets C call back. `sys` and `regex` carry their own C this way.
+> See [`docs/17-extending.md`](docs/17-extending.md).
+>
 > Embedded `math`, `text`,
 > `io`, `fs`, `os`, `regex`, `fmt`, `codec`, and `thread` also provide dependency-free
 > arithmetic, roots/logs/trigonometry/geometry, number theory, familiar string
@@ -189,6 +196,7 @@ go run ./cmd/zexic run tests/json_lib.zx  # parse, build, and print JSON
 go run ./cmd/zexic run tests/html_lib.zx  # escaping, widgets, and templates
 go run ./cmd/zexic run tests/net_local.zx # loopback TCP/UDP, resolve, poll
 go run ./cmd/zexic run tests/recursive.zx # trees through Vec and HashMap
+go run ./cmd/zexic run tests/cinline.zx     # inline C, #[link], and #[no_mangle]
 go run ./cmd/zexic run tests/formatting.zx # bases, grouping, units, alignment
 go run ./cmd/zexic run tests/encoding.zx   # hex, base64, and checksums
 go run ./cmd/zexic run tests/easy.zx      # the easy way: no semicolons, f-strings, defaults, libraries

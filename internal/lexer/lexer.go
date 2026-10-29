@@ -66,6 +66,8 @@ func (l *Lexer) Next() token.Token {
 		return l.scanIdent(startPos, startOff)
 	case isDigit(c):
 		return l.scanNumber(startPos, startOff)
+	case c == '"' && l.peekAt(1) == '"' && l.peekAt(2) == '"':
+		return l.scanTripleString(startPos, startOff)
 	case c == '"':
 		return l.scanString(startPos, startOff)
 	case c == '\'':
@@ -264,6 +266,31 @@ func (l *Lexer) scanString(startPos token.Position, startOff int) token.Token {
 	// Lit is the inner text (quotes excluded); escapes are decoded downstream.
 	inner := l.innerLit(startOff)
 	return l.tok(token.KindString, inner, startPos)
+}
+
+// scanTripleString scans `""" ... """`, a raw string that may contain quotes,
+// newlines, and backslashes without escaping — which is what a block of C (or
+// HTML, or SQL) usually needs. Its value is a `str`, like `r"..."`, so nothing
+// downstream has to know where it came from.
+func (l *Lexer) scanTripleString(startPos token.Position, startOff int) token.Token {
+	start := l.off + 3
+	l.advance()
+	l.advance()
+	l.advance()
+	for {
+		if l.atEnd() {
+			l.errorf("E0001", startPos, "unterminated `\"\"\"` string")
+			return l.tok(token.KindRawString, l.safeSlice(start, l.off), startPos)
+		}
+		if l.peek() == '"' && l.peekAt(1) == '"' && l.peekAt(2) == '"' {
+			content := l.safeSlice(start, l.off)
+			l.advance()
+			l.advance()
+			l.advance()
+			return l.tok(token.KindRawString, content, startPos)
+		}
+		l.advance()
+	}
 }
 
 // scanFString scans an interpolated string `f"..."`. The literal keeps its

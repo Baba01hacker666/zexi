@@ -195,3 +195,37 @@ func TestHashCommentAndFStringTokens(t *testing.T) {
 		t.Fatal("expected a Hash token for #[copy]")
 	}
 }
+
+func TestTripleStringIsRaw(t *testing.T) {
+	// `"""` may hold quotes, backslashes, and newlines without escaping.
+	src := "let s = \"\"\"a \"quoted\" \\n b\"\"\";\nlet t = 1;\n"
+	lx := lexer.New(0, 0, []byte(src))
+	toks := lx.All()
+	if errs := lx.Errors(); len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	want := []token.Kind{
+		token.KindLet, token.KindIdentifier, token.KindEq, token.KindRawString,
+		token.KindSemicolon, token.KindLet, token.KindIdentifier, token.KindEq,
+		token.KindInteger, token.KindSemicolon, token.KindEOF,
+	}
+	if len(toks) != len(want) {
+		t.Fatalf("got %d tokens, want %d", len(toks), len(want))
+	}
+	for i := range want {
+		if toks[i].Kind != want[i] {
+			t.Fatalf("token %d = %v, want %v", i, toks[i].Kind, want[i])
+		}
+	}
+	if got, wantText := toks[3].Lit, "a \"quoted\" \\n b"; got != wantText {
+		t.Fatalf("triple string content = %q, want %q", got, wantText)
+	}
+}
+
+func TestUnterminatedTripleString(t *testing.T) {
+	lx := lexer.New(0, 0, []byte("let s = \"\"\"never closed\n"))
+	_ = lx.All()
+	if len(lx.Errors()) == 0 {
+		t.Fatal("expected an unterminated-string diagnostic")
+	}
+}

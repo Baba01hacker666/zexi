@@ -168,3 +168,131 @@ pub fn rename_path(from: str, to: str) -> i32 {
 pub fn cpu_count() -> i32 {
     return zxs_cpu_count();
 }
+
+// The POSIX side of this module travels with it: a library can carry its own C,
+// so adding a syscall wrapper is an edit here rather than a new file for the
+// compiler to embed. These are process-local libc/POSIX helpers.
+c """
+/* zxsys.c — tiny POSIX helpers for Zexi's `sys` module.
+ *
+ * Linked only when a program selects sys/os/time (or random, which uses the
+ * clock). These are process-local libc/POSIX helpers; no external runtime is
+ * required.
+ */
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+/* Copy a C string into a caller-owned buffer, always NUL-terminating it.
+ * Returns the copied byte length, or -1 for invalid arguments. */
+static int zxs_copy_string(const char *src, char *buf, int cap) {
+    if (!src || !buf || cap <= 0) return -1;
+    size_t n = strlen(src);
+    if (n >= (size_t)cap) n = (size_t)cap - 1;
+    memcpy(buf, src, n);
+    buf[n] = 0;
+    return (int)n;
+}
+
+/* A `&mut [u8; 4096]` parameter arrives as a pointer to the array's wrapper
+ * struct; `->e` is the bytes. */ 
+#define ZXS_BYTES(buf) ((char *)((buf)->e))
+
+/* zxs_env_get copies an environment variable into buf, returning its length,
+ * or -1 when the variable is unset. */
+int32_t zxs_env_get(const char *name, struct zx_arr4096_u8 *buf, int32_t cap) {
+    if (!name) return -1;
+    return zxs_copy_string(getenv(name), ZXS_BYTES(buf), cap);
+}
+
+int zxs_env_has(const char *name) {
+    return name && getenv(name) ? 1 : 0;
+}
+
+int zxs_env_set(const char *name, const char *value, int overwrite) {
+    if (!name || !value) return -1;
+    return setenv(name, value, overwrite ? 1 : 0);
+}
+
+int zxs_env_unset(const char *name) {
+    if (!name) return -1;
+    return unsetenv(name);
+}
+
+/* zxs_time_ms is wall-clock milliseconds since the Unix epoch. */
+int64_t zxs_time_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return -1;
+    return (int64_t)ts.tv_sec * 1000LL + (int64_t)(ts.tv_nsec / 1000000);
+}
+
+/* zxs_mono_ms is a monotonic millisecond clock, for measuring intervals. */
+int64_t zxs_mono_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return -1;
+    return (int64_t)ts.tv_sec * 1000LL + (int64_t)(ts.tv_nsec / 1000000);
+}
+
+/* zxs_sleep_ms pauses for at least ms milliseconds, retrying on EINTR. */
+void zxs_sleep_ms(int64_t ms) {
+    if (ms <= 0) return;
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ms / 1000);
+    ts.tv_nsec = (long)((ms % 1000) * 1000000LL);
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) { /* retry remaining */ }
+}
+
+/* zxs_pid is the current process id. */
+int zxs_pid(void) { return (int)getpid(); }
+
+int32_t zxs_cwd(struct zx_arr4096_u8 *buf, int32_t cap) {
+    if (!buf || cap <= 1) return -1;
+    if (!getcwd(ZXS_BYTES(buf), (size_t)cap)) return -1;
+    return (int)strlen(ZXS_BYTES(buf));
+}
+
+int32_t zxs_hostname(struct zx_arr4096_u8 *buf, int32_t cap) {
+    if (!buf || cap <= 1) return -1;
+    if (gethostname(ZXS_BYTES(buf), (size_t)cap) != 0) return -1;
+    /* POSIX permits a non-terminated result when it exactly fills the buffer. */
+    ZXS_BYTES(buf)[cap - 1] = 0;
+    return (int)strlen(ZXS_BYTES(buf));
+}
+
+int zxs_chdir(const char *path) {
+    return path ? chdir(path) : -1;
+}
+
+/* zxs_mkdir creates a single directory level and treats an existing directory
+ * as success. It deliberately does not emulate recursive mkdir -p. */
+int zxs_mkdir(const char *path) {
+    if (!path) return -1;
+    if (mkdir(path, 0777) == 0) return 0;
+    if (errno == EEXIST) {
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) return 0;
+    }
+    return -1;
+}
+
+int zxs_remove_path(const char *path) {
+    return path ? remove(path) : -1;
+}
+
+int zxs_rename_path(const char *from, const char *to) {
+    return from && to ? rename(from, to) : -1;
+}
+
+int zxs_cpu_count(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n <= 0) return 1;
+    if (n > INT_MAX) return INT_MAX;
+    return (int)n;
+}
+"""

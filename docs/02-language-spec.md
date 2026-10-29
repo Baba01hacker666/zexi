@@ -33,6 +33,7 @@ program namespace.
 | String (UTF-8, immutable) | `"hi\n"`, `"élan"` |
 | Interpolated string (`String`) | `f"hi {name}, {n + 1} pts"` (`{{`/`}}` are literal braces) |
 | Raw string (no escapes) | `r"C:\path"`, `r#"say "hi""#`, `r##"a #" b"##` |
+| Triple-quoted raw string | `"""a "quoted" line\nand a second one"""` — the spelling to use for C, HTML, or SQL |
 | Boolean | `true`, `false` |
 | Unit/void | `()` |
 
@@ -463,12 +464,23 @@ import/module is E9022/E9023.
 
 Files may also be passed directly on the command line, as before.
 
-## 2.9 Attributes (M1/M2)
+## 2.9 Attributes and native code
 
 `#[...]` annotate items: `#[repr(C)]`, `#[inline]`, `#[inline(never)]`,
 `#[no_mangle]`, `#[cold]`, `#[packed]`, `#[export]`, `#[deprecated]`,
-`#[align(N)]`. Attributes are declarations to the compiler, not user-extensible
-macros.
+`#[align(N)]`, `#[link("name")]`. Attributes are declarations to the compiler,
+not user-extensible macros.
+
+Two items let a module reach outside the language:
+
+- `extern "C" fn name(..) -> T;` declares a C function to call.
+- `c """ ... """` compiles a block of C with the program. The block is appended to
+  the generated translation unit, so it can use the runtime types and call
+  `#[no_mangle]` functions.
+
+`#[link("m")]` on either item adds `-lname` to the link step (`"pthread"` also
+adds `-pthread`). Together they are how a library adds native code without a
+change to the compiler — see [`17-extending.md`](17-extending.md).
 
 ## 2.10 Standard library scope (M0)
 
