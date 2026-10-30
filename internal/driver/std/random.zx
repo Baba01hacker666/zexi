@@ -38,12 +38,20 @@ impl Rng {
     }
 
     // int returns a random integer in [lo, hi], inclusive (hi <= lo -> lo).
+    // Rejection sampling removes the modulo bias that a plain `% span` would
+    // introduce when the range does not divide 2^64.
     pub fn int(&mut self, lo: i64, hi: i64) -> i64 {
         if hi <= lo {
             return lo;
         }
         let span = (hi - lo + 1) as u64;
-        return lo + (self.next_u64() % span) as i64;
+        let max: u64 = (0 as u64) - 1;
+        let limit = (max / span) * span;
+        let mut r = self.next_u64();
+        while r >= limit {
+            r = self.next_u64();
+        }
+        return lo + (r % span) as i64;
     }
 
     // float returns a random float in [0.0, 1.0).
@@ -77,10 +85,19 @@ pub fn seed_from_time() {
     srand(time(&mut slot) as u32);
 }
 
-// rand_int returns a random integer in [lo, hi], inclusive on both ends.
+// rand_int returns a random integer in [lo, hi], inclusive on both ends. It uses
+// rejection sampling over rand()'s [0, 2^31) output to avoid modulo bias.
 pub fn rand_int(lo: i64, hi: i64) -> i64 {
     if hi <= lo { return lo; }
-    lo + (rand() as i64) % (hi - lo + 1)
+    let span = (hi - lo + 1) as u64;
+    let limit: u64 = ((2147483648 as u64) / span) * span;
+    loop {
+        let r = rand() as u64;
+        if r < limit {
+            return lo + (r % span) as i64;
+        }
+    }
+    return lo;
 }
 
 // rand_bool returns true or false with roughly even odds.
@@ -88,7 +105,9 @@ pub fn rand_bool() -> bool {
     rand() % 2 == 0
 }
 
-// rand_float returns a random float in [0.0, 1.0].
+// rand_float returns a random float in [0.0, 1.0). Dividing by 2^31 keeps the
+// result strictly below 1.0 even when rand() returns its maximum value, matching
+// Rng::float.
 pub fn rand_float() -> f64 {
-    (rand() as f64) / 2147483647.0
+    (rand() as f64) / 2147483648.0
 }

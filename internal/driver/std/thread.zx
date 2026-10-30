@@ -418,6 +418,8 @@ impl Pool {
 // file, so `use thread;` links it (and `-pthread`) with no driver-side list.
 #[link("pthread")]
 c """
+#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
 #include <pthread.h>
 #include <stdint.h>
 #include <stdatomic.h>

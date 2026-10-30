@@ -19,6 +19,11 @@ pub fn clampi(x: i64, lo: i64, hi: i64) -> i64 {
 }
 
 pub fn absi(x: i64) -> i64 {
+    // i64::MIN has no representable positive counterpart, so saturate instead
+    // of overflowing back to a negative value.
+    if x == -9223372036854775808 {
+        return 9223372036854775807;
+    }
     if x < 0 { -x } else { x }
 }
 

@@ -85,6 +85,24 @@ pub fn write(path: str, data: &[u8]) -> Result<usize, IoError> {
     }
 }
 
+// append writes every byte in `data` to the end of `path`, creating the file
+// when it does not exist, and returns the count.
+pub fn append(path: str, data: &[u8]) -> Result<usize, IoError> {
+    if data.len() > MAX_BYTES {
+        return Err(IoError::TooLarge);
+    }
+    let fd = sys::open_append(path)?;
+    match sys::write_fd(fd, data) {
+        Ok(n) => {
+            sys::close_fd(fd)?;
+            return Ok(n);
+        }
+        Err(e) => {
+            let closed = sys::close_fd(fd);
+            return Err(e);
+        }
+    }
+}
 // copy copies a regular file, streaming through a fixed buffer, and returns the
 // bytes written.
 pub fn copy(from: str, to: str) -> Result<u64, IoError> {
@@ -132,6 +150,74 @@ pub fn copy(from: str, to: str) -> Result<u64, IoError> {
 // remove removes a regular file or an empty directory. It never recurses.
 pub fn remove(path: str) -> Result<(), IoError> {
     return sys::remove_path_status(path);
+}
+
+// list_dir returns the names of the entries in `path` (excluding "." and "..").
+pub fn list_dir(path: str) -> Result<Vec<String>, IoError> {
+    let d = sys::open_dir(path);
+    if d < 0 {
+        return Err(sys::error_of(sys::errno()));
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut buf: [u8; 4096] = [0; 4096];
+    loop {
+        let n = sys::read_dir(d, &mut buf);
+        if n < 0 {
+            let e = sys::errno();
+            let closed = sys::close_dir(d);
+            return Err(sys::error_of(e));
+        }
+        if n == 0 {
+            break;
+        }
+        let mut name = String::with_capacity(n as usize);
+        name.push_bytes(buf[0..n as usize]);
+        out.push(name);
+    }
+    let closed = sys::close_dir(d);
+    return Ok(out);
+}
+
+// create_dir creates one directory level, treating an already-existing directory
+// as success. It does not create missing parents.
+pub fn create_dir(path: str) -> Result<(), IoError> {
+    if sys::mkdir(path) == 0 {
+        return Ok(());
+    }
+    return Err(sys::error_of(sys::errno()));
+}
+
+// create_dir_all creates `path` and any missing parents. It treats an existing
+// directory at any level as success.
+pub fn create_dir_all(path: str) -> Result<(), IoError> {
+    let mut cur = String::from(path);
+    // Drop trailing slashes (but keep the root "/" itself).
+    while cur.len() > 1 && cur.byte_at(cur.len() - 1) == 47 {
+        cur = cur.substr(0, cur.len() - 1);
+    }
+    if cur.len() == 0 {
+        return Ok(());
+    }
+    let bytes = cur.as_bytes();
+    let mut prefix = String::new();
+    let mut i: usize = 0;
+    if bytes.len() > 0 && bytes[0] == 47 {
+        prefix.push_byte(47);
+        i = 1;
+    }
+    while i < bytes.len() {
+        prefix.push_byte(bytes[i]);
+        if bytes[i] == 47 || i == bytes.len() - 1 {
+            // Skip empty components (e.g. a double slash) and the root itself.
+            if prefix.len() > 1 || (prefix.len() == 1 && prefix.byte_at(0) != 47) {
+                if !(prefix.len() == 1 && prefix.byte_at(0) == 47) {
+                    create_dir(prefix.as_str())?;
+                }
+            }
+        }
+        i += 1;
+    }
+    return Ok(());
 }
 
 // metadata reports a path's size and kind.

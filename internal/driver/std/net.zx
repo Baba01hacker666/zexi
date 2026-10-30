@@ -547,6 +547,10 @@ impl Udp {
 // this file, so `use net;` (directly, or through `http`/`fs`/`web`) links it
 // with no driver-side list to keep in sync.
 c """
+/* Feature-test macros are ineffective this late in the translation unit, so the
+ * one POSIX symbol we need that glibc/musl hide under -std=c17 is declared
+ * explicitly. */
+extern char *realpath(const char *, char *);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

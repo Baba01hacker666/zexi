@@ -76,6 +76,8 @@ pub fn replace_first(pattern: str, text: str, replacement: str) -> String {
 // The POSIX ERE bridge travels with the module: `regex` is a thin Zexi wrapper
 // around the system matcher, and the C it needs is right here.
 c """
+#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
 /* zxregex.c — small POSIX ERE bridge for Zexi's opt-in regex module.
  *
  * This deliberately uses the system POSIX regex implementation instead of

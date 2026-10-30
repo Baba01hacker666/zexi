@@ -374,3 +374,59 @@ pub fn is_blank(s: str) -> bool {
     }
     return true;
 }
+
+// trim is the familiar alias for strip (whitespace from both ends).
+pub fn trim(s: str) -> String {
+    return strip(s);
+}
+
+// split breaks s into the pieces separated by `sep`. An empty input yields a
+// single empty piece, and a trailing separator yields a trailing empty piece,
+// matching the usual "a,b,".split(",") -> ["a", "b", ""] behaviour. An empty
+// separator is treated as "no split" and returns the whole string as one piece.
+pub fn split(s: str, sep: str) -> Vec<String> {
+    let hay = s.as_bytes();
+    let needle = sep.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    if needle.len() == 0 {
+        out.push(String::from(s));
+        return out;
+    }
+    let mut pos: usize = 0;
+    let mut done = false;
+    while !done {
+        let at = find_bytes(hay, needle, pos);
+        if at < 0 {
+            let mut part = String::new();
+            part.push_bytes(hay[pos..hay.len()]);
+            out.push(part);
+            done = true;
+        } else {
+            let start = at as usize;
+            let mut part = String::new();
+            part.push_bytes(hay[pos..start]);
+            out.push(part);
+            pos = start + needle.len();
+        }
+    }
+    return out;
+}
+
+// join concatenates the pieces with `sep` between them.
+pub fn join(items: &Vec<String>, sep: str) -> String {
+    let mut out = String::new();
+    let mut i: usize = 0;
+    while i < items.len() {
+        if i > 0 {
+            out.push_str(sep);
+        }
+        out.push_str(items[i].as_str());
+        i += 1;
+    }
+    return out;
+}
+
+// lines splits s on '\n', keeping a possible trailing empty piece.
+pub fn lines(s: str) -> Vec<String> {
+    return split(s, "\n");
+}

@@ -229,9 +229,9 @@ fail.
 
 | module | functions |
 | --- | --- |
-| `sys` | `errno`, `error_string(code)`, `error_of(code)`, `message(e)`, `read_fd`, `write_fd`, `open_read`, `open_write`, `close_fd`, `file_size`, `path_kind`, `write_str_fd`, `remove_path_status`, `env_get`, `env_has`, `env_or`, `env_set`, `env_unset`, `time_ms`, `time_s`, `mono_ms`, `sleep_ms`, `pid`, `millis_since`, `cwd`, `hostname`, `home_dir`, `temp_dir`, `chdir`, `mkdir`, `remove_path`, `rename_path`, `cpu_count` |
+| `sys` | `errno`, `error_string(code)`, `error_of(code)`, `message(e)`, `read_fd`, `write_fd`, `open_read`, `open_write`, `open_append`, `close_fd`, `file_size`, `path_kind`, `write_str_fd`, `remove_path_status`, `env_get`, `env_has`, `env_or`, `env_set`, `env_unset`, `time_ms`, `time_s`, `mono_ms`, `sleep_ms`, `pid`, `millis_since`, `cwd`, `hostname`, `home_dir`, `temp_dir`, `chdir`, `mkdir`, `remove_path`, `rename_path`, `cpu_count` |
 | `io` | `read_byte`, `read_line`, `read_line_into`, `read_all`, `write(&[u8])`, `write_err(&[u8])`, `eprint`, `eprintln`, `input(prompt = "")` |
-| `fs` | `exists`, `file_len`, `read`, `write(path, &[u8])`, `copy`, `remove`, `metadata`, `MAX_BYTES` |
+| `fs` | `exists`, `file_len`, `read`, `write(path, &[u8])`, `append`, `copy`, `remove`, `create_dir`, `create_dir_all`, `metadata`, `MAX_BYTES` |
 
 `IoError` is `Eof`, `Interrupted`, `NotFound`, `Permission`, `IsDir`,
 `TooLarge`, or `Other(errno)`. `sys` also exports the errno constants `EINTR`,
@@ -267,7 +267,7 @@ fn main() {
 | module | functions |
 | --- | --- |
 | `fmt` | `hex(n, upper)`, `radix(n, base)`, `hex_pad`, `thousands`, `thousands_sep`, `fixed`, `sci`, `percent`, `bytes`, `duration`, `ordinal`, `pad_left/right/center(s, width, fill = ' ')`; the earlier names (`hex_lower`, `hex_upper`, `bin_str`, `oct_str`, `radix_str`, `fixed_point`, `sci_notation`, `percent_str`, `byte_size`, `duration_ms`, `align_left/right/center`) remain as aliases |
-| `text` | `to_upper`, `to_lower`, `trim_start/end/strip`, `replace_all`, `replace`, `index_of`, `last_index_of`, `count_occurrences`, `contains`, `starts_with`, `ends_with`, `pad_start`, `pad_end`, `slice_text`, `compare`, `repeat_text`, `join_with`, `is_blank`, `is_digits_only`, `is_digit/alpha/alnum/space`, `format_bool`, plus the borrowed search primitives `find_bytes(&[u8], &[u8], from)` and `match_at` |
+| `text` | `to_upper`, `to_lower`, `trim_start/end/strip/trim`, `replace_all`, `replace`, `index_of`, `last_index_of`, `count_occurrences`, `contains`, `starts_with`, `ends_with`, `pad_start`, `pad_end`, `slice_text`, `compare`, `repeat_text`, `join_with`, `join`, `split`, `lines`, `is_blank`, `is_digits_only`, `is_digit/alpha/alnum/space`, `format_bool`, plus the borrowed search primitives `find_bytes(&[u8], &[u8], from)` and `match_at` |
 | `codec` | `hex_encode`, `hex_encode_upper`, `hex_decode`, `base64_encode`, `base64_encode_url`, `base64_decode`, `crc32`, `adler32`, `fnv1a32`, `fnv1a64`, `djb2` (each with a `_hex` form where useful); every encoder and checksum also has a `_bytes(&[u8])` form, and `hex_decode_bytes`/`base64_decode_bytes` return `Result<String, String>` instead of `""` on bad input |
 | `math` | `min(max, clamp, abs, sign, gcd, lcm, pow, sqrt, isqrt, log2_floor, popcount, trailing_zeros, leading_zeros, is_pow2, div_floor, mod_floor, div_ceil, sin, cos, tan, hypot, lerp, inverse_lerp, remap, approx_eq, floor, ceil, round, trunc, mean2)` — integer forms take an `i`/`_i` suffix or plain names (`mini`/`min_i`), float forms are unprefixed |
 | `random` | `seed_random`, `seed_from_time`, `rand_int(lo, hi)`, `rand_bool`, `rand_float`, `Rng::new` |
