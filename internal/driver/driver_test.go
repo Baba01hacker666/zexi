@@ -73,6 +73,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/std_bytes.zx",
 		"../../tests/fstring_nested.zx",
 		"../../tests/prelude_methods.zx",
+		"../../tests/c_body.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -546,6 +547,23 @@ func TestRunPrograms(t *testing.T) {
 				"brace {literal} and 3",
 				"char } inside a hole",
 				"doubly nested deep 3",
+				"",
+			}, "\n"),
+		},
+		{
+			// Function bodies written in C see the Zexi ABI types directly.
+			file: "../../tests/c_body.zx",
+			want: strings.Join([]string{
+				"55",
+				"2880067194370816120",
+				"32",
+				"42", // bump() through &mut i64
+				"42",
+				"a d 0",     // fill() through &mut [u8]
+				"122", "-1", // str is `const char *`
+				"4 8", // a generic body sees the instantiated type
+				"25",  // &self is a pointer to the struct
+				"30",  // C body calling a #[no_mangle] fn
 				"",
 			}, "\n"),
 		},
@@ -1528,7 +1546,7 @@ func TestParallelCUnitsMatchSingleFile(t *testing.T) {
 		t.Skip("no C compiler available")
 	}
 
-	for _, file := range []string{"../../tests/pi.zx", "../../tests/strings.zx", "../../tests/threads.zx"} {
+	for _, file := range []string{"../../tests/pi.zx", "../../tests/strings.zx", "../../tests/threads.zx", "../../tests/c_body.zx"} {
 		t.Run(filepath.Base(file), func(t *testing.T) {
 			dir := t.TempDir()
 			outputs := make([][]byte, 2)
@@ -3250,5 +3268,57 @@ func TestPanicReportsMessageAndExitCode(t *testing.T) {
 	wantMsg := "zexi panic: division by zero: 1\n"
 	if got := stderr.String(); got != wantMsg {
 		t.Fatalf("stderr = %q, want %q", got, wantMsg)
+	}
+}
+
+// TestCBodyIsEmittedVerbatim checks the shape of the generated C for a function
+// whose body is written in C: the parameters keep their source names, the
+// function stays `static` (so one translation unit can inline it into callers),
+// and the body text appears exactly as written.
+func TestCBodyIsEmittedVerbatim(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "prog.zx")
+	prog := `fn dot(a: &[f32], b: &[f32]) -> f32 {
+    c """
+        float sum = 0.0f;
+        for (size_t i = 0; i < a.len; i++) sum += a.ptr[i] * b.ptr[i];
+        return sum;
+    """
+}
+
+fn main() {
+    let a: [f32; 2] = [1.0, 2.0];
+    println(dot(&a, &a));
+}
+`
+	if err := os.WriteFile(src, []byte(prog), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	em := diag.NewEmitter()
+	art, ok := driver.FrontEndFiles([]string{src}, driver.Options{}, em)
+	if !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("front end reported errors")
+	}
+	csrc := art.CSrc
+	for _, want := range []string{
+		// Signature: `static` linkage and unmangled parameter names.
+		"static float zx_dot(zx_slice_f32 a, zx_slice_f32 b)",
+		// The body, verbatim.
+		"for (size_t i = 0; i < a.len; i++) sum += a.ptr[i] * b.ptr[i];",
+	} {
+		if !strings.Contains(csrc, want) {
+			t.Errorf("generated C is missing %q", want)
+		}
+	}
+	if got := strings.Count(csrc, "return sum;"); got != 1 {
+		t.Errorf("the body appears %d times, want exactly once", got)
+	}
+	for _, line := range strings.Split(csrc, "\n") {
+		if strings.Contains(line, "/* c body */") && strings.Contains(line, "zx_dot(") {
+			if strings.Contains(line, "zx_a") || strings.Contains(line, "zx_b") {
+				t.Errorf("parameters were mangled in %q; a C body refers to them by their source names", line)
+			}
+		}
 	}
 }

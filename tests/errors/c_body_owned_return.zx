@@ -1,0 +1,13 @@
+// Same rule on the way out: a C body may not hand back an owning value it cannot
+// construct with correct drop glue.
+
+// error: E0540 a `c` body cannot return `String`
+fn make_text() -> String {
+    c """
+        return 0;
+    """
+}
+
+fn main() {
+    println(make_text());
+}

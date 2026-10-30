@@ -1,0 +1,8 @@
+// `main` cannot be written in C: the runtime fills in the argument list there.
+
+// error: E0540 `main` cannot have a `c` body
+fn main() -> i32 {
+    c """
+        return 0;
+    """
+}

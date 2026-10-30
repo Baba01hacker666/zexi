@@ -1,0 +1,13 @@
+// A `c` body is the whole body of a function, never a sub-expression.
+
+// error: E0540 a `c` body must be the entire body of a function
+fn mixed() -> i32 {
+    let n = 1;
+    c """
+        return n;
+    """
+}
+
+fn main() {
+    println(mixed());
+}

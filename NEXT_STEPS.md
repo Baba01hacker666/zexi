@@ -20,6 +20,12 @@ forward most. Ordered by value per unit of risk, not by ambition.
   consume their receiver (`E0382` on a second `unwrap`) and the tag tests only
   read it. `panic(msg)` is the `never`-typed counterpart they need. There is no
   `impl` block to write, so nothing in the prelude enums can drift.
+- **A function body can be written in C.** `c """..."""` in body position
+  compiles that body inside the program's one translation unit: parameters keep
+  their source names and their Zexi C types, the C compiler checks them against
+  the generated typedefs, and it inlines across the boundary for free. It is the
+  fifth rung of the extension ladder (`docs/17-extending.md` §17.3b) and the one
+  that most obviously spends the [single-unit design](docs/18-one-translation-unit.md).
 - **An f-string hole holds a real expression.** Nested string and char
   literals, nested braces, and nested interpolations (`f"{"inner"}"`) no longer
   end the outer literal early — the scanner tracks hole depth and the quoting

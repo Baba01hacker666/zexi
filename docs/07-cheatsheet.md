@@ -742,6 +742,38 @@ way. See [`17-extending.md`](17-extending.md).
 `#include "header.h"` at the top of the generated C, so a binding can be
 written against a real header instead of re-declaring its types.
 
+### A whole function body in C
+
+When one function is the hot path, write the body itself in C. Parameters keep
+their names and arrive with the C types the language gives them (`&[T]` is
+`{ptr,len}`, `&mut T` is `T *`, `str` is `const char *`), and the body is
+compiled in the same translation unit as its callers, so `cc` checks the ABI and
+inlines it:
+
+```zx
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    c """
+        float sum = 0.0f;
+        for (size_t i = 0; i < a.len; i++) sum += a.ptr[i] * b.ptr[i];
+        return sum;
+    """
+}
+
+fn main() {
+    let a: [f32; 3] = [1.0, 2.0, 3.0];
+    let b: [f32; 3] = [4.0, 5.0, 6.0];
+    println(dot(&a, &b));   // 32
+}
+```
+
+```
+32
+```
+
+It must be the *whole* body, and parameters and the result must not need a
+destructor (`String`, `Vec<T>`, owning structs → `E0540`): there is no generated
+code left to drop them. Borrow instead (`&String`, `&mut [u8]`).
+
 ## 7.17 Not implemented yet (roadmap M1+)
 
 Traits (and trait bounds), `dyn Trait`, associated types, const generics,

@@ -1286,6 +1286,13 @@ func fnSignature(fn *sema.Fn) string {
 }
 
 func (g *gen) funcDef(fn *sema.Fn) {
+	// A function whose body is written in C is emitted verbatim: the C compiler
+	// sees the Zexi ABI types of the parameters in the same translation unit as
+	// every caller, so it checks the body against them and inlines it freely.
+	if cb := g.info.CBody[fn.Decl]; cb != nil && fn.Name != "main" {
+		g.cBodyDef(fn, cb)
+		return
+	}
 	ret := fn.Ret
 	savedRet := g.ret
 	g.ret = ret
@@ -1331,6 +1338,37 @@ func (g *gen) funcDef(fn *sema.Fn) {
 	g.closeDropFrame()
 	g.w.indent--
 	g.popScope()
+	g.w.line("}")
+	g.w.line("")
+}
+
+// cBodyDef emits a function whose body is the user's C. Parameters keep their
+// Zexi names — the C body refers to them directly — and the body is written out
+// exactly as it appears in the source, so preprocessor directives still start at
+// column 0.
+func (g *gen) cBodyDef(fn *sema.Fn, cb *ast.CBodyExpr) {
+	retC := ctype(fn.Ret)
+	params := make([]string, 0, len(fn.Decl.Params))
+	for i, p := range fn.Decl.Params {
+		pt := types.UnitT
+		if i < len(fn.Params) {
+			pt = fn.Params[i]
+		}
+		params = append(params, ctype(pt)+" "+p.Name)
+	}
+	if len(params) == 0 {
+		params = []string{"void"}
+	}
+	g.w.line("%s%s %s(%s) { /* c body */", g.staticPrefix(fn), retC, funcName(fn), strings.Join(params, ", "))
+	g.w.raw(cb.Body)
+	if !strings.HasSuffix(cb.Body, "\n") {
+		g.w.raw("\n")
+	}
+	if fn.Ret != nil && fn.Ret.Kind != types.Unit {
+		// A C function that falls off its end has undefined behaviour; the
+		// zero return is unreachable when the body returns as written.
+		g.w.line("    return %s;", zeroValue(fn.Ret))
+	}
 	g.w.line("}")
 	g.w.line("")
 }
@@ -3804,16 +3842,9 @@ func (g *gen) interpStrValue(x *ast.InterpStrExpr) string {
 
 // --- naming ---------------------------------------------------------------
 
-var cKeywords = map[string]bool{
-	"auto": true, "break": true, "case": true, "char": true, "const": true,
-	"continue": true, "default": true, "do": true, "double": true, "else": true,
-	"enum": true, "extern": true, "float": true, "for": true, "goto": true,
-	"if": true, "inline": true, "int": true, "long": true, "register": true,
-	"restrict": true, "return": true, "short": true, "signed": true,
-	"sizeof": true, "static": true, "struct": true, "switch": true,
-	"typedef": true, "union": true, "unsigned": true, "void": true,
-	"volatile": true, "while": true, "bool": true, "_Bool": true,
-}
+// cParams names a C body's parameters. Unlike generated locals they are not
+// mangled: the body refers to them by the names the source uses, and the checker
+// has already rejected anything that is not a plain C identifier.
 
 // funcName mangles a Zexi function name into C. `main` and `extern` functions
 // keep their names (the latter must, to match the C ABI); every other function
@@ -3867,7 +3898,7 @@ func safeIdent(name string) string {
 		}
 	}
 	s := b.String()
-	if cKeywords[s] {
+	if token.IsCKeyword(s) {
 		s = "z_" + s
 	}
 	return s

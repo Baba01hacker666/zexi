@@ -4,7 +4,7 @@ The rule this document exists to support: **a new capability should be written i
 Zexi source, in the library that needs it** — not as a new C file the compiler has
 to know about, and not as a special case in the driver.
 
-There are four rungs on the ladder. Take the lowest one that works.
+There are five rungs on the ladder. Take the lowest one that works.
 
 | Rung | Tool | Use when |
 | --- | --- | --- |
@@ -12,6 +12,7 @@ There are four rungs on the ladder. Take the lowest one that works.
 | 2 | `extern "C"` declaration + `#[link("name")]` | the operating system or a system library already does it (`libm`, `libc`, `libsqlite3`) |
 | 3 | `c """ ... """` | you need a few lines of C: a syscall wrapper, a struct the ABI fixes, a vendored helper |
 | 4 | `#[no_mangle]` | C needs to call back into Zexi |
+| 5 | `c """ ... """` as a **function body** | one function is the hot path, and you want it written in C without an FFI boundary at all |
 
 Everything below compiles with plain `zexic run file.zx`. Nothing requires a flag,
 a build file, or a change to this repository.
@@ -162,6 +163,128 @@ fn main() -> i32 {
 | `&[u8]` / `&mut [u8]` / `[T]` | `zx_slice_u8` / `zx_slice_T` (`{ T *ptr; size_t len; }`, by value) |
 | `struct S` | `struct zx_S` |
 | returning `()` | `void` |
+
+## 17.3b Rung 5: a whole function body in C
+
+Rung 3 adds C *next to* Zexi: an `extern "C"` declaration on one side of a call
+and a C definition on the other. Rung 5 removes the boundary. Write the body
+itself in C, and the parameters appear in the body under their own names, with
+the C types the language gives them:
+
+```zx
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    c """
+        float sum = 0.0f;
+        for (size_t i = 0; i < a.len; i++) sum += a.ptr[i] * b.ptr[i];
+        return sum;
+    """
+}
+```
+
+```
+fn fib(n: i32) -> i64 {
+    c """
+        int64_t a = 0, b = 1;
+        for (int32_t i = 0; i < n; i++) { int64_t t = a + b; a = b; b = t; }
+        return a;
+    """
+}
+```
+
+```
+fn bump(p: &mut i64) -> i64 {
+    c """
+        *p += 1;
+        return *p;
+    """
+}
+
+fn main() {
+    let mut n: i64 = 41;
+    println(bump(&mut n));   // 42
+    println(n);              // 42: the C body wrote through the borrow
+}
+```
+
+```
+42
+42
+```
+
+This is the rung that only works because of the [single translation
+unit](18-one-translation-unit.md): the C is compiled in the same file as the
+generated code, so
+
+* **the ABI is checked, not assumed** — the C body is type-checked against the
+  exact typedefs the compiler emits for those parameters, so a signature drift
+  is a `cc` error rather than undefined behaviour;
+* **there is no call** — `cc` sees caller and callee together and inlines the
+  body, so a C body costs nothing at the boundary;
+* **the parameter names are the source names** — no marshalling shim, no
+  `extern` declaration to keep in sync, no second file;
+* **the body can call back into Zexi** through a `#[no_mangle]` function, since
+  both are in that same unit:
+
+```zx
+#[no_mangle]
+fn zx_triple(n: i64) -> i64 {
+    n * 3
+}
+
+fn triple_sum(n: i64) -> i64 {
+    c """
+        int64_t total = 0;
+        for (int64_t i = 1; i <= n; i++) total += zx_triple(i);
+        return total;
+    """
+}
+
+fn main() {
+    println(triple_sum(4));   // 3 + 6 + 9 + 12
+}
+```
+
+```
+30
+```
+
+A generic function is emitted once per instantiation, so `sizeof` inside the
+body sees the concrete type:
+
+```zx
+fn bytes<T>(v: T) -> i64 {
+    c """
+        return (int64_t)sizeof(v);
+    """
+}
+
+fn main() {
+    println(bytes(1 as i32), bytes(1 as i64));   // 4 8
+}
+```
+
+```
+4 8
+```
+
+The mapping is the same table as rung 3 (see "Type mapping" above): `&[T]` is
+`{ T *ptr; size_t len; }` passed by value, `&mut T` is `T *`, `str` is
+`const char *`, `char` is `uint32_t`, and a method's receiver is `self` — a
+pointer to the struct for `&self`, so `self->x` is how you read a field.
+
+Four rules keep this safe, and each is a diagnostic rather than a surprise:
+
+| Rule | Why |
+| --- | --- |
+| It must be the **entire** body (E0540) | nothing else in the function can run, so allowing statements around it would silently drop them |
+| Parameters and the result **may not need a destructor** (E0540) | `String`, `Vec<T>`, and owning structs would leak: the generated drop glue is what normally runs |
+| Parameter names must be **C identifiers** (E0540) | the body refers to them by those names, so `int` or `total count` cannot survive into C |
+| `main` cannot have one (E0540) | the runtime sets up `argc`/`argv` and the exit code there |
+
+`&String`, `&[u8]`, `&mut [u8; N]`, `str`, and scalars are all fine as
+parameters — they are borrowed or `Copy`, so there is nothing to drop. The
+`--emit=mir` dump reports the function as not lowered (`a function body written
+in C`), which is honest: the MIR interpreter cannot run C.
 
 ## 17.4 What the standard library does
 

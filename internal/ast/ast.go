@@ -528,6 +528,32 @@ type LambdaExpr struct {
 func (*LambdaExpr) exprNode()          {}
 func (e *LambdaExpr) Span() token.Span { return e.Sp }
 
+// CBodyExpr is `c r"...\"` in expression position: the body of the enclosing
+// function, written in C. It is the sharpest rung of the extension ladder —
+// the C is compiled inside the same translation unit as the generated code, so
+// it sees the Zexi ABI types of the parameters, is checked against them by the
+// C compiler, and is inlined into callers with no boundary at all.
+//
+//	fn dot(a: &[f32], b: &[f32]) -> f32 {
+//	    c r"""
+//	        float sum = 0.0f;
+//	        for (size_t i = 0; i < a.len; i++) sum += a.ptr[i] * b.ptr[i];
+//	        return sum;
+//	    """
+//	}
+//
+// It is only legal as the entire body of a function, and only when every
+// parameter and the result are free of drop glue (scalars, `str`, borrows,
+// pointers) — otherwise the C body could leak or double-free.
+type CBodyExpr struct {
+	// Body is the C source exactly as written inside the raw string.
+	Body string
+	Sp   token.Span
+}
+
+func (*CBodyExpr) exprNode()          {}
+func (e *CBodyExpr) Span() token.Span { return e.Sp }
+
 // TryExpr is postfix `?`.
 type TryExpr struct {
 	X  Expr

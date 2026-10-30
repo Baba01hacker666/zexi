@@ -45,6 +45,11 @@ of undefined behaviour. §17.4 records what that found: `sys` and `json` had
 declared `void *` returns for what the language types `*Router`. Separate C
 files compiled fine and misbehaved; one unit refused.
 
+The same property is what makes a **C function body** (rung 5 in
+[`17-extending.md`](17-extending.md)) cheap: a body written in `c """..."""` is
+compiled in the same unit as its callers, so `cc` checks it against the generated
+typedefs and inlines it, with no FFI boundary and no second file to keep in sync.
+
 There is a second, quieter benefit that showed up in measurement: a single unit
 lets `cc` see the whole call graph, so it can inline across function
 boundaries. On a synthetic 4 000-function program (~1 MB of C), one unit took

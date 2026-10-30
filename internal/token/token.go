@@ -307,3 +307,44 @@ func (t Token) String() string {
 		return t.Kind.String()
 	}
 }
+
+// cKeywords are the C11 keywords a generated identifier must not collide with.
+// Kept here rather than in the C backend because the checker needs the same list
+// to vet the parameter names a `c` function body will see.
+var cKeywords = map[string]struct{}{
+	"auto": {}, "break": {}, "case": {}, "char": {}, "const": {},
+	"continue": {}, "default": {}, "do": {}, "double": {}, "else": {},
+	"enum": {}, "extern": {}, "float": {}, "for": {}, "goto": {},
+	"if": {}, "inline": {}, "int": {}, "long": {}, "register": {},
+	"restrict": {}, "return": {}, "short": {}, "signed": {},
+	"sizeof": {}, "static": {}, "struct": {}, "switch": {},
+	"typedef": {}, "union": {}, "unsigned": {}, "void": {},
+	"volatile": {}, "while": {}, "bool": {}, "_Bool": {},
+}
+
+// IsCKeyword reports whether s is a C keyword.
+func IsCKeyword(s string) bool {
+	_, ok := cKeywords[s]
+	return ok
+}
+
+// IsCIdentifier reports whether s can be written as a C identifier as-is. A
+// `c` function body refers to its parameters by their source names, so those
+// names have to survive into C unmangled.
+func IsCIdentifier(s string) bool {
+	if s == "" || IsCKeyword(s) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		switch {
+		case ch == '_':
+		case ch >= 'a' && ch <= 'z':
+		case ch >= 'A' && ch <= 'Z':
+		case i > 0 && ch >= '0' && ch <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}

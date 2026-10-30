@@ -745,6 +745,11 @@ func (l *lowerer) exprInto(e ast.Expr, dest Place) error {
 	case *ast.CallExpr:
 		return l.callInto(x, dest)
 
+	case *ast.CBodyExpr:
+		// A function whose body is C has no Zexi-level lowering: the body is
+		// emitted verbatim into the C translation unit instead.
+		return unsupportedf(x.Sp, "a function body written in C")
+
 	case *ast.MethodCallExpr:
 		// The builtin `Option`/`Result` methods were already lowered by the
 		// checker: the extractors are an ordinary match, and a tag test is a

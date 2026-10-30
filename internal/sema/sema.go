@@ -92,6 +92,10 @@ type Info struct {
 	PatVariant map[ast.Pattern]*types.Variant
 	// TryMatches maps a `?` expression to the ordinary `match` it desugars to.
 	TryMatches map[*ast.TryExpr]*ast.MatchExpr
+	// CBody records functions whose entire body is written in C (`c r"..."`),
+	// mapped to the body so codegen can emit it verbatim.
+	CBody map[*ast.FnDecl]*ast.CBodyExpr
+
 	// PreludeMatches maps `Option`/`Result` extractor calls (`unwrap`,
 	// `expect`, `unwrap_or`) to the ordinary `match` they desugar to, so the
 	// extractors reuse the move analysis and drop glue a written-out match
@@ -183,6 +187,7 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 			Aliases:        map[string]*types.Type{},
 			PatVariant:     map[ast.Pattern]*types.Variant{},
 			TryMatches:     map[*ast.TryExpr]*ast.MatchExpr{},
+			CBody:          map[*ast.FnDecl]*ast.CBodyExpr{},
 			PreludeMatches: map[*ast.MethodCallExpr]*ast.MatchExpr{},
 			PreludeTag:     map[*ast.MethodCallExpr]string{},
 			Closures:       map[*ast.LambdaExpr]*Closure{},
@@ -246,6 +251,8 @@ type checker struct {
 	enumDecls   map[string]*ast.EnumDecl
 	// instBusy guards against infinitely recursive generic instantiation.
 	instBusy map[string]bool
+	// cbodyOK is the one `c` body the function being checked may contain.
+	cbodyOK ast.Expr
 	// indirect counts enclosing references/pointers while resolving a type;
 	// recursive instantiations behind one are finite and allowed.
 	indirect int
@@ -1141,6 +1148,57 @@ func (c *checker) tryCollectConst(d *ast.ConstDecl) bool {
 
 // --- body checking --------------------------------------------------------
 
+// cbodyOf returns the `c` body of a function body, when the block is nothing
+// but that body. Anything else (a body with other statements, or a C block in
+// the middle of an expression) is rejected where the block is checked.
+func cbodyOf(b *ast.Block) *ast.CBodyExpr {
+	if b == nil {
+		return nil
+	}
+	if cb, ok := b.Tail.(*ast.CBodyExpr); ok && len(b.Stmts) == 0 {
+		return cb
+	}
+	if len(b.Stmts) == 1 {
+		if es, ok := b.Stmts[0].(*ast.ExprStmt); ok {
+			if cb, ok := es.X.(*ast.CBodyExpr); ok {
+				return cb
+			}
+		}
+	}
+	return nil
+}
+
+// checkCBody validates a function whose body is written in C and records it for
+// codegen. The C body runs instead of generated code, so nothing would emit
+// drop glue for it: parameters and the result must therefore be values that
+// have no destructor to run (scalars, `str`, borrows, pointers, `#[copy]`
+// structs).
+func (c *checker) checkCBody(fn *Fn, cb *ast.CBodyExpr) {
+	if fn.Name == "main" {
+		c.errf(cb.Sp, "E0540", "`main` cannot have a `c` body: the runtime sets up the argument list there")
+		return
+	}
+	for i, p := range fn.Decl.Params {
+		pt := types.UnitT
+		if i < len(fn.Params) {
+			pt = fn.Params[i]
+		}
+		if !token.IsCIdentifier(p.Name) {
+			c.errf(p.Sp, "E0540", "parameter `%s` cannot be used in a `c` body: it is not a C identifier (rename it)", p.Name)
+			return
+		}
+		if pt.NeedsDrop() {
+			c.errf(p.Sp, "E0540", "parameter `%s` has type `%s`, which needs its destructor run; a `c` body cannot drop it, so take `&%s` instead", p.Name, pt, pt)
+			return
+		}
+	}
+	if fn.Ret.NeedsDrop() {
+		c.errf(cb.Sp, "E0540", "a `c` body cannot return `%s`: the value would never be dropped; return a scalar or a borrow", fn.Ret)
+		return
+	}
+	c.info.CBody[fn.Decl] = cb
+}
+
 func (c *checker) checkBodies() {
 	// A worklist: instantiating a generic call appends the concrete function to
 	// FnOrder, and it must be checked in turn. `len` is re-evaluated on every
@@ -1168,7 +1226,12 @@ func (c *checker) checkBodies() {
 		if fn.Ret.Kind != types.Unit {
 			want = fn.Ret
 		}
+		c.cbodyOK = cbodyOf(fn.Decl.Body)
 		bt := c.checkBlockWith(fn.Decl.Body, want)
+		if cb := cbodyOf(fn.Decl.Body); cb != nil && c.info.Types[cb] != nil && c.info.Types[cb].Kind != types.Invalid {
+			c.checkCBody(fn, cb)
+		}
+		c.cbodyOK = nil
 		if fn.Ret.Kind != types.Unit {
 			// An invalid body type has already been diagnosed; don't pile on.
 			if !c.exprAlwaysReturns(fn.Decl.Body) && bt.Kind != types.Never && bt.Kind != types.Invalid {
@@ -1390,6 +1453,18 @@ func (c *checker) bindPattern(p ast.Pattern, ty *types.Type) {
 
 // --- expression checking --------------------------------------------------
 
+// inferCBody accepts `c r"...\"` only where a C body is allowed — as the whole
+// body of the function being checked — and gives it type `never`, since a C
+// `return` leaves the function rather than producing a value here.
+func (c *checker) inferCBody(x *ast.CBodyExpr) *types.Type {
+	if c.cbodyOK != x {
+		c.errf(x.Sp, "E0540", "a `c` body must be the entire body of a function, not part of an expression")
+		return &types.Type{Kind: types.Invalid}
+	}
+	c.info.Types[x] = types.NeverT
+	return types.NeverT
+}
+
 func (c *checker) checkExpr(e ast.Expr, expected *types.Type) *types.Type {
 	t := c.infer(e, expected)
 	if t == nil {
@@ -1403,6 +1478,9 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 	switch x := e.(type) {
 	case *ast.LiteralExpr:
 		return c.inferLiteral(x, expected)
+
+	case *ast.CBodyExpr:
+		return c.inferCBody(x)
 
 	case *ast.IdentExpr:
 		return c.inferIdentExpr(x, expected)

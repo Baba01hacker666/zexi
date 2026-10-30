@@ -557,7 +557,13 @@ Two items let a module reach outside the language:
 - `extern "C" fn name(..) -> T;` declares a C function to call.
 - `c """ ... """` compiles a block of C with the program. The block is appended to
   the generated translation unit, so it can use the runtime types and call
-  `#[no_mangle]` functions.
+  `#[no_mangle]` functions. The same form as the **entire body of a function**
+  writes that function in C, with its parameters in scope under their source
+  names and carrying their Zexi C types (`&[T]` is `{ T *ptr; size_t len; }`,
+  `&mut T` is `T *`, `str` is `const char *`); see `17-extending.md` §17.3b. It
+  is rejected (`E0540`) unless it is the whole body, every parameter and the
+  result are free of drop glue, the parameter names are C identifiers, and the
+  function is not `main`.
 
 `#[link("m")]` on either item adds `-lname` to the link step (`"pthread"` also
 adds `-pthread`). Together they are how a library adds native code without a
