@@ -45,7 +45,9 @@ This repository contains the **initial design and specification** of Zexi: the v
 > **`Option<T>`/`Result<T, E>`** and the **`?` operator** (lowered to `match`,
 > with bare `Some`/`None`/`Ok`/`Err` from context); **owned enum payloads** with
 > match move/drop glue;
-> **first-class arrays** with bounds-checked indexing;
+> **first-class arrays** with bounds-checked indexing, and **borrowed slices**
+> (`&[T]`/`&mut [T]` as a two-word view, `a[lo..hi]`, `for x in slice`, and
+> `String::push_bytes`/`as_bytes` bridging text and bytes);
 > a **use-after-move checker** for non-`Copy` values (opt into copying with
 > `#[copy]`); the built-in owning heap type **`String`** with **deterministic
 > destruction (`Drop`)**, string-parsing methods, and text-building sugar
@@ -101,9 +103,10 @@ This repository contains the **initial design and specification** of Zexi: the v
 > Embedded `math`, `text`,
 > `io`, `fs`, `os`, `regex`, `fmt`, `codec`, and `thread` also provide dependency-free
 > arithmetic, roots/logs/trigonometry/geometry, number theory, familiar string
-> helpers, `input(prompt)`, capped binary-safe file helpers, local process/path
-> conveniences, POSIX-ERE matching, number/value formatting (bases, grouping,
-> fixed decimals, human units, alignment), hex/base64 encoding and checksums
+> helpers, `input(prompt)`/`read_line()` (both `Result`-returning), capped
+> binary-safe `fs::read`/`write`/`copy` (all `Result<_, IoError>`), local
+> process/path conveniences, POSIX-ERE matching, number/value formatting (bases,
+> grouping, fixed decimals, human units, padding), hex/base64 encoding and checksums
 > (CRC-32, FNV, Adler-32), and real OS **concurrency**: fork–join
 > threads, blocking `i64` channels, lock-free `i64` atomics, and a task pool
 > that spreads a function over a range across threads (`Thread::spawn`,

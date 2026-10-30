@@ -67,6 +67,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/web_lib.zx",
 		"../../tests/closures.zx",
 		"../../tests/cinline.zx",
+		"../../tests/slices.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -305,6 +306,18 @@ func TestRunPrograms(t *testing.T) {
 				"[   ab]",
 				"[ ab  ]",
 				"[abcd]",
+				"ff FF",
+				"1010",
+				"3.14",
+				"1.23e4",
+				"25.6%",
+				"1.0 MB",
+				"250ms",
+				"-inf",
+				"inf",
+				"[    42]",
+				"[42....]",
+				"[--ab--]",
 				"base 16: 0x255",
 				"pi: 3.14",
 				"flag true and char Z",
@@ -510,6 +523,12 @@ func TestRunPrograms(t *testing.T) {
 				"42", "42", "20", "101", "100", "42", "23", "n=9!", "14", "6", "8",
 				"0", "1", "4", "9", "16", "3", "true", "true", "30", "1030",
 				"42", "2", "3", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/slices.zx",
+			want: strings.Join([]string{
+				"4", "10", "5", "3", "10", "hello", "3", "5", "hello", "",
 			}, "\n"),
 		},
 		{
@@ -1654,8 +1673,10 @@ func TestReadLine(t *testing.T) {
 	mainPath := filepath.Join(dir, "main.zx")
 	src := `use io;
 fn main() -> i32 {
-    let line = input("prompt> ");
-    println(f"got: {line} ({len(line)})");
+    match input("prompt> ") {
+        Ok(line) => println(f"got: {line} ({len(line)})"),
+        Err(e) => println("input failed"),
+    }
     0
 }
 `
@@ -1757,10 +1778,18 @@ fn main() -> i32 {
     let mut data = String::from("hi");
     data.push_byte(0);
     data.push_str("there");
-    println(write_bytes(source.as_str(), &data));
-    println(copy_file(source.as_str(), target.as_str()));
-    let got = read_bytes(target.as_str());
-    println(got.len(), got.byte_at(2), got.byte_at(7));
+    match fs::write(source.as_str(), data.as_bytes()) {
+        Ok(n) => println(n),
+        Err(e) => println(0),
+    }
+    match fs::copy(source.as_str(), target.as_str()) {
+        Ok(n) => println(n),
+        Err(e) => println(0),
+    }
+    match fs::read(target.as_str()) {
+        Ok(got) => println(got.len(), got.byte_at(2), got.byte_at(7)),
+        Err(e) => println(0),
+    }
     0
 }
 `
@@ -2727,11 +2756,15 @@ fn main() -> i32 {
     println(mkdir(work.as_str()), mkdir(work.as_str()));
     println(chdir(work.as_str()));
     println(cwd().len() > 0);
-    println(write_text(from.as_str(), "local"));
+    let written = match fs::write(from.as_str(), "local".as_bytes()) {
+        Ok(n) => n,
+        Err(e) => 0,
+    };
+    println(written);
     println(rename_path(from.as_str(), to.as_str()));
-    println(path_exists(to.as_str()));
+    println(fs::exists(to.as_str()));
     println(remove_path(to.as_str()));
-    println(path_exists(to.as_str()));
+    println(fs::exists(to.as_str()));
     0
 }
 `

@@ -1030,8 +1030,9 @@ func (p *parser) parsePostfix() ast.Expr {
 			}
 		case token.KindLBracket:
 			p.bump()
-			// Python-style slice: `xs[lo:hi]`, with either bound optional.
-			if p.at(token.KindColon) {
+			// Slices: `xs[lo:hi]` (Python-style) and `xs[lo..hi]` (Rust-style),
+			// with either bound optional.
+			if p.at(token.KindColon) || p.at(token.KindDotDot) {
 				p.bump()
 				var high ast.Expr
 				if !p.at(token.KindRBracket) {
@@ -1041,8 +1042,11 @@ func (p *parser) parsePostfix() ast.Expr {
 				e = &ast.SliceExpr{Recv: e, Low: nil, High: high, Sp: token.Span{Start: e.Span().Start, End: p.prevEnd()}}
 				continue
 			}
-			low := p.parseExpr()
-			if p.accept(token.KindColon) {
+			// Stop before `..`, which is the range operator everywhere else but a
+			// slice separator inside brackets. `9` is the precedence just above
+			// it, so `a[i + 1..n]` still parses the addition as the lower bound.
+			low := p.parseBinary(9)
+			if p.accept(token.KindColon) || p.accept(token.KindDotDot) {
 				var high ast.Expr
 				if !p.at(token.KindRBracket) {
 					high = p.parseExpr()

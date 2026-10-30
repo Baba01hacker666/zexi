@@ -1,83 +1,115 @@
 // io — console input/output, part of the Zexi standard library.
 // Import with `use io;`, `use std::io;`, or `import io;`.
+//
+// Every operation can fail, so reads and writes return `Result<_, IoError>`.
+// `IoError` lives in `sys` (which this module builds on): `Interrupted`,
+// `NotFound`, `Permission`, `IsDir`, `TooLarge`, `Eof`, or `Other(errno)`.
 
-/* The syscall wrappers live in this module's own C so the ABI names cannot
- * collide with <unistd.h> declarations in a program that links several
- * modules (http, say), whose file descriptors have a different signature. */
-c """
-#include <unistd.h>
-int64_t zxi_read(int zx_fd, zx_arr4096_u8 * zx_buf, size_t zx_n) { return read(zx_fd, zx_buf, zx_n); }
-int64_t zxi_write(int zx_fd, const char *zx_buf, size_t zx_n) { return write(zx_fd, zx_buf, zx_n); }
-"""
+use sys;
 
-extern "C" fn zxi_read(fd: i32, buf: &mut [u8; 4096], n: usize) -> i64;
-extern "C" fn zxi_write(fd: i32, buf: str, n: usize) -> i64;
+pub const STDIN: i32 = 0;
+pub const STDOUT: i32 = 1;
+pub const STDERR: i32 = 2;
 
-// read_line reads one line from standard input (without the trailing
-// newline) and returns it as a String. At end of input it returns "".
-// Bytes are read one at a time, which is plenty for interactive input;
-// carriage returns are ignored so CRLF input behaves.
-pub fn read_line() -> String {
-    let mut buf: [u8; 4096] = [0; 4096];
-    let mut out = String::new();
-    let mut done = false;
-    while !done {
-        let n = zxi_read(0, &mut buf, 1);
-        if n <= 0 {
-            done = true;
-        } else if buf[0] == 10 {
-            done = true;
-        } else if buf[0] != 13 {
-            out.push_byte(buf[0]);
+// read_byte reads exactly one byte. End of input is `Err(IoError::Eof)` rather
+// than a magic value, so an empty read and an error can never be confused.
+pub fn read_byte() -> Result<u8, IoError> {
+    let mut buf: [u8; 1] = [0; 1];
+    match sys::read_fd(STDIN, &mut buf) {
+        Ok(n) => {
+            if n == 0 {
+                return Err(IoError::Eof);
+            }
+            return Ok(buf[0]);
         }
+        Err(e) => return Err(e),
     }
-    out
 }
 
-// prompt_line prints a prompt (no newline), then reads a line of input.
-pub fn prompt_line(prompt: str) -> String {
-    print(prompt);
-    read_line()
+// read_line reads one line from standard input without its trailing newline.
+// At end of input it returns `Ok("")`; carriage returns are ignored so CRLF
+// input behaves. Interrupted reads are retried.
+pub fn read_line() -> Result<String, IoError> {
+    let mut out = String::new();
+    read_line_into(&mut out)?;
+    return Ok(out);
 }
 
-// read_all reads standard input to end of file (a pipe, a redirected file,
-// or Ctrl-D) and returns everything read.
-pub fn read_all() -> String {
-    let mut buf: [u8; 4096] = [0; 4096];
-    let mut out = String::with_capacity(4096);
-    let mut done = false;
-    while !done {
-        let n = zxi_read(0, &mut buf, 4096);
-        if n <= 0 {
-            done = true;
-        } else {
-            let mut i: usize = 0;
-            while i < (n as usize) {
-                out.push_byte(buf[i]);
-                i += 1;
+// read_line_into appends one line (without its newline) to `buf` and returns
+// the number of bytes appended. At end of input it returns `Ok(0)`.
+pub fn read_line_into(buf: &mut String) -> Result<usize, IoError> {
+    let start = buf.len();
+    loop {
+        match read_byte() {
+            Ok(b) => {
+                if b == 10 {
+                    break;
+                }
+                if b != 13 {
+                    buf.push_byte(b);
+                }
+            }
+            Err(e) => {
+                match e {
+                    IoError::Eof => break,
+                    IoError::Interrupted => { /* retry */ }
+                    _ => return Err(e),
+                }
             }
         }
     }
-    return out;
+    return Ok(buf.len() - start);
 }
 
-// print_err writes a message to standard error (no newline added).
-pub fn print_err(s: str) {
-    let n = len(s);
-    zxi_write(2, s, n);
+// read_all reads standard input to end of file (a pipe, a redirected file, or
+// Ctrl-D) and returns everything read.
+pub fn read_all() -> Result<String, IoError> {
+    let mut out = String::with_capacity(4096);
+    let mut buf: [u8; 4096] = [0; 4096];
+    loop {
+        match sys::read_fd(STDIN, &mut buf) {
+            Ok(n) => {
+                if n == 0 {
+                    return Ok(out);
+                }
+                out.push_bytes(buf[0..n]);
+            }
+            Err(e) => {
+                match e {
+                    IoError::Interrupted => { /* retry */ }
+                    _ => return Err(e),
+                }
+            }
+        }
+    }
 }
 
-// eprintln_err writes a message to standard error, followed by a newline.
-pub fn eprintln_err(s: str) {
-    print_err(s);
-    zxi_write(2, "\n", 1);
+// write writes every byte of `buf` to standard output and returns the count.
+pub fn write(buf: &[u8]) -> Result<usize, IoError> {
+    return sys::write_fd(STDOUT, buf);
 }
 
-// input is a Python-shaped convenience wrapper around read_line. It accepts an
-// optional prompt and returns the line without its trailing newline.
-pub fn input(prompt: str = "") -> String {
+// write_err writes every byte of `buf` to standard error.
+pub fn write_err(buf: &[u8]) -> Result<usize, IoError> {
+    return sys::write_fd(STDERR, buf);
+}
+
+// eprint writes a message to standard error (no newline added). A write failure
+// is intentionally ignored: there is nowhere to report it that is not stderr.
+pub fn eprint(s: str) {
+    let ignored = sys::write_str_fd(STDERR, s);
+}
+
+// eprintln writes a message to standard error, followed by a newline.
+pub fn eprintln(s: str) {
+    eprint(s);
+    eprint("\n");
+}
+
+// input prints an optional prompt (no newline), then reads a line.
+pub fn input(prompt: str = "") -> Result<String, IoError> {
     if len(prompt) > 0 {
-        print(prompt);
+        let ignored = sys::write_str_fd(STDOUT, prompt);
     }
     return read_line();
 }

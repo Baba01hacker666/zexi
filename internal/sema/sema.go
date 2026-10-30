@@ -3042,6 +3042,8 @@ var stringMethods = map[string]stringMethodSig{
 	"push":        {[]*types.Type{types.CharT}, types.UnitT, true},
 	"push_str":    {[]*types.Type{types.StrT}, types.UnitT, true},
 	"push_byte":   {[]*types.Type{types.U8T}, types.UnitT, true},
+	"push_bytes":  {[]*types.Type{{Kind: types.Ref, Elem: &types.Type{Kind: types.Slice, Elem: types.U8T}}}, types.UnitT, true},
+	"as_bytes":    {nil, &types.Type{Kind: types.Ref, Elem: &types.Type{Kind: types.Slice, Elem: types.U8T}}, false},
 	"byte_at":     {[]*types.Type{types.UsizeT}, types.I64T, false},
 	"find":        {[]*types.Type{types.StrT}, types.I64T, false},
 	"contains":    {[]*types.Type{types.StrT}, types.BoolT, false},
@@ -3165,6 +3167,9 @@ func (c *checker) inferLen(x *ast.CallExpr) *types.Type {
 		t.Kind == types.StringKind || t.Kind == types.VecKind) {
 		return types.UsizeT
 	}
+	if t != nil && t.Kind == types.Ref && t.Elem != nil && t.Elem.Kind == types.Slice {
+		return types.UsizeT
+	}
 	c.errAt(x.Args[0], "E0308", "`len` expects an array, slice, `str`, `String`, or `Vec`, found `%s`", t)
 	return types.UsizeT
 }
@@ -3176,6 +3181,9 @@ func (c *checker) inferIndex(x *ast.IndexExpr) *types.Type {
 	it := c.checkExpr(x.Index, nil)
 	if base := recvBase(rt); base != nil && base.Kind == types.VecKind {
 		rt = base
+	}
+	if rt != nil && rt.Kind == types.Ref && rt.Elem != nil && rt.Elem.Kind == types.Slice {
+		rt = rt.Elem
 	}
 	if rt == nil || (rt.Kind != types.Array && rt.Kind != types.Slice && rt.Kind != types.VecKind) {
 		c.errAt(x, "E0608", "cannot index a value of type `%s`", rt)
@@ -3199,6 +3207,30 @@ func (c *checker) inferIndex(x *ast.IndexExpr) *types.Type {
 func (c *checker) inferSlice(x *ast.SliceExpr) *types.Type {
 	rt := c.checkExpr(x.Recv, nil)
 	isStr := rt != nil && (rt.Kind == types.Str || rt.Kind == types.StringKind)
+	// Arrays and slices slice into a borrowed view without copying. A slice of
+	// a borrowed slice keeps the same element type.
+	base := rt
+	if base != nil && base.Kind == types.Ref && base.Elem != nil {
+		base = base.Elem
+	}
+	if base != nil && (base.Kind == types.Array || base.Kind == types.Slice) {
+		if x.Low != nil {
+			it := c.checkExpr(x.Low, nil)
+			if it != nil && !it.Kind.IsInt() {
+				c.errAt(x.Low, "E0308", "slice bound must be an integer, found `%s`", it)
+			}
+		}
+		if x.High != nil {
+			it := c.checkExpr(x.High, nil)
+			if it != nil && !it.Kind.IsInt() {
+				c.errAt(x.High, "E0308", "slice bound must be an integer, found `%s`", it)
+			}
+		}
+		if base.Kind == types.Slice {
+			return base
+		}
+		return &types.Type{Kind: types.Slice, Elem: base.Elem}
+	}
 	if !isStr {
 		c.errAt(x, "E0608", "cannot slice a value of type `%s`", rt)
 		if x.Low != nil {
@@ -3799,15 +3831,28 @@ func (c *checker) inferTry(x *ast.TryExpr, expected *types.Type) *types.Type {
 	}
 
 	const okName, errName = "__try_ok", "__try_err"
-	okPat := &ast.PathPat{
-		Path: []string{srcBase, "Ok"},
-		Sub:  []ast.Pattern{&ast.BindPat{Name: okName, Sp: x.Sp}},
-		Sp:   x.Sp,
+	// `Ok(())` has no value to bind: use a wildcard instead, so codegen never
+	// declares a `void` local for the payload.
+	unitOK := len(src.En.Args) >= 1 && src.En.Args[0] != nil && src.En.Args[0].Kind == types.Unit
+	var okPat ast.Pattern
+	var okBody ast.Expr
+	if unitOK {
+		okPat = &ast.WildcardPat{Sp: x.Sp}
+		okBody = &ast.TupleExpr{Sp: x.Sp}
+	} else {
+		okPat = &ast.PathPat{
+			Path: []string{srcBase, "Ok"},
+			Sub:  []ast.Pattern{&ast.BindPat{Name: okName, Sp: x.Sp}},
+			Sp:   x.Sp,
+		}
+		okBody = &ast.IdentExpr{Name: okName, Sp: x.Sp}
 	}
 	var errPat ast.Pattern
 	var errBody ast.Expr
 	if srcBase == "Result" {
-		okPat.Path[1] = "Ok"
+		if pp, isPath := okPat.(*ast.PathPat); isPath {
+			pp.Path[1] = "Ok"
+		}
 		errPat = &ast.PathPat{
 			Path: []string{"Result", "Err"},
 			Sub:  []ast.Pattern{&ast.BindPat{Name: errName, Sp: x.Sp}},
@@ -3819,15 +3864,19 @@ func (c *checker) inferTry(x *ast.TryExpr, expected *types.Type) *types.Type {
 			Sp:     x.Sp,
 		}}
 	} else {
-		okPat.Path[1] = "Some"
+		if pp, isPath := okPat.(*ast.PathPat); isPath {
+			pp.Path[1] = "Some"
+		}
 		errPat = &ast.PathPat{Path: []string{"Option", "None"}, Sp: x.Sp}
 		errBody = &ast.JumpExpr{Kind: token.KindReturn, Sp: x.Sp, Val: &ast.PathExpr{Segments: []string{"Option", "None"}, Sp: x.Sp}}
 	}
 	m := &ast.MatchExpr{
 		Scrutinee: x.X,
+		// The error arm comes first: a unit `Ok` desugars to a wildcard, which
+		// would make a later arm unreachable.
 		Arms: []ast.MatchArm{
-			{Pat: okPat, Body: &ast.IdentExpr{Name: okName, Sp: x.Sp}, Sp: x.Sp},
 			{Pat: errPat, Body: errBody, Sp: x.Sp},
+			{Pat: okPat, Body: okBody, Sp: x.Sp},
 		},
 		Sp: x.Sp,
 	}
@@ -4050,6 +4099,21 @@ func recvBase(t *types.Type) *types.Type {
 	return t
 }
 
+// sliceElem returns the element type when t is a slice or a reference to one,
+// and nil otherwise.
+func sliceElem(t *types.Type) *types.Type {
+	if t == nil {
+		return nil
+	}
+	if t.Kind == types.Slice {
+		return t.Elem
+	}
+	if t.Kind == types.Ref && t.Elem != nil && t.Elem.Kind == types.Slice {
+		return t.Elem.Elem
+	}
+	return nil
+}
+
 func (c *checker) inferField(x *ast.FieldExpr) *types.Type {
 	rt := c.checkExpr(x.Recv, nil)
 	base := recvBase(rt)
@@ -4080,9 +4144,13 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 		}
 		return c.inferMapMethod(x, base)
 	}
-	// `len()` is also available directly on arrays and `str` values.
-	if x.Name == "len" && len(x.Args) == 0 && base != nil && (base.Kind == types.Array || base.Kind == types.Str) {
+	// `len()` is also available directly on arrays, slices, and `str` values.
+	if x.Name == "len" && len(x.Args) == 0 && base != nil && (base.Kind == types.Array || base.Kind == types.Str || base.Kind == types.Slice) {
 		return types.UsizeT
+	}
+	// `str::as_bytes()` borrows the text as a byte slice, without copying.
+	if x.Name == "as_bytes" && len(x.Args) == 0 && base != nil && base.Kind == types.Str {
+		return &types.Type{Kind: types.Ref, Elem: &types.Type{Kind: types.Slice, Elem: types.U8T}}
 	}
 	if base == nil || (base.Kind != types.StructKind && base.Kind != types.EnumKind) {
 		c.errAt(x, "E0599", "no method `%s` on type `%s`", x.Name, rt)
@@ -4502,6 +4570,19 @@ func (c *checker) inferFor(x *ast.LoopExpr) *types.Type {
 			c.popScope()
 			return types.UnitT
 		}
+		if elem := sliceElem(it); elem != nil {
+			// A slice yields `Copy` elements by value, like an array.
+			if !elem.IsCopy() {
+				c.errAt(x.Iter, "E0507", "cannot iterate a slice of non-`Copy` element type `%s` by value", elem)
+			}
+			c.pushScope()
+			c.bindPattern(x.Pat, elem)
+			c.loopDepth++
+			c.checkBlock(x.Body)
+			c.loopDepth--
+			c.popScope()
+			return types.UnitT
+		}
 		if base := recvBase(it); base != nil && base.Kind == types.VecKind {
 			// As with arrays, elements must be `Copy`: the binding is a copy
 			// of each element, and an owned element would be dropped twice.
@@ -4761,6 +4842,19 @@ func (c *checker) assignable(dst, src *types.Type) bool {
 	// `&mut T` coerces to `&T`.
 	if dst.Kind == types.Ref && src.Kind == types.Ref && !dst.Mut && src.Mut {
 		return types.Equal(dst.Elem, src.Elem)
+	}
+	// Unsizing: a borrow of a fixed array is a slice of the same elements.
+	// `&mut [T; N]` also satisfies `&[T]`; the other direction does not hold.
+	if dst.Kind == types.Ref && src.Kind == types.Ref && dst.Elem != nil && src.Elem != nil &&
+		dst.Elem.Kind == types.Slice && src.Elem.Kind == types.Array &&
+		types.Equal(dst.Elem.Elem, src.Elem.Elem) {
+		return !dst.Mut || src.Mut
+	}
+	// A slice value may be passed where a borrowed slice is expected: both are
+	// a non-owning view, so taking the borrow is a no-op.
+	if dst.Kind == types.Ref && dst.Elem != nil && dst.Elem.Kind == types.Slice &&
+		src.Kind == types.Slice && types.Equal(dst.Elem, src) {
+		return !dst.Mut
 	}
 	return false
 }

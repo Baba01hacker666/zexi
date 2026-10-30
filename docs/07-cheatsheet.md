@@ -527,7 +527,7 @@ use math as m;              // qualifier alias: m::maxi(1, 2)
 use std::text;
 import http.server;         // package-shaped facade; server::Router, server::serve(&r, p)
 import http.server as srv;  // or srv::Router
-import io.fs;               // filesystem facade: fs::read_text("f")
+import io.fs;               // filesystem facade: fs::read("f")
 import os;                  // environment, local paths, clocks, process helpers
 import text.regex;          // POSIX ERE helpers: regex::is_match(pat, s)
 ```
@@ -579,21 +579,23 @@ The embedded standard library (sources in `internal/driver/std/`) includes:
   for small scripts.
 - `regex`: opt-in POSIX-ERE validation/search/full-match/find/replace helpers
   via `import text.regex;`. It is intentionally not a PCRE engine.
-- `fmt`: pure-Zexi formatting of numbers and values. Bases (`hex_lower`,
-  `hex_upper`, `hex_pad`, `bin_str`, `oct_str`, `radix_str`), decimal grouping
-  (`thousands`, `thousands_sep`), decimals and exponents (`fixed_point`,
-  `sci_notation`, `percent_str`), human units (`byte_size`, `duration_ms`),
-  ordinals (`ordinal`), and alignment (`align_left`/`align_right`/
-  `align_center`). It has no C shim, so it costs nothing to import.
+- `fmt`: pure-Zexi formatting of numbers and values. Bases (`hex(n, upper)`,
+  `radix(n, base)`, `hex_pad`), decimal grouping (`thousands`,
+  `thousands_sep`), decimals and exponents (`fixed`, `sci`, `percent`), human
+  units (`bytes`, `duration`), ordinals (`ordinal`), and padding (`pad_left`,
+  `pad_right`, `pad_center`, each with an optional fill character). The older
+  spellings (`hex_lower`, `fixed_point`, `byte_size`, `align_right`, …) remain
+  as aliases. It has no C shim, so it costs nothing to import.
 - `codec`: pure-Zexi encoders and checksums — hex (`hex_encode`,
   `hex_encode_upper`, `hex_decode`), base64 (`base64_encode`,
   `base64_encode_url`, `base64_decode`), and CRC-32/Adler-32/FNV-1a/djb2 with
   fixed-width `*_hex` forms.
-- `io`, `fs`, `sys`, and `random`: console I/O (`input(prompt = "")` and
-  `read_line`); capped binary-safe file reads plus
-  `write_bytes(path, &String)` (reads, writes, and copies cap at 32 MiB);
-  environment, cwd/hostname, local non-recursive directory/file operations,
-  clocks/sleep; and deterministic or libc-backed random numbers.
+- `sys`, `io`, `fs`, and `random`: `sys` is the POSIX substrate (errno and
+  `IoError`, byte I/O, files, environment, clocks); `io` provides console I/O
+  (`input(prompt = "")`, `read_line() -> Result<String, IoError>`, `eprintln`);
+  `fs` provides capped, binary-safe `read`/`write(path, &[u8])`/`copy`
+  (32 MiB cap) plus `exists`, `metadata`, and `remove`. Random numbers are
+  deterministic or libc-backed.
 - `net` and `http`: TCP and UDP sockets, name resolution, readiness polling, and
   a high-level HTTP client/server. `Client`, `get`, `do`, `fetch`, `request`,
   `post_form_url`, `Router`, `new_app`, the Go-style

@@ -160,7 +160,8 @@ never               the type of `return`/`panic`; coerces to anything
 [T]           slice: (pointer, len) fat pointer, bounds-checked
 &[T] &mut [T] borrowed slice
 (T, U, ...)   tuple; () is the unit type
-str           immutable UTF-8 string slice (pointer + len), not NUL-terminated
+str           immutable borrowed text (a C-ABI `const char *`, NUL-terminated;
+              `str::as_bytes()` yields a `[u8]` view with an explicit length)
 *T *mut T     raw pointer (only usable in `unsafe`)
 &T &mut T     shared / exclusive references
 fn(A, B) -> R function pointer
@@ -204,6 +205,41 @@ let t = s.clone();       // independent deep copy
 | `clear(&mut self)` | | truncate to empty |
 | `push(&mut self, char)` | | append one code point (UTF-8) |
 | `push_str(&mut self, str)` | | append a string slice |
+| `push_byte(&mut self, u8)` | | append one raw byte (no UTF-8 encoding) |
+| `push_bytes(&mut self, &[u8])` | | append a whole byte slice |
+| `as_bytes(&self)` | `-> &[u8]` | borrow the contents as a byte slice |
+
+`str` is still C-ABI-shaped (`const char *`, NUL-terminated) at the FFI
+boundary. `str::as_bytes()` borrows its length via `strlen`, so the slice API
+works over literals and borrowed text without a copy.
+
+### Borrowed slices
+
+`[T]` is a `(pointer, length)` view. `&[T]` and `&mut [T]` denote the same
+two-word value: a slice is `Copy`, so borrowing one adds no indirection, and an
+extern `"C"` function may take one directly.
+
+```zexi
+fn sum(buf: &[u8]) -> u32 {
+    let mut total: u32 = 0;
+    for b in buf {
+        total += b as u32;
+    }
+    total
+}
+
+fn main() {
+    let mut a: [u8; 4] = [1, 2, 3, 4];
+    println(sum(&a));          // 10: &[u8; 4] unsizes to &[u8]
+    println(sum(&a[1..3]));    // 5: a borrowed sub-slice, no copy
+    a[0] = 10;                 // slices index and assign like arrays
+    println(sum(&a));          // 19
+}
+```
+
+Sub-slicing `a[lo..hi]` (or `a[lo:hi]`) yields a borrowed `[T]`; either bound
+may be omitted. Indexing is bounds-checked at run time, and `for b in slice`
+yields each element by value.
 
 Owning values compose: a `struct`, `enum` variant, or array containing a
 `String` is itself an owning type and gets a generated destructor, so dropping
@@ -390,6 +426,7 @@ Rules:
 | Heap types | `String` | `Box<T>`, `Vec<T>`, collections |
 | Enum payloads | `Copy` only (owning payloads rejected: `E0900`) | owning payloads once `match` borrows instead of aliasing |
 | Borrows | `&`/`&mut self` param passing; no lifetime tracking | full NLL borrow checker, lifetimes |
+| Slices | `[T]` / `&[T]` / `&mut [T]` as a `(ptr, len)` value; `a[lo..hi]`, `len`, indexing, and `for x in slice`; `&[T; N]` unsizes to `&[T]` | explicit lifetimes; unsizing from `Vec<T>`/`String` without a method call |
 
 ## 2.7 Error handling
 

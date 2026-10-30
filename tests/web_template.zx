@@ -10,8 +10,8 @@ use fs;
 
 fn main() -> i32 {
     let dir = String::from("/tmp/opencode");
-    fs::write_text(dir.as_str() + "/greeting.html", "<p>hi {{name}}</p>");
-    fs::write_text(dir.as_str() + "/_layout.html", "<!doctype html><html><body>{{@@content@@}}<footer>{{year}}</footer></body></html>");
+    fs::write(dir.as_str() + "/greeting.html", "<p>hi {{name}}</p>".as_bytes());
+    fs::write(dir.as_str() + "/_layout.html", "<!doctype html><html><body>{{@@content@@}}<footer>{{year}}</footer></body></html>".as_bytes());
 
     http::views_dir(dir.as_str());
 

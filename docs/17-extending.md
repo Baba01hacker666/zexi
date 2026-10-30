@@ -50,7 +50,9 @@ Two more attributes extend the same idea:
 An `extern "C"` declaration keeps its Zexi name as the C symbol, so the name you
 declare is the name the linker looks for. Pointers, `str` (`const char *`), and
 the fixed-width integers all map directly; `&mut [u8; N]` arrives as a pointer to
-the generated array wrapper struct (see §17.3).
+the generated array wrapper struct (see §17.3). A slice (`&[u8]`, `&mut [u8]`,
+`[T]`) arrives as the two-word `zx_slice_T` value `{ T *ptr; size_t len; }`,
+which is passed by value like any other struct — no length argument is needed.
 
 ## 17.2 Rung 3: carry your own C
 
@@ -151,6 +153,7 @@ fn main() -> i32 {
 | `String` | `zx_String` (`{ char *ptr; size_t len; size_t cap; }`) |
 | `&T` / `&mut T` | `zx_T *` |
 | `&mut [u8; N]` | `struct zx_arrN_u8 *` (bytes are `buf->e`) |
+| `&[u8]` / `&mut [u8]` / `[T]` | `zx_slice_u8` / `zx_slice_T` (`{ T *ptr; size_t len; }`, by value) |
 | `struct S` | `struct zx_S` |
 | returning `()` | `void` |
 

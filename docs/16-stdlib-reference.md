@@ -221,19 +221,52 @@ and object key order is preserved.
 
 Closures work as task bodies: `pool.map(|x| x * x, 0, 100)`.
 
-## 16.7 `fs`, `io`, `sys`
+## 16.7 `sys`, `io`, `fs`
+
+`sys` is the POSIX substrate and depends on no other standard module; `io` and
+`fs` build on it and return `Result<_, IoError>` from every operation that can
+fail.
 
 | module | functions |
 | --- | --- |
-| `fs` | `read_text`, `read_bytes`, `write_text`, `write_bytes`, `copy_file`, `path_exists`, `file_len` |
-| `io` | `read_line`, `prompt_line`, `read_all`, `input(prompt = "")`, `print_err`, `eprintln_err` |
-| `sys` | `env_get`, `env_has`, `env_or`, `env_set`, `env_unset`, `time_ms`, `time_s`, `mono_ms`, `sleep_ms`, `pid`, `millis_since`, `cwd`, `hostname`, `home_dir`, `temp_dir`, `chdir`, `mkdir`, `remove_path`, `rename_path`, `cpu_count` |
+| `sys` | `errno`, `error_string(code)`, `error_of(code)`, `message(e)`, `read_fd`, `write_fd`, `open_read`, `open_write`, `close_fd`, `file_size`, `path_kind`, `write_str_fd`, `remove_path_status`, `env_get`, `env_has`, `env_or`, `env_set`, `env_unset`, `time_ms`, `time_s`, `mono_ms`, `sleep_ms`, `pid`, `millis_since`, `cwd`, `hostname`, `home_dir`, `temp_dir`, `chdir`, `mkdir`, `remove_path`, `rename_path`, `cpu_count` |
+| `io` | `read_byte`, `read_line`, `read_line_into`, `read_all`, `write(&[u8])`, `write_err(&[u8])`, `eprint`, `eprintln`, `input(prompt = "")` |
+| `fs` | `exists`, `file_len`, `read`, `write(path, &[u8])`, `copy`, `remove`, `metadata`, `MAX_BYTES` |
+
+`IoError` is `Eof`, `Interrupted`, `NotFound`, `Permission`, `IsDir`,
+`TooLarge`, or `Other(errno)`. `sys` also exports the errno constants `EINTR`,
+`EIO`, `ENOENT`, `EACCES`, and `EISDIR`. Reads and writes are capped at
+`fs::MAX_BYTES` (32 MiB) and preserve embedded NUL bytes: an empty file is
+`Ok("")` and a missing one is `Err(IoError::NotFound)`.
+
+```zx
+use fs;
+use io;
+use sys;
+
+fn main() {
+    match io::input("name: ") {
+        Ok(name) => println("hi " + name),
+        Err(e) => io::eprintln("input failed: " + sys::message(e)),
+    }
+
+    let data = "hello".as_bytes();
+    match fs::write("/tmp/zx_docs_out.txt", data) {
+        Ok(n) => println(n),                      // 5
+        Err(e) => println(sys::message(e)),
+    }
+    match fs::remove("/tmp/zx_docs_out.txt") {
+        Ok(_) => {}
+        Err(e) => println(sys::message(e)),
+    }
+}
+```
 
 ## 16.8 `fmt`, `text`, `codec`, `math`, `random`, `regex`
 
 | module | functions |
 | --- | --- |
-| `fmt` | `hex_lower`, `hex_upper`, `hex_pad`, `bin_str`, `oct_str`, `radix_str`, `thousands`, `thousands_sep`, `fixed_point`, `sci_notation`, `percent_str`, `byte_size`, `duration_ms`, `ordinal`, `align_left/right/center` |
+| `fmt` | `hex(n, upper)`, `radix(n, base)`, `hex_pad`, `thousands`, `thousands_sep`, `fixed`, `sci`, `percent`, `bytes`, `duration`, `ordinal`, `pad_left/right/center(s, width, fill = ' ')`; the earlier names (`hex_lower`, `hex_upper`, `bin_str`, `oct_str`, `radix_str`, `fixed_point`, `sci_notation`, `percent_str`, `byte_size`, `duration_ms`, `align_left/right/center`) remain as aliases |
 | `text` | `to_upper`, `to_lower`, `trim_start/end/strip`, `replace_all`, `replace`, `index_of`, `last_index_of`, `count_occurrences`, `contains`, `starts_with`, `ends_with`, `pad_start`, `pad_end`, `slice_text`, `compare`, `repeat_text`, `join_with`, `is_blank`, `is_digits_only`, `is_digit/alpha/alnum/space`, `format_bool` |
 | `codec` | `hex_encode`, `hex_encode_upper`, `hex_decode`, `base64_encode`, `base64_encode_url`, `base64_decode`, `crc32`, `adler32`, `fnv1a32`, `fnv1a64`, `djb2` (each with a `_hex` form where useful) |
 | `math` | `min(max, clamp, abs, sign, gcd, lcm, pow, sqrt, isqrt, log2_floor, popcount, trailing_zeros, leading_zeros, is_pow2, div_floor, mod_floor, div_ceil, sin, cos, tan, hypot, lerp, inverse_lerp, remap, approx_eq, floor, ceil, round, trunc, mean2)` — integer forms take an `i`/`_i` suffix or plain names (`mini`/`min_i`), float forms are unprefixed |
@@ -245,7 +278,7 @@ Closures work as task bodies: `pool.map(|x| x * x, 0, 100)`.
 | builtin | description |
 | --- | --- |
 | `print` / `println` | write a value and a newline |
-| `len(x)` | length of a string, array, `Vec`, or `HashMap` |
+| `len(x)` | length of a string, array, slice, `Vec`, or `HashMap` |
 | `arg_count()` / `arg_at(i)` | command-line arguments (`arg_at` returns `String`) |
 | `project_dir()` | directory of the entry file, baked into the binary |
 | `String::from`, `Vec::new`, `HashMap::new` | container constructors |

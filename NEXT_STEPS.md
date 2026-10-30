@@ -28,6 +28,15 @@ forward most. Ordered by value per unit of risk, not by ambition.
   body as a `String`, and a `templates/_layout.html` whose `{{@@content@@}}`
   slot exists wraps the page in it — substitution only, no second language.
   `{{name}}` substitution is unchanged.
+- **Buffers are borrowed, not copied.** `[T]`, `&[T]`, and `&mut [T]` are a
+  two-word `(ptr, len)` value: `&[T; N]` unsizes, `a[lo..hi]` takes a sub-slice
+  without copying, `for x in slice` yields elements by value, and indexing is
+  bounds-checked. `String::push_bytes`/`as_bytes` and `str::as_bytes` bridge
+  owned text and borrowed bytes.
+- **I/O errors are values.** `sys` is the POSIX substrate (`errno`, `IoError`,
+  byte I/O, files, environment, clocks); `io` and `fs` build on it and return
+  `Result<_, IoError>`, so a missing file is `Err(NotFound)` rather than the
+  same empty string as an empty file.
 - **Borrowed map lookups.** `HashMap<String, V>` has `get_str`/`contains_str`
   that hash and compare over the borrowed bytes, so a template lookup no
   longer allocates a key for every `{{name}}`.
@@ -102,6 +111,9 @@ Collected while writing the library; each is small, each has bitten:
 - No variadic strings (`push_str` chains instead of one call).
 - `while` conditions cannot allocate.
 - Matching an enum through a borrow reports `E0507`.
+- `str` is still C-ABI-shaped (NUL-terminated, no independent length) at the
+  FFI boundary. Slices cover buffers and `str::as_bytes()` covers borrowing;
+  length-prefixing `str` itself is still open.
 
 ## 7. Multi-threading, next layer
 

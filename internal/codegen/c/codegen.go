@@ -54,6 +54,9 @@ type gen struct {
 	vecs       map[string]*types.Type // Vec handle struct name -> Vec type
 	vecSeen    map[string]bool
 	vecOrder   []string
+	slices     map[string]*types.Type // slice struct name -> slice type
+	sliceSeen  map[string]bool
+	sliceOrder []string
 	maps       map[string]*types.Type // HashMap handle struct name -> map type
 	mapSeen    map[string]bool
 	mapOrder   []string
@@ -89,6 +92,9 @@ type gen struct {
 	pendingMoves []pendingMove
 	// lambdas maps each closure to its emission index, in source order.
 	lambdas map[*ast.LambdaExpr]int
+	// ret is the declared return type of the function being emitted, used to
+	// coerce a returned array borrow into a slice.
+	ret *types.Type
 }
 
 // pendingMove is an owned pattern binding whose move out of the scrutinee is
@@ -202,7 +208,7 @@ func GenerateSplit(info *sema.Info, opts Options, n int) (string, []string, erro
 }
 
 func newGen(info *sema.Info, opts Options) *gen {
-	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}, arrays: map[string]*types.Type{}, arrSeen: map[string]bool{}, vecs: map[string]*types.Type{}, vecSeen: map[string]bool{}, maps: map[string]*types.Type{}, mapSeen: map[string]bool{}, hashSeen: map[string]bool{}, dropSeen: map[string]bool{}, externNames: map[string]bool{}}
+	g := &gen{info: info, w: &writer{}, opts: opts, counts: map[string]int{}, arrays: map[string]*types.Type{}, arrSeen: map[string]bool{}, vecs: map[string]*types.Type{}, vecSeen: map[string]bool{}, slices: map[string]*types.Type{}, sliceSeen: map[string]bool{}, maps: map[string]*types.Type{}, mapSeen: map[string]bool{}, hashSeen: map[string]bool{}, dropSeen: map[string]bool{}, externNames: map[string]bool{}}
 	g.used = usedFns(info)
 	g.lambdas = map[*ast.LambdaExpr]int{}
 	for i, l := range info.ClosureOrd {
@@ -224,6 +230,7 @@ func (g *gen) emitPrefix() {
 	g.collectDropTypes()
 	g.runtime()
 	g.typeDefs()
+	g.sliceRuntime()
 	g.dropFuncs()
 	// The Vec and HashMap helpers call the destructors, so they come after
 	// dropFuncs has declared them.
@@ -437,7 +444,7 @@ func (g *gen) preamble() {
 // when the program actually uses the corresponding feature, so trivial programs
 // produce minimal C.
 func (g *gen) runtime() {
-	if len(g.arrayOrder) > 0 || len(g.vecOrder) > 0 || len(g.mapOrder) > 0 {
+	if len(g.arrayOrder) > 0 || len(g.vecOrder) > 0 || len(g.mapOrder) > 0 || len(g.sliceOrder) > 0 {
 		g.hasPanic = true
 		g.boundsHelper()
 	}
@@ -585,6 +592,55 @@ func (g *gen) boundsHelper() {
 	g.w.line("")
 }
 
+// sliceRuntime emits the helpers slices share. It runs after typeDefs because
+// the `String` conversions name a slice struct.
+func (g *gen) sliceRuntime() {
+	if len(g.sliceOrder) == 0 {
+		return
+	}
+	g.w.line("// Bounds-check a sub-slice range, panicking on an inverted or out-of-range")
+	g.w.line("// pair, and normalize negative bounds the way indexing does. An omitted")
+	g.w.line("// upper bound is passed as the length.")
+	g.w.line("static inline void zx_slice_check(int64_t *lo, int64_t *hi, int64_t n) {")
+	g.w.line("    if (*lo < 0) { *lo += n; }")
+	g.w.line("    if (*hi < 0) { *hi += n; }")
+	g.w.line("    if (*lo < 0 || *hi < *lo || *hi > n) {")
+	g.w.line(`        zx_panicf("slice %%lld..%%lld out of bounds for length %%lld", (long long)*lo, (long long)*hi, (long long)n);`)
+	g.w.line("    }")
+	g.w.line("}")
+	g.w.line("")
+	if g.hasString && g.slices["zx_slice_u8"] != nil {
+		g.w.line(zxSliceStringRuntime)
+	}
+}
+
+// zxSliceStringRuntime bridges the owning `String` and a borrowed `&[u8]`.
+const zxSliceStringRuntime = `
+static void zx_string_push_bytes(zx_String *s, zx_slice_u8 v) {
+    if (v.len == 0) return;
+    /* v may point into this string's own buffer (s.push_bytes(s.as_bytes()));
+       remember its offset and re-derive it after the reserve may realloc. */
+    const uint8_t *src = v.ptr;
+    long off = -1;
+    if (s->ptr) {
+        uintptr_t base = (uintptr_t)s->ptr, here = (uintptr_t)v.ptr;
+        if (here >= base && here <= base + (uintptr_t)s->len) off = (long)(here - base);
+    }
+    zx_string_reserve(s, v.len);
+    if (off >= 0) src = (const uint8_t *)s->ptr + off;
+    memmove(s->ptr + s->len, src, v.len);
+    s->len += v.len;
+    s->ptr[s->len] = 0;
+}
+
+static zx_slice_u8 zx_string_as_bytes(const zx_String *s) {
+    zx_slice_u8 r;
+    r.ptr = (uint8_t *)(s->ptr ? s->ptr : (char *)"");
+    r.len = s->len;
+    return r;
+}
+`
+
 func (g *gen) constants() { // Emit in source order for stable output.
 	for _, it := range g.info.File.Items {
 		d, ok := it.(*ast.ConstDecl)
@@ -610,7 +666,7 @@ func (g *gen) constants() { // Emit in source order for stable output.
 // order so that by-value fields refer to complete types. All names are
 // forward-declared first, which also permits self-referential pointers.
 func (g *gen) typeDefs() {
-	if len(g.info.StructOrd) == 0 && len(g.info.EnumOrd) == 0 && len(g.arrayOrder) == 0 && len(g.vecOrder) == 0 && len(g.mapOrder) == 0 {
+	if len(g.info.StructOrd) == 0 && len(g.info.EnumOrd) == 0 && len(g.arrayOrder) == 0 && len(g.vecOrder) == 0 && len(g.mapOrder) == 0 && len(g.sliceOrder) == 0 {
 		return
 	}
 	for _, s := range g.info.StructOrd {
@@ -621,6 +677,12 @@ func (g *gen) typeDefs() {
 	}
 	for _, name := range g.arrayOrder {
 		g.w.line("typedef struct %s %s;", name, name)
+	}
+	// A slice is a fat pointer `(ptr, len)`; only the element pointer appears, so
+	// the definition is complete as soon as nominal element types are forward
+	// declared.
+	for _, name := range g.sliceOrder {
+		g.w.line("typedef struct { %s *ptr; size_t len; } %s;", ctype(g.slices[name].Elem), name)
 	}
 	// A Vec handle holds its element behind a pointer, so its definition is
 	// order-independent and can precede the structs that embed it by value.
@@ -678,7 +740,16 @@ func (g *gen) collectArrayTypes() {
 			walk(t.Elem)
 			g.arrays[name] = t
 			g.arrayOrder = append(g.arrayOrder, name)
-		case types.Ptr, types.Ref, types.Slice:
+		case types.Slice:
+			name := sliceTypeName(t)
+			if g.sliceSeen[name] {
+				return
+			}
+			g.sliceSeen[name] = true
+			walk(t.Elem)
+			g.slices[name] = t
+			g.sliceOrder = append(g.sliceOrder, name)
+		case types.Ptr, types.Ref:
 			walk(t.Elem)
 		case types.StructKind:
 			if t.St == nil || g.arrSeen["#"+t.St.Name] {
@@ -973,7 +1044,13 @@ func (g *gen) emitEnumDef(e *types.Enum) {
 			g.w.line("struct {")
 			g.w.indent++
 			for _, f := range v.Fields {
-				g.w.line("%s %s;", ctype(f.Ty), fieldName(f.Name))
+				ct := ctype(f.Ty)
+				if ct == "void" {
+					// A unit payload (`Ok(())`) still needs a member so the union
+					// arm is well-formed; it occupies no meaningful space.
+					ct = "char"
+				}
+				g.w.line("%s %s;", ct, fieldName(f.Name))
 			}
 			g.w.indent--
 			g.w.line("} v%d;", v.Index)
@@ -1086,6 +1163,32 @@ func arrayTypeName(t *types.Type) string {
 	return "zx_arr" + strconv.FormatInt(t.Len, 10) + "_" + typeMangle(t.Elem)
 }
 
+// sliceTypeName is the deterministic C name of a slice struct.
+func sliceTypeName(t *types.Type) string {
+	return "zx_slice_" + typeMangle(t.Elem)
+}
+
+// isSliceLike reports whether t is a slice or a reference to one. Both are
+// represented by the same two-word value, so borrowing a slice is a no-op.
+func isSliceLike(t *types.Type) bool {
+	return t != nil && (t.Kind == types.Slice ||
+		(t.Kind == types.Ref && t.Elem != nil && t.Elem.Kind == types.Slice))
+}
+
+// sliceElem returns the element type of a slice-like type.
+func sliceElem(t *types.Type) *types.Type {
+	if t == nil {
+		return nil
+	}
+	if t.Kind == types.Slice {
+		return t.Elem
+	}
+	if t.Kind == types.Ref && t.Elem != nil && t.Elem.Kind == types.Slice {
+		return t.Elem.Elem
+	}
+	return nil
+}
+
 // typeMangle renders a type as an identifier fragment for generated names.
 func typeMangle(t *types.Type) string {
 	if t == nil {
@@ -1160,6 +1263,9 @@ func fnSignature(fn *sema.Fn) string {
 
 func (g *gen) funcDef(fn *sema.Fn) {
 	ret := fn.Ret
+	savedRet := g.ret
+	g.ret = ret
+	defer func() { g.ret = savedRet }()
 	retC := ctype(ret)
 	if fn.Name == "main" {
 		ret = types.I32T // C's main returns int
@@ -1298,7 +1404,7 @@ func (g *gen) letStmt(st *ast.LetStmt) {
 	}
 	ct := ctype(ty)
 	if st.Val != nil {
-		g.w.line("%s %s = %s;", ct, name, g.consume(st.Val))
+		g.w.line("%s %s = %s;", ct, name, g.coerce(st.Val, ty))
 	} else {
 		// Zero-initialize so the end-of-scope destructor is safe.
 		g.w.line("%s %s = %s;", ct, name, zeroValue(ty))
@@ -1472,6 +1578,9 @@ func (g *gen) forArray(x *ast.LoopExpr) string {
 	if base := recvBase(it); base != nil && base.Kind == types.VecKind {
 		return g.vecForLoop(x)
 	}
+	if isSliceLike(it) {
+		return g.forSlice(x, it)
+	}
 	if it == nil || it.Kind != types.Array {
 		return "" // sema already diagnosed a non-array iterable
 	}
@@ -1486,6 +1595,29 @@ func (g *gen) forArray(x *ast.LoopExpr) string {
 	g.w.line("for (size_t %s = 0; %s < %d; %s++) {", ctr, ctr, it.Len, ctr)
 	g.w.indent++
 	g.w.line("%s %s = %s.e[%s];", ctype(it.Elem), name, arr, ctr)
+	res := g.loopResult(x)
+	brk, cont := g.openLoop(res)
+	g.blockStmts(x.Body, nil)
+	g.closeLoop()
+	g.endLoopBody(cont)
+	g.w.indent--
+	g.w.line("}")
+	g.w.line("%s: ;", brk)
+	g.popScope()
+	return res
+}
+
+// forSlice lowers `for x in slice`: the slice value is bound once and indexed
+// by a compiler temporary, so each iteration yields an element by value.
+func (g *gen) forSlice(x *ast.LoopExpr, it *types.Type) string {
+	s := g.tmpName()
+	g.w.line("%s %s = %s;", ctype(it), s, g.value(x.Iter))
+	g.pushScope()
+	name := g.bindLoopVar(x.Pat)
+	ctr := g.tmpName()
+	g.w.line("for (size_t %s = 0; %s < %s.len; %s++) {", ctr, ctr, s, ctr)
+	g.w.indent++
+	g.w.line("%s %s = %s.ptr[%s];", ctype(sliceElem(it)), name, s, ctr)
 	res := g.loopResult(x)
 	brk, cont := g.openLoop(res)
 	g.blockStmts(x.Body, nil)
@@ -1803,8 +1935,14 @@ func (g *gen) value(e ast.Expr) string {
 		case token.KindBang:
 			return "(!" + g.value(x.X) + ")"
 		case token.KindStar:
+			if t := g.info.TypeOf(x); isSliceLike(t) {
+				return g.value(x.X)
+			}
 			return "(*" + g.value(x.X) + ")"
 		case token.KindAmp:
+			if t := g.info.TypeOf(x); t != nil && t.Kind == types.Ref && isSliceLike(t) {
+				return g.value(x.X)
+			}
 			return "(&" + g.value(x.X) + ")"
 		}
 		return "0"
@@ -1853,6 +1991,9 @@ func (g *gen) value(e ast.Expr) string {
 		return g.indexValue(x)
 
 	case *ast.SliceExpr:
+		if t := g.info.TypeOf(x); isSliceLike(t) {
+			return g.sliceRangeValue(x)
+		}
 		return g.sliceValue(x)
 
 	case *ast.MatchExpr:
@@ -1987,7 +2128,11 @@ func (g *gen) withArgs(args []ast.Expr, wants []*types.Type, retType string, cal
 			ps[i] = "zx_string_as_str(&" + g.value(e) + ")"
 			continue
 		}
-		ps[i] = g.consume(e)
+		var want *types.Type
+		if i < len(wants) {
+			want = wants[i]
+		}
+		ps[i] = g.coerce(e, want)
 	}
 	if len(decls) == 0 {
 		return call(ps)
@@ -2567,15 +2712,27 @@ func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
 	if base := recvBase(g.info.TypeOf(x.Recv)); base != nil && base.Kind == types.MapKind {
 		return g.mapMethodCall(x)
 	}
-	// `arr.len()` / `s.len()` mirror the builtin `len`.
+	// `arr.len()` / `slice.len()` / `s.len()` mirror the builtin `len`.
 	if x.Name == "len" && len(x.Args) == 0 {
-		if base := recvBase(g.info.TypeOf(x.Recv)); base != nil {
+		rt := g.info.TypeOf(x.Recv)
+		if base := recvBase(rt); base != nil {
 			if base.Kind == types.Array {
 				return strconv.FormatInt(base.Len, 10)
 			}
 			if base.Kind == types.Str {
 				return "strlen(" + g.value(x.Recv) + ")"
 			}
+			if base.Kind == types.Slice {
+				s := g.tmpName()
+				return "({ " + ctype(rt) + " " + s + " = " + g.value(x.Recv) + "; " + s + ".len; })"
+			}
+		}
+	}
+	// `str::as_bytes()` borrows the C string as a byte slice.
+	if x.Name == "as_bytes" && len(x.Args) == 0 {
+		if base := recvBase(g.info.TypeOf(x.Recv)); base != nil && base.Kind == types.Str {
+			tm := g.tmpName()
+			return "({ const char *" + tm + " = " + g.value(x.Recv) + "; (zx_slice_u8){ (uint8_t *)" + tm + ", strlen(" + tm + ") }; })"
 		}
 	}
 	m := g.info.Resolved[x]
@@ -2645,7 +2802,16 @@ func (g *gen) stringMethodCall(x *ast.MethodCallExpr) string {
 			specs = append(specs, "zx_string_as_str(&"+g.value(a)+")")
 			continue
 		}
-		specs = append(specs, g.value(a))
+		var want *types.Type
+		if i < len(wants) {
+			want = wants[i]
+		}
+		if want != nil && want.Kind == types.Ref && want.Elem != nil && want.Elem.Kind == types.Slice {
+			specs = append(specs, g.coerce(a, want))
+		} else {
+			// A `String` method only borrows its arguments; never move one.
+			specs = append(specs, g.value(a))
+		}
 	}
 	var restB strings.Builder
 	for _, s := range specs {
@@ -2672,7 +2838,7 @@ func (g *gen) stringMethodCall(x *ast.MethodCallExpr) string {
 		switch {
 		case rt == nil || rt.Kind == types.Unit || rt.Kind == types.Never:
 			core = "({ " + prologue + call + "; zx_drop_String(&" + t + "); (void)0; })"
-		case x.Name == "as_str":
+		case x.Name == "as_str" || x.Name == "as_bytes":
 			// The result borrows the temporary's buffer, so the buffer cannot be
 			// released until the enclosing statement finishes (M0 limitation).
 			core = "({ " + prologue + call + "; })"
@@ -2743,7 +2909,7 @@ func (g *gen) structLitValue(x *ast.StructLitExpr) string {
 		if !ok {
 			continue
 		}
-		parts = append(parts, fmt.Sprintf(".%s = %s", fieldName(f.Name), g.consume(v)))
+		parts = append(parts, fmt.Sprintf(".%s = %s", fieldName(f.Name), g.coerce(v, f.Ty)))
 	}
 	return "((" + typeName(st.Name) + "){ " + strings.Join(parts, ", ") + " })"
 }
@@ -2765,7 +2931,7 @@ func (g *gen) enumStructValue(ctor *sema.Ctor, fields []ast.FieldInit) string {
 		if !ok {
 			continue
 		}
-		parts = append(parts, "."+fieldName(f.Name)+" = "+g.consume(e))
+		parts = append(parts, "."+fieldName(f.Name)+" = "+g.coerce(e, f.Ty))
 	}
 	return "((" + typeName(en.Name) + "){ .tag = " + tag +
 		", .u.v" + tag + " = { " + strings.Join(parts, ", ") + " } })"
@@ -2780,9 +2946,15 @@ func (g *gen) enumConstruct(ctor *sema.Ctor, args []ast.Expr) string {
 	}
 	var inits []string
 	for i, f := range v.Fields {
+		unit := f.Ty == nil || f.Ty.Kind == types.Unit || f.Ty.Kind == types.Never
 		s := zeroValue(f.Ty)
 		if i < len(args) {
-			s = g.consume(args[i])
+			s = g.coerce(args[i], f.Ty)
+		}
+		if unit {
+			// The union member is a placeholder `char`; a unit payload has no
+			// value to copy into it.
+			s = "0"
 		}
 		inits = append(inits, "."+fieldName(f.Name)+" = "+s)
 	}
@@ -2825,6 +2997,18 @@ func (g *gen) indexValue(x *ast.IndexExpr) string {
 	}
 	if base := recvBase(rt); base != nil && base.Kind == types.VecKind {
 		return vecIndex("("+g.vecReceiverValue(x.Recv)+")", idx)
+	}
+	if isSliceLike(rt) {
+		if isPlaceExpr(x.Recv) {
+			// Keep the element expression an lvalue so `buf[i] = v` and
+			// `&buf[i]` work. A place receiver has no side effects, so reading
+			// it twice costs nothing observable.
+			return "(" + recv + ").ptr[zx_bounds(" + idx + ", (int64_t)(" + recv + ").len)]"
+		}
+		// Bind the slice once: its receiver may have side effects.
+		s := g.tmpName()
+		return "({ " + ctype(rt) + " " + s + " = " + recv + "; " + s +
+			".ptr[zx_bounds(" + idx + ", (int64_t)" + s + ".len)]; })"
 	}
 	return "(" + recv + ")[" + idx + "]"
 }
@@ -2880,6 +3064,73 @@ func (g *gen) sliceValue(x *ast.SliceExpr) string {
 	return "({ const char *" + tm + " = " + recv + "; zx_string_slice(" + tm + ", " + low + ", strlen(" + tm + ")); })"
 }
 
+// sliceRangeValue lowers `xs[lo..hi]` / `xs[lo:hi]` on an array or a slice to a
+// borrowed `[T]` view without copying elements.
+func (g *gen) sliceRangeValue(x *ast.SliceExpr) string {
+	recv := g.value(x.Recv)
+	rt := g.info.TypeOf(x.Recv)
+	base := rt
+	if base != nil && base.Kind == types.Ref && base.Elem != nil {
+		base = base.Elem
+	}
+	var elem *types.Type
+	if base != nil && base.Kind == types.Array {
+		elem = base.Elem
+	} else if isSliceLike(rt) {
+		elem = sliceElem(rt)
+	}
+	if elem == nil {
+		return "0"
+	}
+	name := sliceTypeName(&types.Type{Kind: types.Slice, Elem: elem})
+	lo := "0"
+	if x.Low != nil {
+		lo = g.value(x.Low)
+	}
+	hi := ""
+	if x.High != nil {
+		hi = g.value(x.High)
+	}
+	slot := g.tmpName()
+	l := g.tmpName()
+	h := g.tmpName()
+	var b strings.Builder
+	b.WriteString("({ ")
+	var n string
+	if base.Kind == types.Array {
+		n = strconv.FormatInt(base.Len, 10)
+		if rt.Kind == types.Ref {
+			// `r[lo..hi]` where `r: &[T; N]`: the receiver is already a pointer
+			// to the array wrapper.
+			b.WriteString(ctype(elem) + " *" + slot + " = (" + recv + ")->e; ")
+		} else if isPlaceExpr(x.Recv) {
+			b.WriteString(ctype(elem) + " *" + slot + " = (" + recv + ").e; ")
+		} else {
+			// Bind the array value so its elements outlive the view. A
+			// temporary array's buffer ends with the enclosing statement, which
+			// is exactly the M0 borrow rule for every other temporary.
+			b.WriteString(ctype(&types.Type{Kind: types.Array, Elem: elem, Len: base.Len}) + " " + slot + "arr = " + recv + "; ")
+			b.WriteString(ctype(elem) + " *" + slot + " = " + slot + "arr.e; ")
+		}
+	} else {
+		n = "(int64_t)" + slot + ".len"
+		b.WriteString(ctype(rt) + " " + slot + " = " + recv + "; ")
+	}
+	b.WriteString("int64_t " + l + " = (int64_t)(" + lo + "); ")
+	if hi != "" {
+		b.WriteString("int64_t " + h + " = (int64_t)(" + hi + "); ")
+	} else {
+		b.WriteString("int64_t " + h + " = " + n + "; ")
+	}
+	b.WriteString("zx_slice_check(&" + l + ", &" + h + ", " + n + "); ")
+	if base.Kind == types.Array {
+		b.WriteString("(" + name + "){ " + slot + " + " + l + ", (size_t)(" + h + " - " + l + ") }; })")
+	} else {
+		b.WriteString("(" + name + "){ " + slot + ".ptr + " + l + ", (size_t)(" + h + " - " + l + ") }; })")
+	}
+	return b.String()
+}
+
 // cstrValue emits the C-bridge builtin `cstr(x)`: a borrowed `*u8`
 // pointing at NUL-terminated text. A `str` already is a C string; a
 // `String` place lends its buffer. A computed `String` temporary is
@@ -2912,6 +3163,9 @@ func (g *gen) lenValue(x *ast.CallExpr) string {
 	switch {
 	case t != nil && t.Kind == types.Array:
 		return strconv.FormatInt(t.Len, 10)
+	case isSliceLike(t):
+		s := g.tmpName()
+		return "({ " + ctype(t) + " " + s + " = " + g.value(x.Args[0]) + "; " + s + ".len; })"
 	case t != nil && t.Kind == types.Str:
 		return "strlen(" + g.value(x.Args[0]) + ")"
 	case t != nil && t.Kind == types.VecKind:
@@ -3728,6 +3982,48 @@ func (g *gen) consume(e ast.Expr) string {
 	return g.value(e)
 }
 
+// coerce emits e for a context that expects `want`. The one conversion is
+// unsizing: a borrow of a fixed array becomes a slice of the same elements.
+// Slices are `Copy` views, so borrowing a slice value is a no-op.
+func (g *gen) coerce(e ast.Expr, want *types.Type) string {
+	got := g.info.TypeOf(e)
+	if want != nil && want.Kind == types.Ref && want.Elem != nil && want.Elem.Kind == types.Slice {
+		if got != nil && got.Kind == types.Ref && got.Elem != nil {
+			switch got.Elem.Kind {
+			case types.Slice:
+				return g.value(e)
+			case types.Array:
+				if types.Equal(want.Elem.Elem, got.Elem.Elem) && (!want.Mut || got.Mut) {
+					return g.unsize(e, got.Elem)
+				}
+			}
+		}
+		if got != nil && got.Kind == types.Slice && types.Equal(want.Elem, got) {
+			return g.value(e)
+		}
+	}
+	if want != nil && want.Kind == types.Slice && isSliceLike(got) {
+		return g.value(e)
+	}
+	return g.consume(e)
+}
+
+// unsize lowers a borrow of a fixed array (`&a`, `&mut a`) to the slice struct
+// for `a`'s element type, without copying the elements.
+func (g *gen) unsize(e ast.Expr, arr *types.Type) string {
+	st := &types.Type{Kind: types.Slice, Elem: arr.Elem}
+	name := sliceTypeName(st)
+	n := strconv.FormatInt(arr.Len, 10)
+	if u, ok := e.(*ast.UnExpr); ok && u.Op == token.KindAmp && isPlaceExpr(u.X) {
+		return "((" + name + "){ .ptr = (" + g.value(u.X) + ").e, .len = " + n + " })"
+	}
+	// A borrow that is not spelled `&place` (for example a function returning
+	// `&[T; N]`): bind the pointer once and re-derive the element address.
+	p := g.tmpName()
+	return "({ " + ctype(&types.Type{Kind: types.Ptr, Elem: arr}) + " " + p + " = " + g.value(e) +
+		"; (" + name + "){ .ptr = " + p + "->e, .len = " + n + " }; })"
+}
+
 // emitReturn emits a `return`, first moving the value out (so it is not dropped
 // with the locals) and then running the destructors of every live local.
 func (g *gen) emitReturn(val ast.Expr) {
@@ -3753,7 +4049,7 @@ func (g *gen) emitReturn(val ast.Expr) {
 	// Materialize the value *before* running destructors: the expression may
 	// read locals (or by-value parameters) that the drops are about to free.
 	tmp := g.tmpName()
-	g.w.line("%s %s = %s;", ctype(t), tmp, g.consume(val))
+	g.w.line("%s %s = %s;", ctype(t), tmp, g.coerce(val, g.ret))
 	g.emitDropsFrom(0)
 	g.w.line("return %s;", tmp)
 }
@@ -3793,7 +4089,7 @@ func (g *gen) assignValue(x *ast.AssignExpr) string {
 		return "(" + g.value(x.Lhs) + " " + x.Op.String() + " " + g.value(x.Rhs) + ")"
 	}
 	lt := g.info.TypeOf(x.Lhs)
-	rhs := g.consume(x.Rhs)
+	rhs := g.coerce(x.Rhs, lt)
 	if lt != nil && lt.NeedsDrop() && isPlaceExpr(x.Lhs) {
 		lhs := g.value(x.Lhs)
 		// Materialize the RHS first: it may read the value being overwritten
@@ -3857,12 +4153,20 @@ func ctype(t *types.Type) string {
 		return "float"
 	case types.F64:
 		return "double"
-	case types.Ptr, types.Ref:
+	case types.Ptr:
+		return ctype(t.Elem) + " *"
+	case types.Ref:
+		// A reference to a slice is the slice value itself: both are a
+		// non-owning (ptr, len) view, and a slice is `Copy`, so the extra
+		// indirection C would use for `&T` has nothing to point at.
+		if t.Elem != nil && t.Elem.Kind == types.Slice {
+			return sliceTypeName(t.Elem)
+		}
 		return ctype(t.Elem) + " *"
 	case types.Array:
 		return arrayTypeName(t)
 	case types.Slice:
-		return "const void *"
+		return sliceTypeName(t)
 	case types.StructKind:
 		if t.St != nil {
 			return typeName(t.St.Name)
@@ -3888,8 +4192,15 @@ func zeroValue(t *types.Type) string {
 		return "false"
 	case t.Kind.IsFloat():
 		return "0.0"
-	case t.Kind == types.Str, t.Kind == types.Ptr, t.Kind == types.Ref:
+	case t.Kind == types.Str, t.Kind == types.Ptr:
 		return "0"
+	case t.Kind == types.Ref:
+		if t.Elem != nil && t.Elem.Kind == types.Slice {
+			return "((" + sliceTypeName(t.Elem) + "){ 0 })"
+		}
+		return "0"
+	case t.Kind == types.Slice:
+		return "((" + sliceTypeName(t) + "){ 0 })"
 	case t.Kind == types.StringKind:
 		return "((zx_String){ 0 })"
 	case t.Kind == types.VecKind:

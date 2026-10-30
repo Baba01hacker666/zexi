@@ -1,10 +1,40 @@
-// sys — practical local-system helpers: environment, paths, clocks, and pid.
+// sys — the POSIX substrate: errno, byte I/O, files, environment, clocks, pid.
 // Import with `use sys;`, `use std::sys;`, `import os;`, or `import time;`.
 //
-// A small POSIX C shim (`zxs_*`) is linked only when this module is used.
-// Path-returning helpers use a 4096-byte buffer; failures return an empty
-// String and filesystem operations return 0 on success or -1 on failure.
+// `sys` depends on nothing else in the standard library; `io`, `fs`, and `net`
+// build on it. A small POSIX C shim (`zxs_*`) is linked only when this module is
+// used. Path-returning helpers use a 4096-byte buffer.
 
+// errno values for the errors the standard library maps to `IoError`. They are
+// the Linux and macOS values, which agree for these five.
+pub const EINTR: i32 = 4;
+pub const EIO: i32 = 5;
+pub const ENOENT: i32 = 2;
+pub const EACCES: i32 = 13;
+pub const EISDIR: i32 = 21;
+
+// IoError is the classified failure every fallible I/O operation returns.
+// `Other` carries the platform errno for anything not named here.
+pub enum IoError {
+    Eof,
+    Interrupted,
+    NotFound,
+    Permission,
+    IsDir,
+    TooLarge,
+    Other(i32),
+}
+
+extern "C" fn zxs_errno() -> i32;
+extern "C" fn zxs_strerror(code: i32) -> str;
+extern "C" fn zxs_read(fd: i32, buf: &mut [u8]) -> i64;
+extern "C" fn zxs_write(fd: i32, buf: &[u8]) -> i64;
+extern "C" fn zxs_open_read(path: str) -> i32;
+extern "C" fn zxs_open_write(path: str) -> i32;
+extern "C" fn zxs_close(fd: i32) -> i32;
+extern "C" fn zxs_file_size(path: str) -> i64;
+extern "C" fn zxs_stat_kind(path: str) -> i32;
+extern "C" fn zxs_write_str(fd: i32, s: str, n: usize) -> i64;
 extern "C" fn zxs_env_get(name: str, buf: &mut [u8; 4096], cap: i32) -> i32;
 extern "C" fn zxs_env_has(name: str) -> i32;
 extern "C" fn zxs_env_set(name: str, value: str, overwrite: i32) -> i32;
@@ -20,6 +50,133 @@ extern "C" fn zxs_mkdir(path: str) -> i32;
 extern "C" fn zxs_remove_path(path: str) -> i32;
 extern "C" fn zxs_rename_path(from: str, to: str) -> i32;
 extern "C" fn zxs_cpu_count() -> i32;
+
+// errno is the last C-level error number in this thread.
+pub fn errno() -> i32 {
+    return zxs_errno();
+}
+
+// error_string renders an errno value as the platform's message. The result is
+// borrowed from C's static strerror buffer: copy it before the next call that
+// might overwrite it.
+pub fn error_string(code: i32) -> str {
+    return zxs_strerror(code);
+}
+
+// error_of classifies an errno value.
+pub fn error_of(code: i32) -> IoError {
+    if code == EINTR {
+        return IoError::Interrupted;
+    }
+    if code == ENOENT {
+        return IoError::NotFound;
+    }
+    if code == EACCES {
+        return IoError::Permission;
+    }
+    if code == EISDIR {
+        return IoError::IsDir;
+    }
+    return IoError::Other(code);
+}
+
+// message renders an IoError for a human, including the platform text for the
+// generic case.
+pub fn message(e: IoError) -> String {
+    match e {
+        IoError::Interrupted => String::from("interrupted"),
+        IoError::NotFound => String::from("not found"),
+        IoError::Permission => String::from("permission denied"),
+        IoError::IsDir => String::from("is a directory"),
+        IoError::TooLarge => String::from("file too large"),
+        IoError::Eof => String::from("end of file"),
+        IoError::Other(code) => String::from(error_string(code)),
+    }
+}
+
+// read_fd reads into `buf` once, returning the byte count (0 at end of file).
+pub fn read_fd(fd: i32, buf: &mut [u8]) -> Result<usize, IoError> {
+    let n = zxs_read(fd, buf);
+    if n < 0 {
+        return Err(error_of(errno()));
+    }
+    return Ok(n as usize);
+}
+
+// write_fd writes all of `buf`, retrying short writes. It returns the number of
+// bytes written.
+pub fn write_fd(fd: i32, buf: &[u8]) -> Result<usize, IoError> {
+    let mut done: usize = 0;
+    while done < buf.len() {
+        let slice = buf[done..buf.len()];
+        let n = zxs_write(fd, slice);
+        if n < 0 {
+            return Err(error_of(errno()));
+        }
+        if n == 0 {
+            return Err(IoError::Other(EIO));
+        }
+        done += n as usize;
+    }
+    return Ok(done);
+}
+
+// open_read opens a file for reading.
+pub fn open_read(path: str) -> Result<i32, IoError> {
+    let fd = zxs_open_read(path);
+    if fd < 0 {
+        return Err(error_of(errno()));
+    }
+    return Ok(fd);
+}
+
+// open_write creates or truncates a file for writing.
+pub fn open_write(path: str) -> Result<i32, IoError> {
+    let fd = zxs_open_write(path);
+    if fd < 0 {
+        return Err(error_of(errno()));
+    }
+    return Ok(fd);
+}
+
+// close_fd closes a descriptor.
+pub fn close_fd(fd: i32) -> Result<(), IoError> {
+    if zxs_close(fd) != 0 {
+        return Err(error_of(errno()));
+    }
+    return Ok(());
+}
+
+// file_size reports a regular file's byte length.
+pub fn file_size(path: str) -> Result<u64, IoError> {
+    let n = zxs_file_size(path);
+    if n < 0 {
+        return Err(error_of(errno()));
+    }
+    return Ok(n as u64);
+}
+
+// path_kind reports what a path names: 0 missing, 1 regular file, 2 directory.
+pub fn path_kind(path: str) -> i32 {
+    return zxs_stat_kind(path);
+}
+
+// write_str_fd writes borrowed text, returning its visible byte length.
+pub fn write_str_fd(fd: i32, s: str) -> Result<usize, IoError> {
+    let n = zxs_write_str(fd, s, len(s));
+    if n < 0 {
+        return Err(error_of(errno()));
+    }
+    return Ok(n as usize);
+}
+
+// remove_path_status removes a regular file or an empty directory.
+pub fn remove_path_status(path: str) -> Result<(), IoError> {
+    if zxs_remove_path(path) != 0 {
+        return Err(error_of(errno()));
+    }
+    return Ok(());
+}
 
 // env_get returns the value of an environment variable ("" when unset or
 // empty). Use env_has to distinguish those two cases.
@@ -188,6 +345,7 @@ c """
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 /* Copy a C string into a caller-owned buffer, always NUL-terminating it.
  * Returns the copied byte length, or -1 for invalid arguments. */
@@ -203,6 +361,60 @@ static int zxs_copy_string(const char *src, char *buf, int cap) {
 /* A `&mut [u8; 4096]` parameter arrives as a pointer to the array's wrapper
  * struct; `->e` is the bytes. */ 
 #define ZXS_BYTES(buf) ((char *)((buf)->e))
+
+/* --- errno and byte I/O ------------------------------------------------- */
+
+int32_t zxs_errno(void) { return (int32_t)errno; }
+
+/* The result points at C's static strerror buffer: borrowed, not owned. */
+const char *zxs_strerror(int32_t code) { return strerror((int)code); }
+
+int64_t zxs_read(int32_t fd, zx_slice_u8 buf) {
+    ssize_t n = read(fd, buf.ptr, buf.len);
+    return (int64_t)n;
+}
+
+int64_t zxs_write(int32_t fd, zx_slice_u8 buf) {
+    ssize_t n = write(fd, buf.ptr, buf.len);
+    return (int64_t)n;
+}
+
+int32_t zxs_open_read(const char *path) {
+    return path ? open(path, O_RDONLY) : -1;
+}
+
+int32_t zxs_open_write(const char *path) {
+    if (!path) return -1;
+    return open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+}
+
+int32_t zxs_close(int32_t fd) { return close(fd); }
+
+/* Write a borrowed `str`, whose length the caller supplies. */
+int64_t zxs_write_str(int32_t fd, const char *s, size_t n) {
+    if (!s) return -1;
+    return (int64_t)write(fd, s, n);
+}
+
+int64_t zxs_file_size(const char *path) {
+    struct stat st;
+    if (!path) { errno = EINVAL; return -1; }
+    if (stat(path, &st) != 0) return -1; /* errno describes the failure */
+    if (!S_ISREG(st.st_mode)) {
+        errno = S_ISDIR(st.st_mode) ? EISDIR : EINVAL;
+        return -1;
+    }
+    return (int64_t)st.st_size;
+}
+
+/* 0 missing/other, 1 regular file, 2 directory. */
+int32_t zxs_stat_kind(const char *path) {
+    struct stat st;
+    if (!path || stat(path, &st) != 0) return 0;
+    if (S_ISREG(st.st_mode)) return 1;
+    if (S_ISDIR(st.st_mode)) return 2;
+    return 0;
+}
 
 /* zxs_env_get copies an environment variable into buf, returning its length,
  * or -1 when the variable is unset. */

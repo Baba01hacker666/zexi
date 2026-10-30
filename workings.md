@@ -149,15 +149,15 @@ Embedded in the compiler under `internal/driver/std/`:
 
 | Module | File | Purpose |
 |--------|------|---------|
-| io     | `io.zx` | stdin/stdout, input/read_line/read_all |
-| fs     | `fs.zx` | capped binary-safe file read/write/copy helpers |
+| io     | `io.zx` | stdin/stdout: `Result`-based read_line/read_all/read_byte, byte writes |
+| fs     | `fs.zx` | capped binary-safe file read/write/copy; `Result<_, IoError>` |
 | math   | `math.zx` | integer/bit helpers, roots/logs/trig, geometry/smoothing, primes/combinatorics |
-| fmt    | `fmt.zx` | number/value formatting: bases, grouping, fixed/sci decimals, human units, alignment |
+| fmt    | `fmt.zx` | number/value formatting: bases, grouping, fixed/sci decimals, human units, padding |
 | codec  | `codec.zx` | hex/base64 encode+decode and CRC-32/Adler-32/FNV-1a/djb2 checksums |
 | text   | `text.zx` | string helpers |
 | random | `random.zx` | RNG |
 | regex  | `regex.zx` | POSIX-ERE search/full-match/find/replace (C shim `zxregex_c.txt`) |
-| sys    | `sys.zx` | env, local paths/filesystem ops, clocks, pid (C shim `zxsys_c.txt`) |
+| sys    | `sys.zx` | POSIX substrate: errno/`IoError`, byte I/O, files, env, clocks, pid |
 | net    | `net.zx` | TCP/UDP sockets, `resolve`, poll/bounded accept, shared file ABI (C shim `zxnet_c.txt`) |
 | http   | `http.zx` | HTTP client/server, Router, worker-pool serving, serve/serve_dir helpers |
 | thread | `thread.zx` | OS threads, `i64` channels, `i64` atomics, task `Pool` (C shim `zxthread_c.txt`, links `-pthread`) |
