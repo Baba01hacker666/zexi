@@ -103,9 +103,23 @@ fn fmt_zero_pad(v: i64, width: i32) -> String {
 
 // --- integer bases ---------------------------------------------------------
 
-// radix_str formats n in the given base; base is clamped to 2..36.
-pub fn radix_str(n: i64, base: i32) -> String {
+// radix formats n in the given base; base is clamped to 2..36. radix_str is
+// kept as an alias.
+pub fn radix(n: i64, base: i32) -> String {
     return fmt_radix(n, fmt_clampi(base, 2, 36) as u64);
+}
+
+pub fn radix_str(n: i64, base: i32) -> String {
+    return radix(n, base);
+}
+
+// hex formats n in base 16 (lowercase unless `upper`). hex_lower and hex_upper
+// are kept as aliases.
+pub fn hex(n: i64, upper: bool) -> String {
+    if upper {
+        return hex_upper(n);
+    }
+    return hex_lower(n);
 }
 
 // hex_lower formats n in base 16, lowercase.
@@ -203,7 +217,7 @@ pub fn thousands(n: i64) -> String {
 // fixed_point(2.5, 0) is "3"). `digits` is clamped to 0..18. NaN prints as
 // "NaN" and infinities as "inf". Values too large to scale exactly fall back to
 // the runtime's own float formatting.
-pub fn fixed_point(x: f64, digits: i32) -> String {
+pub fn fixed(x: f64, digits: i32) -> String {
     let d = fmt_clampi(digits, 0, 18);
     if x != x {
         return String::from("NaN");
@@ -213,6 +227,9 @@ pub fn fixed_point(x: f64, digits: i32) -> String {
         ax = 0.0 - x;
     }
     if ax != 0.0 && ax * 0.5 == ax {
+        if x < 0.0 {
+            return String::from("-inf");
+        }
         return String::from("inf");
     }
     let mut scale: i64 = 1;
@@ -241,9 +258,13 @@ pub fn fixed_point(x: f64, digits: i32) -> String {
     return out;
 }
 
-// sci_notation renders x in scientific form with `digits` digits after the
-// decimal point (e.g. sci_notation(12345.0, 2) is "1.23e4").
-pub fn sci_notation(x: f64, digits: i32) -> String {
+pub fn fixed_point(x: f64, digits: i32) -> String {
+    return fixed(x, digits);
+}
+
+// sci renders x in scientific form with `digits` digits after the decimal
+// point (e.g. sci(12345.0, 2) is "1.23e4"). sci_notation is kept as an alias.
+pub fn sci(x: f64, digits: i32) -> String {
     let d = fmt_clampi(digits, 0, 17);
     if x != x {
         return String::from("NaN");
@@ -254,6 +275,9 @@ pub fn sci_notation(x: f64, digits: i32) -> String {
         ax = 0.0 - x;
     }
     if ax != 0.0 && ax * 0.5 == ax {
+        if neg {
+            return String::from("-inf");
+        }
         return String::from("inf");
     }
     if ax == 0.0 {
@@ -299,8 +323,16 @@ pub fn sci_notation(x: f64, digits: i32) -> String {
     return out;
 }
 
-// percent_str renders a fraction as a percentage, e.g. percent_str(0.256, 1) is
-// "25.6%".
+pub fn sci_notation(x: f64, digits: i32) -> String {
+    return sci(x, digits);
+}
+
+// percent renders a fraction as a percentage, e.g. percent(0.256, 1) is
+// "25.6%". percent_str is kept as an alias.
+pub fn percent(frac: f64, digits: i32) -> String {
+    return percent_str(frac, digits);
+}
+
 pub fn percent_str(frac: f64, digits: i32) -> String {
     let mut out = fixed_point(frac * 100.0, digits);
     out.push('%');
@@ -309,9 +341,13 @@ pub fn percent_str(frac: f64, digits: i32) -> String {
 
 // --- human units -----------------------------------------------------------
 
-// byte_size renders a byte count with a decimal unit (B, KB, MB, GB, TB) and
-// one decimal place above 1 KB, e.g. byte_size(1536) is "1.5 KB".
-pub fn byte_size(n: i64) -> String {
+// bytes renders a byte count with a decimal unit (B, KB, MB, GB, TB) and one
+// decimal place above 1 KB, e.g. bytes(1536) is "1.5 KB". byte_size is kept as
+// an alias.
+//
+// Rounding happens before unit promotion, so 999_999 renders as "1.0 MB" rather
+// than the misleading "1000.0 KB".
+pub fn bytes(n: i64) -> String {
     if fmt_mag(n) < 1000 {
         return fmt_i64(n) + " B";
     }
@@ -323,20 +359,35 @@ pub fn byte_size(n: i64) -> String {
         u += 1;
     }
     let units: [str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    // Format first, then promote if the rounded value reaches 1000.
+    let mut text = fixed(v, 1);
+    while u < 4 {
+        let parsed = text.parse_i64();
+        if parsed < 1000 {
+            break;
+        }
+        u += 1;
+        v = v / 1000.0;
+        text = fixed(v, 1);
+    }
     let mut out = String::from("");
     if neg {
         out.push('-');
     }
-    out += fixed_point(v, 1).as_str();
+    out += text.as_str();
     out.push(' ');
     out += units[u];
     return out;
 }
 
-// duration_ms renders a millisecond count as a compact duration, e.g.
-// duration_ms(3661000) is "1h 1m 1s" and duration_ms(250) is "250ms". Negative
-// input is passed through as "<n>ms".
-pub fn duration_ms(ms: i64) -> String {
+pub fn byte_size(n: i64) -> String {
+    return bytes(n);
+}
+
+// duration renders a millisecond count as a compact duration, e.g.
+// duration(3661000) is "1h 1m 1s" and duration(250) is "250ms". Negative input
+// is passed through as "<n>ms". duration_ms is kept as an alias.
+pub fn duration(ms: i64) -> String {
     if ms < 1000 {
         return fmt_i64(ms) + "ms";
     }
@@ -374,6 +425,10 @@ pub fn duration_ms(ms: i64) -> String {
     return out;
 }
 
+pub fn duration_ms(ms: i64) -> String {
+    return duration(ms);
+}
+
 // ordinal renders n with its English ordinal suffix, e.g. ordinal(21) is
 // "21st". Negative values keep their sign ("-3rd").
 pub fn ordinal(n: i64) -> String {
@@ -398,34 +453,34 @@ pub fn ordinal(n: i64) -> String {
     return out;
 }
 
-// --- alignment -------------------------------------------------------------
+// --- padding ---------------------------------------------------------------
 
-// align_left pads s on the right with spaces to `width` columns.
-pub fn align_left(s: str, width: i32) -> String {
+// pad_right pads s on the right with `fill` to `width` columns.
+pub fn pad_right(s: str, width: usize, fill: char = ' ') -> String {
     let mut out = String::from(s);
     let mut pad: i64 = (width as i64) - (s.len() as i64);
     while pad > 0 {
-        out.push(' ');
+        out.push(fill);
         pad -= 1;
     }
     return out;
 }
 
-// align_right pads s on the left with spaces to `width` columns.
-pub fn align_right(s: str, width: i32) -> String {
+// pad_left pads s on the left with `fill` to `width` columns.
+pub fn pad_left(s: str, width: usize, fill: char = ' ') -> String {
     let mut out = String::from("");
     let mut pad: i64 = (width as i64) - (s.len() as i64);
     while pad > 0 {
-        out.push(' ');
+        out.push(fill);
         pad -= 1;
     }
     out += s;
     return out;
 }
 
-// align_center pads s on both sides with spaces to `width` columns, giving the
+// pad_center pads s on both sides with `fill` to `width` columns, giving the
 // extra space on the right for odd padding.
-pub fn align_center(s: str, width: i32) -> String {
+pub fn pad_center(s: str, width: usize, fill: char = ' ') -> String {
     let extra: i64 = (width as i64) - (s.len() as i64);
     if extra <= 0 {
         return String::from(s);
@@ -434,14 +489,36 @@ pub fn align_center(s: str, width: i32) -> String {
     let mut out = String::from("");
     let mut i: i64 = 0;
     while i < left {
-        out.push(' ');
+        out.push(fill);
         i += 1;
     }
     out += s;
     let mut j: i64 = left;
     while j < extra {
-        out.push(' ');
+        out.push(fill);
         j += 1;
     }
     return out;
+}
+
+// align_left / align_right / align_center are the old, space-only spellings.
+pub fn align_left(s: str, width: i32) -> String {
+    if width <= 0 {
+        return String::from(s);
+    }
+    return pad_right(s, width as usize);
+}
+
+pub fn align_right(s: str, width: i32) -> String {
+    if width <= 0 {
+        return String::from(s);
+    }
+    return pad_left(s, width as usize);
+}
+
+pub fn align_center(s: str, width: i32) -> String {
+    if width <= 0 {
+        return String::from(s);
+    }
+    return pad_center(s, width as usize);
 }

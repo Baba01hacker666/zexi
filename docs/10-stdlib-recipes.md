@@ -127,11 +127,27 @@ Useful path/process calls are:
 | `mkdir(path)` | Create one directory level; an existing directory is success; missing parents are **not** created. |
 | `chdir`, `rename_path`, `remove_path` | Explicit local filesystem operations; return `0` or `-1`. `remove_path` is never recursive. |
 
-For file contents, combine this with `import io.fs;`. `read_bytes`,
-`write_bytes(path, &String)`, and `copy_file` preserve embedded NUL bytes and
-cap individual reads/writes/copies at 32 MiB. A missing read is `""`; use
-`path_exists` or `file_len` when an empty file must be distinguished from an
-error.
+For file contents, combine this with `import io.fs;`. `fs::read`,
+`fs::write(path, &[u8])`, and `fs::copy` preserve embedded NUL bytes and cap
+individual reads/writes/copies at `fs::MAX_BYTES` (32 MiB). They return
+`Result<_, IoError>` (`IoError` comes from `sys`), so an empty file is
+`Ok("")` and a missing one is `Err(IoError::NotFound)` instead of the same
+empty string.
+
+```zx
+use fs;
+use sys;
+
+fn main() {
+    let path = "/tmp/zx_fs_recipe.txt";
+    let written = fs::write(path, "hello".as_bytes());
+    match fs::read(path) {
+        Ok(text) => println(text.len()),          // 5
+        Err(e) => println(sys::message(e)),
+    }
+    let removed = fs::remove(path);
+}
+```
 
 ## 10.4 Regular expressions
 
@@ -272,34 +288,38 @@ bases, grouping, fixed decimals, human units, ordinals, and alignment.
 use fmt;
 
 fn main() -> i32 {
-    println(fmt::hex_lower(255));          // ff
+    println(fmt::hex(255, true));          // FF
     println(fmt::hex_pad(255, 4));         // 00ff
     println(fmt::thousands(1234567));      // 1,234,567
-    println(fmt::fixed_point(3.14159, 2)); // 3.14
-    println(fmt::sci_notation(12345.0, 2));// 1.23e4
-    println(fmt::percent_str(0.256, 1));   // 25.6%
-    println(fmt::byte_size(1536));         // 1.5 KB
-    println(fmt::duration_ms(3661000));    // 1h 1m 1s
+    println(fmt::fixed(3.14159, 2));       // 3.14
+    println(fmt::sci(12345.0, 2));         // 1.23e4
+    println(fmt::percent(0.256, 1));       // 25.6%
+    println(fmt::bytes(1536));             // 1.5 KB
+    println(fmt::duration(3661000));       // 1h 1m 1s
     println(fmt::ordinal(21));             // 21st
-    println("[" + fmt::align_right("42", 6) + "]");  // [    42]
+    println("[" + fmt::pad_left("42", 6) + "]");   // [    42]
+    println("[" + fmt::pad_center("ab", 6, '-') + "]"); // [--ab--]
     0
 }
 ```
 
 | Group | APIs |
 | --- | --- |
-| Bases | `hex_lower`, `hex_upper`, `hex_pad`, `bin_str`, `oct_str`, `radix_str` (2..36) |
+| Bases | `hex(n, upper)`, `hex_pad`, `radix(n, base)` (2..36) |
 | Decimal grouping | `thousands`, `thousands_sep` |
-| Decimals and exponents | `fixed_point`, `sci_notation`, `percent_str` |
-| Human units | `byte_size`, `duration_ms` |
+| Decimals and exponents | `fixed`, `sci`, `percent` |
+| Human units | `bytes`, `duration` |
 | Ordinals | `ordinal` |
-| Alignment | `align_left`, `align_right`, `align_center` |
+| Padding | `pad_left`, `pad_right`, `pad_center` (each takes an optional fill character) |
 
 Negative integers keep a leading `-` in front of the digits (`-ff`, not a
-two's-complement form). `fixed_point` rounds half away from zero, prints `NaN`
-for NaN, `inf` for infinities, and falls back to the built-in float formatting
-for values too large to scale exactly. `radix_str` clamps its base to 2..36 and
-`fixed_point`/`sci_notation` clamp their digit count (0..18). See
+two's-complement form). `fixed` rounds half away from zero, prints `NaN` for
+NaN, and keeps the sign for infinities (`-inf`/`inf`); it falls back to the
+built-in float formatting for values too large to scale exactly. `bytes`
+rounds before promoting units, so `fmt::bytes(999_999)` is `"1.0 MB"`, not
+`"1000.0 KB"`. `radix` clamps its base to 2..36 and `fixed`/`sci` clamp their
+digit count (0..18). The old names (`hex_lower`, `fixed_point`, `byte_size`,
+`align_right`, and friends) remain as aliases. See
 [`tests/formatting.zx`](../tests/formatting.zx) for every function.
 
 ## 10.8 Encoders and checksums
@@ -325,13 +345,46 @@ fn main() -> i32 {
 
 | Group | APIs |
 | --- | --- |
-| Hex | `hex_encode`, `hex_encode_upper`, `hex_decode` |
-| Base64 | `base64_encode`, `base64_encode_url`, `base64_decode` |
-| Checksums | `crc32`, `crc32_hex`, `adler32`, `adler32_hex`, `fnv1a32`, `fnv1a32_hex`, `fnv1a64`, `fnv1a64_hex`, `djb2`, `djb2_hex` |
+| Hex | `hex_encode`, `hex_encode_upper`, `hex_decode`, `hex_encode_bytes`, `hex_encode_bytes_upper`, `hex_decode_bytes` |
+| Base64 | `base64_encode`, `base64_encode_url`, `base64_decode`, `base64_encode_bytes`, `base64_encode_url_bytes`, `base64_decode_bytes` |
+| Checksums | `crc32`, `crc32_hex`, `adler32`, `adler32_hex`, `fnv1a32`, `fnv1a32_hex`, `fnv1a64`, `fnv1a64_hex`, `djb2`, `djb2_hex` (each with a `_bytes` twin) |
 
 `crc32` is the zlib/IEEE 802.3 CRC-32; `adler32` matches zlib; `fnv1a32`/`fnv1a64`
 are 32-/64-bit FNV-1a; `djb2` is Bernstein's hash. The numeric forms return an
 `i64` (`u64` for the 64-bit hashes) and the `*_hex` forms return a zero-padded
 lowercase digest. `hex_decode` and `base64_decode` return an empty string on
-malformed input rather than guessing. See
-[`tests/encoding.zx`](../tests/encoding.zx) for the standard test vectors.
+malformed input rather than guessing; the `_bytes` decoders return
+`Result<String, String>` instead, which is what you want for a token that came
+off the wire:
+
+```zx
+use codec;
+use fs;
+
+fn main() -> i32 {
+    // Binary data goes in and comes back byte for byte, NUL included.
+    let mut data = String::new();
+    data.push_byte(0);
+    data.push_byte(255);
+    match fs::write("/tmp/zx_recipe.bin", data.as_bytes()) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    match fs::read("/tmp/zx_recipe.bin") {
+        Ok(raw) => println(codec::hex_encode_bytes(raw.as_bytes())), // 00ff
+        Err(_) => println("read failed"),
+    }
+    match codec::base64_decode_bytes("aGVsbG8=".as_bytes()) {
+        Ok(text) => println(text.as_str()),  // hello
+        Err(_) => println("bad token"),
+    }
+    match fs::remove("/tmp/zx_recipe.bin") {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    0
+}
+```
+
+See [`tests/encoding.zx`](../tests/encoding.zx) and
+[`tests/std_bytes.zx`](../tests/std_bytes.zx) for the standard test vectors.

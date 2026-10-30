@@ -1,6 +1,7 @@
 package parser_test
 
 import (
+	"strings"
 	"testing"
 
 	"zexi/internal/ast"
@@ -365,5 +366,73 @@ fn main() -> i32 {
 	path, ok := ctor.Callee.(*ast.PathExpr)
 	if !ok || len(path.Segments) != 2 || path.Segments[1] != "new" || len(path.TypeArgs) != 1 {
 		t.Fatalf("unexpected qualified ctor: %#v", ctor.Callee)
+	}
+}
+
+// TestParenStatementAfterBlock parses a statement that starts with a
+// parenthesised expression right after a loop or if block. Such a statement
+// used to be swallowed as a call of the block (`while ... { }(*p)`), which then
+// failed with "expression is not callable" and a bogus "cannot assign" error.
+func TestParenStatementAfterBlock(t *testing.T) {
+	src := `fn main() -> i32 {
+    let mut i = 0;
+    while i < 2 { i += 1; }
+    (*p).field = 5;
+    loop { break; }
+    (i) = 7;
+    if true { i += 1; }
+    (i) += 2;
+    i
+}`
+	file, n := parse(t, src)
+	if n != 0 {
+		t.Fatalf("unexpected diagnostics: %d", n)
+	}
+	fn, ok := file.Items[0].(*ast.FnDecl)
+	if !ok {
+		t.Fatalf("expected fn main, got %#v", file.Items[0])
+	}
+	// The `let`, the two loops, the three assignments after the blocks, and the
+	// trailing `i`.
+	if got := len(fn.Body.Stmts); got != 7 {
+		t.Fatalf("expected 7 statements, got %d", got)
+	}
+
+	// A block-shaped expression still accepts postfix syntax on the same line,
+	// which is what `let x = if c { f } else { g }(1);` relies on.
+	if _, n := parse(t, `fn main() -> i32 { let x = if true { 1 } else { 2 }; x }`); n != 0 {
+		t.Fatalf("unexpected diagnostics for same-line postfix: %d", n)
+	}
+}
+
+func TestParsesCBlock(t *testing.T) {
+	src := "#[link(\"m\")]\nc \"\"\"\nint f(void) { return 1; }\n\"\"\"\n\nfn main() -> i32 { 0 }"
+	file, n := parse(t, src)
+	if n != 0 {
+		t.Fatalf("unexpected diagnostics: %d", n)
+	}
+	if len(file.Items) != 2 {
+		t.Fatalf("expected the C block and main, got %d items", len(file.Items))
+	}
+	blk, ok := file.Items[0].(*ast.CBlock)
+	if !ok {
+		t.Fatalf("expected a CBlock, got %#v", file.Items[0])
+	}
+	// Attribute text drops the quotes: `#[link("m")]` arrives as `link(m)`.
+	if len(blk.Attrs) != 1 || blk.Attrs[0] != "link(m)" {
+		t.Fatalf("attributes = %v", blk.Attrs)
+	}
+	if !strings.Contains(blk.Body, "int f(void)") {
+		t.Fatalf("body = %q", blk.Body)
+	}
+
+	// `c_source` is the same item under its longer name.
+	if _, n := parse(t, "c_source r\"int g(void) { return 2; }\"\nfn main() -> i32 { 0 }"); n != 0 {
+		t.Fatalf("c_source: unexpected diagnostics: %d", n)
+	}
+
+	// A plain string is refused: every backslash in C would need doubling.
+	if _, n := parse(t, "c \"int h(void) { return 3; }\"\nfn main() -> i32 { 0 }"); n == 0 {
+		t.Fatal("expected a diagnostic for a non-raw C string")
 	}
 }

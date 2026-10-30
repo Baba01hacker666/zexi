@@ -15,11 +15,13 @@ import (
 	"strings"
 	"sync"
 
+	"zexi/internal/ast"
 	zenc "zexi/internal/codegen/c"
 	"zexi/internal/diag"
 	"zexi/internal/lexer"
 	"zexi/internal/sema"
 	"zexi/internal/token"
+	"zexi/internal/types"
 )
 
 // Options controls a compilation.
@@ -80,6 +82,12 @@ type Artifacts struct {
 	// NeedsPthread is set when the program uses the `thread` module, so the
 	// C compiler is invoked with -pthread.
 	NeedsPthread bool
+	// LinkLibs are libraries the program itself asked for with
+	// `#[link("name")]`, in source order, appended to Options.LinkLibs.
+	LinkLibs []string
+	// LinkDirs are directories the program asked for with `#[link_dir("path")]`,
+	// appended to Options.LibDirs.
+	LinkDirs []string
 }
 
 // FrontEnd runs lexing, parsing, type checking, and C generation. It returns
@@ -146,7 +154,7 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 	art := &Artifacts{Info: info, FileID: l.firstID}
 	// Debug builds check integer overflow; release builds wrap (see
 	// docs/03-memory-model.md). Division by zero panics in both.
-	cgOpts := zenc.Options{DebugChecks: opts.OptLevel == "0"}
+	cgOpts := zenc.Options{DebugChecks: opts.OptLevel == "0", ProjectDir: l.root}
 	if jobs := splitJobs(opts, len(info.FnOrder)); jobs > 1 {
 		header, units, cerr := zenc.GenerateSplit(info, cgOpts, jobs)
 		if cerr != nil {
@@ -169,20 +177,109 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 		}
 		art.CSrc = csrc
 	}
-	if l.usesNet {
-		art.CExtra = append(art.CExtra, string(netCSource))
+
+	// Native code and libraries the program names in its own source. Appending
+	// the text to the generated translation unit (rather than compiling it as a
+	// separate file) means inline C can use the runtime helpers the generated
+	// code already defines: `zx_String`, the Vec/hash helpers, and anything a
+	// `#[no_mangle]` function exposes.
+	blocks, libs, linkDirs, includes, pthread := collectNative(merged.Items)
+	if len(blocks) > 0 || len(includes) > 0 {
+		var parts []string
+		for _, h := range includes {
+			parts = append(parts, `#include "`+h+`"`)
+		}
+		if len(blocks) > 0 {
+			parts = append(parts, strings.Join(blocks, "\n"))
+		}
+		text := "\n// --- C source included from Zexi (`c \"\"\"...\"\"\"` blocks) ---\n" + strings.Join(parts, "\n")
+		if len(art.CUnits) > 1 {
+			art.CUnits[0] += text
+		} else {
+			art.CSrc += text
+		}
 	}
-	if l.usesSys {
-		art.CExtra = append(art.CExtra, string(sysCSource))
-	}
-	if l.usesRegex {
-		art.CExtra = append(art.CExtra, string(regexCSource))
-	}
-	if l.usesThread {
-		art.CExtra = append(art.CExtra, string(threadCSource))
+	art.LinkLibs = libs
+	art.LinkDirs = linkDirs
+	if pthread {
 		art.NeedsPthread = true
 	}
 	return art, true
+}
+
+// collectNative returns the `c r"..."` blocks, the libraries named by
+// `#[link("name")]`, and whether pthread was asked for. Both are declarations
+// in source, so a library can extend the program (a new syscall wrapper, a
+// vendored C helper, a system library) without the compiler knowing about it.
+func collectNative(items []ast.Item) (blocks, libs, linkDirs, includes []string, pthread bool) {
+	seenLib := map[string]bool{}
+	seenBlock := map[string]bool{}
+	seenLinkDir := map[string]bool{}
+	seenInclude := map[string]bool{}
+	var collect func(attrs []string)
+	collect = func(attrs []string) {
+		for _, a := range attrs {
+			switch types.AttrName(a) {
+			case "link":
+				name := strings.Trim(types.AttrArg(a), " \t\"'")
+				if name == "" {
+					continue
+				}
+				if name == "pthread" {
+					pthread = true
+					continue
+				}
+				if seenLib[name] {
+					continue
+				}
+				seenLib[name] = true
+				libs = append(libs, name)
+			case "link_dir":
+				dir := strings.Trim(types.AttrArg(a), " \t\"'")
+				if dir == "" {
+					continue
+				}
+				if seenLinkDir[dir] {
+					continue
+				}
+				seenLinkDir[dir] = true
+				linkDirs = append(linkDirs, dir)
+			case "include":
+				hdr := strings.Trim(types.AttrArg(a), " \t\"'")
+				if hdr == "" {
+					continue
+				}
+				if seenInclude[hdr] {
+					continue
+				}
+				seenInclude[hdr] = true
+				includes = append(includes, hdr)
+			}
+		}
+	}
+	for _, it := range items {
+		switch d := it.(type) {
+		case *ast.CBlock:
+			collect(d.Attrs)
+			body := strings.TrimSpace(d.Body)
+			if body == "" || seenBlock[body] {
+				continue
+			}
+			seenBlock[body] = true
+			blocks = append(blocks, body)
+		case *ast.FnDecl:
+			collect(d.Attrs)
+		case *ast.StructDecl:
+			collect(d.Attrs)
+		case *ast.EnumDecl:
+			collect(d.Attrs)
+		case *ast.ImplBlock:
+			for _, f := range d.Fns {
+				collect(f.Attrs)
+			}
+		}
+	}
+	return blocks, libs, linkDirs, includes, pthread
 }
 
 // splitJobs decides how many translation units to compile in parallel: one
@@ -218,31 +315,6 @@ func splitJobs(opts Options, fns int) int {
 //
 //go:embed std/*.zx
 var stdFS embed.FS
-
-// netCSource is the shared socket/file C runtime compiled into programs that
-// select embedded net/http/fs helpers. Embedded so it needs no installation and
-// stays in sync with the Zexi bindings.
-//
-//go:embed zxnet_c.txt
-var netCSource []byte
-
-// sysCSource is the C shim for the `sys` module (environment, local paths,
-// clocks, and process helpers), embedded like the networking runtime.
-//
-//go:embed zxsys_c.txt
-var sysCSource []byte
-
-// regexCSource is the opt-in POSIX ERE bridge for the `regex` module.
-//
-//go:embed zxregex_c.txt
-var regexCSource []byte
-
-// threadCSource is the opt-in pthread bridge for the `thread` module (threads,
-// i64 channels, and i64 atomics). Programs that import `thread` also link with
-// -pthread.
-//
-//go:embed zxthread_c.txt
-var threadCSource []byte
 
 // Tokens returns the token stream for a file, for the `tokenize` command.
 func Tokens(path string, em *diag.Emitter) ([]token.Token, int, bool) {
@@ -295,6 +367,12 @@ func BuildFiles(paths []string, outPath string, opts Options, em *diag.Emitter) 
 	}
 	if art.NeedsPthread {
 		opts.Pthreads = true
+	}
+	if len(art.LinkLibs) > 0 {
+		opts.LinkLibs = append(opts.LinkLibs, art.LinkLibs...)
+	}
+	if len(art.LinkDirs) > 0 {
+		opts.LibDirs = append(opts.LibDirs, art.LinkDirs...)
 	}
 	if len(art.CUnits) > 1 {
 		if err := CompileUnits(art.CHeader, art.CUnits, outPath, opts); err != nil {

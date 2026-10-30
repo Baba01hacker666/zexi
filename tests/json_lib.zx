@@ -1,0 +1,77 @@
+// tests/json.zx
+// Coverage for the `json` module: parsing every value kind, escapes and
+// unicode, integer/double fidelity, building documents, printing (compact and
+// pretty), accessors, and error positions.
+
+use json;
+
+fn parse_or_fail(raw: str) -> Value {
+    match json::parse(raw) {
+        Ok(v) => return v,
+        Err(e) => {
+            println("parse error:", e);
+            return json::null();
+        }
+    }
+}
+
+fn main() -> i32 {
+    // Scalars and their kinds.
+    let doc = parse_or_fail("{\"s\": \"hi\", \"i\": 42, \"f\": 1.5, \"b\": true, \"n\": null, \"a\": [1, 2, 3]}");
+    println(doc.kind, doc.len());
+    println(doc.get_str("s"));
+    println(doc.get_int("i"));
+    println(doc.get_f64("f"));
+    println(doc.get_bool("b"));
+    println(doc.get("n").is_null(), doc.get("nope").is_null());
+    let arr = doc.get("a");
+    println(arr.is_array(), arr.len(), arr.item(0).as_i64(), arr.item(2).as_i64(), arr.item(9).as_i64());
+
+    // Integers keep their exact value; doubles print in the shortest form that
+    // reads back identically.
+    let big = parse_or_fail("9007199254740993");
+    println(big.is_int(), big.as_i64());
+    let third = parse_or_fail("0.3333333333333333");
+    println(json::stringify(&third));
+
+    // Escapes and \u codepoints, including a surrogate pair.
+    let text = parse_or_fail("\"a\\tb\\n\\\"q\\\" \\u00e9 \\ud83d\\ude00\"");
+    println(text.text());
+    println(json::quote("say \"hi\"\n"));
+
+    // Compact and pretty output round-trip through the parser.
+    let nested = parse_or_fail("{\"a\":[1,{\"b\":2}],\"c\":{}}");
+    println(json::stringify(&nested));
+    let pretty = json::pretty(&nested, 2);
+    println(pretty);
+    let again = parse_or_fail(pretty.as_str());
+    println(json::stringify(&again) == json::stringify(&nested));
+
+    // Building a document with the setters and push helpers.
+    let mut built = json::object();
+    built.set_str("name", "zexi");
+    built.set_int("stars", 7);
+    built.set_bool("draft", false);
+    let mut tags = json::array();
+    tags.push_str("lang");
+    tags.push_int(2);
+    built.set("tags", tags);
+    built.set_null("extra");
+    println(json::stringify(&built));
+    println(built.has("tags"), built.has("missing"), built.index_of("stars"));
+    println(built.key_at(0), built.value_at(0).text());
+    let dropped = built.remove("draft");
+    println(dropped.is_bool(), dropped.as_bool(), built.len());
+
+    // Errors report a byte offset; `valid` is the cheap check.
+    match json::parse("{\"a\": }") {
+        Ok(_) => println("unexpected ok"),
+        Err(e) => println(e),
+    }
+    match json::parse("[1, 2") {
+        Ok(_) => println("unexpected ok"),
+        Err(e) => println(e),
+    }
+    println(json::valid("[]"), json::valid("[] x"), json::valid(""));
+    0
+}

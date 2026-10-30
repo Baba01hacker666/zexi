@@ -1,0 +1,86 @@
+// tests/std_bytes.zx
+// The byte-level standard library: `codec` encodes and checksums binary data
+// (including NUL), `html` escapes a borrowed body, `text` scans a borrowed
+// string, and a binary file round-trips through `fs` unchanged.
+
+use codec;
+use fs;
+use html;
+use sys;
+use text;
+
+fn main() {
+    // --- text scans without owning a copy of the input ---
+    let owned = String::from("Hello, world");
+    println(text::index_of(owned.as_str(), "world"));
+    println(text::last_index_of(owned.as_str(), "l"));
+    println(text::count_occurrences(owned.as_str(), "l"));
+    println(text::replace_all(owned.as_str(), "l", "L"));
+    println(text::to_upper(owned.as_str()));
+    println(text::slice_text(owned.as_str(), 7, 12));
+    println(text::trim_start("   padded"));
+    println(text::starts_with(owned.as_str(), "Hell"));
+    println(text::ends_with(owned.as_str(), "rld"));
+    println(text::compare("abc", "abd"));
+    println(text::is_blank(" \t "));
+    println(text::index_of("abc", ""));
+
+    // find_bytes searches any slice, so a binary haystack needs no text copy.
+    let frame: [u8; 4] = [1, 0, 2, 3];
+    let needle: [u8; 2] = [0, 2];
+    println(text::find_bytes(&frame, &needle, 0));
+    println(text::find_bytes(&frame, "zz".as_bytes(), 0));
+
+    // --- codec treats bytes as data, NUL included ---
+    let mut bin = String::new();
+    bin.push_byte(0);
+    bin.push_byte(255);
+    bin.push_byte(65);
+    println(bin.len());
+    println(codec::hex_encode_bytes(bin.as_bytes()));
+    println(codec::hex_encode_bytes_upper(bin.as_bytes()));
+    match codec::hex_decode_bytes("00ff41".as_bytes()) {
+        Ok(raw) => println(raw.len()),
+        Err(why) => println(why),
+    }
+    match codec::hex_decode_bytes("abc".as_bytes()) {
+        Ok(raw) => println(raw.len()),
+        Err(why) => println(why),
+    }
+    println(codec::base64_encode_bytes(bin.as_bytes()));
+    println(codec::base64_encode("hello"));
+    match codec::base64_decode_bytes("aGVsbG8=".as_bytes()) {
+        Ok(raw) => println(raw.as_str()),
+        Err(why) => println(why),
+    }
+    println(codec::crc32_bytes(bin.as_bytes()));
+    println(codec::crc32("123456789"));
+    println(codec::adler32("hello"));
+    println(codec::fnv1a32("hello"));
+    println(codec::fnv1a64_hex("hello"));
+    println(codec::djb2("hello"));
+
+    // --- html escapes borrowed bytes exactly like text ---
+    println(html::escape_bytes("<a href=\"x\">&'".as_bytes()));
+    println(html::escape("<b>"));
+    println(html::url_query("a b&c"));
+    println(html::script_safe("</script>"));
+    let mut values = html::vars();
+    values.set("name", "<Tom>");
+    println(html::template("<p>{{name}}</p>", &values));
+
+    // --- a binary file survives the trip through fs ---
+    let path = "/tmp/zx_std_bytes_test.bin";
+    match fs::write(path, bin.as_bytes()) {
+        Ok(n) => println(n),
+        Err(e) => println(sys::message(e)),
+    }
+    match fs::read(path) {
+        Ok(data) => println(codec::hex_encode_bytes(data.as_bytes())),
+        Err(e) => println(sys::message(e)),
+    }
+    match fs::remove(path) {
+        Ok(_) => {}
+        Err(e) => println(sys::message(e)),
+    }
+}

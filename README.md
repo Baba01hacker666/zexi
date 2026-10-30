@@ -45,7 +45,9 @@ This repository contains the **initial design and specification** of Zexi: the v
 > **`Option<T>`/`Result<T, E>`** and the **`?` operator** (lowered to `match`,
 > with bare `Some`/`None`/`Ok`/`Err` from context); **owned enum payloads** with
 > match move/drop glue;
-> **first-class arrays** with bounds-checked indexing;
+> **first-class arrays** with bounds-checked indexing, and **borrowed slices**
+> (`&[T]`/`&mut [T]` as a two-word view, `a[lo..hi]`, `for x in slice`, and
+> `String::push_bytes`/`as_bytes` bridging text and bytes);
 > a **use-after-move checker** for non-`Copy` values (opt into copying with
 > `#[copy]`); the built-in owning heap type **`String`** with **deterministic
 > destruction (`Drop`)**, string-parsing methods, and text-building sugar
@@ -61,26 +63,72 @@ This repository contains the **initial design and specification** of Zexi: the v
 > middleware. High-level `serve(&app, 8000)`, `serve_dir(root, 8000)`,
 > `new_app()`, and `listen_n(addr, count)` cover explicit and bounded servers;
 > `Client`, `get`, `do`, `fetch`, and `request` cover the client side (see
-> [`docs/08-networking.md`](docs/08-networking.md)). Embedded `math`, `text`,
+> [`docs/08-networking.md`](docs/08-networking.md)).
+>
+> **Many users at once:** `listen_workers(":8080", 8)` serves the default mux
+> from a pool of OS threads that accept on the same socket, so one slow request
+> no longer stalls everyone else — `listen_workers_n`,
+> `Router::listen_workers*`, and `serve_workers*` are the bounded and
+> explicit-router forms, and `requests_served()`/`stop_serving()` report on and
+> wind down the pool. Under it, `net` adds UDP (`udp_bind`, `send_to`,
+> `recv_from`), name resolution (`resolve`), readiness and bounded accept
+> (`poll_read`, `accept_timeout`), `cpu_count`, and endpoint introspection
+> (`Conn::peer`, `Server::port`).
+>
+> **Websites:** two dependency-free modules make server-rendered pages and JSON
+> APIs easy. `json` (`parse`, `stringify`, `pretty`, `object`, `array`, `Value`)
+> keeps integers exact, round-trips doubles exactly, and preserves member order;
+> `html` (`escape`, `attr`, `tag`, `list`, `table`, `vars`, `template`) escapes
+> by default, so a `{{name}}` taken from a query string cannot inject markup,
+> and `web` ties the three together in the FastAPI shape: `web::get("/x", h)`,
+> `web::page("index", &vars)` reading `templates/index.html`, `web::pages("public")`
+> serving a folder of files, `web::params(req)`, `web::json_pair(k, v)`. See
+> [`docs/14-json-and-html.md`](docs/14-json-and-html.md),
+> [`docs/16-stdlib-reference.md`](docs/16-stdlib-reference.md) and
+> [`examples/site/`](examples/site).
+>
+> **Closures:** `|x| x + 1` captures its surroundings by value, nests, escapes
+> from the function that made it, and is what `Vec::each/count/any/all/fold`
+> take. See [`docs/15-closures.md`](docs/15-closures.md).
+>
+> **Self-extension:** adding a capability is a library change, not a compiler
+> change. `extern "C" fn sqrt(x: f64) -> f64;` with `#[link("m")]` calls a system
+> library, `c """ ... """` compiles C with the program (in the same translation
+> unit, so it sees `String`, the `Vec` helpers, and `#[no_mangle]` functions), and
+> `#[no_mangle]` lets C call back. Every module of the standard library that
+> needs C — `sys`, `regex`, `json`, `net`, `http`, `thread` — carries it this way,
+> so the compiler holds no library C at all. See
+> [`docs/17-extending.md`](docs/17-extending.md).
+>
+> Embedded `math`, `text`,
 > `io`, `fs`, `os`, `regex`, `fmt`, `codec`, and `thread` also provide dependency-free
 > arithmetic, roots/logs/trigonometry/geometry, number theory, familiar string
-> helpers, `input(prompt)`, capped binary-safe file helpers, local process/path
-> conveniences, POSIX-ERE matching, number/value formatting (bases, grouping,
-> fixed decimals, human units, alignment), hex/base64 encoding and checksums
-> (CRC-32, FNV, Adler-32), and real OS **concurrency**: fork–join
-> threads, blocking `i64` channels, and lock-free `i64` atomics
-> (`Thread::spawn`, `Chan::new`, `Atomic::new`; see
+> helpers, `input(prompt)`/`read_line()` (both `Result`-returning), capped
+> binary-safe `fs::read`/`write`/`copy` (all `Result<_, IoError>`), local
+> process/path conveniences, POSIX-ERE matching, number/value formatting (bases,
+> grouping, fixed decimals, human units, padding), hex/base64 encoding and
+> checksums (CRC-32, FNV, Adler-32) — every encoder, checksum, escaper, and
+> search also takes a `&[u8]`, so binary data never round-trips through text —
+> and real OS **concurrency**: fork–join
+> threads, blocking `i64` channels, lock-free `i64` atomics, and a task pool
+> that spreads a function over a range across threads (`Thread::spawn`,
+> `Chan::new`, `Atomic::new`, `Pool::new().map(f, lo, hi)`; see
 > [`docs/11-concurrency.md`](docs/11-concurrency.md)).
 >
 > Not yet implemented: traits (and trait bounds, so generic parameters are
 > unconstrained), `dyn Trait`, associated types, const generics, full module
 > **isolation** (qualified access, `as` aliases, and `pub` checks work, but the
 > merged program is still one flat namespace, so unqualified cross-module names
-> remain visible and ignore `pub`), `Box`/`Vec`,
+> remain visible and ignore `pub`), `Box`,
 > `Send`/`Sync` value passing across threads (today only `i64` handles, arguments,
-> and return values cross a thread boundary),
-> user-defined `Drop`, borrow-lifetime analysis (bound `&`/`*` aliases are not yet
-> tracked), nested patterns, and tuple values. See `docs/05-roadmap.md`.
+> and return values cross a thread boundary), match ergonomics (`ref` bindings,
+> so a payload cannot be read out of a borrowed enum), user-defined `Drop`,
+> borrow-lifetime analysis (bound `&`/`*` aliases are not yet tracked), nested
+> patterns, and tuple values. See `docs/05-roadmap.md`.
+>
+> Recursive types work when the recursion goes through indirection (`Vec<T>`,
+> `HashMap<K, V>`), so trees, comment threads, and JSON documents are ordinary
+> declarations: `enum Tree { Leaf(i64), Node(Vec<Tree>) }`.
 
 ## How it works
 
@@ -150,12 +198,19 @@ go run ./cmd/zexic run tests/syntax.zx    # a runnable tour of the whole syntax
 go run ./cmd/zexic run tests/keywords.zx  # until/elif/defer, or+range patterns, if let, type aliases
 go run ./cmd/zexic run tests/modules.zx   # scoped imports: aliases, mod::item, pub checks
 go run ./cmd/zexic run tests/threads.zx   # threads, channels, and atomics
+go run ./cmd/zexic run tests/pool.zx      # task pool: spread a range over threads
+go run ./cmd/zexic run tests/json_lib.zx  # parse, build, and print JSON
+go run ./cmd/zexic run tests/html_lib.zx  # escaping, widgets, and templates
+go run ./cmd/zexic run tests/net_local.zx # loopback TCP/UDP, resolve, poll
+go run ./cmd/zexic run tests/recursive.zx # trees through Vec and HashMap
+go run ./cmd/zexic run tests/cinline.zx     # inline C, #[link], and #[no_mangle]
 go run ./cmd/zexic run tests/formatting.zx # bases, grouping, units, alignment
 go run ./cmd/zexic run tests/encoding.zx   # hex, base64, and checksums
 go run ./cmd/zexic run tests/easy.zx      # the easy way: no semicolons, f-strings, defaults, libraries
 go run ./cmd/zexic run examples/easy.zx   # same ideas, as a small standalone demo
 go run ./cmd/zexic run tests/sugar.zx     # break-with-value, Type::new(..), print/format sugar
 go run ./cmd/zexic run tests/pi.zx        # 30 digits of π: big-int + Machin's formula
+go run ./cmd/zexic run examples/site                        # a pooled site: templates, folders, JSON API
 go run ./cmd/zexic run examples/http_app.zx                  # Go-style default mux: handle_get + listen
 go run ./cmd/zexic run examples/static_server.zx -- .         # one-call static server
 go run ./cmd/zexic run examples/local_tools.zx -- release-42  # local os + regex helpers
@@ -202,6 +257,7 @@ for why, its real costs, and the plan to replace it with a native backend.
 - [`docs/11-concurrency.md`](docs/11-concurrency.md) — threads, `i64` channels, and atomics.
 - [`docs/12-generics.md`](docs/12-generics.md) — monomorphized generics, `Option`/`Result`, and `?`.
 - [`docs/13-mir.md`](docs/13-mir.md) — the mid-level IR: shape, instruction set, drops, lowering, and verification.
+- [`docs/14-json-and-html.md`](docs/14-json-and-html.md) — building websites: JSON values and safe HTML templating.
 - [`examples/`](examples/) — ready-to-run Zexi programs plus focused feature examples.
 - [`tests/tour.zx`](tests/tour.zx) — the end-to-end program the test suite compiles and runs.
 - [`tests/syntax.zx`](tests/syntax.zx) — a runnable syntax tour; [`tests/pi.zx`](tests/pi.zx) — 30 digits of π.

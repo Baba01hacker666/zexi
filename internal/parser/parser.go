@@ -160,10 +160,37 @@ func (p *parser) parseItem() ast.Item {
 		return p.parseMod(vis, start)
 	case token.KindUse:
 		return p.parseUse(start, vis)
+	case token.KindIdentifier:
+		// `c r"..."` / `c_source r"..."` is raw C compiled with the program.
+		if p.cur().Lit == "c" || p.cur().Lit == "c_source" {
+			return p.parseCBlock(attrs, start)
+		}
+		fallthrough
 	default:
-		p.errf(p.cur(), "E0202", "expected an item (fn, struct, enum, const, type, impl, mod, use, import), found %s", p.cur().Kind)
+		p.errf(p.cur(), "E0202", "expected an item (fn, struct, enum, const, type, impl, mod, use, import, c), found %s", p.cur().Kind)
 		return nil
 	}
+}
+
+// parseCBlock parses `c r"..."`: a raw string holding C source that is compiled
+// together with the generated code. The body is taken verbatim, so it can hold
+// preprocessor directives, string literals, and braces without escaping; a
+// plain string is rejected because every backslash in it would need doubling.
+func (p *parser) parseCBlock(attrs []string, start token.Pos) ast.Item {
+	word := p.bump().Lit // `c` or `c_source`
+	if !p.at(token.KindRawString) {
+		if p.at(token.KindString) {
+			p.errf(p.cur(), "E0202", "write C source in a raw string (`%s r\"...\"`), so backslashes and quotes stay as written", word)
+			p.bump()
+			p.accept(token.KindSemicolon)
+			return nil
+		}
+		p.errf(p.cur(), "E0202", "expected a raw string of C source after `%s`, as in `%s r\"...\"`", word, word)
+		return nil
+	}
+	body := p.bump().Lit
+	p.accept(token.KindSemicolon)
+	return &ast.CBlock{Attrs: attrs, Body: body, Sp: p.spanFrom(start)}
 }
 
 // parseAttributes consumes `#[...]` attribute lists and returns one string per
@@ -974,6 +1001,18 @@ func (p *parser) parseUnary() ast.Expr {
 func (p *parser) parsePostfix() ast.Expr {
 	e := p.parsePrimary()
 	for {
+		// A block-shaped expression (`if`, `match`, `while`, `loop`, `for`)
+		// ends at its closing brace, so a `(` or `[` on the next line starts a
+		// new statement rather than a call or index on the block:
+		//
+		//     while i < 2 { i += 1; }
+		//     (*ptr).field = 5;      // not `while ... { }(*ptr)`
+		//
+		// Without this, such a statement was parsed as a call of the loop,
+		// which then failed with "expression is not callable".
+		if (p.at(token.KindLParen) || p.at(token.KindLBracket)) && isBlockExpr(e) && p.newlineBeforeCur() {
+			return e
+		}
 		switch p.cur().Kind {
 		case token.KindDot:
 			p.bump()
@@ -991,8 +1030,9 @@ func (p *parser) parsePostfix() ast.Expr {
 			}
 		case token.KindLBracket:
 			p.bump()
-			// Python-style slice: `xs[lo:hi]`, with either bound optional.
-			if p.at(token.KindColon) {
+			// Slices: `xs[lo:hi]` (Python-style) and `xs[lo..hi]` (Rust-style),
+			// with either bound optional.
+			if p.at(token.KindColon) || p.at(token.KindDotDot) {
 				p.bump()
 				var high ast.Expr
 				if !p.at(token.KindRBracket) {
@@ -1002,8 +1042,11 @@ func (p *parser) parsePostfix() ast.Expr {
 				e = &ast.SliceExpr{Recv: e, Low: nil, High: high, Sp: token.Span{Start: e.Span().Start, End: p.prevEnd()}}
 				continue
 			}
-			low := p.parseExpr()
-			if p.accept(token.KindColon) {
+			// Stop before `..`, which is the range operator everywhere else but a
+			// slice separator inside brackets. `9` is the precedence just above
+			// it, so `a[i + 1..n]` still parses the addition as the lower bound.
+			low := p.parseBinary(9)
+			if p.accept(token.KindColon) || p.accept(token.KindDotDot) {
 				var high ast.Expr
 				if !p.at(token.KindRBracket) {
 					high = p.parseExpr()
@@ -1031,6 +1074,17 @@ func (p *parser) parsePostfix() ast.Expr {
 // are literal braces. Each hole is parsed by a fresh sub-parser over its
 // source text (with token offsets shifted back into the enclosing file,
 // so diagnostics keep pointing at the right place).
+// isBlockExpr reports whether e is an expression whose body is a braced block.
+// Such an expression is a complete statement on its own, so postfix syntax on
+// the following line belongs to the next statement.
+func isBlockExpr(e ast.Expr) bool {
+	switch e.(type) {
+	case *ast.LoopExpr, *ast.IfExpr, *ast.MatchExpr:
+		return true
+	}
+	return false
+}
+
 func (p *parser) parseFString() ast.Expr {
 	tok := p.bump() // f"..."
 	src := tok.Lit
@@ -1182,6 +1236,38 @@ func (p *parser) parseArgs() []ast.Expr {
 	return args
 }
 
+// parseLambda parses a closure: `|a, b| expr`, `|a: i32| { .. }`, or `|| expr`.
+// Parameter types are optional; an unannotated parameter takes its type from
+// the target type the closure is checked against.
+func (p *parser) parseLambda(start token.Pos) ast.Expr {
+	params := []ast.Param{}
+	if p.at(token.KindPipePipe) {
+		p.bump() // an empty parameter list, written `||`
+	} else {
+		p.expect(token.KindPipe, " to open a closure")
+		for !p.at(token.KindPipe) {
+			sp := p.spanFrom(p.cur().Pos.Offset)
+			name := p.expectIdentPath("closure parameter")
+			pr := ast.Param{Name: name, Sp: sp}
+			if p.accept(token.KindColon) {
+				pr.Ty = p.parseType()
+			}
+			params = append(params, pr)
+			if !p.accept(token.KindComma) {
+				break
+			}
+		}
+		p.expect(token.KindPipe, " to close the closure parameter list")
+	}
+	// A struct literal is legal in the body even when the closure appears in
+	// condition position, where `{` would otherwise be taken for a block.
+	saved := p.noStructLit
+	p.noStructLit = 0
+	body := p.parseExpr()
+	p.noStructLit = saved
+	return &ast.LambdaExpr{Params: params, Body: body, Sp: p.spanFrom(start)}
+}
+
 func (p *parser) parsePrimary() ast.Expr {
 	t := p.cur()
 	start := t.Pos.Offset
@@ -1212,6 +1298,9 @@ func (p *parser) parsePrimary() ast.Expr {
 			return &ast.IdentExpr{Name: path[0], TypeArgs: typeArgs, Sp: p.spanFrom(start)}
 		}
 		return &ast.PathExpr{Segments: path, TypeArgs: typeArgs, Sp: p.spanFrom(start)}
+
+	case token.KindPipe, token.KindPipePipe:
+		return p.parseLambda(start)
 
 	case token.KindLParen:
 		p.bump()

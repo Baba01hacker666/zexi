@@ -429,6 +429,7 @@ var KnownAttrs = map[string]bool{
 	"no_mangle": true, // keep the Zexi name as the C symbol, with external linkage
 	"export":    true, // alias for `no_mangle`, for the C bridge
 	"allow":     true, // accepted and ignored, so lints can be named locally
+	"link":      true, // `link("m")`: link a system library (see the driver)
 }
 
 // CopyAttr reports whether an attribute list opts a type into `Copy`.

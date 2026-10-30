@@ -40,8 +40,10 @@ var mapMethods = map[string]mapMethodSig{
 	"is_empty":     {ret: types.BoolT},
 	"insert":       {params: []*types.Type{nil, nil}, isKey: []bool{true, false}, retOptionVal: true, mut: true},
 	"get":          {params: []*types.Type{nil}, isKey: []bool{true}, retOptionRef: true},
+	"get_str":      {params: []*types.Type{types.StrT}, retOptionRef: true},
 	"remove":       {params: []*types.Type{nil}, isKey: []bool{true}, retOptionVal: true, mut: true},
 	"contains_key": {params: []*types.Type{nil}, isKey: []bool{true}, ret: types.BoolT},
+	"contains_str": {params: []*types.Type{types.StrT}, ret: types.BoolT},
 	"clear":        {ret: types.UnitT, mut: true},
 }
 
@@ -141,6 +143,16 @@ func (c *checker) inferMapMethod(x *ast.MethodCallExpr, recv *types.Type) *types
 	}
 	sig, ok := mapMethods[x.Name]
 	if !ok {
+		c.errAt(x, "E0599", "no method `%s` on type `%s`", x.Name, recv)
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return nil
+	}
+	// Borrowed-key lookups only make sense for maps keyed by `String`:
+	// `HashMap<str, V>` already stores borrowed keys and `contains_key` /
+	// `get` work without allocation, and integer/char keys are `Copy`.
+	if (x.Name == "get_str" || x.Name == "contains_str") && key.Kind != types.StringKind {
 		c.errAt(x, "E0599", "no method `%s` on type `%s`", x.Name, recv)
 		for _, a := range x.Args {
 			c.checkExpr(a, nil)

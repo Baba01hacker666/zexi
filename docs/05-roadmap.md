@@ -45,10 +45,20 @@
 > and server (see docs/08), now with a Go-style default mux: top-level
 > `handle_get("/users/{id}", user)` plus `listen(":8080")`, `{name}` route
 > parameters, and `use_before`/`use_after` middleware.
+> Serving many users is a pool of OS threads: `listen_workers`/`serve_workers*`
+> accept on one listening socket from N threads, pinning an explicit router
+> into a fixed C slot so workers can reach it through an integer handle;
+> `thread::Pool` spreads a function over a range off the request path. Under
+> them, `net` gained UDP, name resolution, readiness polling, bounded accept,
+> and endpoint introspection. Two new embedded modules serve websites: `json`
+> (exact integers, round-tripping doubles, ordered objects) and `html`
+> (escape-by-default templating and widgets).
 > Not yet implemented: traits and trait bounds (generic parameters are
 > unconstrained), `dyn Trait`, associated types, const generics, `Box`,
 > user-defined `Drop`, borrow-lifetime analysis (so bound
-> `&`/`*` aliases are not tracked), nested patterns, and tuple values.
+> `&`/`*` aliases are not tracked), match ergonomics (`ref` bindings, so an
+> owned payload cannot be read out of a borrowed enum), nested patterns, and
+> tuple values.
 > See `docs/06-backend-strategy.md` for the backend status.
 
 The MVP is milestone **M0**: enough language to compile real, safe, small

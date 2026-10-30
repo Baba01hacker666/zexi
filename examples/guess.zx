@@ -16,7 +16,13 @@ fn main() {
     let mut tries = 0
     let mut done = false
     while !done {
-        let line = prompt_line("your guess: ")
+        let mut line = String::new()
+        match input("your guess: ") {
+            Ok(s) => line = s,
+            Err(e) => done = true,
+        }
+        if done { break }
+        if line.len() == 0 { break }   // end of input (or a blank line)
         let guess = line.trim().parse_i64()
         tries += 1
         if guess < secret {

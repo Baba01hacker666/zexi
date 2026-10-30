@@ -173,6 +173,7 @@ func TestCorpusLayoutMatchesTheCCompiler(t *testing.T) {
 	var sb strings.Builder
 	sb.WriteString("#include <stdio.h>\n#include <stdint.h>\n#include <stddef.h>\n#include <stdbool.h>\n")
 	sb.WriteString("typedef struct { char *ptr; size_t len; size_t cap; } zx_String;\n")
+	g.defs = append(g.defs, g.late...)
 	for _, d := range g.defs {
 		sb.WriteString(d + "\n")
 	}
@@ -270,11 +271,11 @@ func TestCorpusLayoutMatchesTheCCompiler(t *testing.T) {
 			}
 		}
 		checked++
-		}
-		if checked < 49 {
+	}
+	if checked < 49 {
 		t.Errorf("verified %d corpus types, want at least 49", checked)
-		}
-		t.Logf("verified %d corpus types against %s", checked, cc)
+	}
+	t.Logf("verified %d corpus types against %s", checked, cc)
 }
 
 // typeLabel names a type for a test failure message.

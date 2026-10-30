@@ -1,114 +1,154 @@
 // fs — small, binary-safe file helpers for the Zexi standard library.
 // Import with `use fs;`, `use io::fs;`, or `import io.fs;`.
 //
-// A String is Zexi's owning byte buffer, so read_bytes/read_text preserve NUL
-// bytes and work for both ordinary text and small binary assets. Reads are
-// capped to keep a malformed or unexpectedly large file from exhausting memory.
+// A String is Zexi's owning byte buffer, so `read` preserves NUL bytes and works
+// for both ordinary text and small binary assets. Every operation that can fail
+// returns `Result<_, IoError>`, where `IoError` comes from `sys`.
 
-// net owns the shared opt-in POSIX C ABI declarations used below.
-use net;
+use sys;
 
-pub const FS_MAX_BYTES: usize = 33554432;
-const FS_BUFFER_BYTES: usize = 8192;
+// MAX_BYTES caps a single read or write so a malformed or unexpectedly large
+// file cannot exhaust memory.
+pub const MAX_BYTES: usize = 33554432;
 
-// path_exists reports whether path names a regular file.
-pub fn path_exists(path: str) -> bool {
-    return zxn_file_size(path) >= 0;
+// FileKind is what a path names.
+pub enum FileKind {
+    File,
+    Dir,
+    Other,
 }
 
-// file_len returns a regular file's byte length, or -1 when it does not exist
-// (or is not a regular file).
-pub fn file_len(path: str) -> i64 {
-    return zxn_file_size(path);
+// Metadata is the small, portable subset of a stat result the library exposes.
+pub struct Metadata {
+    pub size: u64,
+    pub kind: FileKind,
 }
 
-// read_bytes_with_status reads a whole file and records, in `opened`, whether
-// the source actually opened. Callers that must distinguish "empty file" from
-// "unreadable file" use this instead of comparing the byte count to the size.
-fn read_bytes_with_status(path: str, opened: &mut bool) -> String {
-    let size = zxn_file_size(path);
-    if size < 0 || size > FS_MAX_BYTES as i64 {
-        return String::new();
+// exists reports whether path names a file or directory.
+pub fn exists(path: str) -> bool {
+    return sys::path_kind(path) != 0;
+}
+
+// file_len returns a regular file's byte length.
+pub fn file_len(path: str) -> Result<u64, IoError> {
+    return sys::file_size(path);
+}
+
+// read reads a whole file into an owning byte String. Text stays text and
+// binary bytes (including NUL) are preserved.
+pub fn read(path: str) -> Result<String, IoError> {
+    let size = sys::file_size(path)?;
+    if size > MAX_BYTES as u64 {
+        return Err(IoError::TooLarge);
     }
+    let fd = sys::open_read(path)?;
     let mut out = String::with_capacity(size as usize);
-    let handle = zxn_file_open(path);
-    if handle >= 0 {
-        *opened = true;
-        let mut buf: [u8; 8192] = [0; 8192];
-        let mut done = false;
-        while !done && out.len() < FS_MAX_BYTES {
-            let left = FS_MAX_BYTES - out.len();
-            let want = if left < FS_BUFFER_BYTES { left } else { FS_BUFFER_BYTES };
-            let n = zxn_file_read(handle, &mut buf, want as i32);
-            if n <= 0 {
-                done = true;
-            } else {
-                let mut i: usize = 0;
-                while i < n as usize {
-                    out.push_byte(buf[i]);
-                    i += 1;
+    let mut buf: [u8; 8192] = [0; 8192];
+    loop {
+        match sys::read_fd(fd, &mut buf) {
+            Ok(n) => {
+                if n == 0 {
+                    break;
                 }
+                if out.len() + n > MAX_BYTES {
+                    let closed = sys::close_fd(fd);
+                    return Err(IoError::TooLarge);
+                }
+                out.push_bytes(buf[0..n]);
+            }
+            Err(e) => {
+                let closed = sys::close_fd(fd);
+                return Err(e);
             }
         }
-        zxn_file_close(handle);
     }
-    return out;
+    sys::close_fd(fd)?;
+    return Ok(out);
 }
 
-// read_bytes returns a whole file as an owning byte String. Missing files and
-// files above FS_MAX_BYTES yield an empty String; call path_exists/file_len
-// first when an empty file must be distinguished from an error.
-pub fn read_bytes(path: str) -> String {
-    let mut opened = false;
-    return read_bytes_with_status(path, &mut opened);
+// write writes every byte in `data` (up to MAX_BYTES) and returns the count.
+// Parent directories are not created automatically.
+pub fn write(path: str, data: &[u8]) -> Result<usize, IoError> {
+    if data.len() > MAX_BYTES {
+        return Err(IoError::TooLarge);
+    }
+    let fd = sys::open_write(path)?;
+    match sys::write_fd(fd, data) {
+        Ok(n) => {
+            sys::close_fd(fd)?;
+            return Ok(n);
+        }
+        Err(e) => {
+            let closed = sys::close_fd(fd);
+            return Err(e);
+        }
+    }
 }
 
-// read_text is an alias for read_bytes. Zexi does not transcode file data:
-// UTF-8 text stays text, and binary bytes (including NUL) are preserved.
-pub fn read_text(path: str) -> String {
-    return read_bytes(path);
+// copy copies a regular file, streaming through a fixed buffer, and returns the
+// bytes written.
+pub fn copy(from: str, to: str) -> Result<u64, IoError> {
+    let src = sys::open_read(from)?;
+    let dst = match sys::open_write(to) {
+        Ok(fd) => fd,
+        Err(e) => {
+            let closed = sys::close_fd(src);
+            return Err(e);
+        }
+    };
+    let mut buf: [u8; 8192] = [0; 8192];
+    let mut total: u64 = 0;
+    loop {
+        let n = match sys::read_fd(src, &mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                let a = sys::close_fd(src);
+                let b = sys::close_fd(dst);
+                return Err(e);
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        if total + (n as u64) > MAX_BYTES as u64 {
+            let a = sys::close_fd(src);
+            let b = sys::close_fd(dst);
+            return Err(IoError::TooLarge);
+        }
+        match sys::write_fd(dst, buf[0..n]) {
+            Ok(written) => total += written as u64,
+            Err(e) => {
+                let a = sys::close_fd(src);
+                let b = sys::close_fd(dst);
+                return Err(e);
+            }
+        }
+    }
+    sys::close_fd(src)?;
+    sys::close_fd(dst)?;
+    return Ok(total);
 }
 
-// write_bytes writes every byte in an owning String, including embedded NUL
-// bytes, up to FS_MAX_BYTES. It returns bytes written or -1. Parent directories
-// are not created automatically. Taking &String is deliberate: `str` is
-// C-ABI-shaped and has no independent byte length.
-pub fn write_bytes(path: str, data: &String) -> i32 {
-    let n = data.len();
-    if n > FS_MAX_BYTES {
-        return -1;
-    }
-    return zxn_write_file(path, data.as_str(), n as i32);
+// remove removes a regular file or an empty directory. It never recurses.
+pub fn remove(path: str) -> Result<(), IoError> {
+    return sys::remove_path_status(path);
 }
 
-// write_text accepts a borrowed text string and writes its visible byte length.
-pub fn write_text(path: str, data: str) -> i32 {
-    let n = len(data);
-    if n > FS_MAX_BYTES {
-        return -1;
+// metadata reports a path's size and kind.
+pub fn metadata(path: str) -> Result<Metadata, IoError> {
+    let kind = sys::path_kind(path);
+    if kind == 0 {
+        return Err(sys::error_of(sys::errno()));
     }
-    return zxn_write_file(path, data, n as i32);
-}
-
-// copy_file copies a capped regular file. It returns the bytes written, or -1
-// for a missing, too-large, or unwritable file.
-pub fn copy_file(from: str, to: str) -> i32 {
-    let size = file_len(from);
-    if size < 0 || size > FS_MAX_BYTES as i64 {
-        return -1;
+    let mut size: u64 = 0;
+    if kind == 1 {
+        size = sys::file_size(path)?;
     }
-    // A zero-byte file and an unreadable file both report length 0, but only
-    // the former should copy. Track the source-open status directly so an
-    // unreadable source reports -1 without writing to the destination.
-    let mut opened = false;
-    let data = read_bytes_with_status(from, &mut opened);
-    if !opened {
-        return -1;
+    let mut k = FileKind::Other;
+    if kind == 1 {
+        k = FileKind::File;
+    } else if kind == 2 {
+        k = FileKind::Dir;
     }
-    // Detect a concurrent truncation/read failure instead of silently copying a
-    // partial file. (The size is bounded above, so this cast is safe here.)
-    if data.len() != size as usize {
-        return -1;
-    }
-    return write_bytes(to, &data);
+    return Ok(Metadata { size: size, kind: k });
 }
