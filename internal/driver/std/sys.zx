@@ -183,13 +183,9 @@ pub fn remove_path_status(path: str) -> Result<(), IoError> {
 pub fn env_get(name: str) -> String {
     let mut buf: [u8; 4096] = [0; 4096];
     let n = zxs_env_get(name, &mut buf, 4096);
-    let mut out = String::new();
+    let mut out = String::with_capacity(if n > 0 { n as usize } else { 0 });
     if n > 0 {
-        let mut i: usize = 0;
-        while i < (n as usize) {
-            out.push_byte(buf[i]);
-            i += 1;
-        }
+        out.push_bytes(buf[0..n as usize]);
     }
     return out;
 }
@@ -255,13 +251,9 @@ pub fn millis_since(start: i64) -> i64 {
 pub fn cwd() -> String {
     let mut buf: [u8; 4096] = [0; 4096];
     let n = zxs_cwd(&mut buf, 4096);
-    let mut out = String::new();
+    let mut out = String::with_capacity(if n > 0 { n as usize } else { 0 });
     if n > 0 {
-        let mut i: usize = 0;
-        while i < (n as usize) {
-            out.push_byte(buf[i]);
-            i += 1;
-        }
+        out.push_bytes(buf[0..n as usize]);
     }
     return out;
 }
@@ -270,13 +262,9 @@ pub fn cwd() -> String {
 pub fn hostname() -> String {
     let mut buf: [u8; 4096] = [0; 4096];
     let n = zxs_hostname(&mut buf, 4096);
-    let mut out = String::new();
+    let mut out = String::with_capacity(if n > 0 { n as usize } else { 0 });
     if n > 0 {
-        let mut i: usize = 0;
-        while i < (n as usize) {
-            out.push_byte(buf[i]);
-            i += 1;
-        }
+        out.push_bytes(buf[0..n as usize]);
     }
     return out;
 }

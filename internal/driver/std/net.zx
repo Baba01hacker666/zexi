@@ -129,12 +129,12 @@ pub fn listen_local(port: i32) -> Server {
 // It is the shared bridge between the C shims (which fill byte buffers) and
 // Zexi's owning text type.
 fn buf_str(buf: [u8; 256], n: i32) -> String {
-    let mut out = String::new();
-    let mut i: usize = 0;
-    while i < (n as usize) && i < 256 {
-        out.push_byte(buf[i]);
-        i += 1;
+    let mut end: usize = 256;
+    if n >= 0 && (n as usize) < end {
+        end = n as usize;
     }
+    let mut out = String::with_capacity(end);
+    out.push_bytes(buf[0..end]);
     return out;
 }
 
@@ -304,10 +304,8 @@ impl Conn {
         let mut out = String::new();
         let mut buf: [u8; 8192] = [0; 8192];
         let n = zxn_recv(self.fd, &mut buf, cap);
-        let mut i: usize = 0;
-        while n > 0 && i < (n as usize) {
-            out.push_byte(buf[i]);
-            i += 1;
+        if n > 0 {
+            out.push_bytes(buf[0..n as usize]);
         }
         return out;
     }
@@ -348,10 +346,8 @@ impl Conn {
         let mut out = String::new();
         let mut buf: [u8; 8192] = [0; 8192];
         let n = zxn_read_head(self.fd, &mut buf, RECV_BUF as i32);
-        let mut i: usize = 0;
-        while n > 0 && i < (n as usize) {
-            out.push_byte(buf[i]);
-            i += 1;
+        if n > 0 {
+            out.push_bytes(buf[0..n as usize]);
         }
         return out;
     }
@@ -367,11 +363,7 @@ impl Conn {
             if got <= 0 {
                 break;
             }
-            let mut i: usize = 0;
-            while i < (got as usize) {
-                out.push_byte(buf[i]);
-                i += 1;
-            }
+            out.push_bytes(buf[0..got as usize]);
             left = left - (got as usize);
         }
         return out;
@@ -388,11 +380,7 @@ impl Conn {
             if n <= 0 {
                 break;
             }
-            let mut i: usize = 0;
-            while i < (n as usize) {
-                out.push_byte(buf[i]);
-                i += 1;
-            }
+            out.push_bytes(buf[0..n as usize]);
         }
         return out;
     }
@@ -533,11 +521,7 @@ impl Udp {
             return Datagram { data: String::new(), host: String::new(), port: 0 };
         }
         let mut data = String::with_capacity(n as usize);
-        let mut i: usize = 0;
-        while i < (n as usize) {
-            data.push_byte(buf[i]);
-            i += 1;
-        }
+        data.push_bytes(buf[0..n as usize]);
         let mut j: usize = 0;
         while j < 256 && host[j] != 0 {
             j += 1;

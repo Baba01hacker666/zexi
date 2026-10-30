@@ -2,16 +2,21 @@
 //
 // Escaping is the point: any value that came from a request must go through
 // `escape`/`attr` or a `{{name}}` template before it reaches a page.
+//
+// Escapers read a `&[u8]`, so escaping a borrowed body costs one output buffer
+// and no copy of the input.
+
+use text;
 
 // --- escaping --------------------------------------------------------------
 
-// escape makes text safe for HTML content (`& < > " '`).
-pub fn escape(s: str) -> String {
-    let src = String::from(s);
-    let mut out = String::with_capacity(src.len() + 8);
+// escape_bytes makes bytes safe for HTML content (`& < > " '`), which is the
+// form to use on a body read as bytes.
+pub fn escape_bytes(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len() + 8);
     let mut i: usize = 0;
-    while i < src.len() {
-        let c = src.byte_at(i);
+    while i < data.len() {
+        let c = data[i];
         if c == 38 {
             out.push_str("&amp;");
         } else if c == 60 {
@@ -23,11 +28,16 @@ pub fn escape(s: str) -> String {
         } else if c == 39 {
             out.push_str("&#39;");
         } else {
-            out.push_byte(c as u8);
+            out.push_byte(c);
         }
         i += 1;
     }
     return out;
+}
+
+// escape makes text safe for HTML content (`& < > " '`).
+pub fn escape(s: str) -> String {
+    return escape_bytes(s.as_bytes());
 }
 
 // attr escapes a value for a double-quoted attribute.
@@ -35,13 +45,12 @@ pub fn attr(s: str) -> String {
     return escape(s);
 }
 
-// url_query percent-encodes a value for a query string or path segment.
-pub fn url_query(s: str) -> String {
-    let src = String::from(s);
-    let mut out = String::new();
+// url_query_bytes percent-encodes bytes for a query string or path segment.
+pub fn url_query_bytes(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len());
     let mut i: usize = 0;
-    while i < src.len() {
-        let c = src.byte_at(i) as i64;
+    while i < data.len() {
+        let c = data[i] as i64;
         if is_unreserved(c) {
             out.push_byte(c as u8);
         } else {
@@ -52,6 +61,11 @@ pub fn url_query(s: str) -> String {
         i += 1;
     }
     return out;
+}
+
+// url_query percent-encodes a value for a query string or path segment.
+pub fn url_query(s: str) -> String {
+    return url_query_bytes(s.as_bytes());
 }
 
 fn is_unreserved(c: i64) -> bool {
@@ -211,18 +225,18 @@ pub fn json_script(id: str, json: str) -> String {
 }
 
 // script_safe neutralises `</` inside markup embedded in a <script> element.
-pub fn script_safe(text: str) -> String {
-    let src = String::from(text);
-    let mut out = String::new();
+pub fn script_safe(markup: str) -> String {
+    let src = markup.as_bytes();
+    let mut out = String::with_capacity(src.len());
     let mut i: usize = 0;
     while i < src.len() {
-        let c = src.byte_at(i);
-        if c == 60 && i + 1 < src.len() && src.byte_at(i + 1) == 47 {
+        let c = src[i];
+        if c == 60 && i + 1 < src.len() && src[i + 1] == 47 {
             out.push_str("<\\/");
             i += 2;
             continue;
         }
-        out.push_byte(c as u8);
+        out.push_byte(c);
         i += 1;
     }
     return out;
@@ -304,20 +318,25 @@ pub fn template(tpl: str, values: &Vars) -> String {
 
 // template_map is template over a plain map, for callers that already have one.
 pub fn template_map(tpl: str, values: &HashMap<String, String>) -> String {
-    let src = String::from(tpl);
+    let src = tpl.as_bytes();
+    let close_tok = "}}".as_bytes();
     let mut out = String::with_capacity(src.len());
     let mut i: usize = 0;
     while i < src.len() {
-        let c = src.byte_at(i);
-        if c == 123 && i + 3 < src.len() && src.byte_at(i + 1) == 123 && src.byte_at(i + 2) == 123 && src.byte_at(i + 3) == 123 {
+        let c = src[i];
+        if c == 123 && i + 3 < src.len() && src[i + 1] == 123 && src[i + 2] == 123 && src[i + 3] == 123 {
             out.push_str("{{");
             i += 4;
             continue;
         }
-        if c == 123 && i + 1 < src.len() && src.byte_at(i + 1) == 123 {
-            let close = find_at(&src, i + 2, "}}");
+        if c == 123 && i + 1 < src.len() && src[i + 1] == 123 {
+            // Scanning for the closing `}}` reads the borrowed template, so a
+            // placeholder no longer copies the remainder of the page.
+            let close = text::find_bytes(src, close_tok, i + 2);
             if close >= 0 {
-                let inner = src.substr(i + 2, (close as usize) - (i + 2));
+                let name_end = close as usize;
+                let mut inner = String::with_capacity(name_end - (i + 2));
+                inner.push_bytes(src[i + 2..name_end]);
                 let mut name = inner.trim();
                 let mut raw = false;
                 // A placeholder whose name starts with "@@" is not a value: it is
@@ -329,7 +348,7 @@ pub fn template_map(tpl: str, values: &HashMap<String, String>) -> String {
                     out.push_str("{{");
                     out.push_str(inner.as_str());
                     out.push_str("}}");
-                    i = (close as usize) + 2;
+                    i = name_end + 2;
                     continue;
                 }
                 let bar = name.find("|");
@@ -350,11 +369,11 @@ pub fn template_map(tpl: str, values: &HashMap<String, String>) -> String {
                     }
                     None => {}
                 }
-                i = (close as usize) + 2;
+                i = name_end + 2;
                 continue;
             }
         }
-        out.push_byte(c as u8);
+        out.push_byte(c);
         i += 1;
     }
     return out;
@@ -371,17 +390,4 @@ pub fn template_pairs(tpl: str, pairs: &Vec<String>) -> String {
         i += 2;
     }
     return template_map(tpl, &values);
-}
-
-// find_at is `find` from a byte offset (-1 when absent).
-fn find_at(s: &String, from: usize, needle: str) -> i64 {
-    if from > s.len() {
-        return -1;
-    }
-    let rest = s.substr(from, 4294967295);
-    let p = rest.find(needle);
-    if p < 0 {
-        return -1;
-    }
-    return (from as i64) + p;
 }

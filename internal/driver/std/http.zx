@@ -2304,11 +2304,7 @@ pub fn read_file(path: str) -> String {
             if n <= 0 {
                 break;
             }
-            let mut i: usize = 0;
-            while i < (n as usize) {
-                out.push_byte(buf[i]);
-                i += 1;
-            }
+            out.push_bytes(buf[0..n as usize]);
             if out.len() >= MAX_FILE {
                 break;
             }
@@ -2429,11 +2425,7 @@ fn resolve_real_path(path: str) -> String {
     let n = zxn_realpath(path, &mut buf, 4096);
     let mut out = String::new();
     if n > 0 {
-        let mut i: usize = 0;
-        while i < (n as usize) {
-            out.push_byte(buf[i]);
-            i += 1;
-        }
+        out.push_bytes(buf[0..n as usize]);
     }
     return out;
 }

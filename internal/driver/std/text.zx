@@ -3,6 +3,50 @@
 //
 // Functions take `str` inputs (string literals pass directly) and return
 // owning `String`s. Scanning/ASCII only — no Unicode case folding yet.
+//
+// Scanning borrows: each function reads its input through `as_bytes()` and
+// walks a `&[u8]`, so a `String` argument is never copied just to be inspected,
+// and the byte-level helpers (`find_bytes`) work over any slice.
+
+// find_bytes is the byte offset of the first occurrence of `needle` in `hay` at
+// or after `from`, or -1. An empty needle matches at `from` when it is in range.
+// It is the primitive every search below is built on.
+pub fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> i64 {
+    if from > hay.len() {
+        return -1;
+    }
+    let n = needle.len();
+    if n == 0 {
+        return from as i64;
+    }
+    if n > hay.len() {
+        return -1;
+    }
+    let mut i: usize = from;
+    while i + n <= hay.len() {
+        if match_at(hay, needle, i) {
+            return i as i64;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+// match_at reports whether `needle` sits at byte offset `at` in `hay`.
+// Out-of-range offsets are a non-match, never a panic.
+pub fn match_at(hay: &[u8], needle: &[u8], at: usize) -> bool {
+    if at > hay.len() || needle.len() > hay.len() - at {
+        return false;
+    }
+    let mut k: usize = 0;
+    while k < needle.len() {
+        if hay[at + k] != needle[k] {
+            return false;
+        }
+        k += 1;
+    }
+    return true;
+}
 
 // repeat_text returns `s` concatenated `n` times.
 pub fn repeat_text(s: str, n: i32) -> String {
@@ -63,15 +107,15 @@ pub fn shout(s: str) -> String {
 
 // to_upper returns an ASCII-uppercased copy of `s`.
 pub fn to_upper(s: str) -> String {
-    let v = String::from(s);
-    let mut out = String::with_capacity(v.len());
+    let hay = s.as_bytes();
+    let mut out = String::with_capacity(hay.len());
     let mut i: usize = 0;
-    while i < v.len() {
-        let b = v.byte_at(i);
+    while i < hay.len() {
+        let b = hay[i];
         if b >= 97 && b <= 122 {
-            out.push_byte((b - 32) as u8);
+            out.push_byte(b - 32);
         } else {
-            out.push_byte(b as u8);
+            out.push_byte(b);
         }
         i += 1;
     }
@@ -80,15 +124,15 @@ pub fn to_upper(s: str) -> String {
 
 // to_lower returns an ASCII-lowercased copy of `s`.
 pub fn to_lower(s: str) -> String {
-    let v = String::from(s);
-    let mut out = String::with_capacity(v.len());
+    let hay = s.as_bytes();
+    let mut out = String::with_capacity(hay.len());
     let mut i: usize = 0;
-    while i < v.len() {
-        let b = v.byte_at(i);
+    while i < hay.len() {
+        let b = hay[i];
         if b >= 65 && b <= 90 {
-            out.push_byte((b + 32) as u8);
+            out.push_byte(b + 32);
         } else {
-            out.push_byte(b as u8);
+            out.push_byte(b);
         }
         i += 1;
     }
@@ -98,24 +142,23 @@ pub fn to_lower(s: str) -> String {
 // index_of returns the byte offset of the first occurrence of `sub` in `s`,
 // or -1. (String.find is the same operation on an owning String.)
 pub fn index_of(s: str, sub: str) -> i64 {
-    let v = String::from(s);
-    return v.find(sub);
+    return find_bytes(s.as_bytes(), sub.as_bytes(), 0);
 }
 
 // last_index_of returns the byte offset of the last occurrence of `sub`, or -1.
 pub fn last_index_of(s: str, sub: str) -> i64 {
-    let v = String::from(s);
-    let needle = String::from(sub);
-    if needle.len() == 0 {
-        return v.len() as i64;
+    let hay = s.as_bytes();
+    let needle = sub.as_bytes();
+    let n = needle.len();
+    if n == 0 {
+        return hay.len() as i64;
     }
-    if needle.len() > v.len() {
+    if n > hay.len() {
         return -1;
     }
-    let mut i = (v.len() - needle.len()) as i64;
+    let mut i = (hay.len() - n) as i64;
     while i >= 0 {
-        let piece = v.substr(i as usize, needle.len());
-        if piece.as_str() == needle.as_str() {
+        if match_at(hay, needle, i as usize) {
             return i;
         }
         i -= 1;
@@ -125,46 +168,44 @@ pub fn last_index_of(s: str, sub: str) -> i64 {
 
 // count_occurrences counts non-overlapping occurrences of `sub` in `s`.
 pub fn count_occurrences(s: str, sub: str) -> i64 {
-    let v = String::from(s);
-    let needle = String::from(sub);
+    let hay = s.as_bytes();
+    let needle = sub.as_bytes();
     if needle.len() == 0 {
         return 0;
     }
     let mut count: i64 = 0;
     let mut pos: usize = 0;
-    while pos <= v.len() {
-        let rest = v.substr(pos, 4294967295);
-        let at = rest.find(needle.as_str());
+    while pos <= hay.len() {
+        let at = find_bytes(hay, needle, pos);
         if at < 0 {
             break;
         }
         count += 1;
-        pos = pos + (at as usize) + needle.len();
+        pos = (at as usize) + needle.len();
     }
     return count;
 }
 
 // replace_all returns `s` with every occurrence of `from` replaced by `to`.
 pub fn replace_all(s: str, from: str, to: str) -> String {
-    let v = String::from(s);
-    let needle = String::from(from);
-    let mut out = String::new();
+    let hay = s.as_bytes();
+    let needle = from.as_bytes();
+    let mut out = String::with_capacity(hay.len());
     if needle.len() == 0 {
-        out.push_str(v.as_str());
-    } else {
-        let mut pos: usize = 0;
-        while pos < v.len() {
-            let rest = v.substr(pos, 4294967295);
-            let at = rest.find(needle.as_str());
-            if at < 0 {
-                out.push_str(rest.as_str());
-                break;
-            }
-            let piece = rest.substr(0, at as usize);
-            out.push_str(piece.as_str());
-            out.push_str(to);
-            pos = pos + (at as usize) + needle.len();
+        out.push_bytes(hay);
+        return out;
+    }
+    let mut pos: usize = 0;
+    while pos < hay.len() {
+        let at = find_bytes(hay, needle, pos);
+        if at < 0 {
+            out.push_bytes(hay[pos..hay.len()]);
+            break;
         }
+        let start = at as usize;
+        out.push_bytes(hay[pos..start]);
+        out.push_str(to);
+        pos = start + needle.len();
     }
     return out;
 }
@@ -172,49 +213,53 @@ pub fn replace_all(s: str, from: str, to: str) -> String {
 // slice_text returns s[start..end], clamped to the string bounds (never
 // panics; an empty result means the range was out of bounds or inverted).
 pub fn slice_text(s: str, start: usize, end: usize) -> String {
-    let v = String::from(s);
-    let n = v.len();
+    let hay = s.as_bytes();
+    let n = hay.len();
+    let mut out = String::new();
     if start >= n || end <= start {
-        return String::new();
+        return out;
     }
     let last = if end < n { end } else { n };
-    return v.substr(start, last - start);
+    out.push_bytes(hay[start..last]);
+    return out;
 }
 
 // trim_start removes leading ASCII whitespace.
 pub fn trim_start(s: str) -> String {
-    let v = String::from(s);
+    let hay = s.as_bytes();
     let mut i: usize = 0;
-    while i < v.len() && is_space_byte(v.byte_at(i)) {
+    while i < hay.len() && is_space_byte(hay[i] as i64) {
         i += 1;
     }
-    return v.substr(i, 4294967295);
+    let mut out = String::with_capacity(hay.len() - i);
+    out.push_bytes(hay[i..hay.len()]);
+    return out;
 }
 
 // trim_end removes trailing ASCII whitespace.
 pub fn trim_end(s: str) -> String {
-    let v = String::from(s);
-    let mut end = v.len();
-    while end > 0 && is_space_byte(v.byte_at(end - 1)) {
+    let hay = s.as_bytes();
+    let mut end = hay.len();
+    while end > 0 && is_space_byte(hay[end - 1] as i64) {
         end -= 1;
     }
-    return v.substr(0, end);
+    let mut out = String::with_capacity(end);
+    out.push_bytes(hay[0..end]);
+    return out;
 }
 
 // compare is a lexicographic byte comparison: negative when a < b, zero when
 // equal, positive when a > b. Handy for sorting.
 pub fn compare(a: str, b: str) -> i32 {
-    let x = String::from(a);
-    let y = String::from(b);
+    let x = a.as_bytes();
+    let y = b.as_bytes();
     let n = if x.len() < y.len() { x.len() } else { y.len() };
     let mut i: usize = 0;
     while i < n {
-        let bx = x.byte_at(i);
-        let by = y.byte_at(i);
-        if bx < by {
+        if x[i] < y[i] {
             return -1;
         }
-        if bx > by {
+        if x[i] > y[i] {
             return 1;
         }
         i += 1;
@@ -252,13 +297,13 @@ pub fn is_space(c: char) -> bool {
 
 // is_digits_only reports whether `s` is non-empty and all ASCII digits.
 pub fn is_digits_only(s: str) -> bool {
-    let v = String::from(s);
-    if v.len() == 0 {
+    let hay = s.as_bytes();
+    if hay.len() == 0 {
         return false;
     }
     let mut i: usize = 0;
-    while i < v.len() {
-        let b = v.byte_at(i);
+    while i < hay.len() {
+        let b = hay[i];
         if b < 48 || b > 57 {
             return false;
         }
@@ -296,13 +341,21 @@ pub fn strip(s: str) -> String {
 pub fn contains(s: str, sub: str) -> bool { index_of(s, sub) >= 0 }
 
 pub fn starts_with(s: str, prefix: str) -> bool {
-    let value = String::from(s);
-    return value.starts_with(prefix);
+    let hay = s.as_bytes();
+    let p = prefix.as_bytes();
+    if p.len() > hay.len() {
+        return false;
+    }
+    return match_at(hay, p, 0);
 }
 
 pub fn ends_with(s: str, suffix: str) -> bool {
-    let value = String::from(s);
-    return value.ends_with(suffix);
+    let hay = s.as_bytes();
+    let sfx = suffix.as_bytes();
+    if sfx.len() > hay.len() {
+        return false;
+    }
+    return match_at(hay, sfx, hay.len() - sfx.len());
 }
 
 pub fn replace(s: str, from: str, to: str) -> String {
@@ -311,6 +364,13 @@ pub fn replace(s: str, from: str, to: str) -> String {
 
 // is_blank reports whether s is empty or all ASCII whitespace.
 pub fn is_blank(s: str) -> bool {
-    let value = strip(s);
-    return value.len() == 0;
+    let hay = s.as_bytes();
+    let mut i: usize = 0;
+    while i < hay.len() {
+        if !is_space_byte(hay[i] as i64) {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
 }

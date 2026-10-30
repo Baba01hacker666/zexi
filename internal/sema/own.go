@@ -19,6 +19,11 @@ type mover struct {
 	c      *checker
 	moved  map[string]bool
 	frames []map[string]moveState
+	// diverged reports that the path being walked cannot reach the next
+	// statement (it ended in return/break/continue). Such a path contributes
+	// no state to a control-flow join: a value moved only on a path that
+	// leaves the function cannot be a use-after-move after the branch.
+	diverged bool
 }
 
 // checkOwnership runs the move checker over every function with a body.
@@ -127,9 +132,12 @@ func (m *mover) block(b *ast.Block) {
 	}
 	m.enter()
 	for _, s := range b.Stmts {
+		if m.diverged {
+			break // unreachable after a return/break/continue
+		}
 		m.stmt(s)
 	}
-	if b.Tail != nil {
+	if b.Tail != nil && !m.diverged {
 		m.consume(b.Tail)
 	}
 	m.exit()
@@ -197,8 +205,11 @@ func (m *mover) use(e ast.Expr) {
 	case *ast.LambdaExpr:
 		// The body can read anything the closure captured; a capture of an
 		// owning value then moves that value into the environment, so the
-		// enclosing function cannot use it afterwards.
+		// enclosing function cannot use it afterwards. A `return` inside the
+		// closure ends the closure's path, not the enclosing one.
+		outerDiverged := m.diverged
 		m.use(x.Body)
+		m.diverged = outerDiverged
 		if cl := m.c.info.Closures[x]; cl != nil {
 			for _, cap := range cl.Captures {
 				// Only the closure that reads the variable moves it; the
@@ -239,6 +250,7 @@ func (m *mover) use(e ast.Expr) {
 		if x.Val != nil {
 			m.consume(x.Val)
 		}
+		m.diverged = true // return/break/continue ends this path
 	case *ast.TryExpr:
 		// `?` consumes its operand, which the desugared match takes by value.
 		m.consume(x.X)
@@ -392,16 +404,30 @@ func (m *mover) ifExpr(x *ast.IfExpr) {
 	before := m.snapshot()
 
 	m.restore(cloneMap(before))
+	m.diverged = false
 	m.block(x.Then)
+	thenDiverged := m.diverged
 	thenState := m.snapshot()
 
 	elseState := before
+	elseDiverged := false
 	if x.Else != nil {
 		m.restore(cloneMap(before))
+		m.diverged = false
 		m.use(x.Else)
+		elseDiverged = m.diverged
 		elseState = m.snapshot()
 	}
+	// A branch that returns/breaks leaves the enclosing path, so its moves
+	// are not part of the join: only paths that continue can carry them on.
+	if thenDiverged {
+		thenState = cloneMap(before)
+	}
+	if elseDiverged {
+		elseState = cloneMap(before)
+	}
 	m.restore(unionMoves(thenState, elseState))
+	m.diverged = thenDiverged && x.Else != nil && elseDiverged
 }
 
 func (m *mover) matchExpr(x *ast.MatchExpr) {
@@ -417,19 +443,28 @@ func (m *mover) matchExpr(x *ast.MatchExpr) {
 	result := before
 	for _, arm := range x.Arms {
 		m.restore(cloneMap(before))
+		m.diverged = false
 		m.enter()
 		m.declarePat(arm.Pat)
 		if arm.Guard != nil {
 			m.use(arm.Guard)
 		}
 		m.use(arm.Body)
-		result = unionMoves(result, m.snapshot())
+		if !m.diverged { // an arm that returns carries no state onward
+			result = unionMoves(result, m.snapshot())
+		}
 		m.exit()
 	}
 	m.restore(result)
+	m.diverged = false
 }
 
 func (m *mover) loop(x *ast.LoopExpr) {
+	// `break`/`continue` end the iteration, not the enclosing path, so the
+	// body is walked with divergence cleared and the flag is restored after.
+	outerDiverged := m.diverged
+	m.diverged = false
+	defer func() { m.diverged = outerDiverged }()
 	before := m.snapshot()
 	switch x.Kind {
 	case token.KindFor:

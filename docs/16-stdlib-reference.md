@@ -92,9 +92,9 @@ bound.
 
 | function | description |
 | --- | --- |
-| `escape(s)` | `& < > " '` → entities |
+| `escape(s)` / `escape_bytes(&[u8])` | `& < > " '` → entities, from text or bytes |
 | `attr(s)` | escape for an attribute value |
-| `url_query(s)` | percent-encode a query component |
+| `url_query(s)` / `url_query_bytes(&[u8])` | percent-encode a query component |
 | `page(title, body)` / `page_with(title, head, body)` | a complete HTML document |
 | `tag(name, text)` | `<name>text</name>` with the text escaped |
 | `heading(level, text)` | `<h1>`…`<h6>` (level clamped to 1–6) |
@@ -267,11 +267,20 @@ fn main() {
 | module | functions |
 | --- | --- |
 | `fmt` | `hex(n, upper)`, `radix(n, base)`, `hex_pad`, `thousands`, `thousands_sep`, `fixed`, `sci`, `percent`, `bytes`, `duration`, `ordinal`, `pad_left/right/center(s, width, fill = ' ')`; the earlier names (`hex_lower`, `hex_upper`, `bin_str`, `oct_str`, `radix_str`, `fixed_point`, `sci_notation`, `percent_str`, `byte_size`, `duration_ms`, `align_left/right/center`) remain as aliases |
-| `text` | `to_upper`, `to_lower`, `trim_start/end/strip`, `replace_all`, `replace`, `index_of`, `last_index_of`, `count_occurrences`, `contains`, `starts_with`, `ends_with`, `pad_start`, `pad_end`, `slice_text`, `compare`, `repeat_text`, `join_with`, `is_blank`, `is_digits_only`, `is_digit/alpha/alnum/space`, `format_bool` |
-| `codec` | `hex_encode`, `hex_encode_upper`, `hex_decode`, `base64_encode`, `base64_encode_url`, `base64_decode`, `crc32`, `adler32`, `fnv1a32`, `fnv1a64`, `djb2` (each with a `_hex` form where useful) |
+| `text` | `to_upper`, `to_lower`, `trim_start/end/strip`, `replace_all`, `replace`, `index_of`, `last_index_of`, `count_occurrences`, `contains`, `starts_with`, `ends_with`, `pad_start`, `pad_end`, `slice_text`, `compare`, `repeat_text`, `join_with`, `is_blank`, `is_digits_only`, `is_digit/alpha/alnum/space`, `format_bool`, plus the borrowed search primitives `find_bytes(&[u8], &[u8], from)` and `match_at` |
+| `codec` | `hex_encode`, `hex_encode_upper`, `hex_decode`, `base64_encode`, `base64_encode_url`, `base64_decode`, `crc32`, `adler32`, `fnv1a32`, `fnv1a64`, `djb2` (each with a `_hex` form where useful); every encoder and checksum also has a `_bytes(&[u8])` form, and `hex_decode_bytes`/`base64_decode_bytes` return `Result<String, String>` instead of `""` on bad input |
 | `math` | `min(max, clamp, abs, sign, gcd, lcm, pow, sqrt, isqrt, log2_floor, popcount, trailing_zeros, leading_zeros, is_pow2, div_floor, mod_floor, div_ceil, sin, cos, tan, hypot, lerp, inverse_lerp, remap, approx_eq, floor, ceil, round, trunc, mean2)` — integer forms take an `i`/`_i` suffix or plain names (`mini`/`min_i`), float forms are unprefixed |
 | `random` | `seed_random`, `seed_from_time`, `rand_int(lo, hi)`, `rand_bool`, `rand_float`, `Rng::new` |
 | `regex` | `is_valid`, `is_match`, `full_match`, `find`, `find_index`, `match_span`, `replace_first` |
+
+`text`, `codec`, and `html` are written over `&[u8]`: every function lends its
+input with `as_bytes()` and scans the slice, so passing a `String` never copies
+it, and every encoder/checksum has a `_bytes` twin that takes raw bytes
+directly — `codec::hex_encode_bytes(data.as_bytes())` on a file read with
+`fs::read` keeps embedded NUL bytes, which a `str` view would have hidden.
+Decoding has both spellings: `hex_decode`/`base64_decode` return `""` on bad
+input, while `hex_decode_bytes`/`base64_decode_bytes` return
+`Result<String, String>` so a caller can tell a bad token from an empty one.
 
 ## 16.9 Builtins that are not in a module
 

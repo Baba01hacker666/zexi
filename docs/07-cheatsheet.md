@@ -589,7 +589,12 @@ The embedded standard library (sources in `internal/driver/std/`) includes:
 - `codec`: pure-Zexi encoders and checksums — hex (`hex_encode`,
   `hex_encode_upper`, `hex_decode`), base64 (`base64_encode`,
   `base64_encode_url`, `base64_decode`), and CRC-32/Adler-32/FNV-1a/djb2 with
-  fixed-width `*_hex` forms.
+  fixed-width `*_hex` forms. Each takes a `str`; each also has a `_bytes(&[u8])`
+  form for binary data, and `hex_decode_bytes`/`base64_decode_bytes` return a
+  `Result` so bad input is distinguishable from empty output.
+- `text` scans borrowed bytes: `find_bytes(&[u8], &[u8], from)` and `match_at`
+  are the primitives under `index_of`/`replace_all`/`starts_with`, so searching
+  a `String` never copies it.
 - `sys`, `io`, `fs`, and `random`: `sys` is the POSIX substrate (errno and
   `IoError`, byte I/O, files, environment, clocks); `io` provides console I/O
   (`input(prompt = "")`, `read_line() -> Result<String, IoError>`, `eprintln`);

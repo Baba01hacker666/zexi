@@ -68,6 +68,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/closures.zx",
 		"../../tests/cinline.zx",
 		"../../tests/slices.zx",
+		"../../tests/std_bytes.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -529,6 +530,18 @@ func TestRunPrograms(t *testing.T) {
 			file: "../../tests/slices.zx",
 			want: strings.Join([]string{
 				"4", "10", "5", "3", "10", "hello", "3", "5", "hello", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/std_bytes.zx",
+			want: strings.Join([]string{
+				"7", "10", "3", "HeLLo, worLd", "HELLO, WORLD", "world", "padded",
+				"true", "true", "-1", "true", "0", "1", "-1", "3",
+				"00ff41", "00FF41", "3", "odd number of hex digits",
+				"AP9B", "aGVsbG8=", "hello", "1841190246", "3421780262",
+				"103547413", "1335831723", "a430d84680aabd0b", "210714636441",
+				"&lt;a href=&quot;x&quot;&gt;&amp;&#39;", "&lt;b&gt;", "a%20b%26c",
+				"<\\/script>", "<p>&lt;Tom&gt;</p>", "3", "00ff41", "",
 			}, "\n"),
 		},
 		{

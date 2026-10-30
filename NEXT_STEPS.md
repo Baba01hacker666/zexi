@@ -37,6 +37,14 @@ forward most. Ordered by value per unit of risk, not by ambition.
   byte I/O, files, environment, clocks); `io` and `fs` build on it and return
   `Result<_, IoError>`, so a missing file is `Err(NotFound)` rather than the
   same empty string as an empty file.
+- **The standard library speaks bytes natively.** `text`, `codec`, and `html`
+  are written over `&[u8]`: every encoder, checksum, escaper, and search has a
+  `_bytes` twin, decoders return `Result` so bad input is not empty output, and
+  no scan copies its input first — passing a `String` means lending its bytes.
+  The buffer shims in `net`, `http`, `json`, and `sys` push whole slices instead
+  of walking byte by byte. The move checker also understands a branch that
+  returns: a value returned from an `if` or `match` arm is no longer reported as
+  moved on the path that continues past it.
 - **Borrowed map lookups.** `HashMap<String, V>` has `get_str`/`contains_str`
   that hash and compare over the borrowed bytes, so a template lookup no
   longer allocates a key for every `{{name}}`.
@@ -111,6 +119,9 @@ Collected while writing the library; each is small, each has bitten:
 - No variadic strings (`push_str` chains instead of one call).
 - `while` conditions cannot allocate.
 - Matching an enum through a borrow reports `E0507`.
+- `io::read_line` does one `read` syscall per byte. Slices make the buffer easy
+  to hold, but a line still needs a buffered reader type (buffer + consumed
+  mark) before typing at a terminal costs one syscall per character.
 - `str` is still C-ABI-shaped (NUL-terminated, no independent length) at the
   FFI boundary. Slices cover buffers and `str::as_bytes()` covers borrowing;
   length-prefixing `str` itself is still open.

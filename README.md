@@ -106,8 +106,10 @@ This repository contains the **initial design and specification** of Zexi: the v
 > helpers, `input(prompt)`/`read_line()` (both `Result`-returning), capped
 > binary-safe `fs::read`/`write`/`copy` (all `Result<_, IoError>`), local
 > process/path conveniences, POSIX-ERE matching, number/value formatting (bases,
-> grouping, fixed decimals, human units, padding), hex/base64 encoding and checksums
-> (CRC-32, FNV, Adler-32), and real OS **concurrency**: fork–join
+> grouping, fixed decimals, human units, padding), hex/base64 encoding and
+> checksums (CRC-32, FNV, Adler-32) — every encoder, checksum, escaper, and
+> search also takes a `&[u8]`, so binary data never round-trips through text —
+> and real OS **concurrency**: fork–join
 > threads, blocking `i64` channels, lock-free `i64` atomics, and a task pool
 > that spreads a function over a range across threads (`Thread::spawn`,
 > `Chan::new`, `Atomic::new`, `Pool::new().map(f, lo, hi)`; see

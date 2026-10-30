@@ -153,8 +153,8 @@ Embedded in the compiler under `internal/driver/std/`:
 | fs     | `fs.zx` | capped binary-safe file read/write/copy; `Result<_, IoError>` |
 | math   | `math.zx` | integer/bit helpers, roots/logs/trig, geometry/smoothing, primes/combinatorics |
 | fmt    | `fmt.zx` | number/value formatting: bases, grouping, fixed/sci decimals, human units, padding |
-| codec  | `codec.zx` | hex/base64 encode+decode and CRC-32/Adler-32/FNV-1a/djb2 checksums |
-| text   | `text.zx` | string helpers |
+| codec  | `codec.zx` | hex/base64 encode+decode and CRC-32/Adler-32/FNV-1a/djb2 checksums, each over `&[u8]` with a `str` wrapper; decoders return `Result` |
+| text   | `text.zx` | string helpers scanning a borrowed `&[u8]` (`find_bytes`, `match_at` are the primitives) |
 | random | `random.zx` | RNG |
 | regex  | `regex.zx` | POSIX-ERE search/full-match/find/replace (C shim `zxregex_c.txt`) |
 | sys    | `sys.zx` | POSIX substrate: errno/`IoError`, byte I/O, files, env, clocks, pid |
@@ -162,7 +162,7 @@ Embedded in the compiler under `internal/driver/std/`:
 | http   | `http.zx` | HTTP client/server, Router, worker-pool serving, serve/serve_dir helpers |
 | thread | `thread.zx` | OS threads, `i64` channels, `i64` atomics, task `Pool` (C shim `zxthread_c.txt`, links `-pthread`) |
 | json   | `json.zx` | parse/build/print JSON (C shim `zxjson_c.txt` for exact number conversion) |
-| html   | `html.zx` | escaping, documents, widgets, `{{name}}` templates |
+| html   | `html.zx` | escaping (`escape_bytes`/`escape`), documents, widgets, `{{name}}` templates |
 
 Import with `use io;`, `use std::net;`, `use http;`, or Python-shaped
 `import http.server;`, `import io.fs;`, `import os;`, and `import text.regex;`.

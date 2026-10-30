@@ -345,13 +345,46 @@ fn main() -> i32 {
 
 | Group | APIs |
 | --- | --- |
-| Hex | `hex_encode`, `hex_encode_upper`, `hex_decode` |
-| Base64 | `base64_encode`, `base64_encode_url`, `base64_decode` |
-| Checksums | `crc32`, `crc32_hex`, `adler32`, `adler32_hex`, `fnv1a32`, `fnv1a32_hex`, `fnv1a64`, `fnv1a64_hex`, `djb2`, `djb2_hex` |
+| Hex | `hex_encode`, `hex_encode_upper`, `hex_decode`, `hex_encode_bytes`, `hex_encode_bytes_upper`, `hex_decode_bytes` |
+| Base64 | `base64_encode`, `base64_encode_url`, `base64_decode`, `base64_encode_bytes`, `base64_encode_url_bytes`, `base64_decode_bytes` |
+| Checksums | `crc32`, `crc32_hex`, `adler32`, `adler32_hex`, `fnv1a32`, `fnv1a32_hex`, `fnv1a64`, `fnv1a64_hex`, `djb2`, `djb2_hex` (each with a `_bytes` twin) |
 
 `crc32` is the zlib/IEEE 802.3 CRC-32; `adler32` matches zlib; `fnv1a32`/`fnv1a64`
 are 32-/64-bit FNV-1a; `djb2` is Bernstein's hash. The numeric forms return an
 `i64` (`u64` for the 64-bit hashes) and the `*_hex` forms return a zero-padded
 lowercase digest. `hex_decode` and `base64_decode` return an empty string on
-malformed input rather than guessing. See
-[`tests/encoding.zx`](../tests/encoding.zx) for the standard test vectors.
+malformed input rather than guessing; the `_bytes` decoders return
+`Result<String, String>` instead, which is what you want for a token that came
+off the wire:
+
+```zx
+use codec;
+use fs;
+
+fn main() -> i32 {
+    // Binary data goes in and comes back byte for byte, NUL included.
+    let mut data = String::new();
+    data.push_byte(0);
+    data.push_byte(255);
+    match fs::write("/tmp/zx_recipe.bin", data.as_bytes()) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    match fs::read("/tmp/zx_recipe.bin") {
+        Ok(raw) => println(codec::hex_encode_bytes(raw.as_bytes())), // 00ff
+        Err(_) => println("read failed"),
+    }
+    match codec::base64_decode_bytes("aGVsbG8=".as_bytes()) {
+        Ok(text) => println(text.as_str()),  // hello
+        Err(_) => println("bad token"),
+    }
+    match fs::remove("/tmp/zx_recipe.bin") {
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    0
+}
+```
+
+See [`tests/encoding.zx`](../tests/encoding.zx) and
+[`tests/std_bytes.zx`](../tests/std_bytes.zx) for the standard test vectors.

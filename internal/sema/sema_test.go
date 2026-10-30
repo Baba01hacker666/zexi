@@ -72,6 +72,52 @@ fn main() -> i32 {
 	}
 }
 
+func TestMoveFromReturningBranch(t *testing.T) {
+	// A branch that returns leaves the function, so a value moved there cannot
+	// be a use-after-move on the path that continues past the branch.
+	src := `fn build(early: bool) -> String {
+    let mut out = String::from("x");
+    if early {
+        out.push_str("!");
+        return out;
+    }
+    out.push_str("?");
+    return out;
+}
+fn main() -> i32 { println(build(true)); println(build(false)); 0 }`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	// The same shape with a move on a path that continues must still fail.
+	ok, codes := check(t, `fn f(c: bool) -> i32 {
+    let a = String::from("x");
+    if c {
+        let b = a;
+        println(b);
+    }
+    println(a);
+    0
+}`)
+	if ok || !has(codes, "E0382") {
+		t.Fatalf("expected E0382 for a move on a continuing path, got ok=%v codes=%v", ok, codes)
+	}
+	// An arm that returns does not poison the paths that continue past the
+	// match either.
+	if ok, codes := check(t, `enum E { A, B }
+fn f(e: E) -> String {
+    let owned = String::from("x");
+    match e {
+        E::A => { return owned; }
+        E::B => { println(owned); }
+    }
+    println(owned);
+    return String::from("y");
+}
+fn main() -> i32 { println(f(E::A)); 0 }`); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
 func TestLiteralExprAdoptsContextType(t *testing.T) {
 	// A tree of integer literals adopts the annotated type instead of
 	// defaulting to i32: `let x: i64 = 5 ^ 3` is i64.
