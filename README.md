@@ -51,10 +51,12 @@ This repository contains the **initial design and specification** of Zexi: the v
 > (`&[T]`/`&mut [T]` as a two-word view, `a[lo..hi]`, `for x in slice`, and
 > `String::push_bytes`/`as_bytes` bridging text and bytes);
 > a **use-after-move checker** for non-`Copy` values (opt into copying with
-> `#[copy]`); and **C function bodies** — `fn dot(a: &[f32], b: &[f32]) -> f32 { c """...""" }`
-> compiles the body in the program's single translation unit, so it is typed
-> against the generated ABI and inlined with no boundary; the built-in owning heap type **`String`** with **deterministic
-> destruction (`Drop`)**, string-parsing methods, and text-building sugar
+> `#[copy]`); **`&t as *T`** casts (an array borrow decays, the pointee must
+> match) so a C function can write through a borrow; **C function bodies** —
+> `fn dot(a: &[f32], b: &[f32]) -> f32 { c """...""" }` compiles the body in the
+> program's single translation unit, typed against the generated ABI and inlined
+> with no boundary; the built-in owning heap type **`String`** with
+> **deterministic destruction (`Drop`)**, string-parsing methods, and text-building sugar
 > (`"n = " + n`, `s += n`); **`extern "C"` FFI** for
 > calling libc; and compiling **several source files into one binary** — enough
 > to ship an HTTP client/server in [`lib/http.zx`](lib/http.zx), plus embedded

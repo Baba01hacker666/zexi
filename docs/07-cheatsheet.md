@@ -395,7 +395,19 @@ println();            // just a newline
 let n = 65 as char;    // 'A'
 let m = big as i32;    // truncating integer cast
 let f = 3 as f64;
+
+// `as` is also how a borrow becomes a raw pointer for C to write through. The
+// pointee must match, and an array borrow decays to its first element.
+let p = &buf as *u8;            // &[u8; 8] decays to a u8 * of its first byte
+let q = &mut cell as *mut i64;  // the same borrow, mutable
+let t = "hi" as *u8;            // the bytes of a `str`
+let addr = p as usize;          // an address, for a handle or a log line
+let back = addr as *u8;         // ... and back again
 ```
+
+A pointer is deliberately not printable and cannot be dereferenced in safe
+code; it exists to cross into C, where its type is checked. A slice (`&[T]`)
+is a pointer *and* a length, so cast an element (`&xs[i] as *T`) instead.
 
 ## 7.13 Generics, `Option`, and `Result`
 

@@ -1,0 +1,45 @@
+// tests/pointer_cast.zx
+// `&t as *T` is how a Zexi value becomes a raw pointer for C to write through.
+// The pointee must match, so the pointer the C side receives is the type the
+// language promised: a `&mut [u8; N]` or `&mut [u8]` decays to its first
+// element, and `str` gives its byte pointer.
+//
+//     zexic run tests/pointer_cast.zx
+
+extern "C" fn zx_bzero(p: *u8, n: usize);
+extern "C" fn zx_peek(p: *i64) -> i64;
+extern "C" fn zx_addr() -> usize;
+
+c """
+void zx_bzero(uint8_t *p, size_t n) { for (size_t i = 0; i < n; i++) p[i] = 0; }
+int64_t zx_peek(int64_t *p) { return *p; }
+static int64_t zx_cell = 99;
+size_t zx_addr(void) { return (size_t)&zx_cell; }
+"""
+
+fn main() {
+    // A borrowed array decays to a pointer to its first element.
+    let mut buf: [u8; 8] = [65; 8];
+    zx_bzero(&mut buf as *u8, 4);
+    println(buf[0] as i32, buf[3] as i32, buf[4] as char);
+
+    // A borrow of a scalar through `*i64`.
+    let mut n: i64 = 7;
+    println(zx_peek(&n as *i64));
+
+    // The same cast works on an array element and on a whole array.
+    let xs: [i64; 3] = [10, 20, 30];
+    println(zx_peek(&xs as *i64));
+    println(zx_peek(&xs[1] as *i64));
+
+    // A pointer and an integer address convert in both directions, so a C
+    // handle that arrives as a number can be turned into a typed pointer.
+    let raw = zx_addr();
+    println(zx_peek(raw as *i64));
+    println((&n as *i64) as usize == 0);
+
+    // A slice is a pointer *and* a length, so there is no single address to
+    // take; take the address of an element instead.
+    let part = &xs[1..];
+    println(zx_peek(&part[0] as *i64));
+}

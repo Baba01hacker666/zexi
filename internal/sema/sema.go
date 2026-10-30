@@ -1555,6 +1555,35 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		if dstT == nil {
 			return nil
 		}
+		// `&t as *T` (and `&mut t as *mut T`) is the one way to make a raw
+		// pointer from a borrow. The pointee must match: a cast is a spelling
+		// change, not a reinterpretation, so the C side sees the same type the
+		// language promised it.
+		if dstT.Kind == types.Ptr {
+			if e := pointerElem(srcT); e != nil && types.Equal(e, dstT.Elem) {
+				return dstT
+			}
+			// An integer that already holds an address (a C handle a library
+			// returns) can be turned back into a typed pointer.
+			if srcT.Kind.IsInt() {
+				return dstT
+			}
+			inner := srcT
+			if inner.Kind == types.Ref || inner.Kind == types.Ptr {
+				inner = inner.Elem
+			}
+			if inner != nil && inner.Kind == types.Slice {
+				c.errAt(x, "E0308", "cannot cast `%s` to `%s`: a slice is a pointer and a length, so there is no single address to take; cast an element (`&xs[i]`) instead", srcT, dstT)
+				return dstT
+			}
+			c.errAt(x, "E0308", "cannot cast `%s` to `%s`: a pointer cast keeps its pointee type", srcT, dstT)
+			return dstT
+		}
+		// A pointer can be observed as an integer address (for a handle, a hash,
+		// or a log line), but only by asking with `as`.
+		if srcT.Kind == types.Ptr && dstT.Kind.IsInt() {
+			return dstT
+		}
 		if !srcT.Kind.IsNumeric() && srcT.Kind != types.Char && srcT.Kind != types.Bool {
 			c.errAt(x.X, "E0308", "cannot cast `%s` with `as`", srcT)
 			return dstT
@@ -1614,6 +1643,28 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		return c.inferTry(x, expected)
 	}
 	c.errf(e.Span(), "E0900", "unsupported expression")
+	return nil
+}
+
+// pointerElem reports the element type a value of type t would point at if it
+// were cast to a raw pointer, or nil when t is not pointer-shaped. `&mut [u8]
+// as *u8` and `&mut [u8; 8] as *u8` both give a `u8` pointer (an array borrow
+// decays to its first element, exactly as in C), and `str as *u8` gives the
+// byte pointer the string already holds.
+func pointerElem(t *types.Type) *types.Type {
+	if t == nil {
+		return nil
+	}
+	switch t.Kind {
+	case types.Ref, types.Ptr:
+		e := t.Elem
+		if e != nil && e.Kind == types.Array {
+			return e.Elem
+		}
+		return e
+	case types.Str:
+		return types.U8T
+	}
 	return nil
 }
 

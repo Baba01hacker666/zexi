@@ -1,0 +1,9 @@
+// A pointer cast keeps its pointee type: `&i64 as *u8` would hand C an address
+// it reads as bytes, so it is refused rather than silently reinterpreted.
+
+extern "C" fn zx_take(p: *u8);
+
+fn main() {
+    let n: i64 = 1;
+    zx_take(&n as *u8); // error: E0308 cannot cast `&i64` to `*u8`
+}

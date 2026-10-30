@@ -74,6 +74,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/fstring_nested.zx",
 		"../../tests/prelude_methods.zx",
 		"../../tests/c_body.zx",
+		"../../tests/pointer_cast.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -547,6 +548,20 @@ func TestRunPrograms(t *testing.T) {
 				"brace {literal} and 3",
 				"char } inside a hole",
 				"doubly nested deep 3",
+				"",
+			}, "\n"),
+		},
+		{
+			// `&t as *T`: array decay, scalars, elements, and slices.
+			file: "../../tests/pointer_cast.zx",
+			want: strings.Join([]string{
+				"0 0 A",
+				"7",
+				"10",
+				"20",
+				"99",
+				"false",
+				"20",
 				"",
 			}, "\n"),
 		},

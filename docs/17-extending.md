@@ -163,6 +163,7 @@ fn main() -> i32 {
 | `&[u8]` / `&mut [u8]` / `[T]` | `zx_slice_u8` / `zx_slice_T` (`{ T *ptr; size_t len; }`, by value) |
 | `struct S` | `struct zx_S` |
 | returning `()` | `void` |
+| `*T` | `T *` |
 
 ## 17.3b Rung 5: a whole function body in C
 
@@ -285,6 +286,34 @@ Four rules keep this safe, and each is a diagnostic rather than a surprise:
 parameters — they are borrowed or `Copy`, so there is nothing to drop. The
 `--emit=mir` dump reports the function as not lowered (`a function body written
 in C`), which is honest: the MIR interpreter cannot run C.
+
+A `*T` argument is how a C function writes back through a borrow. Zexi has no
+`unsafe` block and no pointer dereference, so a pointer is made explicitly with
+`as` and only ever handed to C:
+
+```zx
+extern "C" fn zx_bzero(p: *u8, n: usize);
+
+c """
+void zx_bzero(uint8_t *p, size_t n) { for (size_t i = 0; i < n; i++) p[i] = 0; }
+"""
+
+fn main() {
+    let mut buf: [u8; 8] = [65; 8];
+    zx_bzero(&mut buf as *u8, 4);    // an array borrow decays to its first byte
+    println(buf[0] as i32, buf[3] as i32, buf[4] as char);
+}
+```
+
+```
+0 0 A
+```
+
+The pointee must match, so the C side receives the type the language promised:
+`&mut buf as *u8` is allowed, `&n as *u8` (where `n: i64`) is `E0308`, and a
+slice borrow is refused with a message pointing at `&xs[i] as *T`. A pointer can
+also be observed as an integer and converted back, which is how a C library's
+opaque handle (returned as `usize`/`i64`) becomes a typed pointer again.
 
 ## 17.4 What the standard library does
 

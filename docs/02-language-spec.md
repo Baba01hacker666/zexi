@@ -162,7 +162,8 @@ never               the type of `return`/`panic`; coerces to anything
 (T, U, ...)   tuple; () is the unit type
 str           immutable borrowed text (a C-ABI `const char *`, NUL-terminated;
               `str::as_bytes()` yields a `[u8]` view with an explicit length)
-*T *mut T     raw pointer (only usable in `unsafe`)
+*T *mut T     raw pointer (no `unsafe` block exists; it is created only by an
+              explicit `as` cast and exists to cross into C)
 &T &mut T     shared / exclusive references
 fn(A, B) -> R function pointer
 ```
@@ -331,8 +332,26 @@ type is an error (`E0599`/`E0308`), never a silently wrong answer. A unit payloa
   element reachable from it, taking `&mut` of it, or calling a `&mut self`
   method on it requires `let mut` (or a binding that is already a `&mut`/`*mut`
   handle). `&self` methods may not mutate the receiver.
-- **Null:** there is no null pointer value in safe code. Absence is `Option<T>`,
-  and `*T` is only dereferenceable in `unsafe`.
+- **Null:** there is no null pointer value in safe code. Absence is `Option<T>`.
+  A `*T` cannot be dereferenced from Zexi at all — it is produced by `as` and
+  consumed by `extern "C"` calls and `c` bodies, so the C side is where the
+  type is checked.
+
+### Casts
+
+`as` converts between numeric types, to and from `char`, and to and from raw
+pointers:
+
+| Cast | Rule |
+| --- | --- |
+| numeric ↔ numeric, numeric ↔ `char` | truncating/saturating as usual; no implicit conversion exists |
+| `&T` / `&mut T` → `*T` | the pointee must match (`&i64 as *u8` is `E0308`) |
+| `&[T; N]` / `&mut [T; N]` → `*T` | an array borrow decays to its first element, as in C |
+| `&[T]` → `*T` | rejected: a slice is a pointer *and* a length, so cast `&xs[i]` instead |
+| `str` → `*u8` | the string's byte pointer |
+| `*T` ↔ integer | an address as a number, for handles and log lines |
+
+Nothing else casts: strings, structs, and enums are not reinterpreted by `as`.
 
 ## 2.5 Control flow & expressions
 

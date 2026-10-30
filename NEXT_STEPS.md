@@ -20,6 +20,12 @@ forward most. Ordered by value per unit of risk, not by ambition.
   consume their receiver (`E0382` on a second `unwrap`) and the tag tests only
   read it. `panic(msg)` is the `never`-typed counterpart they need. There is no
   `impl` block to write, so nothing in the prelude enums can drift.
+- **A borrow can become a pointer.** `&buf as *u8`, `&mut n as *mut i64`,
+  `str as *u8`, and `*T` ↔ integer are the one explicit way to make a raw
+  pointer, which is what a C function that writes back through a borrow needs.
+  The pointee must match (`E0308` otherwise), an array borrow decays to its
+  first element, and there is still no pointer dereference in Zexi — the type is
+  checked on the C side. This was the last known "cannot express it" gap.
 - **A function body can be written in C.** `c """..."""` in body position
   compiles that body inside the program's one translation unit: parameters keep
   their source names and their Zexi C types, the C compiler checks them against
