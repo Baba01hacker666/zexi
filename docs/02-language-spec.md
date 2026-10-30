@@ -31,7 +31,7 @@ program namespace.
 | Byte | `b'A'`, `b'\n'` |
 | Char (a Unicode scalar) | `'A'`, `'\u{1F600}'` |
 | String (UTF-8, immutable) | `"hi\n"`, `"élan"` |
-| Interpolated string (`String`) | `f"hi {name}, {n + 1} pts"` (`{{`/`}}` are literal braces) |
+| Interpolated string (`String`) | `f"hi {name}, {n + 1} pts"` (`{{`/`}}` are literal braces; a hole may contain nested literals and braces: `f"{"inner"}"`) |
 | Raw string (no escapes) | `r"C:\path"`, `r#"say "hi""#`, `r##"a #" b"##` |
 | Triple-quoted raw string | `"""a "quoted" line\nand a second one"""` — the spelling to use for C, HTML, or SQL |
 | Boolean | `true`, `false` |
@@ -286,6 +286,27 @@ types or const generics. Explicit arguments may appear on calls and types
 `Some(T)`/`None` and `Ok(T)`/`Err(E)`. The variant names may be written bare
 (`Ok(n)`, `None`) when the expected type makes the enum unambiguous.
 
+Both enums have a fixed set of **builtin methods**. They are not `impl` methods
+(the prelude enums are compiler templates and cannot be extended), but they are
+specified by their desugaring, so their move and evaluation semantics are the
+same as an explicit `match`:
+
+| Method | Type | Desugaring | Receiver |
+| --- | --- | --- | --- |
+| `r.unwrap()` | `T` | `match r { Err(_) => panic(..), Ok(v) => v }` | moved |
+| `r.expect(msg)` | `T` | same, with `panic(msg)` as the failing arm | moved |
+| `r.unwrap_or(d)` | `T` | failing arm evaluates `d` | moved |
+| `r.is_ok()` | `bool` | discriminant test | borrowed |
+| `r.is_err()` | `bool` | discriminant test | borrowed |
+| `o.is_some()` | `bool` | discriminant test | borrowed |
+| `o.is_none()` | `bool` | discriminant test | borrowed |
+
+The extractors consume their receiver, so unwrapping twice is `E0382`; the tag
+tests only read, so testing and then unwrapping is legal. Asking an `Option` for
+`is_ok`, a `Result` for `is_some`, or passing `unwrap_or` a value of the wrong
+type is an error (`E0599`/`E0308`), never a silently wrong answer. A unit payload
+(`Result<(), E>`) unwraps to `()`.
+
 ## 2.4 Type system rules
 
 - **Static, strong, nominal** for structs/enums; `dyn Trait` is structural.
@@ -370,7 +391,25 @@ an unknown name (E0061), a duplicated argument (E0062), or a missing
 required argument (E0061) is an error. A function whose return type is
 omitted returns `()`. An interpolated string `f"...{expr}..."` evaluates to
 an owning `String`; interpolated values are borrowed (never moved) and must
-be printable (numbers, `bool`, `char`, `str`, `String`).
+be printable (numbers, `bool`, `char`, `str`, `String`). A hole holds a full
+expression, so it may contain its own string or char literal, its own braces,
+or another interpolation — the scanner matches the inner quoting and bracket
+depth, and only a quote outside every hole ends the literal:
+
+```zexi
+fn main() {
+    let n = 3;
+    println(f"nested {"quoted"} works");
+    println(f"{ if n > 3 { "long" } else { "short" } }");
+    println(f"char {'}'} inside a hole");
+}
+```
+
+```
+nested quoted works
+short
+char } inside a hole
+```
 
 <!-- fragment -->
 ```zexi
@@ -447,9 +486,14 @@ No exceptions. Two mechanisms:
    operator works on `Option<T>` (yielding `Some`'s payload and returning
    `None`) inside a function that returns `Option`.
 
-2. **`panic`** for unrecoverable bugs; unwinds are **not** supported in M0 — a
-   panic aborts (or calls a user hook), keeping the binary small and behavior
+2. **`panic(msg)`** for unrecoverable bugs; unwinds are **not** supported in M0 —
+   a panic aborts (or calls a user hook), keeping the binary small and behavior
    predictable. Bounds-check failures and integer-overflow checks (debug) panic.
+   `panic` has type `never`, so it may stand where a value of any type is
+   expected — typically the arm of a `match` that cannot return. It writes
+   `zexi panic: <msg>` to standard error and exits with status **101**; the
+   argument is optional (`panic()` reports `panic`) and may be any printable
+   value.
 
 ## 2.8 Modules & packages
 

@@ -14,6 +14,16 @@ forward most. Ordered by value per unit of risk, not by ambition.
 - **`eprint`/`eprintln` are builtins**, and `&[T; N]` / `&mut [T; N]` index like
   the array they point at, so a buffer a C function filled can be read back
   (previously `E0608`).
+- **`Option`/`Result` have their everyday methods.** `unwrap`, `expect`,
+  `unwrap_or`, and the tag tests `is_ok`/`is_err`/`is_some`/`is_none` are
+  compiler builtins defined by the `match` they desugar to, so extractors
+  consume their receiver (`E0382` on a second `unwrap`) and the tag tests only
+  read it. `panic(msg)` is the `never`-typed counterpart they need. There is no
+  `impl` block to write, so nothing in the prelude enums can drift.
+- **An f-string hole holds a real expression.** Nested string and char
+  literals, nested braces, and nested interpolations (`f"{"inner"}"`) no longer
+  end the outer literal early — the scanner tracks hole depth and the quoting
+  inside it.
 
 - **Self-extension works.** A library adds native code with `c """..."""`,
   `#[link("name")]`, `#[link_dir("path")]`, `#[include("header.h")]`,

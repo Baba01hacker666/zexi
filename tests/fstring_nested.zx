@@ -1,0 +1,21 @@
+// tests/fstring_nested.zx
+// An interpolation hole may hold any expression, including one with its own
+// string or char literals and its own braces.
+//
+//     zexic run tests/fstring_nested.zx
+
+fn greet(name: str) -> String {
+    return String::from(f"hello, {name}!");
+}
+
+fn main() {
+    let n = 3;
+    println(f"n = {n}");
+    println(f"n + 1 = {n + 1}");
+    println(f"nested {"quoted"} works");
+    println(f"call: {greet("zexi")}");
+    println(f"{ if n > 3 { "long" } else { "short" } }");
+    println(f"brace {{literal}} and {n}");
+    println(f"char {'}'} inside a hole");
+    println(f"doubly {f"nested {f"deep {n}"}"}");
+}

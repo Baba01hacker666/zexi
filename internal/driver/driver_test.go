@@ -2,6 +2,7 @@ package driver_test
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	stdhttp "net/http"
@@ -70,6 +71,8 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/slices.zx",
 		"../../tests/ref_array.zx",
 		"../../tests/std_bytes.zx",
+		"../../tests/fstring_nested.zx",
+		"../../tests/prelude_methods.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -530,6 +533,33 @@ func TestRunPrograms(t *testing.T) {
 		{
 			file: "../../tests/ref_array.zx",
 			want: strings.Join([]string{"8", "140", "148", "10", "b", ""}, "\n"),
+		},
+		{
+			// Nested literals and braces inside f-string interpolation holes.
+			file: "../../tests/fstring_nested.zx",
+			want: strings.Join([]string{
+				"n = 3",
+				"n + 1 = 4",
+				"nested quoted works",
+				"call: hello, zexi!",
+				"short",
+				"brace {literal} and 3",
+				"char } inside a hole",
+				"doubly nested deep 3",
+				"",
+			}, "\n"),
+		},
+		{
+			// Option/Result builtin helpers: tag tests borrow, extractors move.
+			file: "../../tests/prelude_methods.zx",
+			want: strings.Join([]string{
+				"true", "false", "42",
+				"false", "true",
+				"-1", "6",
+				"true", "one",
+				"true", "anonymous",
+				"10", "true", "",
+			}, "\n"),
 		},
 		{
 			file: "../../tests/slices.zx",
@@ -3180,5 +3210,45 @@ fn main() -> i32 {
 	final := exchange([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"), 3*time.Second)
 	if !strings.Contains(final, "200 OK") {
 		t.Fatalf("server stopped serving after hostile input: %q (%s)", final, log.String())
+	}
+}
+
+// TestPanicReportsMessageAndExitCode checks that `panic(msg)` writes its
+// message to stderr, stops the program there, and exits with status 101.
+func TestPanicReportsMessageAndExitCode(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+
+	bin := filepath.Join(t.TempDir(), "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build("../../tests/panic_message.zx", bin, driver.Options{}, em); !ok {
+		t.Fatal("build failed")
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command(bin)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("program exited 0, want a non-zero status from panic")
+	}
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		t.Fatalf("running %s: %v", bin, err)
+	}
+	if code := exit.ExitCode(); code != 101 {
+		t.Fatalf("exit code = %d, want 101", code)
+	}
+	if got, want := stdout.String(), "3\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	wantMsg := "zexi panic: division by zero: 1\n"
+	if got := stderr.String(); got != wantMsg {
+		t.Fatalf("stderr = %q, want %q", got, wantMsg)
 	}
 }

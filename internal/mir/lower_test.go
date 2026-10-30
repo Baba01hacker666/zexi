@@ -284,3 +284,40 @@ fn main() -> i32 {
 		t.Errorf("expected a partial-move report for take, got %v", res.Unsupported)
 	}
 }
+
+// TestPanicLowersAsDivergingCall checks that `panic(msg)` lowers to the panic
+// builtin and that control never returns from it: the block after the call holds
+// only an `unreachable`, so the arms of an `unwrap` desugar stay well-formed.
+func TestPanicLowersAsDivergingCall(t *testing.T) {
+	res := lowerString(t, `
+fn main() -> i32 {
+    if 1 > 2 {
+        panic("boom");
+    }
+    0
+}`)
+	for _, u := range res.Unsupported {
+		t.Fatalf("panic should lower, but %s was reported: %s", u.Fn, u.Feature)
+	}
+	if res.Prog.Main == nil {
+		t.Fatal("main was not lowered")
+	}
+
+	var calls, dead int
+	for _, blk := range res.Prog.Main.Body.Blocks {
+		if c, ok := blk.Term.(*mir.Call); ok && c.Callee.Builtin == mir.BnPanic {
+			calls++
+			if int(c.Target) >= len(res.Prog.Main.Body.Blocks) {
+				t.Fatalf("panic call targets block %d of %d", c.Target, len(res.Prog.Main.Body.Blocks))
+			}
+			next := res.Prog.Main.Body.Blocks[c.Target]
+			if _, ok := next.Term.(*mir.Unreachable); !ok {
+				t.Fatalf("successor of panic is %T, want unreachable", next.Term)
+			}
+			dead++
+		}
+	}
+	if calls == 0 || dead == 0 {
+		t.Fatalf("no panic call found in main (%d blocks)", len(res.Prog.Main.Body.Blocks))
+	}
+}

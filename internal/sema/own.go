@@ -351,6 +351,24 @@ func (m *mover) call(x *ast.CallExpr) {
 }
 
 func (m *mover) methodCall(x *ast.MethodCallExpr) {
+	// `Option`/`Result` extractors are desugared to a `match` that takes the
+	// receiver by value, so they move it; the tag tests (`is_ok`, `is_some`)
+	// only read the discriminant. Without this, `v.unwrap()` could be written
+	// twice and both results would own the same payload.
+	if _, tagTest := m.c.info.PreludeTag[x]; tagTest {
+		m.use(x.Recv)
+		for _, a := range x.Args {
+			m.use(a)
+		}
+		return
+	}
+	if _, extract := m.c.info.PreludeMatches[x]; extract {
+		m.consume(x.Recv)
+		for _, a := range x.Args {
+			m.consume(a)
+		}
+		return
+	}
 	fn := m.c.info.Resolved[x]
 	if fn != nil && fn.Self != nil && !fn.Self.ByRef {
 		m.consume(x.Recv) // by-value receiver: moves

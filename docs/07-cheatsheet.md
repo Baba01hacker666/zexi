@@ -466,6 +466,62 @@ payloads move into the arm and are dropped once. A guarded arm copies for the
 guard and takes ownership only after it passes. Binding an owned payload out of
 a borrow is `E0507`.
 
+### Builtin methods on `Option` and `Result`
+
+The two prelude enums come with the usual Rust spellings, so you do not have to
+write the `match` out. `Option`/`Result` cannot have `impl` blocks; these are
+compiler builtins, defined as the desugarings shown here.
+
+| Method | Meaning | Desugars to |
+| --- | --- | --- |
+| `r.unwrap()` | the `Ok`/`Some` payload | `match r { Err(_) => panic("called `unwrap` on a `Err` value"), Ok(v) => v }` |
+| `r.expect(msg)` | the payload, or `panic(msg)` | same, with `panic(msg)` as the failing arm |
+| `r.unwrap_or(d)` | the payload, or `d` | failing arm evaluates `d` |
+| `r.is_ok()` / `r.is_err()` | is the `Ok` arm active? | tag comparison |
+| `o.is_some()` / `o.is_none()` | is the `Some` arm active? | tag comparison |
+
+```zx
+fn parse(s: str) -> Result<i32, String> {
+    if s == "" {
+        return Err(String::from("empty"));
+    }
+    return Ok(42);
+}
+
+fn main() {
+    let r = parse("42");
+    println(r.is_ok());                  // tag test: reads the discriminant
+    println(r.unwrap());                 // extractor: consumes r, so no second unwrap
+    println(parse("").unwrap_or(-1));    // failing arm provides the default
+}
+```
+
+```
+true
+42
+-1
+```
+
+Extractors **consume** their receiver — the same move a `match` performs — so
+`let a = r.unwrap(); r.unwrap();` is `E0382`. The tag tests only read, so
+`is_ok()` followed by `unwrap()` is fine. A unit payload (`Result<(), E>`)
+unwraps to `()`.
+
+### `panic`
+
+`panic(msg)` has type `never`, so it fits anywhere a value is expected —
+typically as the arm that cannot return. It prints `zexi panic: <msg>` to
+stderr and exits **101**.
+
+```zx
+fn divide(a: i32, b: i32) -> i32 {
+    if b == 0 { panic(f"division by zero: {a}"); }
+    return a / b;
+}
+
+panic();        // 0 arguments is allowed: reports "panic"
+```
+
 ## 7.14 Closures
 
 ```zx
@@ -519,6 +575,17 @@ fn greet() { println("hi") }   // no return type needed when returning ()
 - In `f"..."`, `{{` and `}}` are literal braces. Interpolated values are
   borrowed, never moved, and must be printable (numbers, `bool`, `char`,
   `str`, `String`).
+- A hole may hold any expression, including one containing its own string or
+  char literal, its own braces, or another f-string — quoting is tracked, so the
+  inner quotes do not end the outer literal:
+
+  ```zx
+  f"nested {"quoted"} works"             // nested quoted works
+  f"call: {greet("zexi")}"               // a call with a string argument
+  f"{ if n > 3 { "long" } else { "short" } }"
+  f"brace {{literal}} and {n}"           // brace {literal} and 3
+  f"char {'}'} inside a hole"            // char } inside a hole
+  ```
 
 Libraries: `use` and `import` load whole files into your program. Loaded
 declarations are available unqualified (the preview keeps a flat namespace), and

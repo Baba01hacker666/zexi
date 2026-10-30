@@ -72,7 +72,7 @@ M1/M2 are additive.
 | Goal | Compile a safe subset → C → binary | Real programs; modules; NLL | Native backend + size/speed tuning |
 | Types | primitives, tuples, arrays, slices, structs, enums | + generics, traits, `dyn`, `str`/`String` | + const eval, SIMD, niche opt |
 | Ownership | lexical scope, moves, explicit `drop` | full NLL borrow checker, lifetimes | escape analysis, drop elision |
-| Errors | `Result` + `?`, panic abort | + `Option` ergonomics, `?` in `main` | zero-cost error paths |
+| Errors | `Result` + `?`, `Option`/`Result` helper methods, panic abort | + `?` in `main`, richer combinators (`map`/`and_then`) | zero-cost error paths |
 | Modules | file imports + `mod`/`use`/`import` preview | scoped packages, isolation, `pub` enforcement | incremental + parallel builds |
 | Runtime | panic+exit only | opt-in `alloc`/`fmt` | freestanding `no_std` tuned |
 | Backend | C11 | C11 (+ PGO passthrough) | native x86-64 (or Cranelift) |

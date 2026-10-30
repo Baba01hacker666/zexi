@@ -92,6 +92,14 @@ type Info struct {
 	PatVariant map[ast.Pattern]*types.Variant
 	// TryMatches maps a `?` expression to the ordinary `match` it desugars to.
 	TryMatches map[*ast.TryExpr]*ast.MatchExpr
+	// PreludeMatches maps `Option`/`Result` extractor calls (`unwrap`,
+	// `expect`, `unwrap_or`) to the ordinary `match` they desugar to, so the
+	// extractors reuse the move analysis and drop glue a written-out match
+	// already gets.
+	PreludeMatches map[*ast.MethodCallExpr]*ast.MatchExpr
+	// PreludeTag records the tag test a `is_ok`/`is_err`/`is_some`/`is_none`
+	// call lowers to: the variant name whose tag is compared.
+	PreludeTag map[*ast.MethodCallExpr]string
 	// Closures maps each lambda expression to its resolved signature and the
 	// variables it captures from the enclosing function.
 	Closures map[*ast.LambdaExpr]*Closure
@@ -161,23 +169,25 @@ func (in *Info) PlaceThroughBorrow(e ast.Expr) bool {
 func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 	c := &checker{
 		info: &Info{
-			File:       file,
-			Fns:        map[string]*Fn{},
-			Consts:     map[string]*Const{},
-			Structs:    map[string]*types.Struct{},
-			Enums:      map[string]*types.Enum{},
-			Methods:    map[string]map[string]*Fn{},
-			Resolved:   map[ast.Expr]*Fn{},
-			FnValues:   map[ast.Expr]*Fn{},
-			Indirect:   map[ast.Expr]*types.Type{},
-			Ctors:      map[ast.Expr]*Ctor{},
-			TupleCtors: map[ast.Expr]*types.Struct{},
-			Aliases:    map[string]*types.Type{},
-			PatVariant: map[ast.Pattern]*types.Variant{},
-			TryMatches: map[*ast.TryExpr]*ast.MatchExpr{},
-			Closures:   map[*ast.LambdaExpr]*Closure{},
-			Types:      map[ast.Expr]*types.Type{},
-			DeclTypes:  map[ast.Stmt]*types.Type{},
+			File:           file,
+			Fns:            map[string]*Fn{},
+			Consts:         map[string]*Const{},
+			Structs:        map[string]*types.Struct{},
+			Enums:          map[string]*types.Enum{},
+			Methods:        map[string]map[string]*Fn{},
+			Resolved:       map[ast.Expr]*Fn{},
+			FnValues:       map[ast.Expr]*Fn{},
+			Indirect:       map[ast.Expr]*types.Type{},
+			Ctors:          map[ast.Expr]*Ctor{},
+			TupleCtors:     map[ast.Expr]*types.Struct{},
+			Aliases:        map[string]*types.Type{},
+			PatVariant:     map[ast.Pattern]*types.Variant{},
+			TryMatches:     map[*ast.TryExpr]*ast.MatchExpr{},
+			PreludeMatches: map[*ast.MethodCallExpr]*ast.MatchExpr{},
+			PreludeTag:     map[*ast.MethodCallExpr]string{},
+			Closures:       map[*ast.LambdaExpr]*Closure{},
+			Types:          map[ast.Expr]*types.Type{},
+			DeclTypes:      map[ast.Stmt]*types.Type{},
 		},
 		aliasDecls:  map[string]*ast.TypeAlias{},
 		aliasTypes:  map[string]*types.Type{},
@@ -2205,6 +2215,9 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 	if name == "print" || name == "println" || name == "eprint" || name == "eprintln" {
 		return c.inferPrint(x)
 	}
+	if name == "panic" {
+		return c.inferPanic(x)
+	}
 	if name == "len" {
 		return c.inferLen(x)
 	}
@@ -2329,7 +2342,7 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		if t := c.inferBareVariantCtor(x, name, expected); t != nil {
 			return t
 		}
-		cands := []string{"print", "println", "eprint", "eprintln", "len", "cstr", "from_cstr", "arg_count", "arg_at", "project_dir"}
+		cands := []string{"print", "println", "eprint", "eprintln", "panic", "len", "cstr", "from_cstr", "arg_count", "arg_at", "project_dir"}
 		for n := range c.info.Fns {
 			cands = append(cands, n)
 		}
@@ -3786,6 +3799,150 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 // inferTry lowers `e?` to an ordinary match over the operand. The desugared
 // match is kept in Info.TryMatches so codegen (which never sees `?`) can emit
 // it.
+// inferPreludeMethod types the builtin methods of `Option` and `Result`, and
+// reports whether it handled the call. The tag tests lower to a single tag
+// comparison (so they borrow the receiver and never move it); the extractors
+// lower to the same ordinary `match` that `?` desugars to, which is what gives
+// them the move analysis and the once-only drop of the remainder for free —
+// `r.unwrap()` moves the payload out exactly like
+// `match r { Ok(v) => v, Err(_) => panic("...") }`.
+func (c *checker) inferPreludeMethod(x *ast.MethodCallExpr, base *types.Type) (*types.Type, bool) {
+	baseName := nominalBaseName(base)
+	isResult := baseName == "Result"
+	okName, errName := "Some", "None"
+	if isResult {
+		okName, errName = "Ok", "Err"
+	}
+	var payload *types.Type
+	if len(base.En.Args) > 0 {
+		payload = base.En.Args[0]
+	}
+	unitPayload := payload == nil || payload.Kind == types.Unit
+
+	// Tag tests read the discriminant, so they take the receiver by borrow.
+	tags := map[string]string{"is_some": "Some", "is_none": "None"}
+	if isResult {
+		tags = map[string]string{"is_ok": "Ok", "is_err": "Err"}
+	}
+	if variant, ok := tags[x.Name]; ok {
+		if len(x.Args) != 0 {
+			c.errAt(x, "E0061", "`%s` takes no arguments but %d were supplied", x.Name, len(x.Args))
+			for _, a := range x.Args {
+				c.checkExpr(a, nil)
+			}
+		}
+		if _, ok := base.En.Variant(variant); !ok {
+			c.errAt(x, "E0277", "`%s` needs a `%s::%s` variant", x.Name, baseName, variant)
+			return types.BoolT, true
+		}
+		c.info.PreludeTag[x] = variant
+		return types.BoolT, true
+	}
+
+	switch x.Name {
+	case "unwrap", "expect", "unwrap_or":
+	default:
+		return nil, false
+	}
+
+	sp := x.Sp
+	// The failing arm: `Err(_)` for a Result, bare `None` for an Option.
+	failPat := &ast.PathPat{Path: []string{baseName, errName}, Sp: sp}
+	if isResult {
+		// The error value is not needed, and binding it would move an owned
+		// error into an unused local; match it with a wildcard instead.
+		failPat.Sub = []ast.Pattern{&ast.WildcardPat{Sp: sp}}
+	}
+	var failBody ast.Expr
+	switch x.Name {
+	case "unwrap":
+		if len(x.Args) != 0 {
+			c.errAt(x, "E0061", "`unwrap` takes no arguments but %d were supplied", len(x.Args))
+			for _, a := range x.Args {
+				c.checkExpr(a, nil)
+			}
+		}
+		failBody = &ast.CallExpr{
+			Callee: &ast.IdentExpr{Name: "panic", Sp: sp},
+			Args:   []ast.Expr{&ast.LiteralExpr{Kind: token.KindString, Text: "called `unwrap` on a `" + errName + "` value", Sp: sp}},
+			Sp:     sp,
+		}
+	case "expect":
+		if len(x.Args) != 1 {
+			c.errAt(x, "E0061", "`expect` takes 1 argument but %d were supplied", len(x.Args))
+			for _, a := range x.Args {
+				c.checkExpr(a, nil)
+			}
+			return payload, true
+		}
+		at := c.checkExpr(x.Args[0], nil)
+		if !isPrintable(at) {
+			c.errAt(x.Args[0], "E0277", "`%s` cannot be printed", at)
+		}
+		failBody = &ast.CallExpr{
+			Callee: &ast.IdentExpr{Name: "panic", Sp: sp},
+			Args:   []ast.Expr{x.Args[0]},
+			Sp:     sp,
+		}
+	case "unwrap_or":
+		if len(x.Args) != 1 {
+			c.errAt(x, "E0061", "`unwrap_or` takes 1 argument but %d were supplied", len(x.Args))
+			for _, a := range x.Args {
+				c.checkExpr(a, nil)
+			}
+			return payload, true
+		}
+		at := c.checkExpr(x.Args[0], payload)
+		if payload != nil && !c.argAssignable(payload, at, false) {
+			// Already reported: building the match now would only add a second,
+			// less specific diagnostic about its arms.
+			c.errAt(x.Args[0], "E0308", "mismatched types: expected `%s`, found `%s`", payload, at)
+			return payload, true
+		}
+		failBody = x.Args[0]
+	}
+	if _, ok := base.En.Variant(errName); !ok {
+		c.errAt(x, "E0277", "`%s` needs a `%s::%s` variant", x.Name, baseName, errName)
+		return payload, true
+	}
+
+	// The succeeding arm yields the payload, or `()` when there is nothing to
+	// extract (a wildcard stands in for `Ok(())`, so no void local is declared).
+	var okPat ast.Pattern
+	var okBody ast.Expr
+	if unitPayload {
+		okPat = &ast.WildcardPat{Sp: sp}
+		okBody = &ast.TupleExpr{Sp: sp}
+	} else {
+		const bind = "__prelude_value"
+		okPat = &ast.PathPat{
+			Path: []string{baseName, okName},
+			Sub:  []ast.Pattern{&ast.BindPat{Name: bind, Sp: sp}},
+			Sp:   sp,
+		}
+		okBody = &ast.IdentExpr{Name: bind, Sp: sp}
+	}
+
+	m := &ast.MatchExpr{
+		Scrutinee: x.Recv,
+		// The failing arm comes first: a unit success arm is a wildcard, which
+		// would otherwise swallow the failure.
+		Arms: []ast.MatchArm{
+			{Pat: failPat, Body: failBody, Sp: sp},
+			{Pat: okPat, Body: okBody, Sp: sp},
+		},
+		Sp: sp,
+	}
+	c.info.PreludeMatches[x] = m
+	var want *types.Type
+	if x.Name != "unwrap_or" {
+		want = payload
+	}
+	ret := c.checkExpr(m, want)
+	c.info.Types[x] = ret
+	return ret, true
+}
+
 func (c *checker) inferTry(x *ast.TryExpr, expected *types.Type) *types.Type {
 	ret := c.cur.Ret
 	retBase := ""
@@ -4152,6 +4309,17 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 		}
 		return c.inferMapMethod(x, base)
 	}
+	// `Option` and `Result` carry builtin methods: the tag tests and the
+	// extractors. They cannot be `impl` blocks, because the prelude enums are
+	// templates the checker builds itself.
+	if base != nil && base.Kind == types.EnumKind && base.En != nil {
+		switch nominalBaseName(base) {
+		case "Result", "Option":
+			if t, handled := c.inferPreludeMethod(x, base); handled {
+				return t
+			}
+		}
+	}
 	// `len()` is also available directly on arrays, slices, and `str` values.
 	if x.Name == "len" && len(x.Args) == 0 && base != nil && (base.Kind == types.Array || base.Kind == types.Str || base.Kind == types.Slice) {
 		return types.UsizeT
@@ -4455,6 +4623,28 @@ func formatLiteral(args []ast.Expr) (string, bool) {
 // countFormatArgs returns the number of `{}` placeholders in a format string.
 func countFormatArgs(format string) int {
 	return strings.Count(format, "{}")
+}
+
+// inferPanic types `panic(msg)`: it never returns, so its type is `never` and it
+// is usable anywhere a value is expected — the reason it can stand in for an
+// arm body in the match that `unwrap`/`expect` desugar to.
+func (c *checker) inferPanic(x *ast.CallExpr) *types.Type {
+	switch len(x.Args) {
+	case 0:
+		return types.NeverT
+	case 1:
+		at := c.checkExpr(x.Args[0], nil)
+		if !isPrintable(at) {
+			c.errAt(x.Args[0], "E0277", "`%s` cannot be printed", at)
+		}
+		return types.NeverT
+	default:
+		c.errAt(x, "E0061", "`panic` takes at most one argument but %d were supplied", len(x.Args))
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return types.NeverT
+	}
 }
 
 func (c *checker) inferPrint(x *ast.CallExpr) *types.Type {

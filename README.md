@@ -42,8 +42,10 @@ This repository contains the **initial design and specification** of Zexi: the v
 > or-patterns (`A | B`), and range patterns (`1..=9`, `'a'..='z'`);
 > **monomorphized generics** for functions, structs, enums, and impls, with
 > inference and turbofish (`id::<i64>`, `Pair::<i32, str>`); predeclared
-> **`Option<T>`/`Result<T, E>`** and the **`?` operator** (lowered to `match`,
-> with bare `Some`/`None`/`Ok`/`Err` from context); **owned enum payloads** with
+> **`Option<T>`/`Result<T, E>`** with their builtin helpers (`unwrap`, `expect`,
+> `unwrap_or`, `is_ok`/`is_err`/`is_some`/`is_none`) and the **`?` operator**
+> (all lowered to `match`, with bare `Some`/`None`/`Ok`/`Err` from context);
+> **`panic(msg)`** as a `never` expression that exits 101; **owned enum payloads** with
 > match move/drop glue;
 > **first-class arrays** with bounds-checked indexing, and **borrowed slices**
 > (`&[T]`/`&mut [T]` as a two-word view, `a[lo..hi]`, `for x in slice`, and

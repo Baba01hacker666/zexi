@@ -2507,6 +2507,9 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 	if name == "print" || name == "println" || name == "eprint" || name == "eprintln" {
 		return g.printfCall(x, name)
 	}
+	if name == "panic" {
+		return g.panicCall(x)
+	}
 	if name == "len" {
 		return g.lenValue(x)
 	}
@@ -2575,6 +2578,28 @@ func (g *gen) stringCtorValue(x *ast.CallExpr, name string) string {
 	return g.withArgs(x.Args, wants, "zx_String", func(ps []string) string {
 		return "zx_string_" + name + "(" + strings.Join(ps, ", ") + ")"
 	})
+}
+
+// panicCall emits the builtin `panic(msg)`: report and stop through the one exit
+// path every run-time fault uses, so stdout is flushed and the exit status is
+// uniform. Its type is `never`, which is why an arm body can be a panic.
+func (g *gen) panicCall(x *ast.CallExpr) string {
+	g.hasPanic = true
+	if len(x.Args) == 0 {
+		return `zx_panicf("panic")`
+	}
+	t := g.info.TypeOf(x.Args[0])
+	if t != nil && t.Kind == types.StringKind {
+		if isPlaceExpr(x.Args[0]) {
+			return `zx_panicf("%s", zx_string_as_str(&` + g.value(x.Args[0]) + `))`
+		}
+		// A temporary owner: bind it so its buffer outlives the call, and let
+		// the panic exit without dropping it (the process is ending).
+		tm := g.tmpName()
+		return `({ zx_String ` + tm + ` = ` + g.value(x.Args[0]) + `; zx_panicf("%s", zx_string_as_str(&` + tm + `)); })`
+	}
+	format, cast := printFormat(t)
+	return `zx_panicf("` + format + `", ` + cast(g.value(x.Args[0])) + `)`
 }
 
 func (g *gen) printfCall(x *ast.CallExpr, name string) string {
@@ -2735,6 +2760,14 @@ func (g *gen) fieldValue(x *ast.FieldExpr) string {
 // methodCallValue emits a resolved method call, passing the receiver by value
 // or by address according to the method's `self` parameter.
 func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
+	// Builtin `Option`/`Result` methods: the tag tests compare the discriminant,
+	// the extractors are the `match` sema desugared them to.
+	if variant, ok := g.info.PreludeTag[x]; ok {
+		return g.preludeTagValue(x, variant)
+	}
+	if m := g.info.PreludeMatches[x]; m != nil {
+		return g.matchValue(m)
+	}
 	if base := recvBase(g.info.TypeOf(x.Recv)); base != nil && base.Kind == types.StringKind {
 		return g.stringMethodCall(x)
 	}
@@ -2808,6 +2841,26 @@ func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
 		args = append(args, ps...)
 		return funcName(m) + "(" + strings.Join(args, ", ") + ")"
 	})
+}
+
+// preludeTagValue emits an `is_ok`/`is_err`/`is_some`/`is_none` call as a
+// comparison against the variant's tag. It reads through the receiver, so a
+// `&self`-shaped call never moves the value.
+func (g *gen) preludeTagValue(x *ast.MethodCallExpr, variant string) string {
+	rt := g.info.TypeOf(x.Recv)
+	base := recvBase(rt)
+	if base == nil || base.En == nil {
+		return "0"
+	}
+	v, ok := base.En.Variant(variant)
+	if !ok {
+		return "0"
+	}
+	disc := g.value(x.Recv) + ".tag"
+	if rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr) {
+		disc = g.value(x.Recv) + "->tag"
+	}
+	return "(" + disc + " == " + strconv.Itoa(v.Index) + ")"
 }
 
 // stringMethodCall emits a builtin `String` method. Borrowing a place passes its
