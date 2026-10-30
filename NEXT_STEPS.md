@@ -5,6 +5,16 @@ forward most. Ordered by value per unit of risk, not by ambition.
 
 ## Where things stand
 
+- **C libraries install with one command.** `zexic add` writes a bound module
+  (`sqlite`, `zlib`, `crypto`, `curl`, `microhttpd`) into the project's `lib/`,
+  reporting whether the system half is installed by compiling and linking a
+  probe. A package is one `.zx` file, so it is readable, editable, and
+  committable; there is no manifest and no registry server. See
+  `docs/19-modules.md`.
+- **`eprint`/`eprintln` are builtins**, and `&[T; N]` / `&mut [T; N]` index like
+  the array they point at, so a buffer a C function filled can be read back
+  (previously `E0608`).
+
 - **Self-extension works.** A library adds native code with `c """..."""`,
   `#[link("name")]`, `#[link_dir("path")]`, `#[include("header.h")]`,
   `extern "C"` and `#[no_mangle]`. The compiler holds no C for the standard

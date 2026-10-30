@@ -68,6 +68,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/closures.zx",
 		"../../tests/cinline.zx",
 		"../../tests/slices.zx",
+		"../../tests/ref_array.zx",
 		"../../tests/std_bytes.zx",
 	}
 	for _, f := range files {
@@ -525,6 +526,10 @@ func TestRunPrograms(t *testing.T) {
 				"0", "1", "4", "9", "16", "3", "true", "true", "30", "1030",
 				"42", "2", "3", "",
 			}, "\n"),
+		},
+		{
+			file: "../../tests/ref_array.zx",
+			want: strings.Join([]string{"8", "140", "148", "10", "b", ""}, "\n"),
 		},
 		{
 			file: "../../tests/slices.zx",

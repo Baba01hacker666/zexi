@@ -1,0 +1,128 @@
+// zlib — DEFLATE compression and inflation, from the system's zlib.
+//
+//     use zlib;
+//
+//     fn main() -> i32 {
+//         let text = "zexi compresses this text with zlib.";
+//         let mut packed: [u8; 256] = [0; 256];
+//         let n = match zlib::compress(text.as_bytes(), &mut packed) {
+//             Ok(n) => n,
+//             Err(e) => { eprintln(e); return 1; }
+//         };
+//         println(f"compressed {len(text)} bytes to {n}");
+//         let mut plain: [u8; 256] = [0; 256];
+//         let m = match zlib::decompress(&packed[0..n], &mut plain) {
+//             Ok(m) => m,
+//             Err(e) => { eprintln(e); return 1; }
+//         };
+//         println(f"back to {m} bytes");
+//         0
+//     }
+//
+// The API is buffer-in, buffer-out: no allocation crosses the boundary and the
+// caller decides the ceiling. `bound(n)` is the most space `compress` can need
+// for `n` bytes, which is the right size to allocate in advance.
+//
+// Requires zlib (Debian/Ubuntu: `apt install zlib1g-dev`, Fedora: `zlib-devel`;
+// macOS ships it).
+
+#[link("z")]
+#[include("zlib.h")]
+extern "C" fn zxz_bound(n: usize) -> usize;
+extern "C" fn zxz_compress(src: &[u8], dst: &mut [u8], level: i32) -> i64;
+extern "C" fn zxz_decompress(src: &[u8], dst: &mut [u8]) -> i64;
+extern "C" fn zxz_decompress_size(src: &[u8]) -> i64;
+extern "C" fn zxz_crc32(src: &[u8], seed: u32) -> u32;
+
+c """
+#include <stdint.h>
+#include <string.h>
+
+/* `&[u8]` arrives as the generated two-word `zx_slice_u8`, so the definitions
+ * below must spell that type rather than an anonymous struct: the prototypes
+ * the compiler emits use this name, and a mismatch is a hard error here. */
+
+/* -1 = destination too small, -2 = the stream is not valid zlib data. */
+size_t zxz_bound(size_t n) { return (size_t)compressBound((uLong)n); }
+
+int64_t zxz_compress(zx_slice_u8 src, zx_slice_u8 dst, int32_t level) {
+    uLongf out = (uLongf)dst.len;
+    if (src.len == 0) return 0;
+    int rc = compress2(dst.ptr, &out, src.ptr, (uLong)src.len, (int)level);
+    if (rc == Z_BUF_ERROR) return -1;
+    if (rc != Z_OK) return -2;
+    return (int64_t)out;
+}
+
+int64_t zxz_decompress(zx_slice_u8 src, zx_slice_u8 dst) {
+    uLongf out = (uLongf)dst.len;
+    if (src.len == 0) return 0;
+    int rc = uncompress(dst.ptr, &out, src.ptr, (uLong)src.len);
+    if (rc == Z_BUF_ERROR) return -1;
+    if (rc != Z_OK) return -2;
+    return (int64_t)out;
+}
+
+uint32_t zxz_crc32(zx_slice_u8 src, uint32_t seed) {
+    return (uint32_t)crc32((uLong)seed, src.ptr, (unsigned)src.len);
+}
+
+/* decompress_size reports how large the inflated stream is, or -1 when the
+ * input is not a complete zlib stream. */
+int64_t zxz_decompress_size(zx_slice_u8 src) {
+    z_stream s;
+    memset(&s, 0, sizeof s);
+    if (inflateInit(&s) != Z_OK) return -1;
+    s.next_in = (Bytef *)src.ptr;
+    s.avail_in = (unsigned)src.len;
+    unsigned char sink[16384];
+    int64_t total = 0;
+    int rc;
+    do {
+        s.next_out = sink;
+        s.avail_out = (unsigned)sizeof sink;
+        rc = inflate(&s, Z_NO_FLUSH);
+        if (rc != Z_OK && rc != Z_STREAM_END) { inflateEnd(&s); return -1; }
+        total += (int64_t)(sizeof sink - s.avail_out);
+    } while (rc != Z_STREAM_END && s.avail_in > 0);
+    inflateEnd(&s);
+    return rc == Z_STREAM_END ? total : -1;
+}
+"""
+
+// bound is the worst-case compressed size of `n` input bytes.
+pub fn bound(n: usize) -> usize { return zxz_bound(n); }
+
+// compress deflates `src` into `dst` at `level` (0 = store, 1..9 = faster..smaller),
+// returning how many bytes were written.
+pub fn compress(src: &[u8], dst: &mut [u8], level: i32) -> Result<usize, String> {
+    let n = zxz_compress(src, dst, level);
+    return match_code(n);
+}
+
+// compress_level uses the conventional default level, 6.
+pub fn compress_at(src: &[u8], dst: &mut [u8]) -> Result<usize, String> {
+    return compress(src, dst, 6);
+}
+
+// decompress inflates `src` into `dst`.
+pub fn decompress(src: &[u8], dst: &mut [u8]) -> Result<usize, String> {
+    let n = zxz_decompress(src, dst);
+    return match_code(n);
+}
+
+// decompressed_size reports the inflated size without inflating into a buffer.
+pub fn decompressed_size(src: &[u8]) -> Result<usize, String> {
+    let n = zxz_decompress_size(src);
+    if n < 0 { return Err(String::from("not a complete zlib stream")); }
+    return Ok(n as usize);
+}
+
+fn match_code(n: i64) -> Result<usize, String> {
+    if n == -1 { return Err(String::from("destination buffer is too small")); }
+    if n < 0 { return Err(String::from("input is not valid zlib data")); }
+    return Ok(n as usize);
+}
+
+// crc32 is zlib's checksum over `data` (the same value a zip/gzip member stores).
+pub fn crc32(data: &[u8]) -> u32 { return zxz_crc32(data, 0); }

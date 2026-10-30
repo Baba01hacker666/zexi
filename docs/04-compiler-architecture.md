@@ -216,6 +216,7 @@ zexi fmt   [file.zx]              format source
 zexi doc   ...                    generate docs (M2)
 zexi emit  --emit=<mir|c> file.zx     (ast/hir/asm/bin are planned)
 zexi lsp   [entry.zx]             language server on stdio (LSP)
+zexi add   [package]              install a C-library module into lib/ (no argument: list)
 
 Options:
   -o <path>            output path

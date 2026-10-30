@@ -30,11 +30,33 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Install C library development files
+        # The module catalog (`zexic add`) binds real system libraries, and its
+        # end-to-end tests are skip-guarded on the development headers. Installing
+        # them here turns those skips into gates.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libsqlite3-dev zlib1g-dev libssl-dev libcurl4-openssl-dev libmicrohttpd-dev
+
       - name: Build
         run: go build ./...
 
       - name: Test
         run: go test ./...
+
+      - name: Module catalog
+        # `add` with no argument lists the catalog; installing must write exactly
+        # one importable module and be idempotent without --force.
+        run: |
+          go build -o /tmp/zexic ./cmd/zexic
+          /tmp/zexic add
+          work=$(mktemp -d)
+          cd "$work"
+          /tmp/zexic add sqlite
+          test -f lib/sqlite.zx
+          /tmp/zexic add sqlite && exit 1 || true   # refuses to overwrite
+          /tmp/zexic add sqlite --force
 
       - name: Smoke test the front end
         run: go run ./cmd/zexic tokenize examples/hello.zx > /dev/null

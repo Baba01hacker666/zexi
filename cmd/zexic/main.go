@@ -25,6 +25,7 @@ import (
 	"zexi/internal/driver"
 	"zexi/internal/lsp"
 	"zexi/internal/mir"
+	"zexi/internal/registry"
 	"zexi/internal/token"
 )
 
@@ -100,6 +101,14 @@ type cli struct {
 	// msgFormat selects how diagnostics are printed: "human" (default) or
 	// "json" (one JSON object per line).
 	msgFormat string
+	// add-only options: where to install a package, and whether to replace an
+	// existing module file.
+	addDir string
+	force  bool
+	list   bool
+	// unknown collects flags this version does not know, so they are reported
+	// instead of silently changing nothing.
+	unknown []string
 }
 
 func parseArgs(args []string) cli {
@@ -141,8 +150,25 @@ func parseArgs(args []string) cli {
 			if n, err := strconv.Atoi(strings.TrimPrefix(a, "--jobs=")); err == nil && n >= 0 {
 				c.jobs = n
 			}
+		case a == "--jobs" && i+1 < len(args):
+			i++
+			if n, err := strconv.Atoi(args[i]); err == nil && n >= 0 {
+				c.jobs = n
+			}
+		case a == "-O0" || a == "-O1" || a == "-O2" || a == "-O3" || a == "-Os" || a == "-Oz":
+			// The classic spellings, so `zexic build -O2 x.zx` does not need
+			// --opt-level=.
+			c.optLevel = a[2:]
+		case a == "--force":
+			c.force = true
+		case a == "--list":
+			c.list = true
+		case strings.HasPrefix(a, "--dir="):
+			c.addDir = strings.TrimPrefix(a, "--dir=")
 		case strings.HasPrefix(a, "-"):
-			// Unknown flag: ignore for forward compatibility.
+			// Reported rather than ignored: a mistyped flag used to build a
+			// program with silently different settings.
+			c.unknown = append(c.unknown, a)
 		default:
 			c.positional = append(c.positional, a)
 		}
@@ -177,6 +203,12 @@ func run(args []string) int {
 		return 2
 	}
 
+	if len(c.unknown) > 0 {
+		fmt.Fprintf(os.Stderr, "zexic %s: unknown option %s\n", cmd, strings.Join(c.unknown, ", "))
+		fmt.Fprintf(os.Stderr, "run `zexic help` for the options this build understands\n")
+		return 2
+	}
+
 	switch cmd {
 	case "version", "--version", "-V":
 		fmt.Println(versionString())
@@ -188,6 +220,8 @@ func run(args []string) int {
 		return cmdTokenize(c)
 	case "bindgen":
 		return cmdBindgen(c)
+	case "add", "install":
+		return cmdAdd(c)
 	case "check":
 		return cmdCheck(c)
 	case "build":
@@ -449,6 +483,7 @@ commands:
   emit       print an intermediate form (--emit=c)
   tokenize   print the token stream
   bindgen    generate Zexi extern declarations from a C header
+  add        install a C-library module into lib/ (no argument: list them)
   lsp        run the language server on stdio (optional argument: program entry)
   version    print the compiler version
 
@@ -459,9 +494,15 @@ and finally in the standard library. A directory package (use util; with a
 util/ folder holding .zx files) loads the whole folder. Extra .zx files may
 still be passed explicitly and are compiled together with the entry.
 
+C libraries: "zexic add sqlite" installs a bound module (sqlite, zlib, crypto,
+curl, microhttpd) into the project's lib/ folder; "zexic add" alone lists the
+catalog with this machine's dependency status.
+
+An option this build does not know is an error, not a silent no-op.
+
 options:
   -o <path>                  output path for build (or for bindgen)
-  --opt-level=<0|1|2|3|s>    optimization profile (default 2, 's' for size)
+  --opt-level=<0|1|2|3|s|z>  optimization profile (default 2; also -O2, -Os)
   --cc=<path>                C compiler to use (default $CC or cc)
   --emit=<c>                 intermediate form to print
   --root=<dir>               project root for named imports and mod
@@ -476,4 +517,85 @@ C bridge options (build/run):
   --include=<dir>            header search directory for --csrc files (repeatable)
   --jobs=<n>                 parallel C compile units (0 = auto, 1 = single file)
 `)
+}
+
+// cmdAdd installs a catalog module into the project's lib/ folder, or lists the
+// catalog when no name is given. The module is one .zx file carrying its own
+// extern declarations and C glue (docs/17-extending.md), so installing is a file
+// copy: no manifest, no lockfile, no network, and nothing for the compiler to
+// learn. `use <name>;` then resolves through the loader's existing lib/ search.
+func cmdAdd(c cli) int {
+	if len(c.positional) == 0 || c.list {
+		return listPackages(c)
+	}
+	name := c.positional[0]
+	if _, ok := registry.Find(name); !ok {
+		fmt.Fprintf(os.Stderr, "zexic add: no package named %q\n", name)
+		if hints := registry.Suggest(name); len(hints) > 0 {
+			fmt.Fprintf(os.Stderr, "did you mean %s?\n", strings.Join(hints, " or "))
+		}
+		fmt.Fprintf(os.Stderr, "run `zexic add` with no arguments to list the catalog\n")
+		return 1
+	}
+	dir := c.addDir
+	if dir == "" {
+		root := c.root
+		if root == "" {
+			root = "."
+		}
+		dir = registry.DefaultDir(root)
+	}
+	path, pkg, err := registry.Install(dir, name, c.force)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "zexic add: %v\n", err)
+		return 1
+	}
+	fmt.Printf("installed %s — %s\n", path, pkg.Summary)
+	fmt.Printf("  use %s;\n", pkg.Name)
+
+	// Ask the toolchain whether the system half is there. This is advisory: the
+	// program will not build without it, but failing `add` would leave the user
+	// with a module they cannot even keep.
+	deps := registry.Probe(c.cc, pkg)
+	switch {
+	case deps.Ready:
+		fmt.Printf("  system check: ready (%s)\n", strings.Join(pkg.Headers, ", "))
+	case !deps.Checked:
+		fmt.Printf("  system check: skipped (no C compiler on PATH)\n")
+		fmt.Printf("  %s needs %s\n", pkg.Name, strings.Join(pkg.Libs, ", "))
+	default:
+		fmt.Printf("  system check: missing %s\n", strings.Join(append(deps.MissingHeaders, prefixLibs(deps.MissingLibs)...), ", "))
+		fmt.Printf("  install it with: %s\n", pkg.Hint)
+		if deps.Detail != "" {
+			fmt.Printf("  compiler said: %s\n", deps.Detail)
+		}
+	}
+	return 0
+}
+
+func prefixLibs(libs []string) []string {
+	out := make([]string, len(libs))
+	for i, l := range libs {
+		out[i] = "lib" + l
+	}
+	return out
+}
+
+// listPackages prints the catalog with live dependency status, so `zexic add`
+// on its own answers "what can I add, and what would I need to install first?".
+func listPackages(c cli) int {
+	pkgs := registry.All()
+	fmt.Printf("%-12s %-10s %-52s %s\n", "package", "category", "what it gives you", "system")
+	for _, p := range pkgs {
+		status := registry.Probe(c.cc, p).String()
+		fmt.Printf("%-12s %-10s %-52s %s\n", p.Name, p.Category, p.Summary, status)
+	}
+	fmt.Printf("\ninstall one with `zexic add <package>` (writes lib/<package>.zx),\nthen import it with `use <package>;`.\n")
+	for _, p := range pkgs {
+		if d := registry.Probe(c.cc, p); d.Checked && !d.Ready {
+			fmt.Printf("  %-12s %s\n", p.Name, p.Hint)
+		}
+	}
+	fmt.Printf("\nfor a dependency-free server and HTTP client, use the standard library's\n`http` and `net` modules — they need no C library at all.\n")
+	return 0
 }

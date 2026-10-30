@@ -69,6 +69,7 @@ type gen struct {
 	trapDepth  int  // compiler-generated constructs (matches) since the innermost loop
 	hasString  bool // whether the program uses the builtin `String`
 	hasChar    bool // whether a `char` value is printed (needs the UTF-8 helper)
+	hasEprint  bool // whether `eprint`/`eprintln` is used (needs the stderr sink)
 	// hasPanic marks that the program contains at least one run-time check
 	// that can fail, so `zx_panicf` must be defined in the unit.
 	hasPanic bool
@@ -430,6 +431,9 @@ func (g *gen) preamble() {
 	g.w.line("// Defined only when a `char` is printed.")
 	g.w.line("static int zx_print_char(uint32_t c);")
 	g.w.line("")
+	g.w.line("// Defined only when `eprint`/`eprintln` is used; `printf`'s stderr twin.")
+	g.w.line("static void zx_eprintf(const char *fmt, ...);")
+	g.w.line("")
 	g.w.line("// Defined only when the program can panic at run time.")
 	g.w.line("static ZX_NORETURN void zx_panicf(const char *fmt, ...);")
 	g.w.line("")
@@ -498,9 +502,29 @@ func (g *gen) closureRuntime() {
 // static copy; the linker drops the copies it does not use.
 func (g *gen) lateRuntime() {
 	g.charRuntime()
+	g.eprintRuntime()
 	if g.hasPanic {
 		g.panicHelper()
 	}
+}
+
+// eprintRuntime defines `zx_eprintf`, the stderr twin of `printf`. `print` and
+// `eprint` differ only in this sink, so the rest of the printing code does not
+// need to know which stream it is writing to.
+func (g *gen) eprintRuntime() {
+	if !g.hasEprint {
+		return
+	}
+	g.w.line("")
+	g.w.line("// Write to stderr with the same formatting as printf (stdout's twin).")
+	g.w.line("static void zx_eprintf(const char *fmt, ...) {")
+	g.w.line("    va_list ap;")
+	g.w.line("    fflush(stdout);")
+	g.w.line("    va_start(ap, fmt);")
+	g.w.line("    vfprintf(stderr, fmt, ap);")
+	g.w.line("    va_end(ap);")
+	g.w.line("    fflush(stderr);")
+	g.w.line("}")
 }
 
 // panicHelper defines `zx_panicf`, the single exit path for every run-time
@@ -2480,7 +2504,7 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 			name = c.Segments[0]
 		}
 	}
-	if name == "print" || name == "println" {
+	if name == "print" || name == "println" || name == "eprint" || name == "eprintln" {
 		return g.printfCall(x, name)
 	}
 	if name == "len" {
@@ -2555,28 +2579,36 @@ func (g *gen) stringCtorValue(x *ast.CallExpr, name string) string {
 
 func (g *gen) printfCall(x *ast.CallExpr, name string) string {
 	nl := ""
-	if name == "println" {
+	if name == "println" || name == "eprintln" {
 		nl = `\n`
 	}
+	// `print` writes to stdout, `eprint` to stderr. The only difference is the
+	// sink function, so everything below is shared: `printOne` and
+	// `printFormat` take the sink to emit against.
+	sink := "printf"
+	if name == "eprint" || name == "eprintln" {
+		sink = "zx_eprintf"
+		g.hasEprint = true
+	}
 	if len(x.Args) == 0 {
-		return fmt.Sprintf(`printf("%s")`, nl)
+		return fmt.Sprintf(`%s("%s")`, sink, nl)
 	}
 	if format, ok := formatLiteralC(x.Args); ok {
-		return g.printFormat(x.Args[1:], format, nl)
+		return g.printFormat(x.Args[1:], format, nl, sink)
 	}
 	if len(x.Args) == 1 {
-		return g.printOne(x.Args[0], nl)
+		return g.printOne(x.Args[0], nl, sink)
 	}
 	// Several values are printed separated by a single space.
 	parts := make([]string, 0, len(x.Args)+1)
 	for i, arg := range x.Args {
 		if i > 0 {
-			parts = append(parts, `printf(" ")`)
+			parts = append(parts, sink+`(" ")`)
 		}
-		parts = append(parts, g.printOne(arg, ""))
+		parts = append(parts, g.printOne(arg, "", sink))
 	}
 	if nl != "" {
-		parts = append(parts, fmt.Sprintf(`printf("%s")`, nl))
+		parts = append(parts, fmt.Sprintf(`%s("%s")`, sink, nl))
 	}
 	return "({ " + strings.Join(parts, "; ") + "; (void)0; })"
 }
@@ -2624,34 +2656,34 @@ func splitFormat(format string) []string {
 // printFormat prints a `{}`-formatted string: literal segments are emitted
 // with `%s`, and each placeholder is printed with the same per-type lowering
 // `printOne` uses, so `String`, `char`, and numeric values all work.
-func (g *gen) printFormat(args []ast.Expr, format, nl string) string {
+func (g *gen) printFormat(args []ast.Expr, format, nl, sink string) string {
 	segs := splitFormat(format)
 	parts := make([]string, 0, len(segs)*2+1)
 	for i, seg := range segs {
 		if seg != "" {
-			parts = append(parts, `printf("%s", `+cString(seg)+`)`)
+			parts = append(parts, sink+`("%s", `+cString(seg)+`)`)
 		}
 		if i < len(args) {
-			parts = append(parts, g.printOne(args[i], ""))
+			parts = append(parts, g.printOne(args[i], "", sink))
 		}
 	}
 	if nl != "" {
-		parts = append(parts, fmt.Sprintf(`printf("%s")`, nl))
+		parts = append(parts, fmt.Sprintf(`%s("%s")`, sink, nl))
 	}
 	return "({ " + strings.Join(parts, "; ") + "; (void)0; })"
 }
 
 // printOne emits the printing of a single value, optionally followed by `nl`.
-func (g *gen) printOne(arg ast.Expr, nl string) string {
+func (g *gen) printOne(arg ast.Expr, nl, sink string) string {
 	t := g.info.TypeOf(arg)
 	if t != nil && t.Kind == types.StringKind {
 		if isPlaceExpr(arg) {
-			return fmt.Sprintf(`printf("%%s%s", zx_string_as_str(&%s))`, nl, g.value(arg))
+			return fmt.Sprintf(`%s("%%s%s", zx_string_as_str(&%s))`, sink, nl, g.value(arg))
 		}
 		// A temporary owner is released as soon as it has been printed.
 		tm := g.tmpName()
-		return fmt.Sprintf(`({ zx_String %s = %s; printf("%%s%s", zx_string_as_str(&%s)); zx_drop_String(&%s); (void)0; })`,
-			tm, g.value(arg), nl, tm, tm)
+		return fmt.Sprintf(`({ zx_String %s = %s; %s("%%s%s", zx_string_as_str(&%s)); zx_drop_String(&%s); (void)0; })`,
+			tm, g.value(arg), sink, nl, tm, tm)
 	}
 	v := g.value(arg)
 	if t != nil && t.Kind == types.Char {
@@ -2661,10 +2693,10 @@ func (g *gen) printOne(arg ast.Expr, nl string) string {
 		if nl == "" {
 			return fmt.Sprintf(`zx_print_char(%s)`, v)
 		}
-		return fmt.Sprintf(`({ zx_print_char(%s); printf("%s"); })`, v, nl)
+		return fmt.Sprintf(`({ zx_print_char(%s); %s("%s"); })`, v, sink, nl)
 	}
 	format, cast := printFormat(t)
-	return fmt.Sprintf(`printf("%s%s", %s)`, format, nl, cast(v))
+	return fmt.Sprintf(`%s("%s%s", %s)`, sink, format, nl, cast(v))
 }
 
 func printFormat(t *types.Type) (format string, cast func(string) string) {
@@ -2994,6 +3026,11 @@ func (g *gen) indexValue(x *ast.IndexExpr) string {
 	idx := g.value(x.Index)
 	if rt != nil && rt.Kind == types.Array {
 		return "(" + recv + ").e[zx_bounds(" + idx + ", " + strconv.FormatInt(rt.Len, 10) + ")]"
+	}
+	// Indexing a reference to a fixed array reads through the pointer, so a
+	// buffer filled by C is readable (and writable) from Zexi.
+	if rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr) && rt.Elem != nil && rt.Elem.Kind == types.Array {
+		return "(" + recv + ")->e[zx_bounds(" + idx + ", " + strconv.FormatInt(rt.Elem.Len, 10) + ")]"
 	}
 	if base := recvBase(rt); base != nil && base.Kind == types.VecKind {
 		return vecIndex("("+g.vecReceiverValue(x.Recv)+")", idx)

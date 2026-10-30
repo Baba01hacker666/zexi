@@ -15,6 +15,9 @@ fn main() -> i32 {
 
 `//` line comments, `/* ... */` block comments (nesting), `///` doc comments.
 
+`println`/`print` write to stdout; `eprintln`/`eprint` are the same, to stderr
+(and flush stdout first, so interleaved output still reads in order).
+
 ## 7.2 Declarations
 
 ```zx
@@ -321,6 +324,10 @@ let t = s.clone();     // deep copy
 let u = s;             // move: `s` is unusable afterwards (E0382)
 ```
 
+A reference to a fixed array indexes like the array itself, which is the shape a C
+out-parameter arrives in: for `fn f(buf: &mut [u8; 64])`, `buf[i] = v` writes and
+`buf[i]` reads, both bounds-checked. A shared `&[T; N]` is read-only.
+
 A `String` may be passed wherever a borrowed `str` is expected (for example a
 function parameter, `push_str`, or `==`), so `.as_str()` is usually unnecessary.
 When a number, `bool`, or `char` is concatenated with `+` (or `+=`) it is
@@ -597,7 +604,8 @@ The embedded standard library (sources in `internal/driver/std/`) includes:
   a `String` never copies it.
 - `sys`, `io`, `fs`, and `random`: `sys` is the POSIX substrate (errno and
   `IoError`, byte I/O, files, environment, clocks); `io` provides console I/O
-  (`input(prompt = "")`, `read_line() -> Result<String, IoError>`, `eprintln`);
+  (`input(prompt = "")`, `read_line() -> Result<String, IoError>`); `eprintln` and
+  `eprint` are builtins, like `println` and `print`, and write to stderr;
   `fs` provides capped, binary-safe `read`/`write(path, &[u8])`/`copy`
   (32 MiB cap) plus `exists`, `metadata`, and `remove`. Random numbers are
   deterministic or libc-backed.

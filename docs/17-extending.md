@@ -117,6 +117,12 @@ fn main() -> i32 {
 }
 ```
 
+If you are binding a library someone has already bound, you do not have to write
+any of this: `zexic add <name>` installs a finished module (`sqlite`, `zlib`,
+`crypto`, `curl`, `microhttpd`) into your project's `lib/`. A package is exactly
+the `.zx` file described above, so the catalog is a shortcut, not a different
+mechanism — see [`19-modules.md`](19-modules.md).
+
 ## 17.3 Rung 4: let C call back into Zexi
 
 `#[no_mangle]` gives a function external linkage under its Zexi name, so inline C

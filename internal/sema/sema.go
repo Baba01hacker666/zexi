@@ -2202,7 +2202,7 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		}
 		return nil
 	}
-	if name == "print" || name == "println" {
+	if name == "print" || name == "println" || name == "eprint" || name == "eprintln" {
 		return c.inferPrint(x)
 	}
 	if name == "len" {
@@ -2329,7 +2329,7 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		if t := c.inferBareVariantCtor(x, name, expected); t != nil {
 			return t
 		}
-		cands := []string{"print", "println", "len", "cstr", "from_cstr", "arg_count", "arg_at", "project_dir"}
+		cands := []string{"print", "println", "eprint", "eprintln", "len", "cstr", "from_cstr", "arg_count", "arg_at", "project_dir"}
 		for n := range c.info.Fns {
 			cands = append(cands, n)
 		}
@@ -3183,6 +3183,14 @@ func (c *checker) inferIndex(x *ast.IndexExpr) *types.Type {
 		rt = base
 	}
 	if rt != nil && rt.Kind == types.Ref && rt.Elem != nil && rt.Elem.Kind == types.Slice {
+		rt = rt.Elem
+	}
+	// `&[T; N]` and `&mut [T; N]` index like the array they point at, so a
+	// buffer a C function filled can be read (and written) through the
+	// reference a signature declares. Without this, `out[i] = v` on an
+	// `&mut [u8; N]` parameter was E0608 — the one shape an FFI out-parameter
+	// arrives in.
+	if rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr) && rt.Elem != nil && rt.Elem.Kind == types.Array {
 		rt = rt.Elem
 	}
 	if rt == nil || (rt.Kind != types.Array && rt.Kind != types.Slice && rt.Kind != types.VecKind) {

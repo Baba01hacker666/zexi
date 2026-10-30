@@ -430,6 +430,8 @@ var KnownAttrs = map[string]bool{
 	"export":    true, // alias for `no_mangle`, for the C bridge
 	"allow":     true, // accepted and ignored, so lints can be named locally
 	"link":      true, // `link("m")`: link a system library (see the driver)
+	"link_dir":  true, // `link_dir("path")`: add -Lpath to the link step
+	"include":   true, // `include("header.h")`: #include a C header before the program
 }
 
 // CopyAttr reports whether an attribute list opts a type into `Copy`.
