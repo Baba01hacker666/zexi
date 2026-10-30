@@ -7,9 +7,13 @@ use http;
 use web;
 use html;
 use fs;
+use sys;
 
 fn main() -> i32 {
     let dir = String::from("/tmp/opencode");
+    // The directory may not exist yet on a fresh machine; fs does not create
+    // parents, so ask for it first (mkdir succeeds if it is already there).
+    let made = sys::mkdir(dir.as_str());
     fs::write(dir.as_str() + "/greeting.html", "<p>hi {{name}}</p>".as_bytes());
     fs::write(dir.as_str() + "/_layout.html", "<!doctype html><html><body>{{@@content@@}}<footer>{{year}}</footer></body></html>".as_bytes());
 
