@@ -72,6 +72,52 @@ fn main() -> i32 {
 	}
 }
 
+func TestMoveFromReturningBranch(t *testing.T) {
+	// A branch that returns leaves the function, so a value moved there cannot
+	// be a use-after-move on the path that continues past the branch.
+	src := `fn build(early: bool) -> String {
+    let mut out = String::from("x");
+    if early {
+        out.push_str("!");
+        return out;
+    }
+    out.push_str("?");
+    return out;
+}
+fn main() -> i32 { println(build(true)); println(build(false)); 0 }`
+	if ok, codes := check(t, src); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+	// The same shape with a move on a path that continues must still fail.
+	ok, codes := check(t, `fn f(c: bool) -> i32 {
+    let a = String::from("x");
+    if c {
+        let b = a;
+        println(b);
+    }
+    println(a);
+    0
+}`)
+	if ok || !has(codes, "E0382") {
+		t.Fatalf("expected E0382 for a move on a continuing path, got ok=%v codes=%v", ok, codes)
+	}
+	// An arm that returns does not poison the paths that continue past the
+	// match either.
+	if ok, codes := check(t, `enum E { A, B }
+fn f(e: E) -> String {
+    let owned = String::from("x");
+    match e {
+        E::A => { return owned; }
+        E::B => { println(owned); }
+    }
+    println(owned);
+    return String::from("y");
+}
+fn main() -> i32 { println(f(E::A)); 0 }`); !ok {
+		t.Fatalf("expected clean, got %v", codes)
+	}
+}
+
 func TestLiteralExprAdoptsContextType(t *testing.T) {
 	// A tree of integer literals adopts the annotated type instead of
 	// defaulting to i32: `let x: i64 = 5 ^ 3` is i64.
@@ -1760,5 +1806,48 @@ fn main() -> i32 { println("p {}", P { x: 1 }); 0 }`)
 	ok, codes = check(t, `fn main() -> i32 { println("a", 1, 2); 0 }`)
 	if !ok {
 		t.Fatalf("space separated: expected clean, got %v", codes)
+	}
+}
+
+func TestClosuresCaptureAndMove(t *testing.T) {
+	// A closure over a Copy value leaves the binding usable.
+	ok, codes := check(t, `fn main() -> i32 {
+    let base = 2;
+    let f: fn(i32) -> i32 = |n| n + base;
+    println(f(base));
+    0
+}`)
+	if !ok {
+		t.Fatalf("unexpected errors for a Copy capture: %v", codes)
+	}
+
+	// A closure over an owning value moves it into the environment.
+	ok, codes = check(t, `fn main() -> i32 {
+    let s = String::from("x");
+    let f: fn() -> String = || s.clone();
+    println(f().as_str());
+    println(s.as_str());
+    0
+}`)
+	if ok || !has(codes, "E0382") {
+		t.Fatalf("expected E0382 for a use after moving a String into a closure, got %v", codes)
+	}
+
+	// Without a target type the parameter types cannot be inferred.
+	ok, codes = check(t, `fn main() -> i32 {
+    let f = |n| n + 1;
+    0
+}`)
+	if ok || !has(codes, "E0282") {
+		t.Fatalf("expected E0282 for an unannotated closure, got %v", codes)
+	}
+
+	// The arity has to match the target type.
+	ok, codes = check(t, `fn main() -> i32 {
+    let f: fn(i32) -> i32 = |a, b| a + b;
+    0
+}`)
+	if ok || !has(codes, "E0057") {
+		t.Fatalf("expected E0057 for a closure with the wrong arity, got %v", codes)
 	}
 }

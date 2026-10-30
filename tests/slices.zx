@@ -1,0 +1,54 @@
+// tests/slices.zx
+// Borrowed slices: `&[T]` / `&mut [T]` are two-word views, `a[lo..hi]` takes a
+// sub-slice without copying, `for x in slice` walks one, and `String` can push
+// and lend its bytes as `&[u8]`.
+
+use fs;
+use sys;
+
+fn fill(buf: &mut [u8], n: usize) {
+    let mut i: usize = 0;
+    while i < n {
+        buf[i] = (i + 1) as u8;
+        i += 1;
+    }
+}
+
+fn sum(buf: &[u8]) -> i32 {
+    let mut s: i32 = 0;
+    for b in buf {
+        s += b as i32;
+    }
+    return s;
+}
+
+fn main() {
+    let mut a: [u8; 4] = [1, 2, 3, 4];
+    let all: &[u8] = &a;
+    println(len(all));            // 4
+    println(sum(&a));             // 10
+    println(sum(&a[1..3]));       // 5
+    println(sum(a[0..2]));        // 3
+    fill(&mut a, 4);
+    println(sum(&a));             // 10  (1 + 2 + 3 + 4)
+
+    let text = String::from("hello");
+    let mut out = String::new();
+    out.push_bytes(text.as_bytes());
+    println(out.as_str());        // hello
+    println(len("abc".as_bytes())); // 3
+
+    let p = "/tmp/zx_slice_test.bin";
+    match fs::write(p, out.as_bytes()) {
+        Ok(n) => println(n),      // 5
+        Err(e) => println(sys::message(e)),
+    }
+    match fs::read(p) {
+        Ok(s) => println(s.as_str()), // hello
+        Err(e) => println(sys::message(e)),
+    }
+    match fs::remove(p) {
+        Ok(_) => {}
+        Err(e) => println(sys::message(e)),
+    }
+}

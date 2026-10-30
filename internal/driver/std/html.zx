@@ -1,0 +1,393 @@
+// html — escaping, documents, widgets, and {{name}} templates.
+//
+// Escaping is the point: any value that came from a request must go through
+// `escape`/`attr` or a `{{name}}` template before it reaches a page.
+//
+// Escapers read a `&[u8]`, so escaping a borrowed body costs one output buffer
+// and no copy of the input.
+
+use text;
+
+// --- escaping --------------------------------------------------------------
+
+// escape_bytes makes bytes safe for HTML content (`& < > " '`), which is the
+// form to use on a body read as bytes.
+pub fn escape_bytes(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len() + 8);
+    let mut i: usize = 0;
+    while i < data.len() {
+        let c = data[i];
+        if c == 38 {
+            out.push_str("&amp;");
+        } else if c == 60 {
+            out.push_str("&lt;");
+        } else if c == 62 {
+            out.push_str("&gt;");
+        } else if c == 34 {
+            out.push_str("&quot;");
+        } else if c == 39 {
+            out.push_str("&#39;");
+        } else {
+            out.push_byte(c);
+        }
+        i += 1;
+    }
+    return out;
+}
+
+// escape makes text safe for HTML content (`& < > " '`).
+pub fn escape(s: str) -> String {
+    return escape_bytes(s.as_bytes());
+}
+
+// attr escapes a value for a double-quoted attribute.
+pub fn attr(s: str) -> String {
+    return escape(s);
+}
+
+// url_query_bytes percent-encodes bytes for a query string or path segment.
+pub fn url_query_bytes(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len());
+    let mut i: usize = 0;
+    while i < data.len() {
+        let c = data[i] as i64;
+        if is_unreserved(c) {
+            out.push_byte(c as u8);
+        } else {
+            out.push_byte(37);
+            out.push_byte(hex_digit(c / 16));
+            out.push_byte(hex_digit(c % 16));
+        }
+        i += 1;
+    }
+    return out;
+}
+
+// url_query percent-encodes a value for a query string or path segment.
+pub fn url_query(s: str) -> String {
+    return url_query_bytes(s.as_bytes());
+}
+
+fn is_unreserved(c: i64) -> bool {
+    if c >= 48 && c <= 57 {
+        return true;
+    }
+    if c >= 65 && c <= 90 {
+        return true;
+    }
+    if c >= 97 && c <= 122 {
+        return true;
+    }
+    return c == 45 || c == 46 || c == 95 || c == 126;
+}
+
+fn hex_digit(n: i64) -> u8 {
+    if n < 10 {
+        return (48 + n) as u8;
+    }
+    return (87 + n) as u8;
+}
+
+// --- documents -------------------------------------------------------------
+
+// page wraps body in a complete HTML5 document; the title is escaped.
+pub fn page(title: str, body: str) -> String {
+    return page_with(title, "", body);
+}
+
+// page_with is page with extra <head> markup (links, scripts, meta tags).
+pub fn page_with(title: str, head: str, body: str) -> String {
+    let mut out = String::with_capacity(len(head) + len(body) + 256);
+    out.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
+    out.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>");
+    out.push_str(escape(title));
+    out.push_str("</title>\n");
+    out.push_str(head);
+    out.push_str("\n</head>\n<body>\n");
+    out.push_str(body);
+    out.push_str("\n</body>\n</html>\n");
+    return out;
+}
+
+// --- widgets ---------------------------------------------------------------
+
+// tag renders `<name>text</name>` with escaped text.
+pub fn tag(name: str, text: str) -> String {
+    let mut out = String::from("<");
+    out.push_str(name);
+    out.push_str(">");
+    out.push_str(escape(text));
+    out.push_str("</");
+    out.push_str(name);
+    out.push_str(">");
+    return out;
+}
+
+// heading renders `<hN>text</hN>`, with N clamped to 1..6.
+pub fn heading(level: i32, text: str) -> String {
+    let mut n = level;
+    if n < 1 {
+        n = 1;
+    }
+    if n > 6 {
+        n = 6;
+    }
+    let mut out = String::from("<h");
+    out += n;
+    out.push_str(">");
+    out.push_str(escape(text));
+    out.push_str("</h");
+    out += n;
+    out.push_str(">");
+    return out;
+}
+
+// link renders `<a href="..">text</a>` with both parts escaped.
+pub fn link(href: str, text: str) -> String {
+    let mut out = String::from("<a href=\"");
+    out.push_str(attr(href));
+    out.push_str("\">");
+    out.push_str(escape(text));
+    out.push_str("</a>");
+    return out;
+}
+
+// list renders a <ul> with one escaped <li> per item.
+pub fn list(items: &Vec<String>) -> String {
+    return item_list("ul", items);
+}
+
+// ordered_list is list with <ol>.
+pub fn ordered_list(items: &Vec<String>) -> String {
+    return item_list("ol", items);
+}
+
+fn item_list(tag_name: str, items: &Vec<String>) -> String {
+    let mut out = String::from("<");
+    out.push_str(tag_name);
+    out.push_str(">\n");
+    let mut i: usize = 0;
+    while i < items.len() {
+        out.push_str("  <li>");
+        out.push_str(escape(items[i]));
+        out.push_str("</li>\n");
+        i += 1;
+    }
+    out.push_str("</");
+    out.push_str(tag_name);
+    out.push_str(">\n");
+    return out;
+}
+
+// table renders escaped headers and cells; short rows are padded.
+pub fn table(headers: &Vec<String>, rows: &Vec<Vec<String>>) -> String {
+    let mut out = String::from("<table>\n");
+    if headers.len() > 0 {
+        out.push_str("  <thead><tr>");
+        let mut h: usize = 0;
+        while h < headers.len() {
+            out.push_str("<th>");
+            out.push_str(escape(headers[h]));
+            out.push_str("</th>");
+            h += 1;
+        }
+        out.push_str("</tr></thead>\n");
+    }
+    out.push_str("  <tbody>\n");
+    let mut r: usize = 0;
+    while r < rows.len() {
+        let row = &rows[r];
+        out.push_str("    <tr>");
+        let mut c: usize = 0;
+        while c < headers.len() {
+            out.push_str("<td>");
+            if c < row.len() {
+                out.push_str(escape(row[c]));
+            }
+            out.push_str("</td>");
+            c += 1;
+        }
+        out.push_str("</tr>\n");
+        r += 1;
+    }
+    out.push_str("  </tbody>\n</table>\n");
+    return out;
+}
+
+// json_script embeds JSON in a <script> tag that the JSON cannot close early.
+pub fn json_script(id: str, json: str) -> String {
+    let mut out = String::from("<script type=\"application/json\" id=\"");
+    out.push_str(attr(id));
+    out.push_str("\">");
+    out.push_str(script_safe(json));
+    out.push_str("</script>");
+    return out;
+}
+
+// script_safe neutralises `</` inside markup embedded in a <script> element.
+pub fn script_safe(markup: str) -> String {
+    let src = markup.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i: usize = 0;
+    while i < src.len() {
+        let c = src[i];
+        if c == 60 && i + 1 < src.len() && src[i + 1] == 47 {
+            out.push_str("<\\/");
+            i += 2;
+            continue;
+        }
+        out.push_byte(c);
+        i += 1;
+    }
+    return out;
+}
+
+// --- template values -------------------------------------------------------
+
+// Vars is the bag of values a template fills in. Build it with `vars()`:
+//
+//     let mut v = html::vars();
+//     v.set("user", req.query("name"));
+//     v.set_int("count", 3);
+//     html::template("<p>{{user}} {{count}}</p>", &v)
+pub struct Vars {
+    map: HashMap<String, String>,
+}
+
+// vars makes an empty set of template values.
+pub fn vars() -> Vars {
+    return Vars { map: HashMap::new() };
+}
+
+
+
+impl Vars {
+    // set stores a text value.
+    pub fn set(&mut self, key: str, value: str) {
+        self.map.insert(String::from(key), String::from(value));
+    }
+
+    // set_int stores a number rendered as text.
+    pub fn set_int(&mut self, key: str, n: i64) {
+        let mut text = String::new();
+        text += n;
+        self.set(key, text);
+    }
+
+    // set_bool stores "true" or "false".
+    pub fn set_bool(&mut self, key: str, b: bool) {
+        if b {
+            self.set(key, "true");
+        } else {
+            self.set(key, "false");
+        }
+    }
+
+    // get reads a stored value ("" when absent).
+    pub fn get(&self, key: str) -> String {
+        match self.map.get_str(key) {
+            Some(v) => return v.clone(),
+            None => return String::new(),
+        }
+    }
+
+    // has reports whether a key was set.
+    pub fn has(&self, key: str) -> bool {
+        return self.map.contains_str(key);
+    }
+
+    // len is the number of values.
+    pub fn len(&self) -> usize {
+        return self.map.len();
+    }
+
+    // from_map takes ownership of a map built elsewhere (route parameters,
+    // decoded query values, form fields).
+    pub fn from_map(map: HashMap<String, String>) -> Vars {
+        return Vars { map: map };
+    }
+}
+
+// --- templates -------------------------------------------------------------
+
+// template replaces `{{name}}` with an escaped value, `{{name|raw}}` with the
+// value verbatim, and `{{{{` with a literal `{{`. Unknown names become "".
+pub fn template(tpl: str, values: &Vars) -> String {
+    return template_map(tpl, &values.map);
+}
+
+// template_map is template over a plain map, for callers that already have one.
+pub fn template_map(tpl: str, values: &HashMap<String, String>) -> String {
+    let src = tpl.as_bytes();
+    let close_tok = "}}".as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i: usize = 0;
+    while i < src.len() {
+        let c = src[i];
+        if c == 123 && i + 3 < src.len() && src[i + 1] == 123 && src[i + 2] == 123 && src[i + 3] == 123 {
+            out.push_str("{{");
+            i += 4;
+            continue;
+        }
+        if c == 123 && i + 1 < src.len() && src[i + 1] == 123 {
+            // Scanning for the closing `}}` reads the borrowed template, so a
+            // placeholder no longer copies the remainder of the page.
+            let close = text::find_bytes(src, close_tok, i + 2);
+            if close >= 0 {
+                let name_end = close as usize;
+                let mut inner = String::with_capacity(name_end - (i + 2));
+                inner.push_bytes(src[i + 2..name_end]);
+                let mut name = inner.trim();
+                let mut raw = false;
+                // A placeholder whose name starts with "@@" is not a value: it is
+                // a slot the engine leaves verbatim, so a layout can spell a
+                // named insertion point such as `{{@@content@@}}` that `page_text`
+                // fills afterwards. Nothing extra is parsed — the same `{{...}}`
+                // scanner just recognises the prefix.
+                if name.starts_with("@@") {
+                    out.push_str("{{");
+                    out.push_str(inner.as_str());
+                    out.push_str("}}");
+                    i = name_end + 2;
+                    continue;
+                }
+                let bar = name.find("|");
+                if bar >= 0 {
+                    let flag = name.substr((bar + 1) as usize, 4294967295).trim();
+                    if flag.as_str() == "raw" {
+                        raw = true;
+                    }
+                    name = name.substr(0, bar as usize).trim();
+                }
+                match values.get_str(name.as_str()) {
+                    Some(v) => {
+                        if raw {
+                            out.push_str(v.as_str());
+                        } else {
+                            out.push_str(escape(v.as_str()));
+                        }
+                    }
+                    None => {}
+                }
+                i = name_end + 2;
+                continue;
+            }
+        }
+        out.push_byte(c);
+        i += 1;
+    }
+    return out;
+}
+
+// template_pairs is template with alternating key/value arguments:
+//
+//     html::template_pairs("<h1>{{title}}</h1>", "title", "Hi")
+pub fn template_pairs(tpl: str, pairs: &Vec<String>) -> String {
+    let mut values: HashMap<String, String> = HashMap::new();
+    let mut i: usize = 0;
+    while i + 1 < pairs.len() {
+        values.insert(pairs[i].clone(), pairs[i + 1].clone());
+        i += 2;
+    }
+    return template_map(tpl, &values);
+}

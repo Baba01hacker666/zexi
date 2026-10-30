@@ -32,6 +32,9 @@ type vecMethodSig struct {
 	retOptionElem bool
 	// mut marks a `&mut self` receiver.
 	mut bool
+	// closure marks a trailing closure parameter whose type is built from the
+	// element type: 1 = `fn(T) -> ()`, 2 = `fn(T) -> bool`, 3 = `fn(T, T) -> T`.
+	closure int
 }
 
 var vecMethods = map[string]vecMethodSig{
@@ -47,6 +50,14 @@ var vecMethods = map[string]vecMethodSig{
 	"remove":      {params: []*types.Type{types.UsizeT}, retElem: true, mut: true},
 	"swap_remove": {params: []*types.Type{types.UsizeT}, retElem: true, mut: true},
 	"insert":      {params: []*types.Type{types.UsizeT, nil}, elem: []bool{false, true}, ret: types.UnitT, mut: true},
+	// Closure-taking helpers. The closure's parameter type is the element
+	// type, so `v.each(|x| ...)` needs no annotation on the closure.
+	"each":  {params: []*types.Type{nil}, closure: 1, ret: types.UnitT},
+	"count": {params: []*types.Type{nil}, closure: 2, ret: types.UsizeT},
+	"any":   {params: []*types.Type{nil}, closure: 2, ret: types.BoolT},
+	"all":   {params: []*types.Type{nil}, closure: 2, ret: types.BoolT},
+	// `fold(init, f)` accumulates: `v.fold(0, |acc, x| acc + x)`.
+	"fold": {params: []*types.Type{nil, nil}, elem: []bool{true, false}, closure: 3, retElem: true},
 }
 
 // vecElem returns the element type of a `Vec<T>` type, or nil.
@@ -157,11 +168,28 @@ func (c *checker) inferVecMethod(x *ast.MethodCallExpr, recv *types.Type) *types
 		c.errAt(x, "E0277", "`Vec<%s>` cannot be cloned because `%s` is not `Copy`; build a new `Vec` and push each element", elem, elem)
 		return nil
 	}
+	if sig.closure != 0 && !elem.IsCopy() {
+		// The closure receives a copy of the element, which is only sound for
+		// types that own nothing; iterating an owning element needs borrows.
+		c.errAt(x, "E0277", "`Vec::%s` needs `Copy` elements, but `%s` owns memory; iterate with an index and a borrow instead", x.Name, elem)
+		return nil
+	}
 	want := make([]*types.Type, len(sig.params))
 	for i, p := range sig.params {
-		if i < len(sig.elem) && sig.elem[i] {
+		switch {
+		case sig.closure != 0 && i == len(sig.params)-1:
+			fn := &types.Type{Kind: types.Fn, Params: []*types.Type{elem}, Ret: types.UnitT}
+			switch sig.closure {
+			case 2:
+				fn.Ret = types.BoolT
+			case 3:
+				fn.Params = []*types.Type{elem, elem}
+				fn.Ret = elem
+			}
+			want[i] = fn
+		case i < len(sig.elem) && sig.elem[i]:
 			want[i] = elem
-		} else {
+		default:
 			want[i] = p
 		}
 	}

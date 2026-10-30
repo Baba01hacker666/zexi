@@ -1,0 +1,39 @@
+// tests/web_template.zx
+// `page` as a String: `{{name}}` substitution, and a `_layout.html` include
+// that receives the page body in its `{{@@content@@}}` slot. No socket is
+// opened, so the output is deterministic.
+
+use http;
+use web;
+use html;
+use fs;
+use sys;
+
+fn main() -> i32 {
+    let dir = String::from("/tmp/opencode");
+    // The directory may not exist yet on a fresh machine; fs does not create
+    // parents, so ask for it first (mkdir succeeds if it is already there).
+    let made = sys::mkdir(dir.as_str());
+    fs::write(dir.as_str() + "/greeting.html", "<p>hi {{name}}</p>".as_bytes());
+    fs::write(dir.as_str() + "/_layout.html", "<!doctype html><html><body>{{@@content@@}}<footer>{{year}}</footer></body></html>".as_bytes());
+
+    http::views_dir(dir.as_str());
+
+    let mut v = html::vars();
+    v.set("name", "Tom");
+    v.set_int("year", 2026);
+
+    // A template without a layout (no _layout.html in a different folder) — but
+    // here one exists, so the body is wrapped.
+    let wrapped = web::page_text("greeting", &v);
+    println(wrapped.as_str());
+
+    // The marker survives `html::template` on its own, so composition stays
+    // a substitution rather than a second language.
+    let slot = html::template("{{@@content@@}}", &v);
+    println(slot.as_str());
+
+    // A missing template yields "".
+    println(web::page_text("nope", &v).len() == 0);
+    0
+}

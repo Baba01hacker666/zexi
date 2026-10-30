@@ -1,15 +1,42 @@
-// net — TCP sockets over POSIX, part of the Zexi standard library.
+// net — TCP and UDP sockets, name resolution, and socket readiness over POSIX.
 // Import with `use net;`, `use std::net;`, or `import net.tcp;`.
+//
+//     use net;
+//
+//     fn main() -> i32 {
+//         let mut server = listen_tcp("127.0.0.1", 9000);
+//         let conn = server.accept();
+//         conn.write("hello\n");
+//         conn.close();
+//         server.close();
+//         0
+//     }
 //
 // The low-level calls live in the embedded C runtime, linked in only
 // when this module is used. The linker prunes anything the program does not
 // call, so pulling in `use net;` costs nothing unless you open a socket.
+//
+// Everything here is bounded on purpose: reads have caps, `accept_timeout` and
+// `set_timeout` make blocking calls interruptible, and `poll_read` lets a loop
+// serve several descriptors without a thread per socket.
 
 extern "C" fn zxn_socket(domain: i32, typ: i32, protocol: i32) -> i32;
 extern "C" fn zxn_connect(fd: i32, host: str, port: i32, timeout_ms: i32) -> i32;
 extern "C" fn zxn_bind(fd: i32, host: str, port: i32) -> i32;
 extern "C" fn zxn_listen(fd: i32, backlog: i32) -> i32;
 extern "C" fn zxn_accept(fd: i32) -> i32;
+// zxn_accept_timeout waits up to ms milliseconds for a connection: it returns
+// the new descriptor, -2 when nothing arrived in time, and -1 on error.
+extern "C" fn zxn_accept_timeout(fd: i32, ms: i32) -> i32;
+extern "C" fn zxn_poll_read(fd: i32, ms: i32) -> i32;
+extern "C" fn zxn_set_nonblocking(fd: i32, on: i32) -> i32;
+extern "C" fn zxn_local_port(fd: i32) -> i32;
+extern "C" fn zxn_peer_addr(fd: i32, buf: &mut [u8; 256], cap: i32) -> i32;
+extern "C" fn zxn_shutdown_write(fd: i32) -> i32;
+extern "C" fn zxn_resolve(host: str, buf: &mut [u8; 256], cap: i32) -> i32;
+extern "C" fn zxn_strerror_string(err: i32, buf: &mut [u8; 256], cap: i32) -> i32;
+extern "C" fn zxn_last_error() -> i32;
+extern "C" fn zxn_cpu_count() -> i32;
 // zxn_accept_retryable classifies the errno left by a failed zxn_accept: 1 for
 // transient failures worth retrying, 0 for persistent ones (for example,
 // EMFILE/ENFILE when the process is out of file descriptors).
@@ -28,12 +55,17 @@ extern "C" fn zxn_file_read(handle: i64, buf: &mut [u8; 8192], cap: i32) -> i32;
 extern "C" fn zxn_file_close(handle: i64) -> i32;
 extern "C" fn zxn_file_size(path: str) -> i64;
 extern "C" fn zxn_write_file(path: str, buf: str, n: i32) -> i32;
+// UDP sockets: connectionless datagrams.
+extern "C" fn zxn_udp_bind(host: str, port: i32) -> i32;
+extern "C" fn zxn_udp_send_to(fd: i32, host: str, port: i32, buf: str, n: i32) -> i32;
+extern "C" fn zxn_udp_recv_from(fd: i32, buf: &mut [u8; 8192], cap: i32, hostbuf: &mut [u8; 256], hostcap: i32, port_out: &mut i32) -> i32;
 // zxn_realpath resolves symlinks and returns the canonical absolute path in
 // buf (NUL-terminated), or -1 when path cannot be resolved.
 extern "C" fn zxn_realpath(path: str, buf: &mut [u8; 4096], cap: i32) -> i32;
 
 const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;
+const SOCK_DGRAM: i32 = 2;
 const RECV_BUF: usize = 8192;
 // MAX_READ caps read_all so a hostile or broken peer cannot exhaust memory.
 const MAX_READ: usize = 67108864;
@@ -91,7 +123,95 @@ pub fn listen_local(port: i32) -> Server {
     return listen_tcp("127.0.0.1", port);
 }
 
+// --- helpers ---------------------------------------------------------------
+
+// buf_str copies the first n bytes of a fixed buffer into an owning String.
+// It is the shared bridge between the C shims (which fill byte buffers) and
+// Zexi's owning text type.
+fn buf_str(buf: [u8; 256], n: i32) -> String {
+    let mut end: usize = 256;
+    if n >= 0 && (n as usize) < end {
+        end = n as usize;
+    }
+    let mut out = String::with_capacity(end);
+    out.push_bytes(buf[0..end]);
+    return out;
+}
+
+// resolve turns a host name into its first IPv4 address ("example.com" ->
+// "93.184.216.34"). A literal address is returned unchanged, and a name that
+// does not resolve yields "".
+pub fn resolve(host: str) -> String {
+    let mut buf: [u8; 256] = [0; 256];
+    let n = zxn_resolve(host, &mut buf, 256);
+    if n != 0 {
+        return String::new();
+    }
+    let mut i: usize = 0;
+    while i < 256 && buf[i] != 0 {
+        i += 1;
+    }
+    return buf_str(buf, i as i32);
+}
+
+// cpu_count reports how many processors this process may run on, which is how
+// a program sizes a worker pool or splits a computation across threads.
+pub fn cpu_count() -> i32 {
+    return zxn_cpu_count();
+}
+
+// poll_read waits up to ms milliseconds for fd to become readable: 1 ready,
+// 0 timed out, -1 error. Passing -1 samples without waiting and 0 waits
+// forever (POSIX select semantics are remapped to something safer here).
+pub fn poll_read(fd: i32, ms: i32) -> i32 {
+    if fd < 0 {
+        return -1;
+    }
+    if ms < 0 {
+        return zxn_poll_read(fd, 0);
+    }
+    if ms == 0 {
+        return zxn_poll_read(fd, 1 << 30);
+    }
+    return zxn_poll_read(fd, ms);
+}
+
+// last_error is the errno of the most recent failed system call, as text.
+pub fn last_error() -> String {
+    let code = zxn_last_error();
+    let mut buf: [u8; 256] = [0; 256];
+    let n = zxn_strerror_string(code, &mut buf, 256);
+    if n <= 0 {
+        return String::from("unknown error");
+    }
+    let mut i: usize = 0;
+    while i < (n as usize) && buf[i] != 0 {
+        i += 1;
+    }
+    return buf_str(buf, i as i32);
+}
+
+// error_string renders an errno value as text.
+pub fn error_string(code: i32) -> String {
+    let mut buf: [u8; 256] = [0; 256];
+    let n = zxn_strerror_string(code, &mut buf, 256);
+    if n <= 0 {
+        return String::from("unknown error");
+    }
+    let mut i: usize = 0;
+    while i < (n as usize) && buf[i] != 0 {
+        i += 1;
+    }
+    return buf_str(buf, i as i32);
+}
+
 impl Conn {
+    // from_fd adopts an existing descriptor, which is how a worker thread
+    // turns the integer it was given into a Conn.
+    pub fn from_fd(fd: i32) -> Conn {
+        return Conn { fd: fd };
+    }
+
     // ok reports whether the connection was opened successfully.
     pub fn ok(&self) -> bool {
         return self.fd >= 0;
@@ -101,6 +221,23 @@ impl Conn {
     // 0 disables the timeout). Returns 0 on success.
     pub fn set_timeout(&self, ms: i32) -> i32 {
         return zxn_set_timeout(self.fd, ms);
+    }
+
+    // drain discards up to 64 KiB of already-sent request bytes, waiting at
+    // most `ms` for each read. Closing a socket with unread data makes the
+    // kernel send RST, which can destroy a response the peer has not read yet,
+    // so the server drains before it closes.
+    pub fn drain(&self, ms: i32) {
+        let mut buf: [u8; 8192] = [0; 8192];
+        let mut total: usize = 0;
+        self.set_timeout(ms);
+        while total < 65536 {
+            let n = zxn_recv(self.fd, &mut buf, 8192);
+            if n <= 0 {
+                break;
+            }
+            total = total + (n as usize);
+        }
     }
 
     // write sends the whole string. Returns bytes sent, or -1 on error.
@@ -127,6 +264,56 @@ impl Conn {
             return -1;
         }
         return zxn_send_all(self.fd, data, n as i32) as i64;
+    }
+
+    // fd exposes the raw descriptor, for select/poll loops.
+    pub fn fd(&self) -> i32 {
+        return self.fd;
+    }
+
+    // is_open reports whether the connection holds a live descriptor.
+    pub fn is_open(&self) -> bool {
+        return self.fd >= 0;
+    }
+
+    // peer reports the remote "ip:port" endpoint, or "" when unavailable.
+    pub fn peer(&self) -> String {
+        let mut buf: [u8; 256] = [0; 256];
+        let n = zxn_peer_addr(self.fd, &mut buf, 256);
+        if n <= 0 {
+            return String::new();
+        }
+        return buf_str(buf, n);
+    }
+
+    // local_port reports the local port, which is how a connection made from
+    // an ephemeral port learns its own identity.
+    pub fn local_port(&self) -> i32 {
+        return zxn_local_port(self.fd);
+    }
+
+    // wait_readable blocks up to ms milliseconds for input to arrive.
+    pub fn wait_readable(&self, ms: i32) -> bool {
+        return poll_read(self.fd, ms) == 1;
+    }
+
+    // read_some reads at most max bytes, returning as soon as something
+    // arrives ("" at end of stream, on timeout, or on error).
+    pub fn read_some(&self, max: usize) -> String {
+        let cap = if max < RECV_BUF { max } else { RECV_BUF };
+        let mut out = String::new();
+        let mut buf: [u8; 8192] = [0; 8192];
+        let n = zxn_recv(self.fd, &mut buf, cap);
+        if n > 0 {
+            out.push_bytes(buf[0..n as usize]);
+        }
+        return out;
+    }
+
+    // shutdown_write sends EOF to the peer while keeping the socket readable
+    // (the half-close protocol some servers use to end a request).
+    pub fn shutdown_write(&self) -> i32 {
+        return zxn_shutdown_write(self.fd);
     }
 
     // read_line reads one newline-terminated line (without the "\n").
@@ -159,10 +346,8 @@ impl Conn {
         let mut out = String::new();
         let mut buf: [u8; 8192] = [0; 8192];
         let n = zxn_read_head(self.fd, &mut buf, RECV_BUF as i32);
-        let mut i: usize = 0;
-        while n > 0 && i < (n as usize) {
-            out.push_byte(buf[i]);
-            i += 1;
+        if n > 0 {
+            out.push_bytes(buf[0..n as usize]);
         }
         return out;
     }
@@ -178,11 +363,7 @@ impl Conn {
             if got <= 0 {
                 break;
             }
-            let mut i: usize = 0;
-            while i < (got as usize) {
-                out.push_byte(buf[i]);
-                i += 1;
-            }
+            out.push_bytes(buf[0..got as usize]);
             left = left - (got as usize);
         }
         return out;
@@ -199,11 +380,7 @@ impl Conn {
             if n <= 0 {
                 break;
             }
-            let mut i: usize = 0;
-            while i < (n as usize) {
-                out.push_byte(buf[i]);
-                i += 1;
-            }
+            out.push_bytes(buf[0..n as usize]);
         }
         return out;
     }
@@ -222,6 +399,11 @@ impl Conn {
 }
 
 impl Server {
+    // from_fd adopts an existing listening descriptor.
+    pub fn from_fd(fd: i32) -> Server {
+        return Server { fd: fd };
+    }
+
     // ok reports whether the listener was opened successfully.
     pub fn ok(&self) -> bool {
         return self.fd >= 0;
@@ -233,6 +415,41 @@ impl Server {
         return Conn { fd: cfd };
     }
 
+    // accept_timeout waits at most ms milliseconds: on a quiet listener it
+    // returns a closed connection (fd < 0), so a serving loop can check a
+    // shutdown flag and exit instead of blocking forever.
+    pub fn accept_timeout(&self, ms: i32) -> Conn {
+        return Conn { fd: zxn_accept_timeout(self.fd, ms) };
+    }
+
+    // port reports the bound port, which is how a server started on port 0
+    // discovers the port the kernel chose.
+    pub fn port(&self) -> i32 {
+        return zxn_local_port(self.fd);
+    }
+
+    // fd exposes the raw listening descriptor.
+    pub fn fd(&self) -> i32 {
+        return self.fd;
+    }
+
+    // is_open reports whether the listener holds a live descriptor.
+    pub fn is_open(&self) -> bool {
+        return self.fd >= 0;
+    }
+
+    // set_nonblocking toggles O_NONBLOCK on the listener (accept then fails
+    // immediately when nothing is pending).
+    pub fn set_nonblocking(&self, on: bool) -> i32 {
+        let flag = if on { 1 } else { 0 };
+        return zxn_set_nonblocking(self.fd, flag);
+    }
+
+    // wait_readable blocks up to ms milliseconds for a pending connection.
+    pub fn wait_readable(&self, ms: i32) -> bool {
+        return poll_read(self.fd, ms) == 1;
+    }
+
     pub fn close(&mut self) {
         if self.fd >= 0 {
             zxn_close(self.fd);
@@ -240,3 +457,586 @@ impl Server {
         }
     }
 }
+
+// --- UDP -------------------------------------------------------------------
+
+// Datagram is one received UDP packet with its sender.
+pub struct Datagram {
+    pub data: String,
+    pub host: String,
+    pub port: i32,
+}
+
+// Udp is an unconnected UDP socket (a datagram endpoint). Datagrams are
+// connectionless: each send names its destination and each receive reports
+// where it came from. It owns the file descriptor; call close.
+pub struct Udp {
+    pub fd: i32,
+}
+
+// udp_bind opens a datagram socket on host:port. Binding port 0 lets the
+// kernel choose, and `port()` reports the choice.
+pub fn udp_bind(host: str, port: i32) -> Udp {
+    return Udp { fd: zxn_udp_bind(host, port) };
+}
+
+// udp_bind_local is udp_bind on the loopback interface — the safe default for
+// local tools, metrics, and tests.
+pub fn udp_bind_local(port: i32) -> Udp {
+    return udp_bind("127.0.0.1", port);
+}
+
+impl Udp {
+    // ok reports whether the socket was opened.
+    pub fn ok(&self) -> bool {
+        return self.fd >= 0;
+    }
+
+    // port reports the bound port.
+    pub fn port(&self) -> i32 {
+        return zxn_local_port(self.fd);
+    }
+
+    // set_timeout bounds blocking receive calls, in milliseconds.
+    pub fn set_timeout(&self, ms: i32) -> i32 {
+        return zxn_set_timeout(self.fd, ms);
+    }
+
+    // send_to sends one datagram and returns the bytes written, or -1.
+    pub fn send_to(&self, host: str, port: i32, data: str) -> i64 {
+        if len(data) > 65507 {
+            return -1;
+        }
+        return zxn_udp_send_to(self.fd, host, port, data, len(data) as i32) as i64;
+    }
+
+    // recv_from waits for one datagram and reports its payload and sender.
+    // An empty `data` with port 0 means timeout or error.
+    pub fn recv_from(&self) -> Datagram {
+        let mut buf: [u8; 8192] = [0; 8192];
+        let mut host: [u8; 256] = [0; 256];
+        let mut port: i32 = 0;
+        let n = zxn_udp_recv_from(self.fd, &mut buf, 8192, &mut host, 256, &mut port);
+        if n <= 0 {
+            return Datagram { data: String::new(), host: String::new(), port: 0 };
+        }
+        let mut data = String::with_capacity(n as usize);
+        data.push_bytes(buf[0..n as usize]);
+        let mut j: usize = 0;
+        while j < 256 && host[j] != 0 {
+            j += 1;
+        }
+        return Datagram { data: data, host: buf_str(host, j as i32), port: port };
+    }
+
+    // recv_text is recv_from when only the payload matters.
+    pub fn recv_text(&self) -> String {
+        let d = self.recv_from();
+        return d.data;
+    }
+
+    pub fn close(&mut self) {
+        if self.fd >= 0 {
+            zxn_close(self.fd);
+            self.fd = -1;
+        }
+    }
+}
+
+// Sockets, TLS-free HTTP plumbing, and the poll loop are C. It travels with
+// this file, so `use net;` (directly, or through `http`/`fs`/`web`) links it
+// with no driver-side list to keep in sync.
+c """
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <stdint.h>
+#include <stdatomic.h>
+
+int zxn_htons(int hostshort) { return (int)htons((unsigned short)hostshort); }
+
+unsigned int zxn_inet_addr(const char *s) { return inet_addr(s); }
+
+#define ZXN_BYTES(arr) ((char *)((arr)->e))
+
+int zxn_socket(int domain, int type, int protocol) {
+    int fd = socket(domain, type, protocol);
+#ifdef SO_NOSIGPIPE
+    /* macOS/BSD: a peer that closes early must not kill the process. */
+    if (fd >= 0) {
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+    }
+#endif
+    return fd;
+}
+
+int zxn_connect(int fd, const char *host, int port, int timeout_ms) {
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((unsigned short)port);
+    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL)
+            return -1;
+        memcpy(&sa.sin_addr, &((struct sockaddr_in *)res->ai_addr)->sin_addr, sizeof sa.sin_addr);
+        freeaddrinfo(res);
+    }
+    if (timeout_ms <= 0) timeout_ms = 30000;
+    /* Make the socket non-blocking so connect() can be bounded by select(). */
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int rc = connect(fd, (struct sockaddr *)&sa, sizeof sa);
+    if (rc < 0 && errno != EINPROGRESS) {
+        if (flags >= 0) fcntl(fd, F_SETFL, flags);
+        return -1;
+    }
+    if (rc == 0) {
+        if (flags >= 0) fcntl(fd, F_SETFL, flags);
+        return 0;
+    }
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    int sel = select(fd + 1, NULL, &wfds, NULL, &tv);
+    if (sel <= 0) {
+        if (flags >= 0) fcntl(fd, F_SETFL, flags);
+        return -1;
+    }
+    int err = 0;
+    socklen_t len = sizeof err;
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0) {
+        if (flags >= 0) fcntl(fd, F_SETFL, flags);
+        return -1;
+    }
+    if (flags >= 0) fcntl(fd, F_SETFL, flags);
+    return 0;
+}
+
+int zxn_bind(int fd, const char *host, int port) {
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((unsigned short)port);
+    if (host == NULL || strcmp(host, "0.0.0.0") == 0 || strcmp(host, "*") == 0) {
+        sa.sin_addr.s_addr = INADDR_ANY;
+    } else if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
+        /* Not a literal address: resolve it instead of silently binding ANY. */
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL)
+            return -1;
+        memcpy(&sa.sin_addr, &((struct sockaddr_in *)res->ai_addr)->sin_addr, sizeof sa.sin_addr);
+        freeaddrinfo(res);
+    }
+    return bind(fd, (struct sockaddr *)&sa, sizeof sa);
+}
+
+int zxn_listen(int fd, int backlog) { return listen(fd, backlog); }
+
+int zxn_accept(int fd) {
+    for (;;) {
+        int c = accept(fd, NULL, NULL);
+        if (c < 0 && errno == EINTR) continue;
+        return c;
+    }
+}
+
+/* zxn_accept_retryable classifies the errno left by a failed zxn_accept.
+ * Returns 1 for transient failures that are safe to retry, 0 otherwise. */
+int zxn_accept_retryable(void) {
+    switch (errno) {
+    case EINTR:
+    case EAGAIN:
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+    case EWOULDBLOCK:
+#endif
+#ifdef ECONNABORTED
+    case ECONNABORTED:
+#endif
+#ifdef EPROTO
+    case EPROTO:
+#endif
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+int zxn_setsockopt_reuseaddr(int fd) {
+    int one = 1;
+    return setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+}
+
+/* zxn_set_timeout bounds blocking send/recv calls; 0 disables the timeout. */
+int zxn_set_timeout(int fd, int ms) {
+    struct timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    int rc = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) != 0)
+        rc = -1;
+    return rc;
+}
+
+int zxn_send_all(int fd, const char *buf, int n) {
+    int sent = 0;
+    while (sent < n) {
+#ifdef MSG_NOSIGNAL
+        /* Linux: no SIGPIPE when the peer has gone away. */
+        ssize_t r = send(fd, buf + sent, n - sent, MSG_NOSIGNAL);
+#else
+        ssize_t r = send(fd, buf + sent, n - sent, 0);
+#endif
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            return -1;
+        }
+        sent += (int)r;
+    }
+    return sent;
+}
+
+int32_t zxn_recv(int32_t fd, zx_arr8192_u8 *bp, size_t cap) {
+    char *buf = ZXN_BYTES(bp);
+    for (;;) {
+        ssize_t r = recv(fd, buf, cap, 0);
+        if (r < 0 && errno == EINTR) continue;
+        return (int)r;
+    }
+}
+
+int zxn_close(int fd) { return close(fd); }
+
+/* zxn_poll_read waits up to ms milliseconds for fd to become readable.
+ * Returns 1 when readable, 0 on timeout, -1 on error/closed descriptor. */
+int zxn_poll_read(int fd, int ms) {
+    if (fd < 0) return -1;
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    struct timeval tv;
+    if (ms < 0) ms = 0;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    for (;;) {
+        int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (rc >= 0) return rc > 0 ? 1 : 0;
+        if (errno != EINTR) return -1;
+        /* Rebuild the set: select may clear it on interruption. */
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+    }
+}
+
+/* zxn_accept_timeout accepts with a bound, so a worker thread can check a
+ * shutdown flag instead of blocking forever. Returns the new descriptor, -2 on
+ * timeout, -1 on error. */
+int zxn_accept_timeout(int fd, int ms) {
+    int ready = zxn_poll_read(fd, ms);
+    if (ready == 0) return -2;
+    if (ready < 0) return -1;
+    for (;;) {
+        int c = accept(fd, NULL, NULL);
+        if (c >= 0) return c;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
+        return -1;
+    }
+}
+
+int zxn_set_nonblocking(int fd, int on) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (on) flags |= O_NONBLOCK;
+    else flags &= ~O_NONBLOCK;
+    return fcntl(fd, F_SETFL, flags);
+}
+
+/* zxn_resolve turns a host name into its first IPv4 address in dotted form.
+ * Returns 0 on success, -1 when the name does not resolve. A literal address
+ * is copied through unchanged. */
+int32_t zxn_resolve(const char *host, zx_arr256_u8 *bp, int32_t cap) {
+    char *buf = ZXN_BYTES(bp);
+    if (!host || cap <= 0) return -1;
+    struct in_addr literal;
+    if (inet_pton(AF_INET, host, &literal) == 1) {
+        const char *p = inet_ntop(AF_INET, &literal, buf, (socklen_t)cap);
+        return p ? 0 : -1;
+    }
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL) return -1;
+    struct in_addr a = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+    return inet_ntop(AF_INET, &a, buf, (socklen_t)cap) ? 0 : -1;
+}
+
+/* zxn_local_port reports the local port of a bound socket (useful after
+ * binding port 0), or -1. */
+/* zxn_cpu_count is the number of processors available to this process, used
+ * to size a default worker pool. */
+int zxn_cpu_count(void) {
+#ifdef _SC_NPROCESSORS_ONLN
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n > 0 && n < 4096) return (int)n;
+#endif
+    return 1;
+}
+
+int zxn_local_port(int fd) {
+    struct sockaddr_in sa;
+    socklen_t len = sizeof sa;
+    if (getsockname(fd, (struct sockaddr *)&sa, &len) != 0) return -1;
+    return (int)ntohs(sa.sin_port);
+}
+
+/* zxn_peer_addr writes "ip:port" for the peer of a connected socket. */
+int32_t zxn_peer_addr(int32_t fd, zx_arr256_u8 *bp, int32_t cap) {
+    char *buf = ZXN_BYTES(bp);
+    struct sockaddr_in sa;
+    socklen_t len = sizeof sa;
+    if (cap <= 0 || getpeername(fd, (struct sockaddr *)&sa, &len) != 0) return -1;
+    char ip[64];
+    if (!inet_ntop(AF_INET, &sa.sin_addr, ip, sizeof ip)) return -1;
+    int n = snprintf(buf, (size_t)cap, "%s:%d", ip, (int)ntohs(sa.sin_port));
+    return (n > 0 && n < cap) ? n : -1;
+}
+
+int zxn_shutdown_write(int fd) {
+    return shutdown(fd, SHUT_WR);
+}
+
+/* zxn_strerror_string copies the text for an errno value into buf. */
+int32_t zxn_strerror_string(int32_t err, zx_arr256_u8 *bp, int32_t cap) {
+    char *buf = ZXN_BYTES(bp);
+    if (cap <= 0) return -1;
+    const char *msg = strerror(err);
+    if (!msg) msg = "unknown error";
+    int n = snprintf(buf, (size_t)cap, "%s", msg);
+    return (n > 0 && n < cap) ? n : -1;
+}
+
+int zxn_last_error(void) { return errno; }
+
+/* --- UDP ------------------------------------------------------------------ */
+
+int zxn_udp_bind(const char *host, int port) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((unsigned short)port);
+    if (host == NULL || strcmp(host, "0.0.0.0") == 0 || strcmp(host, "*") == 0) {
+        sa.sin_addr.s_addr = INADDR_ANY;
+    } else if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
+        close(fd);
+        return -1;
+    }
+    if (bind(fd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+int zxn_udp_send_to(int fd, const char *host, int port, const char *buf, int n) {
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((unsigned short)port);
+    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) {
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+        if (getaddrinfo(host, NULL, &hints, &res) != 0 || res == NULL) return -1;
+        memcpy(&sa.sin_addr, &((struct sockaddr_in *)res->ai_addr)->sin_addr, sizeof sa.sin_addr);
+        freeaddrinfo(res);
+    }
+    ssize_t r = sendto(fd, buf, (size_t)n, 0, (struct sockaddr *)&sa, sizeof sa);
+    return (int)r;
+}
+
+/* zxn_udp_recv_from receives one datagram into buf and records the sender. The
+ * source address is written to hostbuf as "ip" and the port through port_out. */
+int32_t zxn_udp_recv_from(int32_t fd, zx_arr8192_u8 *bp, int32_t cap, zx_arr256_u8 *hbp,
+                          int32_t hostcap, int32_t *port_out) {
+    char *buf = ZXN_BYTES(bp);
+    char *hostbuf = ZXN_BYTES(hbp);
+    struct sockaddr_in sa;
+    socklen_t len = sizeof sa;
+    ssize_t r = recvfrom(fd, buf, (size_t)cap, 0, (struct sockaddr *)&sa, &len);
+    if (r < 0) {
+        if (errno == EINTR) return 0;
+        return -1;
+    }
+    if (hostbuf && hostcap > 0) {
+        if (!inet_ntop(AF_INET, &sa.sin_addr, hostbuf, (socklen_t)hostcap))
+            hostbuf[0] = '\0';
+    }
+    if (port_out) *port_out = (int)ntohs(sa.sin_port);
+    return (int)r;
+}
+
+/* --- file helpers (static files and downloads) ---------------------------
+ * Handles are FILE* pointers as integers, so binary data can be streamed
+ * through the same byte-buffer path as sockets without NUL truncation. */
+
+long zxn_file_open(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    return (long)(intptr_t)f;
+}
+
+int32_t zxn_file_read(int64_t handle, zx_arr8192_u8 *bp, int32_t cap) {
+    char *buf = ZXN_BYTES(bp);
+    FILE *f = (FILE *)(intptr_t)handle;
+    if (!f || cap <= 0) return -1;
+    size_t n = fread(buf, 1, (size_t)cap, f);
+    if (n == 0 && ferror(f)) return -1;
+    return (int)n;
+}
+
+int zxn_file_close(long handle) {
+    FILE *f = (FILE *)(intptr_t)handle;
+    if (!f) return -1;
+    return fclose(f);
+}
+
+long zxn_file_size(const char *path) {
+    struct stat st;
+    if (!path || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+    return (long)st.st_size;
+}
+
+/* zxn_realpath resolves symlinks and returns the canonical absolute path in
+ * buf (NUL-terminated), or -1 when path cannot be resolved. */
+int32_t zxn_realpath(const char *path, zx_arr4096_u8 *bp, int32_t cap) {
+    char *buf = ZXN_BYTES(bp);
+    if (!path || cap <= 0) return -1;
+    char *resolved = realpath(path, NULL);
+    if (!resolved) return -1;
+    size_t n = strlen(resolved);
+    if (n >= (size_t)cap) { free(resolved); return -1; }
+    memcpy(buf, resolved, n);
+    buf[n] = '\0';
+    free(resolved);
+    return (int)n;
+}
+
+int zxn_write_file(const char *path, const char *buf, int n) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    size_t wrote = fwrite(buf, 1, (size_t)n, f);
+    if (fclose(f) != 0) return -1;
+    return wrote == (size_t)n ? n : -1;
+}
+
+/* zxn_read_head reads until "\r\n\r\n" (end of HTTP head) or the buffer is
+ * full. Returns the number of bytes read, or -1 on error. */
+int32_t zxn_read_head(int32_t fd, zx_arr8192_u8 *bp, int32_t cap) {
+    char *buf = ZXN_BYTES(bp);
+    int total = 0;
+    if (cap < 5) return 0;
+    while (total < cap - 1) {
+        int room = cap - 1 - total;
+        /* Peek first, then read exactly up to the blank line. A byte-at-a-time
+         * loop costs one syscall per header byte (a 600-byte head is 600
+         * syscalls) and a plain chunked read would swallow body bytes that the
+         * caller has no way to put back. */
+        ssize_t avail = recv(fd, buf + total, (size_t)room, MSG_PEEK);
+        if (avail < 0) {
+            if (errno == EINTR) continue;
+            break;                       /* timeout or error: keep what we have */
+        }
+        if (avail == 0) break;            /* peer closed */
+        int want = (int)avail;
+        int end = 0;
+        for (int i = 0; i + 3 < want; i++) {
+            if (buf[total + i] == '\r' && buf[total + i + 1] == '\n' &&
+                buf[total + i + 2] == '\r' && buf[total + i + 3] == '\n') {
+                end = i + 4;
+                break;
+            }
+        }
+        if (end > 0) want = end;
+        ssize_t got = recv(fd, buf + total, (size_t)want, 0);
+        if (got <= 0) {
+            if (got < 0 && errno == EINTR) continue;
+            break;
+        }
+        total += (int)got;
+        if (end > 0 && got == want) break;
+    }
+    buf[total] = '\0';
+    return total;
+}
+
+/* zxn_http_send writes a complete HTTP response. */
+int zxn_http_send(int fd, const char *status_line, const char *body) {
+    int r = zxn_send_all(fd, status_line, (int)strlen(status_line));
+    if (r < 0) return -1;
+    return zxn_send_all(fd, body, (int)strlen(body));
+}
+
+/* zxn_http_get performs a simple HTTP GET and returns the full response as a
+ * malloc'd string (caller frees), or NULL on failure. */
+char *zxn_http_get(const char *host, int port, const char *path) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return NULL;
+    if (zxn_connect(fd, host, port, 30000) != 0) {
+        close(fd);
+        return NULL;
+    }
+    char req[4096];
+    int n = snprintf(req, sizeof req,
+        "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: zexi-net/0.1\r\n"
+        "Accept: */*\r\nConnection: close\r\n\r\n",
+        path, host);
+    if (zxn_send_all(fd, req, n) < 0) {
+        close(fd);
+        return NULL;
+    }
+    int cap = 1 << 16;
+    char *out = malloc(cap);
+    if (!out) { close(fd); return NULL; }
+    int total = 0;
+    for (;;) {
+        if (total >= cap - 1) break;
+        ssize_t r = recv(fd, out + total, cap - total - 1, 0);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            break;
+        }
+        total += (int)r;
+    }
+    out[total] = '\0';
+    close(fd);
+    return out;
+}
+"""
+

@@ -1,0 +1,40 @@
+// tests/cinline.zx
+// Adding native code from Zexi itself: a `c """..."""` block is compiled with
+// the program, `#[link("m")]` links a system library, and `#[no_mangle]` exports
+// a Zexi function to the C that calls back into it.
+
+#[no_mangle]
+fn zx_add_one(n: i64) -> i64 {
+    return n + 1;
+}
+
+extern "C" fn zx_twice(n: i64) -> i64;
+extern "C" fn zx_greet(name: &String) -> String;
+
+#[link("m")]
+extern "C" fn sqrt(x: f64) -> f64;
+
+c """
+/* Everything the generated program defines is visible here: the String
+ * runtime, the Vec/HashMap helpers, and `#[no_mangle]` functions. */
+int64_t zx_twice(int64_t n) { return n * 2; }
+
+zx_String zx_greet(zx_String *name) {
+    char buf[128];
+    snprintf(buf, sizeof buf, "hello, %s (%lld)", name->ptr, (long long)zx_add_one(41));
+    return zx_string_from(buf);
+}
+"""
+
+fn main() -> i32 {
+    // A raw `"""` string keeps quotes and newlines as written.
+    let text = """raw "quoted" text""";
+    println(text);
+
+    println(zx_twice(21));
+    println(sqrt(9.0));
+
+    let who = String::from("zexi");
+    println(zx_greet(&who).as_str());
+    0
+}

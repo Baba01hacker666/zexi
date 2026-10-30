@@ -316,13 +316,152 @@ Client connections get a 30 s default timeout and every body read is capped
 (`MAX_BODY`, 16 MiB). Requests are framed by Content-Length; responses support
 Content-Length, chunked encoding, and read-until-close.
 
-Still deliberately out of scope: TLS/HTTPS, HTTP/2, connection pooling, a
-client cookie jar (servers can read/set cookies, and clients can send them
-with `set_header`), multipart uploads, range requests, path-pattern routing,
-and middleware. Function values are supported, but the lack of dynamic
-collections keeps route tables fixed at 32 entries.
+Still deliberately out of scope: TLS/HTTPS, HTTP/2, a client cookie jar
+(servers can read/set cookies, and clients can send them with `set_header`),
+multipart uploads, range requests, and a client connection pool. Server-side
+routing does support `{name}` path patterns, `*` prefixes, and
+`use_before`/`use_after` middleware; the route table and middleware lists are
+fixed-size arrays (32 routes, 8 hooks each), so a router that needs more must be
+split across routers (up to four can be served at once, counting the default
+mux).
 
-## 8.7 What this demonstrates
+## 8.7 Serving many users at once
+
+Everything above serves one connection at a time: `listen` accepts, reads,
+dispatches, writes, closes, and only then looks at the next connection. That is
+fine for a laptop demo and wrong for anything with two visitors — a single slow
+request, or a client that connects and sends nothing, stalls everyone behind it.
+
+A **worker pool** fixes that by letting several OS threads accept on the *same*
+listening socket. The kernel hands each new connection to whichever thread is
+idle, so a slow request only occupies its own worker:
+
+<!-- check-only -->
+```zx
+import http.server;
+
+fn home(req: &Request) -> Response {
+    Response::html(200, "<h1>home</h1>")
+}
+
+fn main() -> i32 {
+    handle_get("/", home);
+    listen_workers(":8080", 8)      // eight threads accepting together
+}
+```
+
+| Call | What it does |
+| --- | --- |
+| `listen_workers(addr = "0.0.0.0:8000", workers = 0)` | serve the default mux with a pool (`workers` 0 = two per core) |
+| `listen_workers_n(addr, workers, max_requests)` | the same, stopping after a pool-wide request budget |
+| `Router::listen_workers(addr, workers)`, `Router::listen_workers_n(addr, workers, max_requests)` | the pool serving an explicit router |
+| `serve_workers(router, workers, port, host)` / `serve_workers_n(...)` | function forms of the `Router` methods |
+| `serve_local_workers(router, ...)` / `serve_local_workers_n(...)` | the same bound to loopback |
+| `requests_served()`, `connections_served()` | pool-wide counters (C11 atomics, no lock) |
+| `stop_serving()`, `serving_stopped()`, `reset_stats()` | cooperative shutdown and counter reset |
+
+How a `Router` reaches a thread: a worker thread can only be handed integers
+(the language has no closures yet), so the pool **pins** the router — it copies
+the route table into a fixed, over-aligned slot in the C runtime and passes the
+slot number. The default mux already lives in slot 0, so it needs no copy. Three
+slots are available for explicit routers; if all are busy, `serve_workers*`
+falls back to serving on the calling thread instead of failing.
+
+Shutdown is cooperative. Workers accept with `accept_timeout` (see §8.8) so each
+one notices the stop flag within `WORKER_POLL_MS` (100 ms) instead of blocking
+forever. A request budget (`*_n` calls) is how tests and one-shot tools exit
+deterministically: when the pool-wide count reaches the budget, one worker sets
+the stop flag and the rest wind down after their current request.
+
+Handlers stay ordinary functions and need no locking: a request and its
+response are per-thread values, and the router is read-only once the pool
+starts. Anything shared between requests must be shared explicitly (an
+`Atomic` from `thread`, or a channel).
+
+### What a hostile client costs
+
+A worker pool bounds, but does not remove, the cost of a client that misbehaves,
+so every accepted connection carries deadlines:
+
+| Deadline | Default | What it stops |
+| --- | --- | --- |
+| first byte | 250 ms (`FIRST_BYTE_MS`) | a socket that connects and sends nothing |
+| request head | 1 s (`HEAD_TIMEOUT_MS`), `app.header_timeout(ms)` | a head sent a byte at a time |
+| body and I/O | 30 s (`DEFAULT_TIMEOUT_MS`) | a client that stalls mid-body or stops reading |
+
+| Bad input | Answer |
+| --- | --- |
+| head larger than 8 KiB without its blank line | `431 Request Header Fields Too Large` |
+| bytes but no parseable request line | `400 Bad Request` |
+| `Content-Length` above `MAX_BODY` | `413 Payload Too Large` |
+| chunked body that does not parse | the normal `404`/`400`, drained first so the reset cannot eat it |
+
+The last column matters for the same reason the timeouts do: closing a socket
+that still has unread bytes makes the kernel send RST, which can destroy the
+response the client has not read yet. The server drains before it closes.
+
+One limit remains honest: a client that sends *part* of a head occupies a worker
+until the head deadline expires. Twenty-four such clients against four workers
+delay a new request by roughly `24 / 4 × 1 s`. Raise `workers`, lower
+`header_timeout`, or put a real edge in front when that matters. A single
+thread-per-connection or event-loop server is the next step, and the pieces it
+needs (`poll_read`, `wait_readable`, per-connection buffers) are already in
+`net`.
+
+## 8.8 UDP, name resolution, and readiness
+
+The same module covers the rest of a small server's needs.
+
+<!-- check-only -->
+```zx
+use net;
+
+fn main() -> i32 {
+    // Never leave the machine: port 0 asks the kernel for a free port.
+    let mut server = listen_local(0);
+    println("listening on", server.port());
+
+    // A bounded accept lets a loop check for shutdown instead of hanging.
+    let conn = server.accept_timeout(100);
+    if !conn.is_open() {
+        println("no connection within 100 ms");
+    }
+
+    // UDP: connectionless datagrams, each received with its sender.
+    let mut udp = udp_bind_local(0);
+    udp.send_to("127.0.0.1", udp.port(), "ping");
+    let packet = udp.recv_from();
+    println(packet.data, packet.host, packet.port);
+    udp.close();
+    server.close();
+    0
+}
+```
+
+| API | Purpose |
+| --- | --- |
+| `resolve(host) -> String` | first IPv4 address for a name ("" when it does not resolve) |
+| `cpu_count() -> i32` | processors available, for sizing pools and splitting work |
+| `poll_read(fd, ms) -> i32` | wait for readability: 1 ready, 0 timeout, -1 error |
+| `Conn::wait_readable(ms)`, `Server::wait_readable(ms)` | the same over a handle |
+| `Server::accept_timeout(ms)` | bounded accept, returning a closed `Conn` on timeout |
+| `Server::port()`, `Server::set_nonblocking(on)`, `Server::from_fd(fd)` | bound port, `O_NONBLOCK`, adopt a descriptor |
+| `Conn::from_fd(fd)`, `Conn::fd()`, `Conn::is_open()`, `Conn::peer()` | adopt/introspect a connection |
+| `Conn::local_port()`, `Conn::read_some(max)`, `Conn::shutdown_write()` | own endpoint, one bounded read, half-close |
+| `udp_bind(host, port)`, `udp_bind_local(port)` | open a datagram endpoint |
+| `Udp::send_to(host, port, data)`, `Udp::recv_from() -> Datagram`, `Udp::recv_text()`, `Udp::set_timeout(ms)` | datagram I/O |
+| `last_error()`, `error_string(code)` | the last `errno`, as text |
+
+`Datagram` carries `data`, `host`, and `port`, so a datagram server answers with
+`udp.send_to(packet.host.as_str(), packet.port, reply)`.
+
+Limits worth knowing: everything is IPv4, plaintext, and single-address-per-name
+(`resolve` returns the first answer). `MAX_READ` (64 MiB), `MAX_LINE` (64 KiB),
+and the HTTP layer's `MAX_BODY` (16 MiB) bound what a peer can make you buffer.
+A pool is capped at `MAX_WORKERS` (64) threads, and the router slot table holds
+one default mux plus three explicitly served routers at a time.
+
+## 8.9 What this demonstrates
 
 - `extern "C"` FFI is real enough to bind the POSIX socket API with no compiler
   changes to the networking path.

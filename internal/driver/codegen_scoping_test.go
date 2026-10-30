@@ -432,6 +432,7 @@ func TestF32LiteralRounding(t *testing.T) {
 }
 `, "0\n")
 }
+
 // C promotes narrow integer operands to int and unsuffixed literals to double.
 // Expression results must still have Zexi's declared width, even when consumed
 // directly instead of first being assigned to a narrow local.

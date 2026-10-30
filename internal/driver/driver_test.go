@@ -21,6 +21,7 @@ import (
 // supported subset type-checks cleanly.
 func TestTypeCheckExamples(t *testing.T) {
 	files := []string{
+		"../../examples/site/main.zx",
 		"../../examples/hello.zx",
 		"../../examples/easy.zx",
 		"../../examples/cbridge.zx",
@@ -58,6 +59,16 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/option_result.zx",
 		"../../tests/vec.zx",
 		"../../tests/hashmap.zx",
+		"../../tests/json_lib.zx",
+		"../../tests/html_lib.zx",
+		"../../tests/pool.zx",
+		"../../tests/net_local.zx",
+		"../../tests/recursive.zx",
+		"../../tests/web_lib.zx",
+		"../../tests/closures.zx",
+		"../../tests/cinline.zx",
+		"../../tests/slices.zx",
+		"../../tests/std_bytes.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -296,6 +307,18 @@ func TestRunPrograms(t *testing.T) {
 				"[   ab]",
 				"[ ab  ]",
 				"[abcd]",
+				"ff FF",
+				"1010",
+				"3.14",
+				"1.23e4",
+				"25.6%",
+				"1.0 MB",
+				"250ms",
+				"-inf",
+				"inf",
+				"[    42]",
+				"[42....]",
+				"[--ab--]",
 				"base 16: 0x255",
 				"pi: 3.14",
 				"flag true and char Z",
@@ -368,6 +391,194 @@ func TestRunPrograms(t *testing.T) {
 				"-2",
 				"0",
 				"3",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/json_lib.zx",
+			want: strings.Join([]string{
+				"6 6",
+				"hi",
+				"42",
+				"1.5",
+				"true",
+				"true true",
+				"true 3 1 3 0",
+				"true 9007199254740993",
+				"0.3333333333333333",
+				"a\tb",
+				"\"q\" \u00e9 \U0001F600",
+				"\"say \\\"hi\\\"\\n\"",
+				"{\"a\":[1,{\"b\":2}],\"c\":{}}",
+				"{",
+				"  \"a\": [",
+				"    1,",
+				"    {",
+				"      \"b\": 2",
+				"    }",
+				"  ],",
+				"  \"c\": {}",
+				"}",
+				"true",
+				"{\"name\":\"zexi\",\"stars\":7,\"draft\":false,\"tags\":[\"lang\",2],\"extra\":null}",
+				"true false 1",
+				"name zexi",
+				"true false 4",
+				"json: expected a value at byte 6",
+				"json: expected `,` or `]` at byte 5",
+				"true false false",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/html_lib.zx",
+			want: strings.Join([]string{
+				"&lt;b&gt;Tom &amp; Jerry&#39;s&lt;/b&gt;",
+				"&quot;quoted&quot; &amp; &#39;single&#39;",
+				"a%20b%26c%3dd%2fe%3ff%23g~h",
+				"plain text stays put",
+				"true",
+				"true",
+				"true",
+				"true",
+				"<a href=\"/x?a=1&amp;b=2\">go &lt;now&gt;</a>",
+				"<h2>Title &lt;x&gt;</h2>",
+				"<h6>clamped</h6>",
+				"<ul>",
+				"  <li>one &lt;1&gt;</li>",
+				"  <li>two</li>",
+				"</ul>",
+				"",
+				"<ol>",
+				"  <li>one &lt;1&gt;</li>",
+				"  <li>two</li>",
+				"</ol>",
+				"",
+				"<table>",
+				"  <thead><tr><th>name</th><th>n</th></tr></thead>",
+				"  <tbody>",
+				"    <tr><td>a&lt;b</td><td>1</td></tr>",
+				"    <tr><td>only</td><td></td></tr>",
+				"  </tbody>",
+				"</table>",
+				"",
+				"<p>&lt;b&gt;Zexi&lt;/b&gt;</p><p><b>Zexi</b></p><p>3 </p>{{literal}}",
+				"<h1>Hello &lt;world&gt;</h1>",
+				"<script type=\"application/json\" id=\"data\">{\"a\":\"<\\/script>\"}</script>",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/pool.zx",
+			want: strings.Join([]string{
+				"true 4",
+				"1 441",
+				"9 16 -5",
+				"385",
+				"2666866670000",
+				"0",
+				"1 385",
+				"true",
+				"true",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/net_local.zx",
+			want: strings.Join([]string{
+				"127.0.0.1",
+				"0",
+				"true true true",
+				"false",
+				"false",
+				"true true",
+				"true true",
+				"ping",
+				"pong",
+				"true true",
+				"8",
+				"datagram 127.0.0.1 true",
+				"true",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/recursive.zx",
+			want: strings.Join([]string{
+				"10",
+				"4",
+				"2 hi",
+				"12",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/cinline.zx",
+			want: strings.Join([]string{
+				`raw "quoted" text`, "42", "3", "hello, zexi (42)", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/closures.zx",
+			want: strings.Join([]string{
+				"42", "42", "20", "101", "100", "42", "23", "n=9!", "14", "6", "8",
+				"0", "1", "4", "9", "16", "3", "true", "true", "30", "1030",
+				"42", "2", "3", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/slices.zx",
+			want: strings.Join([]string{
+				"4", "10", "5", "3", "10", "hello", "3", "5", "hello", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/std_bytes.zx",
+			want: strings.Join([]string{
+				"7", "10", "3", "HeLLo, worLd", "HELLO, WORLD", "world", "padded",
+				"true", "true", "-1", "true", "0", "1", "-1", "3",
+				"00ff41", "00FF41", "3", "odd number of hex digits",
+				"AP9B", "aGVsbG8=", "hello", "1841190246", "3421780262",
+				"103547413", "1335831723", "a430d84680aabd0b", "210714636441",
+				"&lt;a href=&quot;x&quot;&gt;&amp;&#39;", "&lt;b&gt;", "a%20b%26c",
+				"<\\/script>", "<p>&lt;Tom&gt;</p>", "3", "00ff41", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/web_template.zx",
+			want: strings.Join([]string{
+				"<!doctype html><html><body><p>hi Tom</p><footer>2026</footer></body></html>",
+				"{{@@content@@}}",
+				"true",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/web_lib.zx",
+			want: strings.Join([]string{
+				"200 application/json {\"id\":\"42\",\"found\":true}",
+				"200 item:7",
+				"404 {\"error\":\"not found\"}",
+				"400 {\"error\":\"bad input\"}",
+				"<b>zexi</b>",
+				"<p>&lt;b&gt;zexi&lt;/b&gt;</p>",
+				"200 text/html; charset=utf-8",
+				"302 /next",
+				"{\"error\":\"nope\"}",
+				"127.0.0.1 8080",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/web_result.zx",
+			want: strings.Join([]string{
+				"200 home",
+				"500 text/html; charset=utf-8 true",
+				"200 v=down",
+				"500",
+				"200 {\"id\":\"17\"}",
+				"500",
+				"404 ",
 				"",
 			}, "\n"),
 		},
@@ -462,17 +673,270 @@ func TestHTTPServerAndClient(t *testing.T) {
 	}
 }
 
+// TestWorkerPoolServerServesConcurrently builds a server whose router is
+// served by a worker pool and checks two things a single-threaded server cannot
+// do: answer a request while other connections are held open without sending
+// anything, and use several OS threads to accept at once. Both entry points are
+// covered — an explicit Router through `listen_workers_n` (which pins the
+// router into a slot so worker threads can reach it) and the process-wide
+// default mux through `serve_workers_n`.
+func TestWorkerPoolServerServesConcurrently(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end network test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+
+	cases := []struct {
+		name string
+		port string
+		src  string
+	}{
+		{
+			name: "router",
+			port: "18083",
+			src: `use http;
+
+fn hello(req: &Request) -> Response {
+    return Response::text(200, "hi");
+}
+
+fn main() -> i32 {
+    let mut app = new_app();
+    app.get("/", hello);
+    let rc = app.listen_workers_n("127.0.0.1:18083", 4, 2);
+    println("rc", rc, requests_served());
+    0
+}
+`,
+		},
+		{
+			name: "default_mux",
+			port: "18084",
+			src: `use http;
+
+fn hello(req: &Request) -> Response {
+    return Response::text(200, "hi");
+}
+
+fn main() -> i32 {
+    handle_get("/", hello);
+    let rc = listen_workers_n("127.0.0.1:18084", 3, 2);
+    println("rc", rc, requests_served());
+    0
+}
+`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			src := filepath.Join(dir, "server.zx")
+			if err := os.WriteFile(src, []byte(tc.src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			bin := filepath.Join(dir, "server")
+			em := diag.NewEmitter()
+			if _, ok := driver.Build(src, bin, driver.Options{}, em); !ok {
+				em.Render(os.Stderr, em.FirstFileID())
+				t.Fatal("failed to build the worker-pool server")
+			}
+
+			var out bytes.Buffer
+			server := exec.Command(bin)
+			server.Stdout = &out
+			server.Stderr = &out
+			if err := server.Start(); err != nil {
+				t.Fatalf("starting server: %v", err)
+			}
+			defer func() { _ = server.Process.Kill() }()
+
+			addr := "127.0.0.1:" + tc.port
+			if !waitPort(addr) {
+				t.Fatalf("server never started listening; output:\n%s", out.String())
+			}
+
+			// Two connections that connect and then say nothing: each ties up a
+			// worker until its read times out. A server that handles one
+			// connection at a time would never get to the requests below.
+			idle := make([]net.Conn, 0, 2)
+			for i := 0; i < 2; i++ {
+				c, err := net.DialTimeout("tcp", addr, 2*time.Second)
+				if err != nil {
+					t.Fatalf("opening idle connection: %v", err)
+				}
+				idle = append(idle, c)
+			}
+			defer func() {
+				for _, c := range idle {
+					_ = c.Close()
+				}
+			}()
+
+			client := &stdhttp.Client{Timeout: 5 * time.Second}
+			for i := 0; i < 2; i++ {
+				resp, err := client.Get("http://" + addr + "/")
+				if err != nil {
+					t.Fatalf("request %d while idle connections are open: %v\nserver output:\n%s", i+1, err, out.String())
+				}
+				body, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode != 200 || string(body) != "hi" {
+					t.Fatalf("request %d: status %d body %q", i+1, resp.StatusCode, body)
+				}
+			}
+
+			for _, c := range idle {
+				_ = c.Close()
+			}
+			idle = nil
+
+			done := make(chan struct{})
+			go func() { _ = server.Wait(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("server did not exit after its request budget; output:\n%s", out.String())
+			}
+			if got := strings.TrimSpace(out.String()); got != "rc 0 2" {
+				t.Fatalf("server output mismatch\n got: %q\nwant: %q", got, "rc 0 2")
+			}
+		})
+	}
+}
+
+// TestWebAppProject builds a project whose folders are named relative to the
+// entry file ("templates", "public") and serves it from a worker pool. It
+// checks the conventions the `web` module promises: templates come from the
+// views folder, unmatched paths are served from the pages folder (with the
+// ".html" fallback), `{name}` segments reach the handler, and JSON handlers
+// answer JSON — all regardless of the directory the binary is started from.
+func TestWebAppProject(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end network test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+
+	dir := t.TempDir()
+	files := map[string]string{
+		"main.zx": `use web;
+use html;
+use json;
+
+fn home(req: &Request) -> Response {
+    let mut v = html::vars();
+    v.set("title", "Home <1>");
+    return web::page("index", &v);
+}
+
+fn user(req: &Request) -> Response {
+    let p = web::params(req);
+    let mut doc = json::object();
+    doc.set_str("id", p.get("id"));
+    return web::json_of(&doc);
+}
+
+fn main() -> i32 {
+    let mut app = web::new_app();
+    app.get("/", home);
+    app.get("/users/{id}", user);
+    app.views("templates");
+    app.pages("public");
+    app.files("/static", "public");
+    app.workers(3);
+    return app.serve_n(18087, 3);
+}
+`,
+		"templates/index.html": "<h1>{{title}}</h1>\n",
+		"public/about.html":    "<p>about</p>\n",
+		"public/style.css":     "body { color: red; }\n",
+	}
+	for name, body := range files {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	bin := filepath.Join(dir, "app")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(filepath.Join(dir, "main.zx"), bin, driver.Options{Root: dir}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build the web app")
+	}
+
+	var out bytes.Buffer
+	server := exec.Command(bin)
+	server.Dir = t.TempDir() // prove folder paths do not depend on the cwd
+	server.Stdout = &out
+	server.Stderr = &out
+	if err := server.Start(); err != nil {
+		t.Fatalf("starting server: %v", err)
+	}
+	defer func() { _ = server.Process.Kill() }()
+
+	const addr = "127.0.0.1:18087"
+	if !waitPort(addr) {
+		t.Fatalf("server never started listening; output:\n%s", out.String())
+	}
+
+	client := &stdhttp.Client{Timeout: 5 * time.Second}
+	check := func(path, wantBody string, wantType string) {
+		t.Helper()
+		resp, err := client.Get("http://" + addr + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("GET %s: status %d", path, resp.StatusCode)
+		}
+		if got := string(body); got != wantBody {
+			t.Fatalf("GET %s body = %q, want %q", path, got, wantBody)
+		}
+		if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, wantType) {
+			t.Fatalf("GET %s content type = %q, want %q", path, ct, wantType)
+		}
+	}
+	check("/", "<h1>Home &lt;1&gt;</h1>\n", "text/html")
+	check("/about", "<p>about</p>\n", "text/html")
+	check("/users/42", "{\"id\":\"42\"}", "application/json")
+
+	done := make(chan struct{})
+	go func() { _ = server.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("server did not exit after its request budget; output:\n%s", out.String())
+	}
+}
+
 // TestHTTPExamplesTypeCheck ensures the HTTP examples compile against the
 // library (no C compiler needed).
 func TestHTTPExamplesTypeCheck(t *testing.T) {
-	for _, f := range []string{
-		"../../examples/http_server.zx",
-		"../../examples/http_client.zx",
-	} {
+	cases := []struct {
+		files []string
+		label string
+	}{
+		{[]string{"../../examples/http_server.zx", "../../lib/http.zx"}, "http_server.zx + lib/http.zx"},
+		{[]string{"../../examples/http_client.zx", "../../lib/http.zx"}, "http_client.zx + lib/http.zx"},
+		// The site project uses the standard library only (no extra C source
+		// and no on-disk library), so it compiles on its own.
+		{[]string{"../../examples/site/main.zx"}, "site/main.zx"},
+	}
+	for _, tc := range cases {
 		em := diag.NewEmitter()
-		if _, ok := driver.FrontEndFiles([]string{f, "../../lib/http.zx"}, driver.Options{}, em); !ok {
+		if _, ok := driver.FrontEndFiles(tc.files, driver.Options{}, em); !ok {
 			em.Render(os.Stderr, em.FirstFileID())
-			t.Errorf("%s + lib/http.zx: front end reported errors", f)
+			t.Errorf("%s: front end reported errors", tc.label)
 		}
 	}
 }
@@ -1222,8 +1686,10 @@ func TestReadLine(t *testing.T) {
 	mainPath := filepath.Join(dir, "main.zx")
 	src := `use io;
 fn main() -> i32 {
-    let line = input("prompt> ");
-    println(f"got: {line} ({len(line)})");
+    match input("prompt> ") {
+        Ok(line) => println(f"got: {line} ({len(line)})"),
+        Err(e) => println("input failed"),
+    }
     0
 }
 `
@@ -1325,10 +1791,18 @@ fn main() -> i32 {
     let mut data = String::from("hi");
     data.push_byte(0);
     data.push_str("there");
-    println(write_bytes(source.as_str(), &data));
-    println(copy_file(source.as_str(), target.as_str()));
-    let got = read_bytes(target.as_str());
-    println(got.len(), got.byte_at(2), got.byte_at(7));
+    match fs::write(source.as_str(), data.as_bytes()) {
+        Ok(n) => println(n),
+        Err(e) => println(0),
+    }
+    match fs::copy(source.as_str(), target.as_str()) {
+        Ok(n) => println(n),
+        Err(e) => println(0),
+    }
+    match fs::read(target.as_str()) {
+        Ok(got) => println(got.len(), got.byte_at(2), got.byte_at(7)),
+        Err(e) => println(0),
+    }
     0
 }
 `
@@ -2295,11 +2769,15 @@ fn main() -> i32 {
     println(mkdir(work.as_str()), mkdir(work.as_str()));
     println(chdir(work.as_str()));
     println(cwd().len() > 0);
-    println(write_text(from.as_str(), "local"));
+    let written = match fs::write(from.as_str(), "local".as_bytes()) {
+        Ok(n) => n,
+        Err(e) => 0,
+    };
+    println(written);
     println(rename_path(from.as_str(), to.as_str()));
-    println(path_exists(to.as_str()));
+    println(fs::exists(to.as_str()));
     println(remove_path(to.as_str()));
-    println(path_exists(to.as_str()));
+    println(fs::exists(to.as_str()));
     0
 }
 `
@@ -2457,5 +2935,245 @@ func TestBuiltinTypeNamesAreReserved(t *testing.T) {
 				t.Fatalf("%s: expected E0428, got:\n%s", tc.name, buf.String())
 			}
 		})
+	}
+}
+
+// TestLibraryShipsItsOwnC covers the "extend the language from a library"
+// path: a module brings a `c """..."""` block and an `extern "C"` declaration,
+// and the program that imports it links and runs with no compiler change and no
+// extra C file on the command line.
+func TestLibraryShipsItsOwnC(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	files := map[string]string{
+		"lib/fastmath.zx": `// A library that brings its own C.
+pub extern "C" fn fm_cube(n: i64) -> i64;
+
+c """
+int64_t fm_cube(int64_t n) { return n * n * n; }
+"""
+`,
+		"main.zx": `use fastmath;
+
+fn main() -> i32 {
+    println(fastmath::fm_cube(3));
+    println(fastmath::fm_cube(-2));
+    0
+}
+`,
+	}
+	for name, src := range files {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	bin := filepath.Join(dir, "app")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(filepath.Join(dir, "main.zx"), bin, driver.Options{Root: dir}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build a program whose library ships C")
+	}
+	out, err := exec.Command(bin).CombinedOutput()
+	if err != nil {
+		t.Fatalf("running: %v\n%s", err, out)
+	}
+	if got, want := string(out), "27\n-8\n"; got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+// TestInlineCLinkLibs checks that `#[link("m")]` reaches the C compiler: the
+// program calls libm's `sqrt` without Options.LinkLibs being set by the caller.
+func TestInlineCLinkLibs(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	src := `#[link("m")]
+extern "C" fn sqrt(x: f64) -> f64;
+
+fn main() -> i32 {
+    println(sqrt(81.0));
+    0
+}
+`
+	entry := filepath.Join(dir, "main.zx")
+	if err := os.WriteFile(entry, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "app")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(entry, bin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build the libm program")
+	}
+	out, err := exec.Command(bin).CombinedOutput()
+	if err != nil {
+		t.Fatalf("running: %v\n%s", err, out)
+	}
+	if got, want := string(out), "9\n"; got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+// TestStandardLibraryNeedsNoCompilerC keeps the extension promise honest:
+// library C lives in the module that uses it, as a `c """..."""` block, so
+// adding a module never means adding an embedded blob and a flag in the driver.
+// The check is structural — no C file under internal/driver, and every standard
+// module that ships C ships it in a self-contained block.
+func TestStandardLibraryNeedsNoCompilerC(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasPrefix(name, "zx") || !strings.HasSuffix(name, "_c.txt") {
+			continue
+		}
+		t.Errorf("internal/driver/%s is driver-side library C; move it into its module's `c \"\"\"` block", name)
+	}
+
+	drv, err := os.ReadFile("driver.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(drv), "go:embed zx") {
+		t.Error("driver.go embeds a library C file again; the module should carry its own C")
+	}
+
+	shippingC := []string{"http.zx", "json.zx", "net.zx", "regex.zx", "sys.zx", "thread.zx"}
+	for _, name := range shippingC {
+		src, err := os.ReadFile(filepath.Join("std", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(src)
+		block := strings.Index(text, "c \"\"\"")
+		if block < 0 {
+			t.Errorf("std/%s ships C but has no `c \"\"\"` block", name)
+			continue
+		}
+		if !strings.Contains(text[block:], "#include") && !strings.Contains(text[:block], "#include") {
+			t.Errorf("std/%s block includes no header; a block must be self-contained", name)
+		}
+		if !strings.Contains(text, `extern "C" fn`) {
+			t.Errorf("std/%s ships C but declares no extern fn", name)
+		}
+	}
+}
+
+// TestServerRejectsBadRequests is the hostile-client test: a server must answer
+// a malformed, slow, or oversized request with a status line instead of holding
+// a worker forever, and it must keep serving normal traffic throughout.
+func TestServerRejectsBadRequests(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end network test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	src := filepath.Join(dir, "server.zx")
+	program := `use web;
+use http;
+
+fn home(req: &Request) -> Response {
+    return Response::text(200, "ok");
+}
+
+fn main() -> i32 {
+    let mut app = web::new_app();
+    app.get("/", home);
+    app.workers(2);
+    app.header_timeout(700);
+    return app.serve_local(18090);
+}
+`
+	if err := os.WriteFile(src, []byte(program), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "server")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(src, bin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build the hostile-client server")
+	}
+	var log bytes.Buffer
+	server := exec.Command(bin)
+	server.Stdout = &log
+	server.Stderr = &log
+	if err := server.Start(); err != nil {
+		t.Fatalf("starting server: %v", err)
+	}
+	defer func() { _ = server.Process.Kill() }()
+
+	// exchange sends payload and returns whatever the server wrote before it
+	// closed the connection, waiting at most `wait`.
+	exchange := func(payload []byte, wait time.Duration) string {
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:18090", 2*time.Second)
+		if err != nil {
+			return ""
+		}
+		defer conn.Close()
+		if len(payload) > 0 {
+			if _, err := conn.Write(payload); err != nil {
+				return ""
+			}
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(wait))
+		data, _ := io.ReadAll(conn)
+		return string(data)
+	}
+
+	// The server needs a moment to bind.
+	status := ""
+	for i := 0; i < 50 && status == ""; i++ {
+		status = exchange([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"), time.Second)
+		if status == "" {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	if !strings.Contains(status, "200 OK") {
+		t.Fatalf("server did not answer a valid request: %q (%s)", status, log.String())
+	}
+
+	cases := []struct {
+		name    string
+		payload []byte
+		want    string
+	}{
+		{"half-head", []byte("GET / HTT"), "400"},
+		{"no-terminator", []byte(strings.Repeat("A", 9000)), "431"},
+		{"empty-request-line", []byte("\r\n\r\n"), "400"},
+	}
+	for _, tc := range cases {
+		got := exchange(tc.payload, 5*time.Second)
+		if !strings.Contains(got, tc.want) {
+			t.Errorf("%s: expected a %s response, got %q", tc.name, tc.want, got)
+		}
+	}
+
+	// A connection that sends nothing must be dropped, not parked.
+	start := time.Now()
+	silent := exchange([]byte{}, 4*time.Second)
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("silent connection held for %v, expected it to be dropped quickly", elapsed)
+	}
+	if strings.Contains(silent, "200") {
+		t.Errorf("silent connection got a response: %q", silent)
+	}
+
+	// After all that, the server must still answer.
+	final := exchange([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"), 3*time.Second)
+	if !strings.Contains(final, "200 OK") {
+		t.Fatalf("server stopped serving after hostile input: %q (%s)", final, log.String())
 	}
 }

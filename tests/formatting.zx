@@ -49,6 +49,20 @@ fn main() -> i32 {
     println("[" + fmt::align_center("ab", 5) + "]");
     println("[" + fmt::align_center("abcd", 2) + "]");
 
+    // New spellings, plus the promotion and infinity fixes.
+    println(fmt::hex(255, false), fmt::hex(255, true));
+    println(fmt::radix(10, 2));
+    println(fmt::fixed(3.14159, 2));
+    println(fmt::sci(12345.0, 2));
+    println(fmt::percent(0.256, 1));
+    println(fmt::bytes(999999));            // 1.0 MB, promoted after rounding
+    println(fmt::duration(250));
+    println(fmt::fixed(-1.0 / 0.0, 2));     // -inf keeps its sign
+    println(fmt::fixed(1.0 / 0.0, 2));
+    println("[" + fmt::pad_left("42", 6) + "]");
+    println("[" + fmt::pad_right("42", 6, '.') + "]");
+    println("[" + fmt::pad_center("ab", 6, '-') + "]");
+
     // println with `{}` placeholders: the argument's type drives the
     // conversion, and literal text is emitted verbatim.
     println("base 16: 0x{}", 255);

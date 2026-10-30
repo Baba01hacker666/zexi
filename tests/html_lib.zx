@@ -1,0 +1,62 @@
+// tests/html_lib.zx
+// Coverage for the `html` module: escaping in text and attributes, percent
+// encoding, documents, widgets, and `{{name}}` templates.
+
+use html;
+
+fn main() -> i32 {
+    // Escaping: the five dangerous characters in text and attributes.
+    println(html::escape("<b>Tom & Jerry's</b>"));
+    println(html::attr("\"quoted\" & 'single'"));
+    println(html::url_query("a b&c=d/e?f#g~h"));
+    println(html::escape("plain text stays put"));
+
+    // A whole document, with an escaped title and trusted body markup.
+    let body = html::tag("h1", "Users <all>");
+    let doc = html::page("Admin & Tools", body.as_str());
+    println(doc.ends_with("</html>\n"));
+    println(doc.contains("<title>Admin &amp; Tools</title>"));
+    println(doc.contains("<h1>Users &lt;all&gt;</h1>"));
+    println(doc.contains("charset=\"utf-8\""));
+
+    // Widgets escape their inputs.
+    println(html::link("/x?a=1&b=2", "go <now>"));
+    println(html::heading(2, "Title <x>"));
+    println(html::heading(99, "clamped"));
+
+    let mut items: Vec<String> = Vec::new();
+    items.push(String::from("one <1>"));
+    items.push(String::from("two"));
+    println(html::list(&items));
+    println(html::ordered_list(&items));
+
+    let mut headers: Vec<String> = Vec::new();
+    headers.push(String::from("name"));
+    headers.push(String::from("n"));
+    let mut row: Vec<String> = Vec::new();
+    row.push(String::from("a<b"));
+    row.push(String::from("1"));
+    let mut short: Vec<String> = Vec::new();
+    short.push(String::from("only"));
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    rows.push(row);
+    rows.push(short);
+    println(html::table(&headers, &rows));
+
+    // Templates escape by default, `|raw` opts out, and unknown names vanish.
+    let mut vars = html::vars();
+    vars.set("name", "<b>Zexi</b>");
+    vars.set("markup", "<b>Zexi</b>");
+    vars.set_int("count", 3);
+    println(html::template("<p>{{name}}</p><p>{{markup|raw}}</p><p>{{count}} {{missing}}</p>{{{{literal}}", &vars));
+
+    // Pair form, for a template with a couple of variables.
+    let mut pairs: Vec<String> = Vec::new();
+    pairs.push(String::from("title"));
+    pairs.push(String::from("Hello <world>"));
+    println(html::template_pairs("<h1>{{title}}</h1>", &pairs));
+
+    // JSON embedded in a page cannot close the script element early.
+    println(html::json_script("data", "{\"a\":\"</script>\"}"));
+    0
+}

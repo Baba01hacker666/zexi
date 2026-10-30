@@ -459,7 +459,34 @@ payloads move into the arm and are dropped once. A guarded arm copies for the
 guard and takes ownership only after it passes. Binding an owned payload out of
 a borrow is `E0507`.
 
-## 7.14 Writing it the easy way
+## 7.14 Closures
+
+```zx
+fn adder(n: i32) -> fn(i32) -> i32 { return |x| x + n; }   // escapes
+
+fn main() -> i32 {
+    let base = 100;
+    let shifted: fn(i32) -> i32 = |n| n + base; // captures `base` by copy
+    println(shifted(1));                        // 101
+    let add7 = adder(7);
+    println(add7(35));                          // 42
+
+    let mut v: Vec<i64> = Vec::new();
+    v.push(4);
+    v.push(9);
+    v.each(|x| println(x));                     // 4 9
+    println(v.count(|x| x > 5));                // 2
+    println(v.fold(0, |acc, x| acc + x));       // 13
+    0
+}
+```
+
+The target type supplies the signature, so annotate the binding when nothing
+else fixes it. `Copy` values are captured by copy; `String`/`Vec`/`HashMap`
+move into the closure (using the original afterwards is `E0382`). See
+[`15-closures.md`](15-closures.md).
+
+## 7.15 Writing it the easy way
 
 Zexi borrows Python's ergonomics where they cost nothing at run time:
 
@@ -500,7 +527,7 @@ use math as m;              // qualifier alias: m::maxi(1, 2)
 use std::text;
 import http.server;         // package-shaped facade; server::Router, server::serve(&r, p)
 import http.server as srv;  // or srv::Router
-import io.fs;               // filesystem facade: fs::read_text("f")
+import io.fs;               // filesystem facade: fs::read("f")
 import os;                  // environment, local paths, clocks, process helpers
 import text.regex;          // POSIX ERE helpers: regex::is_match(pat, s)
 ```
@@ -552,31 +579,52 @@ The embedded standard library (sources in `internal/driver/std/`) includes:
   for small scripts.
 - `regex`: opt-in POSIX-ERE validation/search/full-match/find/replace helpers
   via `import text.regex;`. It is intentionally not a PCRE engine.
-- `fmt`: pure-Zexi formatting of numbers and values. Bases (`hex_lower`,
-  `hex_upper`, `hex_pad`, `bin_str`, `oct_str`, `radix_str`), decimal grouping
-  (`thousands`, `thousands_sep`), decimals and exponents (`fixed_point`,
-  `sci_notation`, `percent_str`), human units (`byte_size`, `duration_ms`),
-  ordinals (`ordinal`), and alignment (`align_left`/`align_right`/
-  `align_center`). It has no C shim, so it costs nothing to import.
+- `fmt`: pure-Zexi formatting of numbers and values. Bases (`hex(n, upper)`,
+  `radix(n, base)`, `hex_pad`), decimal grouping (`thousands`,
+  `thousands_sep`), decimals and exponents (`fixed`, `sci`, `percent`), human
+  units (`bytes`, `duration`), ordinals (`ordinal`), and padding (`pad_left`,
+  `pad_right`, `pad_center`, each with an optional fill character). The older
+  spellings (`hex_lower`, `fixed_point`, `byte_size`, `align_right`, …) remain
+  as aliases. It has no C shim, so it costs nothing to import.
 - `codec`: pure-Zexi encoders and checksums — hex (`hex_encode`,
   `hex_encode_upper`, `hex_decode`), base64 (`base64_encode`,
   `base64_encode_url`, `base64_decode`), and CRC-32/Adler-32/FNV-1a/djb2 with
-  fixed-width `*_hex` forms.
-- `io`, `fs`, `sys`, and `random`: console I/O (`input(prompt = "")` and
-  `read_line`); capped binary-safe file reads plus
-  `write_bytes(path, &String)` (reads, writes, and copies cap at 32 MiB);
-  environment, cwd/hostname, local non-recursive directory/file operations,
-  clocks/sleep; and deterministic or libc-backed random numbers.
-- `net` and `http`: TCP and a high-level HTTP client/server. `Client`, `get`,
-  `do`, `fetch`, `request`, `post_form_url`, `Router`, `new_app`, the Go-style
+  fixed-width `*_hex` forms. Each takes a `str`; each also has a `_bytes(&[u8])`
+  form for binary data, and `hex_decode_bytes`/`base64_decode_bytes` return a
+  `Result` so bad input is distinguishable from empty output.
+- `text` scans borrowed bytes: `find_bytes(&[u8], &[u8], from)` and `match_at`
+  are the primitives under `index_of`/`replace_all`/`starts_with`, so searching
+  a `String` never copies it.
+- `sys`, `io`, `fs`, and `random`: `sys` is the POSIX substrate (errno and
+  `IoError`, byte I/O, files, environment, clocks); `io` provides console I/O
+  (`input(prompt = "")`, `read_line() -> Result<String, IoError>`, `eprintln`);
+  `fs` provides capped, binary-safe `read`/`write(path, &[u8])`/`copy`
+  (32 MiB cap) plus `exists`, `metadata`, and `remove`. Random numbers are
+  deterministic or libc-backed.
+- `net` and `http`: TCP and UDP sockets, name resolution, readiness polling, and
+  a high-level HTTP client/server. `Client`, `get`, `do`, `fetch`, `request`,
+  `post_form_url`, `Router`, `new_app`, the Go-style
   `handle_get`/`handle_post`/`use_before`/`use_after` + `listen(":8080")`
   default mux with `{name}` route parameters, `serve_local`, `serve_n`,
-  `serve_dir`, and static-file helpers are documented in
+  `serve_dir`, and static-file helpers; `listen_workers`/`serve_workers*` serve
+  with a pool of OS threads, and `requests_served()`/`stop_serving()` report and
+  stop it; `udp_bind`/`send_to`/`recv_from`, `resolve`, `poll_read`,
+  `accept_timeout`, and `cpu_count` sit underneath. Documented in
   [`08-networking.md`](08-networking.md).
 - `thread`: OS threads (`Thread::spawn`/`spawn2`/`spawn_void`, `join`), blocking
-  `i64` channels (`Chan`, `chan_send`/`chan_recv`/`chan_close`), and lock-free
-  `i64` atomics (`Atomic`, `atomic_add`/`get`/`set`). Only `i64` values cross a
-  thread boundary; see [`11-concurrency.md`](11-concurrency.md).
+  `i64` channels (`Chan`, `chan_send`/`chan_recv`/`chan_close`), lock-free
+  `i64` atomics (`Atomic`, `atomic_add`/`get`/`set`), and a task pool
+  (`Pool::new`, `submit`/`wait`/`result`, `map` over a range, `free`). Only
+  `i64` values cross a thread boundary; see
+  [`11-concurrency.md`](11-concurrency.md).
+- `json`: parse, build, and print JSON with exact integers, round-tripping
+  doubles, insertion-ordered objects, and errors that name a byte offset
+  (`parse`, `stringify`, `pretty`, `Value`, `object`, `array`, `of_*`,
+  `quote`, `valid`). See [`14-json-and-html.md`](14-json-and-html.md).
+- `html`: safe server-rendered markup — `escape`/`attr`/`url_query`,
+  `page`/`page_with`, `tag`/`heading`/`link`/`list`/`table`, `json_script`, and
+  `template` with `{{name}}` (escaped) and `{{name|raw}}`. See
+  [`14-json-and-html.md`](14-json-and-html.md).
 
 See [`10-stdlib-recipes.md`](10-stdlib-recipes.md) for runnable local HTTP,
 filesystem, OS, and regex patterns.
@@ -586,12 +634,48 @@ is the program name) and `arg_at(i)` returns argument `i` as a `String`
 (`""` when out of range) — see `examples/args.zx`. For a complete small
 program that ties it all together, see `examples/guess.zx`.
 
-## 7.15 Not implemented yet (roadmap M1+)
+## 7.16 Adding native code from a library
+
+<!-- check-only -->
+```zx
+#[link("m")]
+extern "C" fn sqrt(x: f64) -> f64;        // call into a system library
+
+#[no_mangle]
+fn zx_half(n: i64) -> i64 { return n / 2; }   // ... and let C call back
+
+extern "C" fn zx_quarter(n: i64) -> i64;
+
+c """
+int64_t zx_quarter(int64_t n) { return zx_half(n); }
+"""
+
+fn main() -> i32 {
+    println(sqrt(256.0));      // 16
+    println(zx_quarter(10));   // 5
+    0
+}
+```
+
+`c """..."""` compiles C with the program, in the same translation unit, so it
+can use `String`, the `Vec`/`HashMap` helpers, generated structs, and any
+`#[no_mangle]` function. That is how a library adds a syscall wrapper or a
+vendored helper without a compiler change: `sys` and `regex` ship their C this
+way. See [`17-extending.md`](17-extending.md).
+
+`#[link_dir("path")]` adds `-Lpath` and `#[include("header.h")]` emits
+`#include "header.h"` at the top of the generated C, so a binding can be
+written against a real header instead of re-declaring its types.
+
+## 7.17 Not implemented yet (roadmap M1+)
 
 Traits (and trait bounds), `dyn Trait`, associated types, const generics,
-`HashMap`, `Box`, user-defined `Drop`, tuple values (tuple *structs* exist;
-`(a, b)` values and destructuring do not yet), borrow-lifetime (NLL) analysis,
-bindings inside or-patterns, and nested patterns. Scoped modules have landed for
+`Box`, user-defined `Drop`, closure environments are not freed yet, tuple values (tuple *structs* exist; `(a, b)` values
+and destructuring do not yet), borrow-lifetime (NLL) analysis, bindings inside
+or-patterns, and nested patterns. Pattern bindings in a `match` on a *borrowed*
+enum still cannot move an owned payload out (E0507), which is why `json::Value`
+is a tagged struct rather than an enum; `ref` bindings / match ergonomics are
+the missing piece. Scoped modules have landed for
 *qualified* access (imports, `as` aliases, `mod::item`, `pub` checks), but the
 merged program is still one flat namespace: unqualified cross-module names
 remain visible and ignore `pub`, so full isolation and package metadata are

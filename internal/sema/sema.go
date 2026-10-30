@@ -92,9 +92,32 @@ type Info struct {
 	PatVariant map[ast.Pattern]*types.Variant
 	// TryMatches maps a `?` expression to the ordinary `match` it desugars to.
 	TryMatches map[*ast.TryExpr]*ast.MatchExpr
+	// Closures maps each lambda expression to its resolved signature and the
+	// variables it captures from the enclosing function.
+	Closures map[*ast.LambdaExpr]*Closure
+	// ClosureOrd is every lambda in source order, so codegen can emit the
+	// lifted functions deterministically.
+	ClosureOrd []*ast.LambdaExpr
 	Types      map[ast.Expr]*types.Type
 	DeclTypes  map[ast.Stmt]*types.Type
 	Main       *Fn
+}
+
+// Closure is the resolved shape of a lambda: its parameter and return types
+// plus the enclosing bindings it captures (by value).
+type Closure struct {
+	Params   []*types.Type
+	Ret      *types.Type
+	Captures []Capture
+}
+
+// Capture is one variable a closure copies into its environment. Direct marks
+// the closure whose body actually reads the variable; enclosing closures carry
+// it too (they must hand the value down when the inner closure is built).
+type Capture struct {
+	Name   string
+	Ty     *types.Type
+	Direct bool
 }
 
 // Ctor is a resolved enum-variant constructor.
@@ -152,6 +175,7 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 			Aliases:    map[string]*types.Type{},
 			PatVariant: map[ast.Pattern]*types.Variant{},
 			TryMatches: map[*ast.TryExpr]*ast.MatchExpr{},
+			Closures:   map[*ast.LambdaExpr]*Closure{},
 			Types:      map[ast.Expr]*types.Type{},
 			DeclTypes:  map[ast.Stmt]*types.Type{},
 		},
@@ -227,7 +251,18 @@ type checker struct {
 	typeEnv   map[string]*types.Type   // in-scope type parameters (name -> type)
 	cur       *Fn
 	loopDepth int
-	breaks    []*breakInfo // one entry per enclosing loop, innermost last
+	// lambdas is the stack of closures being checked, innermost last. Each
+	// frame remembers the scope depth it opened at, so resolving a name below
+	// that depth is a capture.
+	lambdas []*lambdaFrame
+	breaks  []*breakInfo // one entry per enclosing loop, innermost last
+}
+
+// lambdaFrame is one closure being checked.
+type lambdaFrame struct {
+	node     *ast.LambdaExpr
+	base     int // scope depth of the enclosing function at the `|`
+	captures []Capture
 }
 
 // pendingInt is a defaulted integer literal awaiting a concrete integer type.
@@ -1365,6 +1400,7 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 	case *ast.PathExpr:
 		if len(x.Segments) == 1 {
 			if t := c.lookupScope(x.Segments[0]); t != nil {
+				c.noteCapture(x.Segments[0], t)
 				c.adoptInt(t, expected)
 			}
 			return c.inferIdent(x.Segments[0], x.Sp)
@@ -1412,6 +1448,9 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 
 	case *ast.Block:
 		return c.checkBlockWith(x, expected)
+
+	case *ast.LambdaExpr:
+		return c.inferLambda(x, expected)
 
 	case *ast.UnExpr:
 		return c.inferUnary(x, expected)
@@ -1652,9 +1691,111 @@ func (c *checker) adoptInt(t, want *types.Type) *types.Type {
 // inferIdentExpr types a bare name used as a value. A generic function is
 // instantiated when explicit type arguments (`f::<i64>`) or an expected
 // function type determine its parameters.
+// inferLambda checks a closure against the type it is expected to have. The
+// target type supplies any parameter or return type the closure leaves out,
+// which is why a closure has to appear where its signature is known:
+//
+//	let f: fn(i32) -> i32 = |n| n * 2;
+//	vec.each(|x| println(x));            // the parameter type comes from `each`
+func (c *checker) inferLambda(x *ast.LambdaExpr, expected *types.Type) *types.Type {
+	if expected == nil || expected.Kind != types.Fn {
+		c.errf(x.Sp, "E0282", "cannot infer the type of this closure; give it a target type, as in `let f: fn(i32) -> i32 = |n| n;`")
+		return &types.Type{Kind: types.Invalid}
+	}
+	if len(expected.Params) != len(x.Params) {
+		c.errf(x.Sp, "E0057", "this closure takes %d parameter(s) but `%s` expects %d", len(x.Params), expected.String(), len(expected.Params))
+		return &types.Type{Kind: types.Invalid}
+	}
+	params := make([]*types.Type, len(expected.Params))
+	copy(params, expected.Params)
+	for i, p := range x.Params {
+		if p.Ty == nil {
+			continue
+		}
+		want := c.resolveType(p.Ty)
+		if want == nil {
+			return &types.Type{Kind: types.Invalid}
+		}
+		if !c.assignable(want, params[i]) {
+			c.errf(p.Sp, "E0308", "closure parameter `%s` has type `%s`, but `%s` expects `%s`", p.Name, want.String(), expected.String(), params[i].String())
+			return &types.Type{Kind: types.Invalid}
+		}
+	}
+
+	cl := &Closure{Params: params, Ret: expected.Ret}
+	frame := &lambdaFrame{node: x, base: len(c.scope)}
+
+	// Parameters are bindings like any other, so the body resolves them
+	// normally; `base` is above them, which keeps them out of the captures.
+	c.pushScope()
+	for i, p := range x.Params {
+		c.declare(p.Name, params[i])
+	}
+	c.lambdas = append(c.lambdas, frame)
+	body := c.checkExpr(x.Body, expected.Ret)
+	c.lambdas = c.lambdas[:len(c.lambdas)-1]
+	c.popScope()
+
+	switch body.Kind {
+	case types.Unit, types.Never, types.Invalid:
+	default:
+		if !c.assignable(body, expected.Ret) {
+			c.errf(x.Body.Span(), "E0308", "this closure returns `%s`, but `%s` expects `%s`", body.String(), expected.String(), expected.Ret.String())
+		}
+	}
+
+	cl.Captures = frame.captures
+	c.info.Closures[x] = cl
+	c.info.ClosureOrd = append(c.info.ClosureOrd, x)
+	return expected
+}
+
+// noteCapture records that the innermost closure reads a binding from the
+// enclosing function. Variables declared inside the closure (parameters and
+// locals) are not captures.
+func (c *checker) noteCapture(name string, ty *types.Type) {
+	if len(c.lambdas) == 0 || ty == nil {
+		return
+	}
+	depth := c.lookupScopeDepth(name)
+	if depth < 0 {
+		return
+	}
+	// The innermost closure reads the value and owns the move; each enclosing
+	// closure only carries it so it can build the inner one.
+	for i := len(c.lambdas) - 1; i >= 0; i-- {
+		frame := c.lambdas[i]
+		if depth >= frame.base {
+			break // bound inside this closure, so not a capture of it or of any outer one
+		}
+		found := false
+		for _, cap := range frame.captures {
+			if cap.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			frame.captures = append(frame.captures, Capture{Name: name, Ty: ty, Direct: i == len(c.lambdas)-1})
+		}
+	}
+}
+
+// lookupScopeDepth is lookupScope, but it also reports the scope the binding
+// was found in (-1 when it is not a local).
+func (c *checker) lookupScopeDepth(name string) int {
+	for i := len(c.scope) - 1; i >= 0; i-- {
+		if _, ok := c.scope[i][name]; ok {
+			return i
+		}
+	}
+	return -1
+}
+
 func (c *checker) inferIdentExpr(x *ast.IdentExpr, expected *types.Type) *types.Type {
 	// A local binding or constant shadows a function of the same name.
 	if t := c.lookupScope(x.Name); t != nil {
+		c.noteCapture(x.Name, t)
 		c.adoptInt(t, expected)
 		return c.inferIdent(x.Name, x.Sp)
 	}
@@ -1965,6 +2106,45 @@ func (c *checker) isPlace(e ast.Expr) bool {
 	return false
 }
 
+// isCallableName reports whether the callee is a plain name (identifier or
+// path), which the other branches of inferCall handle.
+func isCallableName(e ast.Expr) bool {
+	switch e.(type) {
+	case *ast.IdentExpr, *ast.PathExpr:
+		return true
+	}
+	return false
+}
+
+// exprOfFnType checks a callee expression that is not a name and returns its
+// `fn(..)` type, or nil when it is not a function value.
+func (c *checker) exprOfFnType(e ast.Expr) *types.Type {
+	t := c.checkExpr(e, nil)
+	if t != nil && t.Kind == types.Fn {
+		return t
+	}
+	return nil
+}
+
+// checkIndirectCall type-checks a call through a computed function value.
+func (c *checker) checkIndirectCall(x *ast.CallExpr, ft *types.Type) *types.Type {
+	c.info.Indirect[x] = ft
+	if len(x.Args) != len(ft.Params) {
+		c.errAt(x, "E0061", "function value takes %d argument(s) but %d were supplied", len(ft.Params), len(x.Args))
+	}
+	for i, a := range x.Args {
+		var want *types.Type
+		if i < len(ft.Params) {
+			want = ft.Params[i]
+		}
+		at := c.checkExpr(a, want)
+		if want != nil && !c.argAssignable(want, at, false) {
+			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
+		}
+	}
+	return ft.Ret
+}
+
 func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 	// `Enum::Variant(args)` is a variant constructor, and `String::new()` /
 	// `String::from(..)` are builtin constructors.
@@ -2001,6 +2181,19 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		}
 		return c.inferVariantCtor(x, p, expected)
 	}
+	// Any expression of function type is callable, not just a name: the result
+	// of a call that returns a `fn(..)` (`make_adder(3)(x)`), an indexed slot
+	// (`handlers[i](req)`), or a field (`self.on_click(req)`).
+	if !isCallableName(x.Callee) {
+		if ft := c.exprOfFnType(x.Callee); ft != nil {
+			return c.checkIndirectCall(x, ft)
+		}
+		c.errAt(x.Callee, "E0618", "expression is not callable")
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return nil
+	}
 	name, ok := calleeName(x.Callee)
 	if !ok {
 		c.errAt(x.Callee, "E0618", "expression is not callable")
@@ -2023,6 +2216,14 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 	}
 	if name == "arg_count" {
 		return c.inferArgCount(x)
+	}
+	if name == "project_dir" {
+		if len(x.Args) != 0 {
+			c.errAt(x, "E0061", "`project_dir` takes no arguments but %d were supplied", len(x.Args))
+		}
+		// An owning String, like `arg_at`: the directory is baked into the
+		// binary and handed to the program, so it needs a real value.
+		return types.StringT
 	}
 	if name == "arg_at" {
 		return c.inferArgAt(x)
@@ -2100,8 +2301,11 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		return &types.Type{Kind: types.StructKind, St: concrete}
 	}
 	// A local binding of function type can be called directly: this is the
-	// indirect call the router/handler APIs are built on.
+	// indirect call the router/handler APIs are built on. Reading the binding
+	// from the enclosing scope is also a capture, like any other read — a
+	// closure that calls `handler(x)` must carry `handler` in its environment.
 	if ft := c.lookupScope(name); ft != nil && ft.Kind == types.Fn {
+		c.noteCapture(name, ft)
 		c.info.Indirect[x] = ft
 		if len(x.Args) != len(ft.Params) {
 			c.errAt(x, "E0061", "function value takes %d argument(s) but %d were supplied", len(ft.Params), len(x.Args))
@@ -2125,7 +2329,7 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		if t := c.inferBareVariantCtor(x, name, expected); t != nil {
 			return t
 		}
-		cands := []string{"print", "println", "len", "cstr", "from_cstr", "arg_count", "arg_at"}
+		cands := []string{"print", "println", "len", "cstr", "from_cstr", "arg_count", "arg_at", "project_dir"}
 		for n := range c.info.Fns {
 			cands = append(cands, n)
 		}
@@ -2838,6 +3042,8 @@ var stringMethods = map[string]stringMethodSig{
 	"push":        {[]*types.Type{types.CharT}, types.UnitT, true},
 	"push_str":    {[]*types.Type{types.StrT}, types.UnitT, true},
 	"push_byte":   {[]*types.Type{types.U8T}, types.UnitT, true},
+	"push_bytes":  {[]*types.Type{{Kind: types.Ref, Elem: &types.Type{Kind: types.Slice, Elem: types.U8T}}}, types.UnitT, true},
+	"as_bytes":    {nil, &types.Type{Kind: types.Ref, Elem: &types.Type{Kind: types.Slice, Elem: types.U8T}}, false},
 	"byte_at":     {[]*types.Type{types.UsizeT}, types.I64T, false},
 	"find":        {[]*types.Type{types.StrT}, types.I64T, false},
 	"contains":    {[]*types.Type{types.StrT}, types.BoolT, false},
@@ -2961,6 +3167,9 @@ func (c *checker) inferLen(x *ast.CallExpr) *types.Type {
 		t.Kind == types.StringKind || t.Kind == types.VecKind) {
 		return types.UsizeT
 	}
+	if t != nil && t.Kind == types.Ref && t.Elem != nil && t.Elem.Kind == types.Slice {
+		return types.UsizeT
+	}
 	c.errAt(x.Args[0], "E0308", "`len` expects an array, slice, `str`, `String`, or `Vec`, found `%s`", t)
 	return types.UsizeT
 }
@@ -2972,6 +3181,9 @@ func (c *checker) inferIndex(x *ast.IndexExpr) *types.Type {
 	it := c.checkExpr(x.Index, nil)
 	if base := recvBase(rt); base != nil && base.Kind == types.VecKind {
 		rt = base
+	}
+	if rt != nil && rt.Kind == types.Ref && rt.Elem != nil && rt.Elem.Kind == types.Slice {
+		rt = rt.Elem
 	}
 	if rt == nil || (rt.Kind != types.Array && rt.Kind != types.Slice && rt.Kind != types.VecKind) {
 		c.errAt(x, "E0608", "cannot index a value of type `%s`", rt)
@@ -2995,6 +3207,30 @@ func (c *checker) inferIndex(x *ast.IndexExpr) *types.Type {
 func (c *checker) inferSlice(x *ast.SliceExpr) *types.Type {
 	rt := c.checkExpr(x.Recv, nil)
 	isStr := rt != nil && (rt.Kind == types.Str || rt.Kind == types.StringKind)
+	// Arrays and slices slice into a borrowed view without copying. A slice of
+	// a borrowed slice keeps the same element type.
+	base := rt
+	if base != nil && base.Kind == types.Ref && base.Elem != nil {
+		base = base.Elem
+	}
+	if base != nil && (base.Kind == types.Array || base.Kind == types.Slice) {
+		if x.Low != nil {
+			it := c.checkExpr(x.Low, nil)
+			if it != nil && !it.Kind.IsInt() {
+				c.errAt(x.Low, "E0308", "slice bound must be an integer, found `%s`", it)
+			}
+		}
+		if x.High != nil {
+			it := c.checkExpr(x.High, nil)
+			if it != nil && !it.Kind.IsInt() {
+				c.errAt(x.High, "E0308", "slice bound must be an integer, found `%s`", it)
+			}
+		}
+		if base.Kind == types.Slice {
+			return base
+		}
+		return &types.Type{Kind: types.Slice, Elem: base.Elem}
+	}
 	if !isStr {
 		c.errAt(x, "E0608", "cannot slice a value of type `%s`", rt)
 		if x.Low != nil {
@@ -3595,15 +3831,28 @@ func (c *checker) inferTry(x *ast.TryExpr, expected *types.Type) *types.Type {
 	}
 
 	const okName, errName = "__try_ok", "__try_err"
-	okPat := &ast.PathPat{
-		Path: []string{srcBase, "Ok"},
-		Sub:  []ast.Pattern{&ast.BindPat{Name: okName, Sp: x.Sp}},
-		Sp:   x.Sp,
+	// `Ok(())` has no value to bind: use a wildcard instead, so codegen never
+	// declares a `void` local for the payload.
+	unitOK := len(src.En.Args) >= 1 && src.En.Args[0] != nil && src.En.Args[0].Kind == types.Unit
+	var okPat ast.Pattern
+	var okBody ast.Expr
+	if unitOK {
+		okPat = &ast.WildcardPat{Sp: x.Sp}
+		okBody = &ast.TupleExpr{Sp: x.Sp}
+	} else {
+		okPat = &ast.PathPat{
+			Path: []string{srcBase, "Ok"},
+			Sub:  []ast.Pattern{&ast.BindPat{Name: okName, Sp: x.Sp}},
+			Sp:   x.Sp,
+		}
+		okBody = &ast.IdentExpr{Name: okName, Sp: x.Sp}
 	}
 	var errPat ast.Pattern
 	var errBody ast.Expr
 	if srcBase == "Result" {
-		okPat.Path[1] = "Ok"
+		if pp, isPath := okPat.(*ast.PathPat); isPath {
+			pp.Path[1] = "Ok"
+		}
 		errPat = &ast.PathPat{
 			Path: []string{"Result", "Err"},
 			Sub:  []ast.Pattern{&ast.BindPat{Name: errName, Sp: x.Sp}},
@@ -3615,15 +3864,19 @@ func (c *checker) inferTry(x *ast.TryExpr, expected *types.Type) *types.Type {
 			Sp:     x.Sp,
 		}}
 	} else {
-		okPat.Path[1] = "Some"
+		if pp, isPath := okPat.(*ast.PathPat); isPath {
+			pp.Path[1] = "Some"
+		}
 		errPat = &ast.PathPat{Path: []string{"Option", "None"}, Sp: x.Sp}
 		errBody = &ast.JumpExpr{Kind: token.KindReturn, Sp: x.Sp, Val: &ast.PathExpr{Segments: []string{"Option", "None"}, Sp: x.Sp}}
 	}
 	m := &ast.MatchExpr{
 		Scrutinee: x.X,
+		// The error arm comes first: a unit `Ok` desugars to a wildcard, which
+		// would make a later arm unreachable.
 		Arms: []ast.MatchArm{
-			{Pat: okPat, Body: &ast.IdentExpr{Name: okName, Sp: x.Sp}, Sp: x.Sp},
 			{Pat: errPat, Body: errBody, Sp: x.Sp},
+			{Pat: okPat, Body: okBody, Sp: x.Sp},
 		},
 		Sp: x.Sp,
 	}
@@ -3846,6 +4099,21 @@ func recvBase(t *types.Type) *types.Type {
 	return t
 }
 
+// sliceElem returns the element type when t is a slice or a reference to one,
+// and nil otherwise.
+func sliceElem(t *types.Type) *types.Type {
+	if t == nil {
+		return nil
+	}
+	if t.Kind == types.Slice {
+		return t.Elem
+	}
+	if t.Kind == types.Ref && t.Elem != nil && t.Elem.Kind == types.Slice {
+		return t.Elem.Elem
+	}
+	return nil
+}
+
 func (c *checker) inferField(x *ast.FieldExpr) *types.Type {
 	rt := c.checkExpr(x.Recv, nil)
 	base := recvBase(rt)
@@ -3876,9 +4144,13 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 		}
 		return c.inferMapMethod(x, base)
 	}
-	// `len()` is also available directly on arrays and `str` values.
-	if x.Name == "len" && len(x.Args) == 0 && base != nil && (base.Kind == types.Array || base.Kind == types.Str) {
+	// `len()` is also available directly on arrays, slices, and `str` values.
+	if x.Name == "len" && len(x.Args) == 0 && base != nil && (base.Kind == types.Array || base.Kind == types.Str || base.Kind == types.Slice) {
 		return types.UsizeT
+	}
+	// `str::as_bytes()` borrows the text as a byte slice, without copying.
+	if x.Name == "as_bytes" && len(x.Args) == 0 && base != nil && base.Kind == types.Str {
+		return &types.Type{Kind: types.Ref, Elem: &types.Type{Kind: types.Slice, Elem: types.U8T}}
 	}
 	if base == nil || (base.Kind != types.StructKind && base.Kind != types.EnumKind) {
 		c.errAt(x, "E0599", "no method `%s` on type `%s`", x.Name, rt)
@@ -4298,6 +4570,19 @@ func (c *checker) inferFor(x *ast.LoopExpr) *types.Type {
 			c.popScope()
 			return types.UnitT
 		}
+		if elem := sliceElem(it); elem != nil {
+			// A slice yields `Copy` elements by value, like an array.
+			if !elem.IsCopy() {
+				c.errAt(x.Iter, "E0507", "cannot iterate a slice of non-`Copy` element type `%s` by value", elem)
+			}
+			c.pushScope()
+			c.bindPattern(x.Pat, elem)
+			c.loopDepth++
+			c.checkBlock(x.Body)
+			c.loopDepth--
+			c.popScope()
+			return types.UnitT
+		}
 		if base := recvBase(it); base != nil && base.Kind == types.VecKind {
 			// As with arrays, elements must be `Copy`: the binding is a copy
 			// of each element, and an owned element would be dropped twice.
@@ -4557,6 +4842,19 @@ func (c *checker) assignable(dst, src *types.Type) bool {
 	// `&mut T` coerces to `&T`.
 	if dst.Kind == types.Ref && src.Kind == types.Ref && !dst.Mut && src.Mut {
 		return types.Equal(dst.Elem, src.Elem)
+	}
+	// Unsizing: a borrow of a fixed array is a slice of the same elements.
+	// `&mut [T; N]` also satisfies `&[T]`; the other direction does not hold.
+	if dst.Kind == types.Ref && src.Kind == types.Ref && dst.Elem != nil && src.Elem != nil &&
+		dst.Elem.Kind == types.Slice && src.Elem.Kind == types.Array &&
+		types.Equal(dst.Elem.Elem, src.Elem.Elem) {
+		return !dst.Mut || src.Mut
+	}
+	// A slice value may be passed where a borrowed slice is expected: both are
+	// a non-owning view, so taking the borrow is a no-op.
+	if dst.Kind == types.Ref && dst.Elem != nil && dst.Elem.Kind == types.Slice &&
+		src.Kind == types.Slice && types.Equal(dst.Elem, src) {
+		return !dst.Mut
 	}
 	return false
 }

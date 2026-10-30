@@ -339,6 +339,9 @@ func (g *gen) vecMethodCall(x *ast.MethodCallExpr) string {
 		// `pop` yields `Option<T>`, so the empty case builds `None` instead of
 		// faulting. The runtime helper's own empty check stays as a backstop.
 		return "({ " + prologue + popOption(recv, vn, g.info.TypeOf(x), t.Elem) + epilogue + " })"
+	case "each", "count", "any", "all", "fold":
+		return g.vecClosureLoop(x, recv, t)
+
 	case "remove", "swap_remove":
 		rt := g.info.TypeOf(x)
 		res := g.tmpName()
@@ -352,6 +355,82 @@ func (g *gen) vecMethodCall(x *ast.MethodCallExpr) string {
 		return "0 /* unhandled Vec method */"
 	}
 	return "({ " + prologue + expr + ";" + epilogue + " })"
+}
+
+// vecClosureLoop lowers the closure-taking Vec methods (`each`, `count`, `any`,
+// `all`) to an inline loop over the buffer. The element is copied per
+// iteration, which is why sema requires `Copy` elements.
+func (g *gen) vecClosureLoop(x *ast.MethodCallExpr, recv string, t *types.Type) string {
+	elem := t.Elem
+	argIdx := 0
+	if x.Name == "fold" {
+		argIdx = 1
+	}
+	fnTy := g.info.TypeOf(x.Args[argIdx])
+	if fnTy == nil || fnTy.Kind != types.Fn {
+		return "0 /* closure type missing */"
+	}
+	f := g.tmpName()
+	ctr := g.tmpName()
+	el := g.tmpName()
+	vec := g.tmpName()
+	call := g.callClosure(f, fnTy, []string{el})
+	acc := g.tmpName()
+	var head, tail string
+	switch x.Name {
+	case "each":
+		head, tail = "", ""
+	case "count":
+		head, tail = "size_t zx_n = 0;", "zx_n"
+	case "any":
+		head, tail = "bool zx_ok = false;", "zx_ok"
+	case "all":
+		head, tail = "bool zx_ok = true;", "zx_ok"
+	case "fold":
+		head, tail = ctype(elem)+" "+acc+" = "+g.consume(x.Args[0])+";", acc
+	}
+	var body string
+	switch x.Name {
+	case "each":
+		body = call + ";"
+	case "count":
+		body = "if (" + call + ") zx_n++;"
+	case "any":
+		body = "if (" + call + ") { zx_ok = true; break; }"
+	case "all":
+		body = "if (!(" + call + ")) { zx_ok = false; break; }"
+	case "fold":
+		body = acc + " = " + g.callClosure(f, fnTy, []string{acc, el}) + ";"
+	}
+	out := "({ "
+	out += ctype(t) + " " + vec + " = " + recv + "; "
+	out += "void *" + f + " = " + g.value(x.Args[argIdx]) + "; "
+	out += head + " "
+	out += "size_t " + ctr + "; "
+	out += "for (" + ctr + " = 0; " + ctr + " < (size_t)(" + vec + ").len; " + ctr + "++) { "
+	out += ctype(elem) + " " + el + " = (" + vec + ").ptr[" + ctr + "]; "
+	out += body + " } "
+	if tail != "" {
+		out += tail + "; "
+	}
+	out += "})"
+	return out
+}
+
+// callClosure emits a call through a function value: the record carries both
+// the function and the environment it runs with.
+func (g *gen) callClosure(callee string, fnTy *types.Type, args []string) string {
+	params := make([]string, 0, len(fnTy.Params)+1)
+	for _, p := range fnTy.Params {
+		params = append(params, ctype(p))
+	}
+	sig := ctype(fnTy.Ret) + " (*)(void *"
+	if len(params) > 0 {
+		sig += ", " + strings.Join(params, ", ")
+	}
+	sig += ")"
+	all := append([]string{"(void *)" + callee}, args...)
+	return "((" + sig + ")(((zx_Closure *)" + callee + ")->fn))(" + strings.Join(all, ", ") + ")"
 }
 
 // popOption builds the `Option<T>` result of `pop`: `None` when the Vec is

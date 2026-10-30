@@ -1,6 +1,6 @@
-// codec — encoders and checksums for byte strings.
+// codec — encoders and checksums for byte data.
 //
-// Pure Zexi over the built-in `String` (no C shim), `codec` covers the small
+// Pure Zexi over `String`/slices (no C shim), `codec` covers the small
 // conversions a program reaches for around the network edge: hex and base64 for
 // tokens, Basic auth, data URIs, and cache keys, plus the checksums commonly
 // used for ETags and integrity checks.
@@ -12,11 +12,11 @@
 //     println(codec::crc32_hex("123456789"));  // cbf43926
 //     println(codec::fnv1a64_hex("hello"));    // a430d84680aabd0b
 //
-// Inputs and outputs are `str`-shaped: a `String` argument is accepted anywhere
-// a `str` is, and encode/checksum functions return an owning `String` or a
-// numeric hash. Because Zexi has no byte-array type yet, decoded bytes are
-// returned as a `String` (which is byte-safe for lengths and `byte_at`, but is
-// intended for text-shaped data).
+// Every encoder has a `_bytes` form taking a `&[u8]`, so binary data — a file
+// read with `fs::read`, a request body, a socket frame — is encoded without a
+// detour through text. The `str` spellings are one-line wrappers that lend
+// their bytes, and decoded output is an owning `String` (Zexi's byte buffer),
+// so NUL and high bytes survive a round trip.
 
 // codec_hex_digit maps 0..15 to its lowercase ASCII digit byte.
 fn codec_hex_digit(d: i64) -> u8 {
@@ -24,6 +24,14 @@ fn codec_hex_digit(d: i64) -> u8 {
         return (48 as u8) + (d as u8); // '0'
     }
     return (87 as u8) + (d as u8); // 'a' - 10
+}
+
+// codec_hex_digit_upper maps 0..15 to its uppercase ASCII digit byte.
+fn codec_hex_digit_upper(d: i64) -> u8 {
+    if d < 10 {
+        return (48 as u8) + (d as u8); // '0'
+    }
+    return (55 as u8) + (d as u8); // 'A' - 10
 }
 
 // codec_hex_value is the numeric value of an ASCII hex digit, or -1.
@@ -57,7 +65,7 @@ fn codec_hex_u64(v: u64, width: i32) -> String {
     if w > 16 {
         w = 16;
     }
-    let mut out = String::from("");
+    let mut out = String::with_capacity(w as usize);
     let mut j: usize = w as usize;
     while j > 0 {
         j -= 1;
@@ -68,13 +76,13 @@ fn codec_hex_u64(v: u64, width: i32) -> String {
 
 // --- hex -------------------------------------------------------------------
 
-// hex_encode renders the bytes of s as lowercase hex.
-pub fn hex_encode(s: str) -> String {
-    let v = String::from(s);
-    let mut out = String::from("");
+// hex_encode_bytes renders data as lowercase hex. Its output is always twice
+// the input length, so the buffer is sized once instead of grown.
+pub fn hex_encode_bytes(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len() * 2);
     let mut i: usize = 0;
-    while i < v.len() {
-        let b = v.byte_at(i);
+    while i < data.len() {
+        let b = data[i] as i64;
         out.push_byte(codec_hex_digit(b / 16));
         out.push_byte(codec_hex_digit(b % 16));
         i += 1;
@@ -82,41 +90,46 @@ pub fn hex_encode(s: str) -> String {
     return out;
 }
 
-// hex_encode_upper renders the bytes of s as uppercase hex.
-pub fn hex_encode_upper(s: str) -> String {
-    let v = String::from(s);
-    let mut out = String::from("");
+// hex_encode renders the bytes of s as lowercase hex.
+pub fn hex_encode(s: str) -> String {
+    return hex_encode_bytes(s.as_bytes());
+}
+
+// hex_encode_bytes_upper renders data as uppercase hex. Both nibbles go
+// through the uppercase digit table, so `ff` is "FF" and not "fF".
+pub fn hex_encode_bytes_upper(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len() * 2);
     let mut i: usize = 0;
-    while i < v.len() {
-        let b = v.byte_at(i);
-        out.push_byte(codec_hex_digit(b / 16));
-        let lo = codec_hex_digit(b % 16);
-        if lo >= 97 && lo <= 102 {
-            out.push_byte(lo - 32);
-        } else {
-            out.push_byte(lo);
-        }
+    while i < data.len() {
+        let b = data[i] as i64;
+        out.push_byte(codec_hex_digit_upper(b / 16));
+        out.push_byte(codec_hex_digit_upper(b % 16));
         i += 1;
     }
     return out;
 }
 
-// hex_decode parses hex into its bytes. Whitespace is ignored; an odd digit
-// count or any non-hex character makes it return an empty string.
-pub fn hex_decode(s: str) -> String {
-    let v = String::from(s);
-    let mut out = String::from("");
+// hex_encode_upper renders the bytes of s as uppercase hex.
+pub fn hex_encode_upper(s: str) -> String {
+    return hex_encode_bytes_upper(s.as_bytes());
+}
+
+// hex_decode_bytes parses hex into its bytes, ignoring ASCII whitespace. An odd
+// digit count or a non-hex character is an error, so a truncated token cannot
+// silently decode to a shorter value.
+pub fn hex_decode_bytes(data: &[u8]) -> Result<String, String> {
+    let mut out = String::with_capacity(data.len() / 2);
     let mut hi: i64 = -1;
     let mut i: usize = 0;
-    while i < v.len() {
-        let c = v.byte_at(i);
+    while i < data.len() {
+        let c = data[i] as i64;
         i += 1;
         if c == 32 || c == 9 || c == 10 || c == 13 {
             continue;
         }
         let d = codec_hex_value(c);
         if d < 0 {
-            return String::from("");
+            return Err(String::from("invalid hex digit"));
         }
         if hi < 0 {
             hi = d;
@@ -126,53 +139,55 @@ pub fn hex_decode(s: str) -> String {
         }
     }
     if hi >= 0 {
-        return String::from("");
+        return Err(String::from("odd number of hex digits"));
     }
-    return out;
+    return Ok(out);
+}
+
+// hex_decode parses hex into its bytes, returning "" on malformed input. Use
+// hex_decode_bytes when the caller needs to tell bad input from empty output.
+pub fn hex_decode(s: str) -> String {
+    match hex_decode_bytes(s.as_bytes()) {
+        Ok(out) => return out,
+        Err(_) => return String::new(),
+    }
 }
 
 // --- base64 ----------------------------------------------------------------
 
-// codec_b64_at is the byte of the alphabet at index k.
-fn codec_b64_at(alpha: str, k: i64) -> u8 {
-    let a = String::from(alpha);
-    return a.byte_at(k as usize) as u8;
-}
-
-// codec_b64 encodes s; url picks the URL-safe alphabet and pad adds `=`.
-fn codec_b64(s: str, url: bool, pad: bool) -> String {
-    let v = String::from(s);
-    let mut alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+// codec_b64 encodes data; url picks the URL-safe alphabet and pad adds `=`.
+fn codec_b64(data: &[u8], url: bool, pad: bool) -> String {
+    let mut alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".as_bytes();
     if url {
-        alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".as_bytes();
     }
-    let mut out = String::from("");
+    let mut out = String::with_capacity((data.len() / 3 + 1) * 4);
     let mut i: usize = 0;
-    while i + 3 <= v.len() {
-        let b0 = v.byte_at(i);
-        let b1 = v.byte_at(i + 1);
-        let b2 = v.byte_at(i + 2);
-        out.push_byte(codec_b64_at(alpha, b0 / 4));
-        out.push_byte(codec_b64_at(alpha, (b0 % 4) * 16 + b1 / 16));
-        out.push_byte(codec_b64_at(alpha, (b1 % 16) * 4 + b2 / 64));
-        out.push_byte(codec_b64_at(alpha, b2 % 64));
+    while i + 3 <= data.len() {
+        let b0 = data[i] as i64;
+        let b1 = data[i + 1] as i64;
+        let b2 = data[i + 2] as i64;
+        out.push_byte(alpha[(b0 / 4) as usize]);
+        out.push_byte(alpha[((b0 % 4) * 16 + b1 / 16) as usize]);
+        out.push_byte(alpha[((b1 % 16) * 4 + b2 / 64) as usize]);
+        out.push_byte(alpha[(b2 % 64) as usize]);
         i += 3;
     }
-    let rem = v.len() - i;
+    let rem = data.len() - i;
     if rem == 1 {
-        let b0 = v.byte_at(i);
-        out.push_byte(codec_b64_at(alpha, b0 / 4));
-        out.push_byte(codec_b64_at(alpha, (b0 % 4) * 16));
+        let b0 = data[i] as i64;
+        out.push_byte(alpha[(b0 / 4) as usize]);
+        out.push_byte(alpha[((b0 % 4) * 16) as usize]);
         if pad {
             out.push('=');
             out.push('=');
         }
     } else if rem == 2 {
-        let b0 = v.byte_at(i);
-        let b1 = v.byte_at(i + 1);
-        out.push_byte(codec_b64_at(alpha, b0 / 4));
-        out.push_byte(codec_b64_at(alpha, (b0 % 4) * 16 + b1 / 16));
-        out.push_byte(codec_b64_at(alpha, (b1 % 16) * 4));
+        let b0 = data[i] as i64;
+        let b1 = data[i + 1] as i64;
+        out.push_byte(alpha[(b0 / 4) as usize]);
+        out.push_byte(alpha[((b0 % 4) * 16 + b1 / 16) as usize]);
+        out.push_byte(alpha[((b1 % 16) * 4) as usize]);
         if pad {
             out.push('=');
         }
@@ -180,14 +195,25 @@ fn codec_b64(s: str, url: bool, pad: bool) -> String {
     return out;
 }
 
+// base64_encode_bytes renders data with the standard alphabet and `=` padding.
+pub fn base64_encode_bytes(data: &[u8]) -> String {
+    return codec_b64(data, false, true);
+}
+
 // base64_encode renders s with the standard alphabet and `=` padding.
 pub fn base64_encode(s: str) -> String {
-    return codec_b64(s, false, true);
+    return base64_encode_bytes(s.as_bytes());
+}
+
+// base64_encode_url_bytes is base64_encode_bytes with the URL-safe alphabet and
+// no padding.
+pub fn base64_encode_url_bytes(data: &[u8]) -> String {
+    return codec_b64(data, true, false);
 }
 
 // base64_encode_url renders s with the URL-safe alphabet and no padding.
 pub fn base64_encode_url(s: str) -> String {
-    return codec_b64(s, true, false);
+    return base64_encode_url_bytes(s.as_bytes());
 }
 
 // codec_b64_value is the 6-bit value of a base64 character from either
@@ -211,16 +237,15 @@ fn codec_b64_value(c: i64) -> i64 {
     return -1;
 }
 
-// base64_decode decodes either alphabet, ignoring `=` and whitespace. A
-// malformed length or character makes it return an empty string.
-pub fn base64_decode(s: str) -> String {
-    let v = String::from(s);
+// base64_decode_bytes decodes either alphabet, ignoring `=` and whitespace. A
+// malformed length or character is an error rather than a silent truncation.
+pub fn base64_decode_bytes(data: &[u8]) -> Result<String, String> {
     let mut acc: [i64; 4] = [0; 4];
     let mut n: usize = 0;
-    let mut out = String::from("");
+    let mut out = String::with_capacity((data.len() / 4) * 3);
     let mut i: usize = 0;
-    while i < v.len() {
-        let c = v.byte_at(i);
+    while i < data.len() {
+        let c = data[i] as i64;
         i += 1;
         if c == 61 {
             continue; // '='
@@ -230,7 +255,7 @@ pub fn base64_decode(s: str) -> String {
         }
         let d = codec_b64_value(c);
         if d < 0 {
-            return String::from("");
+            return Err(String::from("invalid base64 character"));
         }
         acc[n] = d;
         n += 1;
@@ -247,21 +272,28 @@ pub fn base64_decode(s: str) -> String {
         out.push_byte(((acc[0] * 4 + acc[1] / 16) as u8));
         out.push_byte(((acc[1] % 16 * 16 + acc[2] / 4) as u8));
     } else if n != 0 {
-        return String::from("");
+        return Err(String::from("truncated base64 input"));
     }
-    return out;
+    return Ok(out);
+}
+
+// base64_decode decodes either alphabet, returning "" on malformed input.
+pub fn base64_decode(s: str) -> String {
+    match base64_decode_bytes(s.as_bytes()) {
+        Ok(out) => return out,
+        Err(_) => return String::new(),
+    }
 }
 
 // --- checksums -------------------------------------------------------------
 
-// crc32 is the standard (zlib/IEEE 802.3) CRC-32 of s, as an unsigned 32-bit
-// value in an i64.
-pub fn crc32(s: str) -> i64 {
-    let v = String::from(s);
+// crc32_bytes is the standard (zlib/IEEE 802.3) CRC-32 of data, as an unsigned
+// 32-bit value in an i64.
+pub fn crc32_bytes(data: &[u8]) -> i64 {
     let mut crc: i64 = 4294967295; // 0xFFFFFFFF
     let mut i: usize = 0;
-    while i < v.len() {
-        crc = (crc ^ v.byte_at(i)) & 4294967295;
+    while i < data.len() {
+        crc = (crc ^ (data[i] as i64)) & 4294967295;
         let mut k: i32 = 0;
         while k < 8 {
             if crc % 2 == 1 {
@@ -276,24 +308,33 @@ pub fn crc32(s: str) -> i64 {
     return (crc ^ 4294967295) & 4294967295;
 }
 
+// crc32 is the standard CRC-32 of s, as an unsigned 32-bit value in an i64.
+pub fn crc32(s: str) -> i64 {
+    return crc32_bytes(s.as_bytes());
+}
+
 // crc32_hex is crc32 rendered as eight lowercase hex digits.
 pub fn crc32_hex(s: str) -> String {
     return codec_hex_u64(crc32(s) as u64, 8);
 }
 
-// adler32 is the zlib Adler-32 checksum of s, as an unsigned 32-bit value in an
-// i64.
-pub fn adler32(s: str) -> i64 {
-    let v = String::from(s);
+// adler32_bytes is the zlib Adler-32 checksum of data, as an unsigned 32-bit
+// value in an i64.
+pub fn adler32_bytes(data: &[u8]) -> i64 {
     let mut a: i64 = 1;
     let mut b: i64 = 0;
     let mut i: usize = 0;
-    while i < v.len() {
-        a = (a + v.byte_at(i)) % 65521;
+    while i < data.len() {
+        a = (a + (data[i] as i64)) % 65521;
         b = (b + a) % 65521;
         i += 1;
     }
     return b * 65536 + a;
+}
+
+// adler32 is the Adler-32 checksum of s, as an unsigned 32-bit value in an i64.
+pub fn adler32(s: str) -> i64 {
+    return adler32_bytes(s.as_bytes());
 }
 
 // adler32_hex is adler32 rendered as eight lowercase hex digits.
@@ -301,16 +342,21 @@ pub fn adler32_hex(s: str) -> String {
     return codec_hex_u64(adler32(s) as u64, 8);
 }
 
-// fnv1a32 is the 32-bit FNV-1a hash of s, as an unsigned 32-bit value in an i64.
-pub fn fnv1a32(s: str) -> i64 {
-    let v = String::from(s);
+// fnv1a32_bytes is the 32-bit FNV-1a hash of data, as an unsigned 32-bit value
+// in an i64.
+pub fn fnv1a32_bytes(data: &[u8]) -> i64 {
     let mut h: i64 = 0x811c9dc5;
     let mut i: usize = 0;
-    while i < v.len() {
-        h = ((h ^ v.byte_at(i)) * 0x01000193) & 0xffffffff;
+    while i < data.len() {
+        h = ((h ^ (data[i] as i64)) * 0x01000193) & 0xffffffff;
         i += 1;
     }
     return h;
+}
+
+// fnv1a32 is the 32-bit FNV-1a hash of s, as an unsigned 32-bit value in an i64.
+pub fn fnv1a32(s: str) -> i64 {
+    return fnv1a32_bytes(s.as_bytes());
 }
 
 // fnv1a32_hex is fnv1a32 rendered as eight lowercase hex digits.
@@ -318,16 +364,20 @@ pub fn fnv1a32_hex(s: str) -> String {
     return codec_hex_u64(fnv1a32(s) as u64, 8);
 }
 
-// fnv1a64 is the 64-bit FNV-1a hash of s.
-pub fn fnv1a64(s: str) -> u64 {
-    let v = String::from(s);
+// fnv1a64_bytes is the 64-bit FNV-1a hash of data.
+pub fn fnv1a64_bytes(data: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     let mut i: usize = 0;
-    while i < v.len() {
-        h = (h ^ (v.byte_at(i) as u64)) * 0x100000001b3;
+    while i < data.len() {
+        h = (h ^ (data[i] as u64)) * 0x100000001b3;
         i += 1;
     }
     return h;
+}
+
+// fnv1a64 is the 64-bit FNV-1a hash of s.
+pub fn fnv1a64(s: str) -> u64 {
+    return fnv1a64_bytes(s.as_bytes());
 }
 
 // fnv1a64_hex is fnv1a64 rendered as sixteen lowercase hex digits.
@@ -335,16 +385,20 @@ pub fn fnv1a64_hex(s: str) -> String {
     return codec_hex_u64(fnv1a64(s), 16);
 }
 
-// djb2 is Bernstein's djb2 hash of s over 64 bits.
-pub fn djb2(s: str) -> u64 {
-    let v = String::from(s);
+// djb2_bytes is Bernstein's djb2 hash of data over 64 bits.
+pub fn djb2_bytes(data: &[u8]) -> u64 {
     let mut h: u64 = 5381;
     let mut i: usize = 0;
-    while i < v.len() {
-        h = h * 33 + (v.byte_at(i) as u64);
+    while i < data.len() {
+        h = h * 33 + (data[i] as u64);
         i += 1;
     }
     return h;
+}
+
+// djb2 is Bernstein's djb2 hash of s over 64 bits.
+pub fn djb2(s: str) -> u64 {
+    return djb2_bytes(s.as_bytes());
 }
 
 // djb2_hex is djb2 rendered as sixteen lowercase hex digits.
