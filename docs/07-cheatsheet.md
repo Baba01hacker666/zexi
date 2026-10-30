@@ -367,12 +367,35 @@ v.clear();
 when the `Vec` goes out of scope, is reassigned, or is truncated. Indexing is
 bounds-checked and panics rather than reading out of bounds.
 
-Two operations need a `Copy` element type, because there is no element-wise
-clone trait yet:
+`clone` needs a `Copy` element type, because there is no element-wise clone
+trait yet: `clone` on a `Vec<String>` is E0277 — build a new `Vec` and push each
+element.
 
-- `clone` on a `Vec<String>` is E0277 — build a new `Vec` and push each element.
-- `for x in v` borrows the elements, so it needs `Copy` too; iterating a
-  `Vec<String>` is E0507. Index with `v[i]` instead.
+The closure-taking helpers (`each`, `count`, `any`, `all`) take the element
+either by value (a copy, so only for `Copy` elements) or by reference:
+
+```zx
+let mut words: Vec<String> = Vec::new();
+words.push(String::from("alpha"));
+words.push(String::from("b"));
+
+words.count(|w: &String| w.len() > 1);      // 1  — borrowed in place
+words.any(|w: &String| w == "b");           // true
+words.each(|w: &String| { println(w); });   // the vector is unchanged
+
+let mut nums: Vec<i64> = Vec::new();
+nums.push(7);
+nums.count(|n: i64| n > 7);                 // 0  — a copy is fine here
+nums.count(|n: &i64| n > 7);                // 0  — so is a borrow
+```
+
+A borrow reads like the value it points at: a method call goes through it
+(`w.len()`), a comparison reads through it (`w == "b"`, `n > 7`), and `println`
+prints it. It is still a borrow — assigning to it is an error, and a `fold`
+accumulates by value, so its elements must be `Copy`.
+
+`for x in v` still copies each element, so iterating a `Vec<String>` is E0507;
+use `each` with a `&T` closure, or index with `v[i]`.
 
 Nested (`Vec<Vec<i64>>`) and struct-holding (`Vec<Item>`) vectors work, and a
 struct may hold a `Vec` field. See `tests/vec.zx` for a full tour.

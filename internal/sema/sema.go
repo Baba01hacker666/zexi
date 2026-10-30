@@ -2089,6 +2089,23 @@ func isScalarText(t *types.Type) bool {
 	return t.Kind.IsNumeric() || t.Kind == types.Bool || t.Kind == types.Char
 }
 
+// comparableValue reports whether a value of type t (or of the type t points
+// at) can take part in a comparison, which is what makes reading through a
+// borrow meaningful.
+func comparableValue(t *types.Type) bool {
+	if t == nil {
+		return false
+	}
+	if t.Kind == types.Ref {
+		t = t.Elem
+	}
+	if t == nil {
+		return false
+	}
+	return t.Kind.IsNumeric() || t.Kind == types.Bool || t.Kind == types.Char ||
+		t.Kind == types.Str || t.Kind == types.StringKind
+}
+
 // isComparison reports whether op is one of the six comparison operators.
 func isComparison(op token.Kind) bool {
 	switch op {
@@ -2132,6 +2149,34 @@ func (c *checker) inferBinary(x *ast.BinExpr, expected *types.Type) *types.Type 
 		case isStrLike(lt) && (isStrLike(rt) || isScalarText(rt)),
 			isStrLike(rt) && isScalarText(lt):
 			return types.StringT
+		}
+	}
+	// A comparison reads through a borrow on either side: `n > 7` where
+	// `n: &i64`, or `s == "b"` where `s: &String`. The reference is peeled for
+	// the type check only — codegen emits the dereference — and only when the
+	// pointee is itself comparable, so comparing two pointers by address stays
+	// an error rather than silently becoming a value comparison.
+	if isComparison(x.Op) && (lt.Kind == types.Ref || rt.Kind == types.Ref) && comparableValue(lt) && comparableValue(rt) {
+		peel := func(t *types.Type) *types.Type {
+			if t.Kind == types.Ref && t.Elem != nil {
+				return t.Elem
+			}
+			return t
+		}
+		pl, pr := peel(lt), peel(rt)
+		switch {
+		case types.Equal(pl, pr):
+			lt, rt = pl, pr
+		case isStrLike(pl) && isStrLike(pr):
+			// `s == "b"` where `s: &String`: compare the text behind the borrow.
+			lt, rt = pl, pr
+		case isIntLiteral(x.R) && pl.Kind.IsNumeric():
+			// `n > 7` where `n: &i64`: the literal takes the pointee's type.
+			lt = pl
+			rt = c.checkExpr(x.R, pl)
+		case isIntLiteral(x.L) && pr.Kind.IsNumeric():
+			lt = c.checkExpr(x.L, pr)
+			rt = pr
 		}
 	}
 	// Comparison over any two string-like operands compares bytes, so `"a" < b`
@@ -5410,6 +5455,10 @@ func isPrintable(t *types.Type) bool {
 	switch t.Kind {
 	case types.Str, types.Char, types.Bool, types.StringKind:
 		return true
+	case types.Ref:
+		// Reading through a borrow prints the value it points at, so a closure
+		// over `&T` can print what it was handed.
+		return isPrintable(t.Elem)
 	}
 	return t.Kind.IsNumeric()
 }

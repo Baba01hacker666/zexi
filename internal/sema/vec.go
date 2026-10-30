@@ -168,17 +168,29 @@ func (c *checker) inferVecMethod(x *ast.MethodCallExpr, recv *types.Type) *types
 		c.errAt(x, "E0277", "`Vec<%s>` cannot be cloned because `%s` is not `Copy`; build a new `Vec` and push each element", elem, elem)
 		return nil
 	}
-	if sig.closure != 0 && !elem.IsCopy() {
-		// The closure receives a copy of the element, which is only sound for
-		// types that own nothing; iterating an owning element needs borrows.
-		c.errAt(x, "E0277", "`Vec::%s` needs `Copy` elements, but `%s` owns memory; iterate with an index and a borrow instead", x.Name, elem)
+	// A closure may take the element by value (a copy, sound only when the
+	// element owns nothing) or by reference (`|s: &String| ...`), which borrows
+	// the element in place and is what owning elements need. `fold` is the
+	// exception: its accumulator is an element value, and the generated loop
+	// cannot drop the ones it replaces, so it stays by-value only.
+	borrowElem := sig.closure != 0 && sig.closure != 3 && c.vecClosureBorrows(x, sig, elem)
+	if sig.closure != 0 && !elem.IsCopy() && !borrowElem {
+		if sig.closure == 3 {
+			c.errAt(x, "E0277", "`Vec::fold` needs `Copy` elements, but `%s` owns memory; accumulate with a borrow and an index instead", elem)
+		} else {
+			c.errAt(x, "E0277", "`Vec::%s` needs either `Copy` elements or a closure that borrows them; write the parameter as `&%s`", x.Name, elem)
+		}
 		return nil
 	}
 	want := make([]*types.Type, len(sig.params))
 	for i, p := range sig.params {
 		switch {
 		case sig.closure != 0 && i == len(sig.params)-1:
-			fn := &types.Type{Kind: types.Fn, Params: []*types.Type{elem}, Ret: types.UnitT}
+			pt := elem
+			if borrowElem {
+				pt = types.RefTo(elem, false)
+			}
+			fn := &types.Type{Kind: types.Fn, Params: []*types.Type{pt}, Ret: types.UnitT}
 			switch sig.closure {
 			case 2:
 				fn.Ret = types.BoolT
@@ -207,6 +219,25 @@ func (c *checker) inferVecMethod(x *ast.MethodCallExpr, recv *types.Type) *types
 		}
 	}
 	return c.vecResultType(x.Sp, sig, elem)
+}
+
+// vecClosureBorrows reports whether the closure passed to a `Vec` method takes
+// its element by reference: `v.each(|s: &String| ...)`. Only a written `&T`
+// counts, so an unannotated closure keeps taking the element by value.
+func (c *checker) vecClosureBorrows(x *ast.MethodCallExpr, sig vecMethodSig, elem *types.Type) bool {
+	idx := 0
+	if sig.closure == 3 {
+		idx = 1
+	}
+	if idx >= len(x.Args) {
+		return false
+	}
+	lam, ok := x.Args[idx].(*ast.LambdaExpr)
+	if !ok || len(lam.Params) == 0 || lam.Params[0].Ty == nil {
+		return false
+	}
+	pt := c.resolveType(lam.Params[0].Ty)
+	return pt != nil && pt.Kind == types.Ref && types.Equal(pt.Elem, elem)
 }
 
 // VecMethodMut reports whether the builtin `Vec` method takes `&mut self`.

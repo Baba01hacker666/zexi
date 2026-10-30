@@ -75,6 +75,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/prelude_methods.zx",
 		"../../tests/c_body.zx",
 		"../../tests/pointer_cast.zx",
+		"../../tests/vec_visit.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -548,6 +549,19 @@ func TestRunPrograms(t *testing.T) {
 				"brace {literal} and 3",
 				"char } inside a hole",
 				"doubly nested deep 3",
+				"",
+			}, "\n"),
+		},
+		{
+			// Visiting a Vec of owning elements by borrowing each one.
+			file: "../../tests/vec_visit.zx",
+			want: strings.Join([]string{
+				"2", "true", "true", // count, any, all over a borrow
+				"alpha", "b", "gamma",
+				"3", "alpha",
+				"7", "8", "1",
+				"z",
+				"1",
 				"",
 			}, "\n"),
 		},

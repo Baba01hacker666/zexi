@@ -353,6 +353,15 @@ pointers:
 
 Nothing else casts: strings, structs, and enums are not reinterpreted by `as`.
 
+### Reading through a borrow
+
+A `&T` behaves like the value it points at in the two places that matter for
+iteration and for `&self` methods: method calls resolve on the pointee, and a
+comparison reads through the borrow (`n > 7` for `n: &i64`, `s == "b"` for
+`s: &String`). Printing a `&T` prints the value. Nothing else is implicit: an
+assignment to a borrow is an error, and comparing two references compares the
+values they point at, never their addresses.
+
 ## 2.5 Control flow & expressions
 
 Everything except declarations is an expression.

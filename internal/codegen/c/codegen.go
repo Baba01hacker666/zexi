@@ -2244,6 +2244,16 @@ func (g *gen) binValue(x *ast.BinExpr) string {
 			return "zx_string_concat(" + ps[0] + ", " + ps[1] + ")"
 		})
 	}
+	// A comparison that reads through a borrow: `n > 7` where `n: &i64`, or
+	// `s == "b"` where `s: &String`. The checker peeled the reference for its
+	// type check, so the dereference belongs here.
+	if isComparisonOp(x.Op) && (g.borrowsValue(x.L) || g.borrowsValue(x.R)) {
+		l, r := g.cmpOperand(x.L), g.cmpOperand(x.R)
+		if isStrType(g.peelRef(x.L)) && isStrType(g.peelRef(x.R)) {
+			return "(strcmp(" + l + ", " + r + ") " + x.Op.String() + " 0)"
+		}
+		return "(" + l + " " + x.Op.String() + " " + r + ")"
+	}
 	// String comparison compares bytes, not pointers, for any mix of `str` and
 	// `String`. Ordering follows strcmp's byte order, which is the same order
 	// Rust's Ord gives str.
@@ -2739,6 +2749,23 @@ func (g *gen) printFormat(args []ast.Expr, format, nl, sink string) string {
 // printOne emits the printing of a single value, optionally followed by `nl`.
 func (g *gen) printOne(arg ast.Expr, nl, sink string) string {
 	t := g.info.TypeOf(arg)
+	if t != nil && t.Kind == types.Ref && t.Elem != nil {
+		// `println(s)` where `s: &T` prints the value behind the borrow.
+		inner := t.Elem
+		v := g.value(arg)
+		if inner.Kind == types.StringKind {
+			return fmt.Sprintf(`%s("%%s%s", zx_string_as_str(%s))`, sink, nl, v)
+		}
+		if inner.Kind == types.Char {
+			g.hasChar = true
+			if nl == "" {
+				return fmt.Sprintf(`zx_print_char(*%s)`, v)
+			}
+			return fmt.Sprintf(`({ zx_print_char(*%s); %s("%s"); })`, v, sink, nl)
+		}
+		format, cast := printFormat(inner)
+		return fmt.Sprintf(`%s("%s%s", %s)`, sink, format, nl, cast("(*"+v+")"))
+	}
 	if t != nil && t.Kind == types.StringKind {
 		if isPlaceExpr(arg) {
 			return fmt.Sprintf(`%s("%%s%s", zx_string_as_str(&%s))`, sink, nl, g.value(arg))
@@ -2760,6 +2787,44 @@ func (g *gen) printOne(arg ast.Expr, nl, sink string) string {
 	}
 	format, cast := printFormat(t)
 	return fmt.Sprintf(`%s("%s%s", %s)`, sink, format, nl, cast(v))
+}
+
+// borrowsValue reports whether e has a reference type, i.e. a comparison has to
+// read through it.
+func (g *gen) borrowsValue(e ast.Expr) bool {
+	t := g.info.TypeOf(e)
+	return t != nil && t.Kind == types.Ref && t.Elem != nil
+}
+
+// peelRef returns the type behind a reference, or t itself.
+func (g *gen) peelRef(e ast.Expr) *types.Type {
+	t := g.info.TypeOf(e)
+	if t != nil && t.Kind == types.Ref && t.Elem != nil {
+		return t.Elem
+	}
+	return t
+}
+
+// cmpOperand renders a comparison operand, dereferencing a borrow so the
+// comparison is over the value that was borrowed.
+func (g *gen) cmpOperand(e ast.Expr) string {
+	v := g.value(e)
+	t := g.info.TypeOf(e)
+	if t == nil || t.Kind != types.Ref || t.Elem == nil {
+		return v
+	}
+	if t.Elem.Kind == types.StringKind {
+		return "zx_string_as_str(" + v + ")"
+	}
+	return "(*" + v + ")"
+}
+
+func isComparisonOp(op token.Kind) bool {
+	switch op {
+	case token.KindEqEq, token.KindBangEq, token.KindLt, token.KindLe, token.KindGt, token.KindGe:
+		return true
+	}
+	return false
 }
 
 func printFormat(t *types.Type) (format string, cast func(string) string) {
