@@ -513,6 +513,15 @@ func TestRunPrograms(t *testing.T) {
 			}, "\n"),
 		},
 		{
+			file: "../../tests/web_template.zx",
+			want: strings.Join([]string{
+				"<!doctype html><html><body><p>hi Tom</p><footer>2026</footer></body></html>",
+				"{{@@content@@}}",
+				"true",
+				"",
+			}, "\n"),
+		},
+		{
 			file: "../../tests/web_lib.zx",
 			want: strings.Join([]string{
 				"200 application/json {\"id\":\"42\",\"found\":true}",
@@ -525,6 +534,19 @@ func TestRunPrograms(t *testing.T) {
 				"302 /next",
 				"{\"error\":\"nope\"}",
 				"127.0.0.1 8080",
+				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/web_result.zx",
+			want: strings.Join([]string{
+				"200 home",
+				"500 text/html; charset=utf-8 true",
+				"200 v=down",
+				"500",
+				"200 {\"id\":\"17\"}",
+				"500",
+				"404 ",
 				"",
 			}, "\n"),
 		},

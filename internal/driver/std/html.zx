@@ -271,7 +271,7 @@ impl Vars {
 
     // get reads a stored value ("" when absent).
     pub fn get(&self, key: str) -> String {
-        match self.map.get(String::from(key)) {
+        match self.map.get_str(key) {
             Some(v) => return v.clone(),
             None => return String::new(),
         }
@@ -279,7 +279,7 @@ impl Vars {
 
     // has reports whether a key was set.
     pub fn has(&self, key: str) -> bool {
-        return self.map.contains_key(String::from(key));
+        return self.map.contains_str(key);
     }
 
     // len is the number of values.
@@ -320,6 +320,18 @@ pub fn template_map(tpl: str, values: &HashMap<String, String>) -> String {
                 let inner = src.substr(i + 2, (close as usize) - (i + 2));
                 let mut name = inner.trim();
                 let mut raw = false;
+                // A placeholder whose name starts with "@@" is not a value: it is
+                // a slot the engine leaves verbatim, so a layout can spell a
+                // named insertion point such as `{{@@content@@}}` that `page_text`
+                // fills afterwards. Nothing extra is parsed — the same `{{...}}`
+                // scanner just recognises the prefix.
+                if name.starts_with("@@") {
+                    out.push_str("{{");
+                    out.push_str(inner.as_str());
+                    out.push_str("}}");
+                    i = (close as usize) + 2;
+                    continue;
+                }
                 let bar = name.find("|");
                 if bar >= 0 {
                     let flag = name.substr((bar + 1) as usize, 4294967295).trim();
@@ -328,7 +340,7 @@ pub fn template_map(tpl: str, values: &HashMap<String, String>) -> String {
                     }
                     name = name.substr(0, bar as usize).trim();
                 }
-                match values.get(String::from(name.as_str())) {
+                match values.get_str(name.as_str()) {
                     Some(v) => {
                         if raw {
                             out.push_str(v.as_str());

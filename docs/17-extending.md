@@ -36,6 +36,17 @@ spells it: `"m"`, `"pthread"`, `"sqlite3"`, `"ssl"`. `#[link("pthread")]` also
 turns on `-pthread`, so the thread runtime links the same way a `use thread;`
 program does.
 
+Two more attributes extend the same idea:
+
+- `#[link_dir("path")]` adds `-Lpath` to the link step, so a library that lives
+  outside the system search path (a vendored `.a`, a build tree) is found
+  without a custom build script.
+- `#[include("header.h")]` puts `#include "header.h"` at the top of the
+  generated C, before the program's own definitions. Use it to bring in a real
+  header (types, macros, prototypes) instead of re-declaring them by hand. The
+  header is searched along the usual `-I` paths, so pair it with the matching
+  `#[link_dir]` or pass `-I` to the compiler.
+
 An `extern "C"` declaration keeps its Zexi name as the C symbol, so the name you
 declare is the name the linker looks for. Pointers, `str` (`const char *`), and
 the fixed-width integers all map directly; `&mut [u8; N]` arrives as a pointer to

@@ -370,8 +370,8 @@ func TestLayoutMatchesTheCCompiler(t *testing.T) {
 				} else if c != f.Offset {
 					t.Errorf("%s field %s: cc says offset %d, table says %d", key, f.Name, c, f.Offset)
 				}
-		}
-	case types.EnumKind:
+			}
+		case types.EnumKind:
 			el, err := tgt.Enum(ty.En)
 			if err != nil {
 				t.Errorf("%s: Enum: %v", key, err)

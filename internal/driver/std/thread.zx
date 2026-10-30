@@ -264,6 +264,8 @@ extern "C" fn zxt_pool_wait(handle: i64) -> i32;
 extern "C" fn zxt_pool_result(handle: i64, seq: i64) -> i64;
 extern "C" fn zxt_pool_done_count(handle: i64) -> i32;
 extern "C" fn zxt_pool_workers(handle: i64) -> i32;
+extern "C" fn zxt_pool_capacity(handle: i64) -> i64;
+extern "C" fn zxt_pool_queued(handle: i64) -> i64;
 extern "C" fn zxt_pool_free(handle: i64) -> i32;
 
 // cpu_count reports how many processors this process may run on.
@@ -271,7 +273,9 @@ pub fn cpu_count() -> i32 {
     return zxt_cpu_count();
 }
 
-// MAX_POOL_JOBS is how many jobs one pool can queue before submit fails.
+// MAX_POOL_JOBS is how many jobs one queue holds before submit fails: the wrap
+// point where `Pool::map` banks its results. The C side is the source of truth
+// (`ZXT_MAX_JOBS`); this is the documented number.
 const MAX_POOL_JOBS: i32 = 4096;
 
 // Pool is a set of long-lived worker threads draining a job queue. Create it
@@ -339,26 +343,43 @@ impl Pool {
 
     // map runs `f(i)` for every i in lo..hi across the pool and returns the sum
     // of the results — the shortest way to parallelise a loop. Ranges larger
-    // than the job queue work too: when the queue fills, map collects the
-    // finished results and carries on, so nothing is lost.
+    // than the job queue work too, but the queue is a single shared ring: once
+    // it is full and every job in it, past or present, has finished, the next
+    // submit recycles it and destroys any result that has not been collected.
+    // So map counts the room the queue actually has left — the whole queue
+    // minus what an earlier caller may have left queued — and waits and banks
+    // every result *at* that wrap point, before submitting again. Reacting only
+    // to a failed submit comes too late.
     pub fn map(&self, f: fn(i64) -> i64, lo: i64, hi: i64) -> i64 {
         let mut total: i64 = 0;
         let mut base: i64 = -1;
         let mut submitted: i64 = 0;
         let mut i = lo;
+        let cap = zxt_pool_capacity(self.id);
+        let mut room = cap - zxt_pool_queued(self.id);
+        if room < 0 {
+            room = 0;
+        }
         while i < hi {
-            let mut seq = zxt_pool_submit(self.id, f, i);
-            if seq < 0 {
-                // Queue full: wait for it to drain, bank those results, and
-                // submit the job again.
+            if base >= 0 && room > 0 && submitted >= room {
                 self.wait();
-                let mut k: i64 = 0;
-                while k < submitted {
-                    total += zxt_pool_result(self.id, base + k);
-                    k += 1;
-                }
+                total += self.bank(base, submitted);
                 submitted = 0;
                 base = -1;
+                // The queue is full and fully drained now, so the next submit
+                // reclaims it: the following batch has the whole queue again.
+                room = cap;
+            }
+            let mut seq = zxt_pool_submit(self.id, f, i);
+            if seq < 0 {
+                // Queue full with jobs still running: drain it, bank what is
+                // there, and try this job again — that retry is the one that
+                // reclaims the queue.
+                self.wait();
+                total += self.bank(base, submitted);
+                submitted = 0;
+                base = -1;
+                room = cap;
                 seq = zxt_pool_submit(self.id, f, i);
             }
             if seq < 0 {
@@ -371,6 +392,14 @@ impl Pool {
             i += 1;
         }
         self.wait();
+        total += self.bank(base, submitted);
+        return total;
+    }
+
+    // bank adds up the results of `submitted` jobs queued starting at `base`.
+    // Call it only after `wait`, or unfinished jobs contribute 0.
+    fn bank(&self, base: i64, submitted: i64) -> i64 {
+        let mut total: i64 = 0;
         let mut k: i64 = 0;
         while k < submitted {
             total += zxt_pool_result(self.id, base + k);
@@ -928,6 +957,22 @@ int64_t zxt_pool_new(int workers) {
 int zxt_pool_workers(int64_t h) {
     zxt_pool_t *p = zxt_pool_resolve(h);
     return p ? p->workers : 0;
+}
+
+/* zxt_pool_capacity is how many jobs the queue holds before submit fails. It is
+ * the wrap point at which Pool::map banks its queued results, so callers never
+ * have to guess the size. */
+int64_t zxt_pool_capacity(int64_t h) {
+    zxt_pool_t *p = zxt_pool_resolve(h);
+    return p ? p->cap : 0;
+}
+
+/* zxt_pool_queued is how many jobs the queue currently holds, finished or not.
+ * map uses it to see how much room it has before a submit would recycle the
+ * queue and destroy results that have not been collected yet. */
+int64_t zxt_pool_queued(int64_t h) {
+    zxt_pool_t *p = zxt_pool_resolve(h);
+    return p ? p->njobs : 0;
 }
 
 /* zxt_pool_submit queues one job and returns its index (>= 0), or -1 when the

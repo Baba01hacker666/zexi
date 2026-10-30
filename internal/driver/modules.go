@@ -1052,7 +1052,34 @@ func (r *rewriter) expr(e ast.Expr) {
 		for i := range x.Fields {
 			r.expr(x.Fields[i].Val)
 		}
+	case *ast.LambdaExpr:
+		// A closure body names module items like any other expression, with
+		// its own parameters shadowing outer bindings.
+		r.pushScope()
+		for i := range x.Params {
+			p := &x.Params[i]
+			if p.Ty != nil {
+				r.typ(p.Ty)
+			}
+			if p.Default != nil {
+				r.expr(p.Default)
+			}
+			if p.Name != "" {
+				r.bind(p.Name)
+			}
+		}
+		r.block2(x.Body)
+		r.popScope()
 	}
+}
+
+// block2 rewrites a body that is either a block or a single expression.
+func (r *rewriter) block2(body ast.Expr) {
+	if b, ok := body.(*ast.Block); ok {
+		r.block(b)
+		return
+	}
+	r.expr(body)
 }
 
 // pat rewrites the module-qualified paths inside a pattern. Binding names are

@@ -377,6 +377,25 @@ func (g *gen) emitMapRuntime(t *types.Type) {
 	g.w.line("    m->len = 0;")
 	g.w.line("    m->cap = 0;")
 	g.w.line("}")
+	if t.Key.Kind == types.StringKind {
+		g.w.line("")
+		g.w.line("/* Borrowed-key lookups for maps keyed by String: hash and compare over")
+		g.w.line(" * the bytes of the borrowed `str`, with no key allocation. */")
+		g.w.line("static int zx_hashmap_get_strkey_%s(%s *m, const char *key, %s **out) {", mn, mn, vt)
+		g.w.line("    if (m->cap == 0 || m->entries == NULL) return 0;")
+		g.w.line("    size_t idx = zx_hash_fnv((const unsigned char *)key, strlen(key)) %% m->cap;")
+		g.w.line("    while (m->entries[idx].used && strcmp(zx_string_as_str(&m->entries[idx].key), key) != 0) idx = (idx + 1) %% m->cap;")
+		g.w.line("    if (!m->entries[idx].used) return 0;")
+		g.w.line("    *out = &m->entries[idx].value;")
+		g.w.line("    return 1;")
+		g.w.line("}")
+		g.w.line("static int zx_hashmap_contains_strkey_%s(%s *m, const char *key) {", mn, mn)
+		g.w.line("    if (m->cap == 0 || m->entries == NULL) return 0;")
+		g.w.line("    size_t idx = zx_hash_fnv((const unsigned char *)key, strlen(key)) %% m->cap;")
+		g.w.line("    while (m->entries[idx].used && strcmp(zx_string_as_str(&m->entries[idx].key), key) != 0) idx = (idx + 1) %% m->cap;")
+		g.w.line("    return m->entries[idx].used;")
+		g.w.line("}")
+	}
 }
 
 // mapCtorValue lowers `HashMap::new()`.
@@ -472,6 +491,14 @@ func (g *gen) mapMethodCall(x *ast.MethodCallExpr) string {
 			keyExpr + ", &zx__p);" + keyPost + epilogue +
 			" " + optionExpr(rt, types.RefTo(t.Val, false), "zx__hit", "zx__p") + "; })"
 		return expr
+	case "get_str":
+		rt := g.info.TypeOf(x)
+		res := g.tmpName()
+		expr := "({ " + prologue + ctype(rt) + " " + res + "; " + ctype(t.Val) + " *zx__p;" +
+			" int zx__hit = zx_hashmap_get_strkey_" + mn + "(&" + recv + ", " +
+			g.value(x.Args[0]) + ", &zx__p);" + epilogue +
+			" " + optionExpr(rt, types.RefTo(t.Val, false), "zx__hit", "zx__p") + "; })"
+		return expr
 	case "remove":
 		rt := g.info.TypeOf(x)
 		res := g.tmpName()
@@ -486,6 +513,10 @@ func (g *gen) mapMethodCall(x *ast.MethodCallExpr) string {
 		res := g.tmpName()
 		return "({ " + prologue + keyPre + "bool " + res + " = (bool)zx_hashmap_contains_" + mn + "(&" + recv + ", " +
 			keyExpr + ");" + keyPost + epilogue + " " + res + "; })"
+	case "contains_str":
+		res := g.tmpName()
+		return "({ " + prologue + "bool " + res + " = (bool)zx_hashmap_contains_strkey_" + mn + "(&" + recv + ", " +
+			g.value(x.Args[0]) + ");" + epilogue + " " + res + "; })"
 	}
 	return "0 /* unhandled HashMap method */"
 }

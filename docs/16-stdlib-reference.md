@@ -49,7 +49,9 @@ fn main() -> i32 {
 | --- | --- |
 | `new_app() -> App` | empty app |
 | `app.get/post/put/delete(path, handler)` | register a handler; `{name}` segments are captured |
+| `app.get_result/post_result/put_result/delete_result(path, handler)` | register a `Result<Response, String>` handler; `Err` becomes a logged 500 |
 | `app.route(method, path, handler)` | any method |
+| `app.route_result(method, path, handler)` | any method, `Result`-returning handler |
 | `app.fallback(handler)` | replace the 404 handler |
 | `app.before(mw)` / `app.after(mw)` | middleware around routing |
 | `app.pages(root)` | serve a folder as the site (`/` → `index.html`, `/x` → `x.html` or `x/index.html`) |
@@ -63,6 +65,8 @@ fn main() -> i32 {
 | `app.serve_n(port, max_requests)` | serve a request budget, then return (tests, one-shot tools) |
 | `page(name, &vars) -> Response` | fill `templates/<name>.html` |
 | `page_status(status, name, &vars)` | same, explicit status |
+| `page_text(name, &vars) -> String` | the rendered body as a `String`; wraps in `templates/_layout.html` when it exists, filling its `{{@@content@@}}` slot |
+| `page_string(name, &vars) -> String` | alias for `page_text` (the `page(path, values)` spelling) |
 | `template_text(name)` / `template_path(name)` | the raw text / resolved path of a template |
 | `html_page(body)` / `html_status(status, body)` | HTML responses |
 | `text(body)` | plain-text response |
@@ -147,12 +151,14 @@ Template rules: `{{name}}` is escaped, `{{name|raw}}` is inserted verbatim,
 | --- | --- |
 | `new_app() -> Router` | router |
 | `router.get/post/put/delete/add(method, …)`, `set_fallback`, `use_before`, `use_after` | registration |
+| `router.get_result/post_result/put_result/delete_result/add_result(method, …)` | `Result<Response, String>` handlers |
 | `router.files(prefix, root)`, `router.pages(root)`, `router.views(dir)` | folder mounts |
 | `serve(router, port, host)` / `serve_local(router, port)` / `serve_n(router, max_requests, …)` | single-threaded serving |
 | `serve_workers(router, workers = 0, port, host)` | pooled serving (0 = two threads per core) |
 | `serve_workers_n(router, workers, max_requests, …)` | pooled with a budget |
 | `listen(addr)`, `listen_n(addr, max_requests)`, `listen_workers(addr, workers)` | default-mux entry points |
 | `handle_get/handle_post/handle_put/handle_delete(path, fn)` | default-mux routes |
+| `handle_get_result/handle_post_result/handle_put_result/handle_delete_result(path, fn)` | default-mux routes returning `Result<Response, String>` |
 | `serve_file(path)`, `serve_static(root, url_path)`, `serve_page(root, url_path)` | file responses |
 | `serve_dir(root, port)`, `serve_dir_n`, `serve_dir_local` | serve a folder with no code |
 | `project_path(path)` | resolve a relative folder against the entry directory |
@@ -243,4 +249,5 @@ Closures work as task bodies: `pool.map(|x| x * x, 0, 100)`.
 | `arg_count()` / `arg_at(i)` | command-line arguments (`arg_at` returns `String`) |
 | `project_dir()` | directory of the entry file, baked into the binary |
 | `String::from`, `Vec::new`, `HashMap::new` | container constructors |
+| `HashMap::get_str(key: str)`, `HashMap::contains_str(key: str)` | borrowed-key lookups on `HashMap<String, V>` (no key allocation) |
 | closures (`\|x\| …`) | see [§15](15-closures.md) |

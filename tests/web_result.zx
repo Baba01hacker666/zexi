@@ -1,0 +1,94 @@
+// tests/web_result.zx
+// Handlers that return `Result<Response, String>`: `Ok` is served as-is, `Err`
+// becomes a logged 500, and `?` propagates a failed lookup to that turn. No
+// socket is opened, so the output is deterministic.
+
+use http;
+use web;
+use json;
+
+fn home(req: &Request) -> Result<Response, String> {
+    let p = web::params(req);
+    let _ = p;
+    return Ok(Response::text(200, "home"));
+}
+
+// boom answers nothing useful: its Err becomes a 500 with a generic body.
+fn boom(req: &Request) -> Result<Response, String> {
+    let _ = req;
+    return Err(String::from("disk sat on its tail"));
+}
+
+// failops shows `?`-propagation inside a handler: one mark for the whole path.
+fn failops(req: &Request) -> Result<Response, String> {
+    let wants = step_down(req)?;
+    return Ok(Response::text(200, wants));
+}
+
+// step_down is the lookup failops would `?` on.
+fn step_down(req: &Request) -> Result<String, String> {
+    let v = req.query("v");
+    if v == "" {
+        return Err(String::from("v is missing"));
+    }
+    let mut out = String::from("v=");
+    out.push_str(v.as_str());
+    return Ok(out);
+}
+
+// err_json shows the JSON route of the same idea (Ok/Err either way).
+fn report(req: &Request) -> Result<Response, String> {
+    let id = web::value(req, "id");
+    if id.parse_i64() <= 0 {
+        return Err(String::from("id must be positive"));
+    }
+    let mut doc = json::object();
+    doc.set_str("id", id.as_str());
+    return Ok(web::json_of(&doc));
+}
+
+fn main() -> i32 {
+    let mut app = web::new_app();
+    app.get_result("/home", home);
+    app.get_result("/boom", boom);
+    app.get_result("/failops", failops);
+    app.get_result("/report/{id}", report);
+
+    let mut raw = String::from("GET /home HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut req = parse_request(&raw);
+    let res = app.dispatch(&mut req);
+    println(res.status, res.body);
+
+    raw = String::from("GET /boom HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut req2 = parse_request(&raw);
+    let res2 = app.dispatch(&mut req2);
+    println(res2.status, res2.content_type.as_str(), res2.body.len() > 0);
+
+    raw = String::from("GET /failops?v=down HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut req3 = parse_request(&raw);
+    let res3 = app.dispatch(&mut req3);
+    println(res3.status, res3.body);
+
+    raw = String::from("GET /failops HTTP/1.1\r\nHost: x\r\n\r\n");
+    // The v lookup fails, `?` returns from failops, and the Err becomes 500.
+    let mut req4 = parse_request(&raw);
+    let res4 = app.dispatch(&mut req4);
+    println(res4.status);
+
+    raw = String::from("GET /report/17 HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut req5 = parse_request(&raw);
+    let res5 = app.dispatch(&mut req5);
+    println(res5.status, res5.body);
+
+    raw = String::from("GET /report/0 HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut req6 = parse_request(&raw);
+    let res6 = app.dispatch(&mut req6);
+    println(res6.status);
+
+    // Unrouted paths still fall through to the plain 404.
+    raw = String::from("GET /nope HTTP/1.1\r\nHost: x\r\n\r\n");
+    let mut req7 = parse_request(&raw);
+    let res7 = app.dispatch(&mut req7);
+    println(res7.status, res7.body);
+    0
+}

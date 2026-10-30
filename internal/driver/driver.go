@@ -85,6 +85,9 @@ type Artifacts struct {
 	// LinkLibs are libraries the program itself asked for with
 	// `#[link("name")]`, in source order, appended to Options.LinkLibs.
 	LinkLibs []string
+	// LinkDirs are directories the program asked for with `#[link_dir("path")]`,
+	// appended to Options.LibDirs.
+	LinkDirs []string
 }
 
 // FrontEnd runs lexing, parsing, type checking, and C generation. It returns
@@ -180,9 +183,16 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 	// separate file) means inline C can use the runtime helpers the generated
 	// code already defines: `zx_String`, the Vec/hash helpers, and anything a
 	// `#[no_mangle]` function exposes.
-	blocks, libs, pthread := collectNative(merged.Items)
-	if len(blocks) > 0 {
-		text := "\n// --- C source included from Zexi (`c r\"...\"` blocks) ---\n" + strings.Join(blocks, "\n")
+	blocks, libs, linkDirs, includes, pthread := collectNative(merged.Items)
+	if len(blocks) > 0 || len(includes) > 0 {
+		var parts []string
+		for _, h := range includes {
+			parts = append(parts, `#include "`+h+`"`)
+		}
+		if len(blocks) > 0 {
+			parts = append(parts, strings.Join(blocks, "\n"))
+		}
+		text := "\n// --- C source included from Zexi (`c \"\"\"...\"\"\"` blocks) ---\n" + strings.Join(parts, "\n")
 		if len(art.CUnits) > 1 {
 			art.CUnits[0] += text
 		} else {
@@ -190,6 +200,7 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 		}
 	}
 	art.LinkLibs = libs
+	art.LinkDirs = linkDirs
 	if pthread {
 		art.NeedsPthread = true
 	}
@@ -200,34 +211,56 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 // `#[link("name")]`, and whether pthread was asked for. Both are declarations
 // in source, so a library can extend the program (a new syscall wrapper, a
 // vendored C helper, a system library) without the compiler knowing about it.
-func collectNative(items []ast.Item) (blocks, libs []string, pthread bool) {
+func collectNative(items []ast.Item) (blocks, libs, linkDirs, includes []string, pthread bool) {
 	seenLib := map[string]bool{}
 	seenBlock := map[string]bool{}
-	var links func(attrs []string)
-	links = func(attrs []string) {
+	seenLinkDir := map[string]bool{}
+	seenInclude := map[string]bool{}
+	var collect func(attrs []string)
+	collect = func(attrs []string) {
 		for _, a := range attrs {
-			if types.AttrName(a) != "link" {
-				continue
+			switch types.AttrName(a) {
+			case "link":
+				name := strings.Trim(types.AttrArg(a), " \t\"'")
+				if name == "" {
+					continue
+				}
+				if name == "pthread" {
+					pthread = true
+					continue
+				}
+				if seenLib[name] {
+					continue
+				}
+				seenLib[name] = true
+				libs = append(libs, name)
+			case "link_dir":
+				dir := strings.Trim(types.AttrArg(a), " \t\"'")
+				if dir == "" {
+					continue
+				}
+				if seenLinkDir[dir] {
+					continue
+				}
+				seenLinkDir[dir] = true
+				linkDirs = append(linkDirs, dir)
+			case "include":
+				hdr := strings.Trim(types.AttrArg(a), " \t\"'")
+				if hdr == "" {
+					continue
+				}
+				if seenInclude[hdr] {
+					continue
+				}
+				seenInclude[hdr] = true
+				includes = append(includes, hdr)
 			}
-			name := strings.Trim(types.AttrArg(a), " \t\"'")
-			if name == "" {
-				continue
-			}
-			if name == "pthread" {
-				pthread = true
-				continue
-			}
-			if seenLib[name] {
-				continue
-			}
-			seenLib[name] = true
-			libs = append(libs, name)
 		}
 	}
 	for _, it := range items {
 		switch d := it.(type) {
 		case *ast.CBlock:
-			links(d.Attrs)
+			collect(d.Attrs)
 			body := strings.TrimSpace(d.Body)
 			if body == "" || seenBlock[body] {
 				continue
@@ -235,18 +268,18 @@ func collectNative(items []ast.Item) (blocks, libs []string, pthread bool) {
 			seenBlock[body] = true
 			blocks = append(blocks, body)
 		case *ast.FnDecl:
-			links(d.Attrs)
+			collect(d.Attrs)
 		case *ast.StructDecl:
-			links(d.Attrs)
+			collect(d.Attrs)
 		case *ast.EnumDecl:
-			links(d.Attrs)
+			collect(d.Attrs)
 		case *ast.ImplBlock:
 			for _, f := range d.Fns {
-				links(f.Attrs)
+				collect(f.Attrs)
 			}
 		}
 	}
-	return blocks, libs, pthread
+	return blocks, libs, linkDirs, includes, pthread
 }
 
 // splitJobs decides how many translation units to compile in parallel: one
@@ -337,6 +370,9 @@ func BuildFiles(paths []string, outPath string, opts Options, em *diag.Emitter) 
 	}
 	if len(art.LinkLibs) > 0 {
 		opts.LinkLibs = append(opts.LinkLibs, art.LinkLibs...)
+	}
+	if len(art.LinkDirs) > 0 {
+		opts.LibDirs = append(opts.LibDirs, art.LinkDirs...)
 	}
 	if len(art.CUnits) > 1 {
 		if err := CompileUnits(art.CHeader, art.CUnits, outPath, opts); err != nil {

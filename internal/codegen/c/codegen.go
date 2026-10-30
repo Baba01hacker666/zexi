@@ -277,6 +277,38 @@ func usedFns(info *sema.Info) map[*sema.Fn]bool {
 			add(f)
 		}
 	}
+	// Closures are emitted for every closure in the program regardless of
+	// whether their enclosing function is reachable (closureDefs walks
+	// ClosureOrd unconditionally), so their direct callees must be seeded
+	// here too — otherwise a closure body calls a function whose definition
+	// was pruned and the generated C fails to compile.
+	for lam := range info.Closures {
+		walkExprs(lam.Body, func(e ast.Expr) {
+			switch x := e.(type) {
+			case *ast.CallExpr:
+				if r := info.Resolved[x]; r != nil {
+					add(r)
+				}
+			case *ast.MethodCallExpr:
+				if r := info.Resolved[x]; r != nil {
+					add(r)
+				}
+			case *ast.IdentExpr:
+				if r := info.FnValues[x]; r != nil {
+					add(r)
+				} else if r := info.Fns[x.Name]; r != nil {
+					add(r)
+				}
+			case *ast.PathExpr:
+				if len(x.Segments) == 1 {
+					if r := info.Fns[x.Segments[0]]; r != nil {
+						add(r)
+					}
+				}
+			}
+		})
+	}
+
 	for len(queue) > 0 {
 		f := queue[0]
 		queue = queue[1:]

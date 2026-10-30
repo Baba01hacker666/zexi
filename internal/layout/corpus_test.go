@@ -271,11 +271,11 @@ func TestCorpusLayoutMatchesTheCCompiler(t *testing.T) {
 			}
 		}
 		checked++
-		}
-		if checked < 49 {
+	}
+	if checked < 49 {
 		t.Errorf("verified %d corpus types, want at least 49", checked)
-		}
-		t.Logf("verified %d corpus types against %s", checked, cc)
+	}
+	t.Logf("verified %d corpus types against %s", checked, cc)
 }
 
 // typeLabel names a type for a test failure message.

@@ -1,8 +1,17 @@
 // io — console input/output, part of the Zexi standard library.
 // Import with `use io;`, `use std::io;`, or `import io;`.
 
-extern "C" fn read(fd: i32, buf: &mut [u8; 4096], n: usize) -> i64;
-extern "C" fn write(fd: i32, buf: str, n: usize) -> i64;
+/* The syscall wrappers live in this module's own C so the ABI names cannot
+ * collide with <unistd.h> declarations in a program that links several
+ * modules (http, say), whose file descriptors have a different signature. */
+c """
+#include <unistd.h>
+int64_t zxi_read(int zx_fd, zx_arr4096_u8 * zx_buf, size_t zx_n) { return read(zx_fd, zx_buf, zx_n); }
+int64_t zxi_write(int zx_fd, const char *zx_buf, size_t zx_n) { return write(zx_fd, zx_buf, zx_n); }
+"""
+
+extern "C" fn zxi_read(fd: i32, buf: &mut [u8; 4096], n: usize) -> i64;
+extern "C" fn zxi_write(fd: i32, buf: str, n: usize) -> i64;
 
 // read_line reads one line from standard input (without the trailing
 // newline) and returns it as a String. At end of input it returns "".
@@ -13,7 +22,7 @@ pub fn read_line() -> String {
     let mut out = String::new();
     let mut done = false;
     while !done {
-        let n = read(0, &mut buf, 1);
+        let n = zxi_read(0, &mut buf, 1);
         if n <= 0 {
             done = true;
         } else if buf[0] == 10 {
@@ -38,7 +47,7 @@ pub fn read_all() -> String {
     let mut out = String::with_capacity(4096);
     let mut done = false;
     while !done {
-        let n = read(0, &mut buf, 4096);
+        let n = zxi_read(0, &mut buf, 4096);
         if n <= 0 {
             done = true;
         } else {
@@ -55,13 +64,13 @@ pub fn read_all() -> String {
 // print_err writes a message to standard error (no newline added).
 pub fn print_err(s: str) {
     let n = len(s);
-    write(2, s, n);
+    zxi_write(2, s, n);
 }
 
 // eprintln_err writes a message to standard error, followed by a newline.
 pub fn eprintln_err(s: str) {
     print_err(s);
-    write(2, "\n", 1);
+    zxi_write(2, "\n", 1);
 }
 
 // input is a Python-shaped convenience wrapper around read_line. It accepts an

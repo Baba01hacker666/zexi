@@ -656,6 +656,10 @@ can use `String`, the `Vec`/`HashMap` helpers, generated structs, and any
 vendored helper without a compiler change: `sys` and `regex` ship their C this
 way. See [`17-extending.md`](17-extending.md).
 
+`#[link_dir("path")]` adds `-Lpath` and `#[include("header.h")]` emits
+`#include "header.h"` at the top of the generated C, so a binding can be
+written against a real header instead of re-declaring its types.
+
 ## 7.17 Not implemented yet (roadmap M1+)
 
 Traits (and trait bounds), `dyn Trait`, associated types, const generics,

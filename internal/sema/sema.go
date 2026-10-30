@@ -2301,8 +2301,11 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		return &types.Type{Kind: types.StructKind, St: concrete}
 	}
 	// A local binding of function type can be called directly: this is the
-	// indirect call the router/handler APIs are built on.
+	// indirect call the router/handler APIs are built on. Reading the binding
+	// from the enclosing scope is also a capture, like any other read — a
+	// closure that calls `handler(x)` must carry `handler` in its environment.
 	if ft := c.lookupScope(name); ft != nil && ft.Kind == types.Fn {
+		c.noteCapture(name, ft)
 		c.info.Indirect[x] = ft
 		if len(x.Args) != len(ft.Params) {
 			c.errAt(x, "E0061", "function value takes %d argument(s) but %d were supplied", len(ft.Params), len(x.Args))

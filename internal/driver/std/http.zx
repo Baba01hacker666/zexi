@@ -32,6 +32,12 @@
 // (`new_app()`, `app.get`, `app.listen`) is available when a program holds
 // several servers.
 //
+// A handler may return `Result<Response, String>` instead, registered through
+// `get_result` and friends: `Err(e)` becomes a 500 with a generic body, and
+// the message goes to the server log. Inside the handler the `?` operator
+// propagates a lookup failure to that answer, so a data or file error does not
+// need a match at every step.
+//
 // Many users at once: the single-threaded `listen` handles one request at a
 // time, which is fine for a laptop demo and wrong for a real site. A worker
 // pool serves several connections in parallel:
@@ -52,6 +58,7 @@
 
 use net;
 use thread;
+use io;
 
 // File helpers are declared by `net`, which owns the shared opt-in C shim.
 
@@ -295,7 +302,7 @@ fn hex_value(b: i64) -> i64 {
 // query_value returns the decoded value of `name` in a raw query string, or
 // "" when absent. Works for both query strings and form bodies.
 pub fn query_value(raw: &String, name: str) -> String {
-    let want = String::from(name);
+    // The lookup compares bytes, so no key allocation is needed.
     let mut pos: usize = 0;
     while pos <= raw.len() {
         let rest = raw.substr(pos, 4294967295);
@@ -305,7 +312,7 @@ pub fn query_value(raw: &String, name: str) -> String {
         let key_raw = if eq < 0 { pair.clone() } else { pair.substr(0, eq as usize) };
         let val_raw = if eq < 0 { String::new() } else { pair.substr((eq + 1) as usize, 4294967295) };
         let key = url_decode(key_raw.as_str());
-        if key.as_str() == want.as_str() {
+        if key.as_str() == name {
             return url_decode(val_raw.as_str());
         }
         if amp < 0 {
@@ -1225,6 +1232,29 @@ fn pass_through(req: &Request) -> Response {
 fn noop_after(req: &Request, res: &mut Response) {
 }
 
+// internal_error is what a `Result` handler's `Err(e)` becomes: 500, a generic
+// body, and the real message in the server log. A failure inside a handler is
+// the server's fault, so the response says nothing about whose fault else it
+// could be and logs what happened instead.
+fn internal_error(message: str) -> Response {
+    let mut line = String::from("zexi: handler error: ");
+    line.push_str(message);
+    io::eprintln_err(line.as_str());
+    let body = "<!doctype html><html><body><h1>500 Internal Server Error</h1><p>The server could not handle the request; see its log for the reason.</p></body></html>";
+    return Response::html(500, body);
+}
+
+// route_result runs a `Result`-returning handler and folds its failure side
+// into a response. Handlers keep the natural `Result<Response, String>` shape
+// — and their `?`s — and the framework decides what `Err` looks like to the
+// client.
+fn route_result(handler: fn(&Request) -> Result<Response, String>, req: &Request) -> Response {
+    match handler(req) {
+        Ok(resp) => return resp,
+        Err(e) => return internal_error(e.as_str()),
+    }
+}
+
 // The default mux is a process-global Router for the top-level handlers:
 //
 //     handle_get("/users/{id}", user);
@@ -1419,6 +1449,33 @@ impl Router {
         self.count = self.count + 1;
     }
 
+    // get_result/controller_result register a handler that returns
+    // `Result<Response, String>`. The framework wraps it once at registration,
+    // so dispatch stays the plain handler shape: an `Ok` is served as-is, an
+    // `Err` becomes a logged 500. Inside the handler, `?` propagates a lookup
+    // failure to exactly this turn.
+    pub fn get_result(&mut self, path: str, handler: fn(&Request) -> Result<Response, String>) {
+        self.add("GET", path, |req| route_result(handler, req));
+    }
+
+    pub fn post_result(&mut self, path: str, handler: fn(&Request) -> Result<Response, String>) {
+        self.add("POST", path, |req| route_result(handler, req));
+    }
+
+    pub fn put_result(&mut self, path: str, handler: fn(&Request) -> Result<Response, String>) {
+        self.add("PUT", path, |req| route_result(handler, req));
+    }
+
+    pub fn delete_result(&mut self, path: str, handler: fn(&Request) -> Result<Response, String>) {
+        self.add("DELETE", path, |req| route_result(handler, req));
+    }
+
+    // add_result registers any method ("PATCH", "OPTIONS", ...) with a
+    // Result-returning handler.
+    pub fn add_result(&mut self, method: str, path: str, handler: fn(&Request) -> Result<Response, String>) {
+        self.add(method, path, |req| route_result(handler, req));
+    }
+
     // dispatch routes one parsed request through the before hooks, the
     // matching handler (or fallback), and the after hooks. Captured `{name}`
     // values are stored on the request for `param`/`route_param`.
@@ -1567,6 +1624,28 @@ pub fn handle_put(path: str, handler: fn(&Request) -> Response) {
 pub fn handle_delete(path: str, handler: fn(&Request) -> Response) {
     let mux = default_router();
     mux.delete(path, handler);
+}
+
+// handle_get_result/post_result/... register a Result-returning handler on the
+// default mux: `Err` becomes a logged 500 without a match at every step.
+pub fn handle_get_result(path: str, handler: fn(&Request) -> Result<Response, String>) {
+    let mux = default_router();
+    mux.get_result(path, handler);
+}
+
+pub fn handle_post_result(path: str, handler: fn(&Request) -> Result<Response, String>) {
+    let mux = default_router();
+    mux.post_result(path, handler);
+}
+
+pub fn handle_put_result(path: str, handler: fn(&Request) -> Result<Response, String>) {
+    let mux = default_router();
+    mux.put_result(path, handler);
+}
+
+pub fn handle_delete_result(path: str, handler: fn(&Request) -> Result<Response, String>) {
+    let mux = default_router();
+    mux.delete_result(path, handler);
 }
 
 // use_before/use_after attach middleware to the default mux, mirroring the

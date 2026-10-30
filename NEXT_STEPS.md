@@ -6,19 +6,36 @@ forward most. Ordered by value per unit of risk, not by ambition.
 ## Where things stand
 
 - **Self-extension works.** A library adds native code with `c """..."""`,
-  `#[link("name")]`, `extern "C"` and `#[no_mangle]`. The compiler holds no C for
-  the standard library: `sys`, `regex`, `json`, `net`, `http`, and `thread` each
-  ship their C inside their own `.zx` file, and
-  `TestStandardLibraryNeedsNoCompilerC` fails if any of it moves back into the
-  driver. See `docs/17-extending.md`.
+  `#[link("name")]`, `#[link_dir("path")]`, `#[include("header.h")]`,
+  `extern "C"` and `#[no_mangle]`. The compiler holds no C for the standard
+  library: `sys`, `regex`, `json`, `net`, `http`, and `thread` each ship their
+  C inside their own `.zx` file, and `TestStandardLibraryNeedsNoCompilerC`
+  fails if any of it moves back into the driver. See `docs/17-extending.md`.
 - **The server survives hostile input.** Oversized heads get `431`, malformed
   ones `400`, oversized bodies `413`; a connection that sends nothing is dropped
   after 250 ms and a slow head after 1 s; responses are drained out before the
   close so a reset cannot swallow them. See `docs/08-networking.md` §8.7.
 - **Closures, worker pools, JSON, HTML, and a folder-based web layer** are in,
   with tests (`go test ./...`, the doc-example gate, and the examples folder).
-- Verification in place: unit tests, an end-to-end demo site, ASan/UBSan builds,
-  a truncation fuzzer over every `.zx` file, and adversarial socket probes.
+  Closures may now *call* a captured handler (a `fn(..)` value read from the
+  enclosing scope is carried in the environment), which is what makes
+  `spawn(|| ...)` wrappers and Result-returning handlers possible.
+- **Handlers can fail.** `get_result`/`post_result`/... and the `add_result`
+  family accept `fn(&Request) -> Result<Response, String>`; `Err(e)` becomes a
+  logged 500 and the message never reaches the client, and `?` propagates a
+  lookup failure to that turn without a match at every step.
+- **Templates compose.** `web::page_text(name, values)` returns the rendered
+  body as a `String`, and a `templates/_layout.html` whose `{{@@content@@}}`
+  slot exists wraps the page in it — substitution only, no second language.
+  `{{name}}` substitution is unchanged.
+- **Borrowed map lookups.** `HashMap<String, V>` has `get_str`/`contains_str`
+  that hash and compare over the borrowed bytes, so a template lookup no
+  longer allocates a key for every `{{name}}`.
+- **Verification in place:** unit tests, an end-to-end demo site, ASan/UBSan
+  builds, a truncation fuzzer over every `.zx` file, and adversarial socket
+  probes. The worker pool's `map` no longer loses a batch when the queue
+  wraps: it banks its results at the real wrap point, measured against the
+  queue's actual occupancy (including jobs an earlier caller left queued).
 
 ## 1. A connection engine that cannot be stalled
 
@@ -39,38 +56,39 @@ timeout*.
 
 LeakSanitizer reports every allocation the language makes: closure
 environments, `String`, `Vec`, `HashMap`. Nothing crashes, but a long-running
-server grows.
+server grows. The closure-record release path (`zx_clo_release` called from
+`Drop` glue for `fn(..)` values) is the prerequisite; once it exists, captured
+values free through the drop glue the compiler already emits.
 
-- Give the closure record a real release path (`zx_clo_release` called from
-  `Drop` glue for `fn(..)` values), then free captured values through the drop
-  glue the compiler already emits.
+- Give the closure record a real release path, then free captured values
+  through the drop glue the compiler already emits.
 - Make `Vec`/`HashMap` shrink on clear and free on scope exit.
 - Keep the ASan run in the test loop so the count is a number, not a feeling.
 
 ## 3. Errors that a request handler can return
 
-Handlers return `Response`; a failure inside one has nowhere to go.
+**Done:** `Result<Response, String>` returning handlers (`get_result` and
+friends, plus `add_result`), with the framework turning `Err` into a logged
+500; `?` already propagates inside any handler. Remaining:
 
-- Add `Result<Response, String>` returning handlers, with the framework turning
-  `Err` into a 500 and logging the message.
-- Add `?` propagation for handlers, so a database or file error does not need a
-  match at every step.
+- A compile-time complaint when a handler captures something non-`Send`-able
+  (see §7).
 
 ## 4. Templates without a template language
 
-The current answer is deliberately small: serve a folder, read a file, fill
-placeholders. The next step is composition rather than a syntax:
+**Done:** `page_text(path, values)` returns a `String` with `{{name}}`
+substitution, and a `_layout.html` include wraps it through the
+`{{@@content@@}}` slot. Remaining:
 
-- `page(path, values)` returning a `String`, with `{{name}}` substitution and a
-  layout include.
-- Nothing to parse, nothing to compile, no second language in the project.
+- Convenience helpers for the layout case (`page` returning a `Response` already
+  exists; nothing further is planned).
 
 ## 5. Reach further out of the language
 
-- `#[link]` today names a library; add `#[link_dir("path")]` and
-  `#[include("header.h")]` so a binding can be written against a real header.
-- Ship `bindgen` output for two or three common libraries (SQLite, OpenSSL,
-  zlib) as standard modules, each carrying its own C.
+- `#[link]` names a library; `#[link_dir("path")]` and `#[include("header.h")]`
+  are now supported. Still to do: ship `bindgen` output for two or three
+  common libraries (SQLite, OpenSSL, zlib) as standard modules, each carrying
+  its own C.
 - Add `extern "C"` variadics so `printf`-shaped APIs are usable directly.
 
 ## 6. Language gaps worth closing
@@ -79,7 +97,8 @@ Collected while writing the library; each is small, each has bitten:
 
 - `Vec` closure methods (`each`, `count`, `any`, `all`, `fold`) need `Copy`
   elements.
-- `HashMap::get` takes an owned `String`, so every lookup allocates.
+- `HashMap::get` takes an owned `String`, so every lookup allocates —
+  `get_str`/`contains_str` now cover the `HashMap<String, V>` case.
 - No variadic strings (`push_str` chains instead of one call).
 - `while` conditions cannot allocate.
 - Matching an enum through a borrow reports `E0507`.
@@ -90,8 +109,8 @@ Collected while writing the library; each is small, each has bitten:
   `spawn(|| ...)` wrapper that packs an environment is a natural fit.
 - A `Shared<T>` guard that makes "read-only after start" explicit, and a
   compile-time complaint when a handler captures something non-`Send`-able.
-- Cancellation: a worker should be able to abandon a request that has run past a
-  deadline.
+- Cancellation: a worker should be able to abandon a request that has run past
+  a deadline.
 
 ## 8. Things that stay out of scope for now
 
