@@ -2655,6 +2655,22 @@ func (c *checker) resolveArgs(sp token.Span, args []ast.Expr, names []string, de
 	return append(out, extra...)
 }
 
+// isCVariadicPassable reports whether t can be passed through a C variadic
+// tail. Only scalar values, `str`, and pointer-shaped types are safe: owning
+// strings and other heap-backed types must be converted before emission.
+func isCVariadicPassable(t *types.Type) bool {
+	if t == nil {
+		return false
+	}
+	switch t.Kind {
+	case types.Bool, types.Char, types.I8, types.I16, types.I32, types.I64, types.Isize,
+		types.U8, types.U16, types.U32, types.U64, types.Usize, types.F32, types.F64,
+		types.Str, types.Ptr, types.Ref:
+		return true
+	}
+	return false
+}
+
 // checkCallArgs records the resolved callee, checks a call's arguments against
 // its parameter list, and returns the callee's return type.
 func (c *checker) checkCallArgs(x *ast.CallExpr, fn *Fn, label string) *types.Type {
@@ -2678,6 +2694,23 @@ func (c *checker) checkCallArgs(x *ast.CallExpr, fn *Fn, label string) *types.Ty
 		at := c.checkExpr(a, want)
 		if want != nil && !c.argAssignable(want, at, fn.Extern) {
 			c.errAt(a, "E0308", "mismatched types: expected `%s`, found `%s`", want, at)
+		}
+	}
+	if fn.Variadic && fn.Extern {
+		for i := len(fn.Params); i < len(x.Args); i++ {
+			at := c.info.TypeOf(x.Args[i])
+			if at == nil {
+				continue
+			}
+			if at.Kind == types.StringKind {
+				// Borrow owning `String` to `str` so the emitted C passes a
+				// pointer rather than the struct by value.
+				c.errAt(x.Args[i], "E0308", "argument %d: pass `%s` as `str` (for example `s.as_str()`) instead of an owning `String` to a C variadic function", i+1, at)
+				continue
+			}
+			if !isCVariadicPassable(at) {
+				c.errAt(x.Args[i], "E0308", "argument %d: %s cannot be passed to a C variadic function", i+1, at)
+			}
 		}
 	}
 	return fn.Ret

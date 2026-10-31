@@ -1754,7 +1754,7 @@ fn main() -> i32 {
 		t.Fatalf("partial head answered after %s, want within the 1s head timeout", d)
 	}
 	_ = c2.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, err := c2.Read(make([]byte, 16)); err != io.EOF {
+	if _, err := c2.Read(make([]byte, 16)); !errors.Is(err, io.EOF) {
 		t.Fatalf("after 400 the connection should be closed, read err = %v", err)
 	}
 	_ = c2.Close()

@@ -43,6 +43,7 @@ extern "C" fn zxn_cpu_count() -> i32;
 extern "C" fn zxn_accept_retryable() -> i32;
 extern "C" fn zxn_setsockopt_reuseaddr(fd: i32) -> i32;
 extern "C" fn zxn_set_timeout(fd: i32, ms: i32) -> i32;
+extern "C" fn zxn_set_nodelay(fd: i32) -> i32;
 extern "C" fn zxn_send_all(fd: i32, buf: str, n: i32) -> i32;
 extern "C" fn zxn_recv(fd: i32, buf: &mut [u8; 8192], cap: usize) -> i32;
 extern "C" fn zxn_read_head(fd: i32, buf: &mut [u8; 8192], cap: i32) -> i32;
@@ -674,9 +675,12 @@ int zxn_accept(int fd) {
     for (;;) {
         int c = accept(fd, NULL, NULL);
         if (c < 0 && errno == EINTR) continue;
-        if (c >= 0) zxn_set_nodelay(c);
+        if (c >= 0) {
+            zxn_set_nodelay(c);
+            zxn_set_nonblocking(c, 0);
+        }
         return c;
-    }
+        }
 }
 
 /* zxn_accept_retryable classifies the errno left by a failed zxn_accept.
@@ -775,7 +779,11 @@ int zxn_accept_timeout(int fd, int ms) {
     if (ready < 0) return -1;
     for (;;) {
         int c = accept(fd, NULL, NULL);
-        if (c >= 0) { zxn_set_nodelay(c); return c; }
+        if (c >= 0) {
+            zxn_set_nodelay(c);
+            zxn_set_nonblocking(c, 0);
+            return c;
+        }
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
         return -1;

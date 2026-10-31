@@ -254,7 +254,7 @@ and `send_response` remain public.
 | `Request.query/param/route_param/cookie/path_only/raw_query/wants_keep_alive` | request access (`param` reads query, route, then form) |
 | `Response::text/html/json/empty/redirect`, `Response.set_header/set_cookie` | response builders |
 | `send_response(&Conn, &Response) -> i64` | serialize and write a response |
-| `Response.keep_alive` | advertise a persistent connection — every serve loop honours it (`Connection: keep-alive`, socket stays open) |
+| `Response.keep_alive` | advertise a persistent connection — the pool still honours it, but idle keep-alive exits after `KEEPALIVE_IDLE_MS` unless the client sends another request |
 | `handle*` / `use_before` / `use_after` / `listen` / `listen_n` | top-level default-mux registration and serving |
 | `new_app()`, `Router.get/.post/.put/.delete/.add`, `.use_before/.use_after`, `.set_fallback`, `.listen/.listen_n`, `.dispatch/.serve` | explicit router with the same features |
 | `serve(&router, port)`, `serve_n(...)`, `serve_local(...)`, `serve_local_n(...)` | low-level accept loops (forever or request-bounded) |
@@ -379,9 +379,9 @@ blocks in `accept()` forever, which used to hang budget shutdown entirely. A
 request budget (`*_n` calls) is how tests and one-shot tools exit
 deterministically: the budget counts **requests**, not connections, so a
 keep-alive connection that carries the whole budget still triggers it — the
-worker that reaches the budget answers that request, sets the stop flag
-immediately (no keep-alive idle wait), and the rest wind down within one poll
-interval.
+worker that reaches the budget finishes that request, sets the stop flag, and
+drops the socket instead of idling in `KEEPALIVE_IDLE_MS`; the rest wind down
+within one poll interval.
 
 Handlers stay ordinary functions and need no locking: a request and its
 response are per-thread values, and the router is read-only once the pool
@@ -438,15 +438,16 @@ sampled from `/proc` — is [`bench/http-results.md`](../bench/http-results.md):
 | sustained 5 s, w=4 c=128 | 4 | 128 | **42,036** | — | — | **0.76 (38%)** | **0.9 peak** |
 
 Across repeated runs the pool peaks at roughly 33k–54k tiny requests/s; the
-p99 outliers at high concurrency are accept-queue waits, not handler time.
-Takeaways: keep-alive is ≈2–4× close-mode at concurrency ≥ 8 (a pooled
-accept+close per request costs ~2.5 ms p50 on this box); neither server comes
-close to saturating the 2 cores — the Python load generator shares them, and
-the server only ever needs ~0.8 cores. Two fixes came out of these numbers:
-`TCP_NODELAY` on all sockets (head+body are two small writes; without it the
-second waits for a delayed ACK — 23 req/s, p50 ≈ 44 ms at c=1 became 11k+),
-and a non-blocking listener in every pool entry point (a poll/accept race let
-one worker block in `accept()` forever and hang budget shutdown).
+p99 outliers at high concurrency come from the accept queue and thread
+scheduling, not handler time. Takeaway: keep-alive is ≈2–4× close-mode at
+concurrency ≥ 8 (a pooled accept+close per request costs ~2.5 ms p50 on this
+box); neither server comes close to saturating the 2 cores — the Python load
+generator shares them, and the server only ever needs ~0.8 cores. Two fixes
+came out of these numbers: `TCP_NODELAY` on all sockets (head+body are two
+small writes; without it the second waits for a delayed ACK — 23 req/s, p50 ≈
+44 ms at c=1 became 11k+), and a non-blocking listener in every pool entry
+point (a poll/accept race let one worker block in `accept()` forever and hang
+budget shutdown).
 
 ### Zexi vs a raw C twin
 

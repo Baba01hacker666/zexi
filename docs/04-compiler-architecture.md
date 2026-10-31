@@ -69,11 +69,11 @@ a debugging/testing aid (the golden-file test corpus uses it).
         ┌──────────┴───────────┐
         ▼                      ▼
   ┌───────────┐         ┌────────────┐
-  │ codegen/c │         │ codegen/   │   codegen/llvm (landed, opt-in:
-  └─────┬─────┘         │ x86_64     │   --backend=llvm, MIR -> LLVM IR)
+  │ codegen/c │         │ codegen/   │
+  └─────┬─────┘         │ llvm       │   MIR → LLVM IR + runtime shim
         │               └─────┬──────┘
         ▼                     ▼
-   foo.c ──cc──▶ a.out     object files ──ld──▶ a.out
+   foo.c ──cc──▶ a.out     foo.ll ──clang──▶ a.out
                 (standalone native binary)
 ```
 

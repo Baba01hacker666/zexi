@@ -93,6 +93,14 @@ const DRAIN_MS: i32 = 100;
 // persistent connections, so this — not the first-byte deadline — bounds an
 // idle keep-alive socket.
 const KEEPALIVE_IDLE_MS: i32 = 5000;
+// MAX_REQUESTS_PER_CONN caps how many requests a single keep-alive connection
+// may serve. Without this, one well-behaved client can monopolize a worker for
+// the full keep-alive lifetime. A small worker pool needs this limit.
+const MAX_REQUESTS_PER_CONN: i64 = 100;
+// CONNECTION_LIFETIME_MS bounds how long a single connection may stay open
+// regardless of keep-alive activity. Prevents a slow client from holding a
+// worker indefinitely.
+const CONNECTION_LIFETIME_MS: i32 = 30000;
 // DEFAULT_MAX_REDIRECTS is how many redirect hops a client follows.
 const DEFAULT_MAX_REDIRECTS: i32 = 5;
 
@@ -1585,11 +1593,29 @@ impl Router {
     // (keep-alive), 0 = a request was served and the connection must close,
     // -1 = nothing arrived (a probe or a clean EOF) and nothing was sent.
     fn serve_one(&self, c: &Conn, first: bool) -> i32 {
-        // The first byte of a fresh connection gets the short deadline; a
-        // keep-alive connection gets the idle deadline between requests.
-        let wait_ms = if first { FIRST_BYTE_MS } else { KEEPALIVE_IDLE_MS };
-        if !c.wait_readable(wait_ms) {
-            return -1;
+        if first {
+            if !c.wait_readable(FIRST_BYTE_MS) {
+                return -1;
+            }
+        } else {
+            let mut waited: i32 = 0;
+            while waited < KEEPALIVE_IDLE_MS {
+                if zxh_stopping() == 1 {
+                    return -1;
+                }
+                let slice = if KEEPALIVE_IDLE_MS - waited < WORKER_POLL_MS {
+                    KEEPALIVE_IDLE_MS - waited
+                } else {
+                    WORKER_POLL_MS
+                };
+                if c.wait_readable(slice) {
+                    break;
+                }
+                waited += slice;
+            }
+            if waited >= KEEPALIVE_IDLE_MS {
+                return -1;
+            }
         }
         c.set_timeout(self.header_timeout_ms);
         let mut req = read_request(c);
@@ -1660,7 +1686,17 @@ impl Router {
     pub fn serve_count(&self, c: &Conn) -> i64 {
         let mut served: i64 = 0;
         let mut first = true;
+        let start = zxh_now_ms();
         loop {
+            if zxh_stopping() == 1 {
+                break;
+            }
+            if served >= MAX_REQUESTS_PER_CONN {
+                break;
+            }
+            if zxh_now_ms() - start > (CONNECTION_LIFETIME_MS as i64) {
+                break;
+            }
             let r = self.serve_one(c, first);
             if r < 0 {
                 break;
@@ -1676,6 +1712,9 @@ impl Router {
                 break;
             }
             if r == 0 {
+                break;
+            }
+            if zxh_stopping() == 1 {
                 break;
             }
         }
@@ -1878,6 +1917,7 @@ extern "C" fn zxh_budget() -> i64;
 extern "C" fn zxh_stop();
 extern "C" fn zxh_clear_stop();
 extern "C" fn zxh_stopping() -> i32;
+extern "C" fn zxh_now_ms() -> i64;
 
 // WORKER_POLL_MS bounds how long a worker waits on an idle listener before it
 // re-checks the stop flag, so a pool shuts down promptly instead of hanging on
@@ -2906,6 +2946,7 @@ fn push_int(s: &mut String, n: i64) {
 c """
 #include <stdatomic.h>
 #include <stdint.h>
+#include <time.h>
 
 #define ZXH_MUX_SLOTS 4
 
@@ -2982,4 +3023,8 @@ static _Atomic int64_t zxh_budget_requests = 0;
 void zxh_set_budget(int64_t n) { atomic_store(&zxh_budget_requests, n); }
 
 int64_t zxh_budget(void) { return atomic_load(&zxh_budget_requests); }
+
+int64_t zxh_now_ms(void) {
+    return (int64_t)(clock() * 1000 / CLOCKS_PER_SEC);
+}
 """

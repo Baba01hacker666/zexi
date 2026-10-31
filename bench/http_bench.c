@@ -21,6 +21,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,14 +90,22 @@ static void serve_conn(int fd) {
         // --- read the head ---
         int hend = head_end(buf, have);
         long first_deadline = now_ms() + (first ? FIRST_BYTE_MS : KEEPALIVE_IDLE_MS);
-        long head_deadline = now_ms() + HEAD_TIMEOUT_MS;
+        long head_deadline = 0;
         while (hend < 0) {
             if (have >= HEAD_MAX) {
                 send_simple(fd, 431, "Request Header Fields Too Large", "", 0);
                 goto out;
             }
             long now = now_ms();
-            long wait = (have == 0) ? (first_deadline - now) : (head_deadline - now);
+            long wait;
+            if (have == 0) {
+                wait = first_deadline - now;
+            } else {
+                if (head_deadline == 0) {
+                    head_deadline = now + HEAD_TIMEOUT_MS;
+                }
+                wait = head_deadline - now;
+            }
             if (wait <= 0) {
                 if (have == 0) goto out;              // idle: close silently
                 send_simple(fd, 400, "Bad Request", "", 0);  // partial head
@@ -137,6 +146,7 @@ static void serve_conn(int fd) {
                 p = le + 2;
             }
         }
+        if (clen < 0) { send_simple(fd, 400, "Bad Request", "", 0); goto out; }
         if (clen > BODY_MAX) { send_simple(fd, 413, "Payload Too Large", "", 0); goto out; }
         // --- read the body (may already be buffered past the head) ---
         int body_have = have - hend;
@@ -214,6 +224,7 @@ static void *worker(void *arg) {
 }
 
 int main(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);
     int port = argc > 1 ? atoi(argv[1]) : 18090;
     int workers = argc > 2 ? atoi(argv[2]) : 0;
     g_budget = argc > 3 ? atol(argv[3]) : 0;

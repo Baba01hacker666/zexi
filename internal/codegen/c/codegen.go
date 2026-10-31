@@ -2178,7 +2178,7 @@ func (g *gen) textDecl(buf string, e ast.Expr) string {
 // from an owning `String`. Temporary `String` arguments are bound to locals
 // inside a statement expression so their buffers outlive the call and are then
 // freed. When retType is "", the call is emitted as a statement.
-func (g *gen) withArgs(args []ast.Expr, wants []*types.Type, retType string, call func(ps []string) string) string {
+func (g *gen) withArgs(args []ast.Expr, wants []*types.Type, retType string, call func(ps []string) string, variadic bool) string {
 	ps := make([]string, len(args))
 	var decls, drops []string
 	for i, e := range args {
@@ -2195,11 +2195,22 @@ func (g *gen) withArgs(args []ast.Expr, wants []*types.Type, retType string, cal
 			ps[i] = "zx_string_as_str(&" + g.value(e) + ")"
 			continue
 		}
-		var want *types.Type
-		if i < len(wants) {
-			want = wants[i]
+		if variadic && i >= len(wants) && t != nil && t.Kind == types.StringKind {
+			if !isPlaceExpr(e) {
+				tm := g.tmpName()
+				decls = append(decls, "zx_String "+tm+" = "+g.value(e)+";")
+				ps[i] = "zx_string_as_str(&" + tm + ")"
+				drops = append(drops, "zx_drop_String(&"+tm+");")
+				continue
+			}
+			ps[i] = "zx_string_as_str(&" + g.value(e) + ")"
+			continue
 		}
-		ps[i] = g.coerce(e, want)
+		var want2 *types.Type
+		if i < len(wants) {
+			want2 = wants[i]
+		}
+		ps[i] = g.coerce(e, want2)
 	}
 	if len(decls) == 0 {
 		return call(ps)
@@ -2523,7 +2534,7 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 				return call
 			}
 			return "({ void *" + once + " = " + callee + "; " + call + "; })"
-		})
+		}, false)
 	}
 	if ctor := g.info.Ctors[x]; ctor != nil {
 		return g.enumConstruct(ctor, x.Args)
@@ -2546,7 +2557,7 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 	if fn := g.info.Resolved[x]; fn != nil {
 		return g.withArgs(x.Args, fn.Params, g.exprStmtType(x), func(ps []string) string {
 			return funcName(fn) + "(" + strings.Join(ps, ", ") + ")"
-		})
+		}, fn.Variadic)
 	}
 	name := ""
 	switch c := x.Callee.(type) {
@@ -2594,7 +2605,7 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 	}
 	return g.withArgs(x.Args, fn.Params, g.exprStmtType(x), func(ps []string) string {
 		return funcName(fn) + "(" + strings.Join(ps, ", ") + ")"
-	})
+	}, fn.Variadic)
 }
 
 // cQuote renders s as a C string literal.
@@ -2630,7 +2641,7 @@ func (g *gen) stringCtorValue(x *ast.CallExpr, name string) string {
 	}
 	return g.withArgs(x.Args, wants, "zx_String", func(ps []string) string {
 		return "zx_string_" + name + "(" + strings.Join(ps, ", ") + ")"
-	})
+	}, false)
 }
 
 // panicCall emits the builtin `panic(msg)`: report and stop through the one exit
@@ -2948,7 +2959,7 @@ func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
 		}
 		args = append(args, ps...)
 		return funcName(m) + "(" + strings.Join(args, ", ") + ")"
-	})
+	}, m.Variadic)
 }
 
 // preludeTagValue emits an `is_ok`/`is_err`/`is_some`/`is_none` call as a
@@ -3025,15 +3036,21 @@ func (g *gen) stringMethodCall(x *ast.MethodCallExpr) string {
 	if variadic && len(specs) > 1 {
 		// A variadic `String` method (`push_str`) chains one call per
 		// argument: `s.push_str("a", "b")` emits two zx_string_push_str calls.
+		// For place-expression and pointer receivers we can pass the address
+		// directly (same as the non-variadic path); only non-place receivers
+		// need a temporary to avoid re-evaluating a side-effecting expression.
 		var recvArg, prologue, epilogue string
-		switch {
-		case recvIsPtr:
+		if recvIsPtr {
 			recvArg = g.value(x.Recv)
-		case isPlaceExpr(x.Recv):
-			recvArg = "&" + g.value(x.Recv)
-		default:
+			prologue = ""
+			epilogue = ""
+		} else if isPlaceExpr(x.Recv) {
+			recvArg = "(&" + g.value(x.Recv) + ")"
+			prologue = ""
+			epilogue = ""
+		} else {
 			t := g.tmpName()
-			recvArg = "&" + t
+			recvArg = "(&" + t + ")"
 			prologue = "zx_String " + t + " = " + g.value(x.Recv) + "; "
 			epilogue = "zx_drop_String(&" + t + "); "
 		}

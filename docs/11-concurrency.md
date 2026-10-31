@@ -23,10 +23,9 @@ A spawned function **takes its inputs as arguments** and **returns its result
 by joining**. Closures exist (see [`15-closures.md`](15-closures.md)) and a
 capturing closure may be passed in place of a plain `fn` — it captures by
 value, so `Thread::spawn(|x: i64| x + base, 5)` runs `5 + base` on the new
-thread. What does *not* cross the boundary is a shared reference: only `i64`
-arguments, `i64` return values, and `i64` handles (channels, atomics) are
-guaranteed to arrive intact — there is no `Send`/`Sync` check yet, so passing
-an owning value across threads is the programmer's responsibility:
+thread. Owned values such as `String` move into the new thread; shared
+references are not yet checked with `Send`/`Sync`, so passing an owning value
+across threads is the programmer's responsibility:
 
 | Entry point | Runs on a new thread | Result |
 | --- | --- | --- |
@@ -181,8 +180,10 @@ fn main() -> i32 {
 ```
 
 A job is `fn(i64) -> i64` plus one argument; the function may also be a closure
-that captures by value (e.g. `|x: i64| x + base`). For bigger fan-out, submit
-several jobs and collect their results by the sequence number `submit` returns:
+that captures by value (e.g. `|x: i64| x + base`). The captured environment is
+**not cloned**: every submission reuses the same closure, so mutable captures
+race across concurrent jobs. Prefer immutable captures or synchronized handles
+(`Atomic`, channels).
 
 <!-- check-only -->
 ```zx

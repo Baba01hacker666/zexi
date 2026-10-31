@@ -10,8 +10,8 @@ in `tests/`, `examples/`, and `bench/`; every body it produces passes the
 invariants in `Validate`, and the subset it covers is checked for *semantic*
 equivalence against the C backend by a differential test. The C backend still
 walks the typed AST directly, so MIR is a second, verified description of the
-same program — and the opt-in **LLVM backend** (`zexic --backend=llvm`,
-`--emit=llvm`) is its first real consumer: it lowers the same MIR to LLVM IR
+same program — and the opt-in **LLVM backend** (`zexic build --backend=llvm`,
+`zexic emit --emit=llvm`) is its first real consumer: it lowers the same MIR to LLVM IR
 and links through `clang`.
 
 ---

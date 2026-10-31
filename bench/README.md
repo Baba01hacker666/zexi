@@ -78,7 +78,7 @@ python3 bench/http_load.py --server c --total 8000 --concurrency 1,8,32,128 \
 ```
 
 On the 2-core test box both servers land in the same throughput ballpark at
-~1 MiB RSS, but the zexi server uses ~1.8× more CPU per request (see the
+~1 MiB RSS, but the zexi server uses ~1.7× more CPU per request (see the
 comparison table in `docs/08-networking.md` §8.7 and
 [`http-c-results.md`](http-c-results.md)).
 

@@ -125,8 +125,11 @@ class Server:
 
     def _sample_once(self):
         try:
+            rss, hwm = _proc_rss(self.pid)
+            if hwm == 0:
+                return  # zombie / exiting: skip so the last valid RSS sample sticks
             self._samp.append((time.perf_counter(), _proc_jiffies(self.pid),
-                               *_proc_rss(self.pid)))
+                               rss, hwm))
         except (OSError, ValueError, IndexError):
             pass  # process gone
 
