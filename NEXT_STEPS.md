@@ -103,6 +103,12 @@ keep-alive idle hold), request-counted pool budgets with a non-blocking listener
 (fixed a poll/accept race that hung budget shutdown with workers > 1), and a
 repeatable harness (`bench/http_load.py` + `bench/http_bench.zx`).
 
+Compared against a raw C twin (`bench/http_bench.c`, `--server c`): same
+throughput ballpark and same ~1 MiB RSS, but the zexi server uses ~1.8× more
+CPU per request (0.76 vs 0.42 cores sustained at ~40k req/s) — the parser/
+`String`/dispatch overhead the microbenchmarks measure in isolation
+(`bench/http-c-results.md`, docs/08 §8.7).
+
 Still open — one slow client holds one worker until its head deadline (1 s):
 8 stalled heads delayed a normal request by ~1.1 s at 8 workers, ~4.4 s at
 2 workers, i.e. about *n / workers × timeout*. Bounded, but not fair.

@@ -61,11 +61,26 @@ python3 bench/http_load.py --concurrency 1,8,32,128 --workers 1,4 --total 8000 \
 ```
 
 Phases: keep-alive throughput vs concurrency × workers (with per-request
-p50/p95/p99 and a server-side request-count cross-check), close-mode
-comparison, 64 KiB GET, 1 KiB POST echo, a slowloris probe (stalled half-sent
-heads vs one normal request), and abuse probes (431/400/silent). Results land
-in [`http-results.md`](http-results.md); compare rows only on the machine they
-name.
+p50/p95/p99, a server-side request-count cross-check, and the server process's
+CPU cores + peak RSS sampled from `/proc` while the load runs), close-mode
+comparison, 64 KiB GET, 1 KiB POST echo, a sustained 5 s resource measurement,
+a slowloris probe (stalled half-sent heads vs one normal request), and abuse
+probes (431/400/silent). Results land in [`http-results.md`](http-results.md);
+compare rows only on the machine they name.
+
+`http_bench.c` is a raw C twin of `http_bench.zx` — same routes, CLI, exit
+line, keep-alive/deadline behaviour — so the two implementations can be
+measured identically and compared (CPU/RSS included):
+
+```sh
+python3 bench/http_load.py --server c --total 8000 --concurrency 1,8,32,128 \
+    --workers 1,4 --out bench/http-c-results.md
+```
+
+On the 2-core test box both servers land in the same throughput ballpark at
+~1 MiB RSS, but the zexi server uses ~1.8× more CPU per request (see the
+comparison table in `docs/08-networking.md` §8.7 and
+[`http-c-results.md`](http-c-results.md)).
 
 ## What the numbers mean (and do not)
 

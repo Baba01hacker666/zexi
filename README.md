@@ -68,7 +68,9 @@ This repository contains the **initial design and specification** of Zexi: the v
 > fixed-capacity router built on function values — served with HTTP/1.1
 > keep-alive, `TCP_NODELAY` on every socket, and a thread pool
 > (`listen_workers(":8080", 8)`), measured at 33k–54k req/s tiny-body on a
-> 2-core box ([bench/http-results.md](bench/http-results.md)). Go-style servers are a
+> 2-core box at ~1 MiB RSS — same ballpark as a raw C twin, at ~1.8× its CPU
+> per request ([bench/http-results.md](bench/http-results.md),
+> [bench/http-c-results.md](bench/http-c-results.md)). Go-style servers are a
 > few lines: `handle_get("/users/{id}", user); listen(":8080")` registers on a
 > default mux with `{name}` route parameters and `use_before`/`use_after`
 > middleware. High-level `serve(&app, 8000)`, `serve_dir(root, 8000)`,

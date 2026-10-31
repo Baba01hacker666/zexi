@@ -425,30 +425,57 @@ per-connection buffers) are already in `net`.
 The stdlib server is dependency-free (own HTTP/1.1 implementation over BSD
 sockets — no libmicrohttpd), so `bench/http_bench.zx` + `bench/http_load.py`
 measure exactly what ships. Latest committed run — every cell server-count
-verified, 8000 requests per throughput cell, raw-socket client — is
-[`bench/http-results.md`](../bench/http-results.md):
+verified, 8000 requests per throughput cell, raw-socket client, server CPU/RSS
+sampled from `/proc` — is [`bench/http-results.md`](../bench/http-results.md):
 
-| load | workers | concurrency | req/s | p50 ms | p99 ms |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| GET / keep-alive (tiny body) | 1 | 1 / 8 / 32 / 128 | 33,233 / 31,323 / 24,663 / 16,633 | 0.02 | 0.06–0.15 |
-| GET / keep-alive | 4 | 1 / 8 / 32 / 128 | 25,995 / 28,312 / 41,790 / 27,652 | 0.02–0.06 | 0.10–1.43 |
-| GET / close-mode (one conn per request) | 1 / 4 | 32 | 12,597 / 12,690 | 2.01 / 1.64 | 4.64 / 7.72 |
-| GET /big (64 KiB body) keep-alive | 4 | 16 | 12,078 (≈0.8 GB/s) | 0.05 | 0.60 |
-| POST /echo (1 KiB body) keep-alive | 4 | 16 | 13,258 | 0.02 | 0.13 |
+| load | workers | concurrency | req/s | p50 ms | p99 ms | cpu cores | rss MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| GET / keep-alive (tiny body) | 1 | 1 / 8 / 32 / 128 | 17,304 / 12,960 / 17,502 / 16,426 | 0.05–0.07 | 0.12–0.13 | 0.50–0.54 | ~0 |
+| GET / keep-alive | 4 | 1 / 8 / 32 / 128 | 15,646 / 41,904 / 35,739 / 33,160 | 0.06–0.08 | 0.12–0.93 | 0.55–0.78 | 0.9–1.0 |
+| GET / close-mode (one conn per request) | 1 / 4 | 32 | 11,673 / 11,384 | 2.48–2.50 | 7.48–7.66 | 0.28 | ~0–0.9 |
+| GET /big (64 KiB body) keep-alive | 4 | 16 | 19,845 (≈1.3 GB/s) | 0.14 | 1.07 | 0.86 | 1.1 |
+| POST /echo (1 KiB body) keep-alive | 4 | 16 | 41,920 | 0.05 | 0.99 | 0.52 | 1.0 |
+| sustained 5 s, w=4 c=128 | 4 | 128 | **42,036** | — | — | **0.76 (38%)** | **0.9 peak** |
 
-Across repeated runs the pool peaks at roughly 38k–54k tiny requests/s; the
+Across repeated runs the pool peaks at roughly 33k–54k tiny requests/s; the
 p99 outliers at high concurrency are accept-queue waits, not handler time.
 Takeaways: keep-alive is ≈2–4× close-mode at concurrency ≥ 8 (a pooled
-accept+close per request costs ~2 ms p50 on this box); past a handful of
-connections the two cores — not the pool — are the limit. Two fixes came out
-of these numbers: `TCP_NODELAY` on all sockets (head+body are two small
-writes; without it the second waits for a delayed ACK — 23 req/s, p50 ≈ 44 ms
-at c=1 became 11k+), and a non-blocking listener in every pool entry point (a
-poll/accept race let one worker block in `accept()` forever and hang budget
-shutdown).
+accept+close per request costs ~2.5 ms p50 on this box); neither server comes
+close to saturating the 2 cores — the Python load generator shares them, and
+the server only ever needs ~0.8 cores. Two fixes came out of these numbers:
+`TCP_NODELAY` on all sockets (head+body are two small writes; without it the
+second waits for a delayed ACK — 23 req/s, p50 ≈ 44 ms at c=1 became 11k+),
+and a non-blocking listener in every pool entry point (a poll/accept race let
+one worker block in `accept()` forever and hang budget shutdown).
+
+### Zexi vs a raw C twin
+
+`bench/http_bench.c` is a hand-written C server with the same routes, CLI,
+keep-alive semantics, deadlines, and exit line, measured by the same harness
+(`--server c`, report in [`bench/http-c-results.md`](../bench/http-c-results.md)).
+Same machine, same run shape:
+
+| cell (w=4 unless noted) | zexi req/s | raw C req/s | zexi cpu cores | C cpu cores | rss both |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| keep-alive c=1 | 15,646 | 15,770 | 0.55 | 0.45 | ~1 MiB |
+| keep-alive c=8 | 41,904 | 31,719 | 0.78 | 0.40 | ~1 MiB |
+| keep-alive c=32 | 35,739 | 30,743 | 0.67 | 0.35 | ~1 MiB |
+| sustained 5 s c=128 | 42,036 | 39,217 | 0.76 (38%) | 0.42 (21%) | 0.9 MiB |
+| close-mode c=32 (w=1) | 11,673 | 16,115 | 0.28 | 0.22 | ~0–1 MiB |
+| /big 64 KiB c=16 | 19,845 | 26,880 | 0.86 | 0.17 | ~1.1 MiB |
+| POST /echo c=16 | 41,920 | 24,608 | 0.52 | 0.15 | ~1 MiB |
+
+Verdict: throughput is the same ballpark (run-to-run noise ±30 % dominates; zexi
+is compiled to C, so this is expected), memory is identical (~1 MiB resident),
+but the zexi server burns about **1.8× more CPU per request** at the same RPS
+(0.76 vs 0.42 cores sustained) — the cost of the higher-level parser, `String`
+handling, and route dispatch, which is exactly what the microbenchmarks in
+`bench/results.md` measure in isolation. A raw C server would not go faster
+on this box (the load generator, not the server, is the bottleneck); it would
+only use less CPU per request.
 
 Reproduce: `python3 bench/http_load.py --total 8000 --concurrency 1,8,32,128 --workers 1,4 --out bench/http-results.md`
-(see `bench/README.md`).
+and the same with `--server c --out bench/http-c-results.md` (see `bench/README.md`).
 
 ## 8.8 UDP, name resolution, and readiness
 
