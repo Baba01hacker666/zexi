@@ -1,0 +1,61 @@
+// tests/ref_array.zx
+// A reference to a fixed array is indexable: `&[T; N]` reads and `&mut [T; N]`
+// writes, with the same bounds check as indexing the array itself. This is the
+// shape a C out-parameter arrives in, so it is what lets a program read a buffer
+// a native function filled.
+//
+//     zexic run tests/ref_array.zx
+
+// The C side fills the caller's buffer, exactly as a real library would.
+extern "C" fn fill_squares(buf: &mut [u8; 8], cap: i32) -> i32;
+
+c """
+int32_t fill_squares(struct zx_arr8_u8 *b, int32_t cap) {
+    int32_t n = cap < 8 ? cap : 8;
+    for (int32_t i = 0; i < n; i++) b->e[i] = (uint8_t)(i * i);
+    return n;
+}
+"""
+
+// read reads through a shared reference.
+fn read(buf: &[u8; 8]) -> i32 {
+    let mut total = 0;
+    let mut i = 0;
+    while i < 8 {
+        total += buf[i] as i32;
+        i += 1;
+    }
+    return total;
+}
+
+// bump writes through a mutable reference.
+fn bump(buf: &mut [u8; 8], by: u8) {
+    let mut i = 0;
+    while i < 8 {
+        buf[i] = buf[i] + by;
+        i += 1;
+    }
+}
+
+fn main() {
+    let mut buf: [u8; 8] = [0; 8];
+
+    // A C function writes into the buffer through a &mut [u8; 8] parameter.
+    let n = fill_squares(&mut buf, 8);
+    println(n);
+    println(read(&buf));
+
+    // The same reference is writable from Zexi: 0,1,4,9,16,25,36,49 + 1 each.
+    bump(&mut buf, 1);
+    println(read(&buf));
+
+    // Indexing an array directly still works, and bounds still panic (try
+    // buf[8] to see it).
+    println(buf[3]);
+
+    // A local helper can also take a reference to one element's array slice,
+    // and a str's bytes are the same two-word view.
+    let word = "abc";
+    let bytes = word.as_bytes();
+    println(bytes[1] as char);
+}

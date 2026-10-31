@@ -1,0 +1,7 @@
+// `is_some` belongs to `Option` and `is_ok` to `Result`; asking for the wrong
+// one is not silently false.
+
+fn main() {
+    let r: Result<i32, String> = Ok(1);
+    println(r.is_some()); // error: E0599 no method `is_some`
+}

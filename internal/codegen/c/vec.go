@@ -374,7 +374,14 @@ func (g *gen) vecClosureLoop(x *ast.MethodCallExpr, recv string, t *types.Type) 
 	ctr := g.tmpName()
 	el := g.tmpName()
 	vec := g.tmpName()
-	call := g.callClosure(f, fnTy, []string{el})
+	// A closure that declares `&T` borrows the element in place; anything else
+	// receives a copy (which sema only allows for `Copy` elements).
+	byRef := len(fnTy.Params) > 0 && fnTy.Params[0].Kind == types.Ref
+	elemArg := el
+	if byRef {
+		elemArg = "(&(" + vec + ").ptr[" + ctr + "])"
+	}
+	call := g.callClosure(f, fnTy, []string{elemArg})
 	acc := g.tmpName()
 	var head, tail string
 	switch x.Name {
@@ -400,7 +407,7 @@ func (g *gen) vecClosureLoop(x *ast.MethodCallExpr, recv string, t *types.Type) 
 	case "all":
 		body = "if (!(" + call + ")) { zx_ok = false; break; }"
 	case "fold":
-		body = acc + " = " + g.callClosure(f, fnTy, []string{acc, el}) + ";"
+		body = acc + " = " + g.callClosure(f, fnTy, []string{acc, elemArg}) + ";"
 	}
 	out := "({ "
 	out += ctype(t) + " " + vec + " = " + recv + "; "
@@ -408,7 +415,9 @@ func (g *gen) vecClosureLoop(x *ast.MethodCallExpr, recv string, t *types.Type) 
 	out += head + " "
 	out += "size_t " + ctr + "; "
 	out += "for (" + ctr + " = 0; " + ctr + " < (size_t)(" + vec + ").len; " + ctr + "++) { "
-	out += ctype(elem) + " " + el + " = (" + vec + ").ptr[" + ctr + "]; "
+	if !byRef {
+		out += ctype(elem) + " " + el + " = (" + vec + ").ptr[" + ctr + "]; "
+	}
 	out += body + " } "
 	if tail != "" {
 		out += tail + "; "

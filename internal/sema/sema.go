@@ -92,6 +92,18 @@ type Info struct {
 	PatVariant map[ast.Pattern]*types.Variant
 	// TryMatches maps a `?` expression to the ordinary `match` it desugars to.
 	TryMatches map[*ast.TryExpr]*ast.MatchExpr
+	// CBody records functions whose entire body is written in C (`c r"..."`),
+	// mapped to the body so codegen can emit it verbatim.
+	CBody map[*ast.FnDecl]*ast.CBodyExpr
+
+	// PreludeMatches maps `Option`/`Result` extractor calls (`unwrap`,
+	// `expect`, `unwrap_or`) to the ordinary `match` they desugar to, so the
+	// extractors reuse the move analysis and drop glue a written-out match
+	// already gets.
+	PreludeMatches map[*ast.MethodCallExpr]*ast.MatchExpr
+	// PreludeTag records the tag test a `is_ok`/`is_err`/`is_some`/`is_none`
+	// call lowers to: the variant name whose tag is compared.
+	PreludeTag map[*ast.MethodCallExpr]string
 	// Closures maps each lambda expression to its resolved signature and the
 	// variables it captures from the enclosing function.
 	Closures map[*ast.LambdaExpr]*Closure
@@ -161,23 +173,26 @@ func (in *Info) PlaceThroughBorrow(e ast.Expr) bool {
 func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 	c := &checker{
 		info: &Info{
-			File:       file,
-			Fns:        map[string]*Fn{},
-			Consts:     map[string]*Const{},
-			Structs:    map[string]*types.Struct{},
-			Enums:      map[string]*types.Enum{},
-			Methods:    map[string]map[string]*Fn{},
-			Resolved:   map[ast.Expr]*Fn{},
-			FnValues:   map[ast.Expr]*Fn{},
-			Indirect:   map[ast.Expr]*types.Type{},
-			Ctors:      map[ast.Expr]*Ctor{},
-			TupleCtors: map[ast.Expr]*types.Struct{},
-			Aliases:    map[string]*types.Type{},
-			PatVariant: map[ast.Pattern]*types.Variant{},
-			TryMatches: map[*ast.TryExpr]*ast.MatchExpr{},
-			Closures:   map[*ast.LambdaExpr]*Closure{},
-			Types:      map[ast.Expr]*types.Type{},
-			DeclTypes:  map[ast.Stmt]*types.Type{},
+			File:           file,
+			Fns:            map[string]*Fn{},
+			Consts:         map[string]*Const{},
+			Structs:        map[string]*types.Struct{},
+			Enums:          map[string]*types.Enum{},
+			Methods:        map[string]map[string]*Fn{},
+			Resolved:       map[ast.Expr]*Fn{},
+			FnValues:       map[ast.Expr]*Fn{},
+			Indirect:       map[ast.Expr]*types.Type{},
+			Ctors:          map[ast.Expr]*Ctor{},
+			TupleCtors:     map[ast.Expr]*types.Struct{},
+			Aliases:        map[string]*types.Type{},
+			PatVariant:     map[ast.Pattern]*types.Variant{},
+			TryMatches:     map[*ast.TryExpr]*ast.MatchExpr{},
+			CBody:          map[*ast.FnDecl]*ast.CBodyExpr{},
+			PreludeMatches: map[*ast.MethodCallExpr]*ast.MatchExpr{},
+			PreludeTag:     map[*ast.MethodCallExpr]string{},
+			Closures:       map[*ast.LambdaExpr]*Closure{},
+			Types:          map[ast.Expr]*types.Type{},
+			DeclTypes:      map[ast.Stmt]*types.Type{},
 		},
 		aliasDecls:  map[string]*ast.TypeAlias{},
 		aliasTypes:  map[string]*types.Type{},
@@ -236,6 +251,8 @@ type checker struct {
 	enumDecls   map[string]*ast.EnumDecl
 	// instBusy guards against infinitely recursive generic instantiation.
 	instBusy map[string]bool
+	// cbodyOK is the one `c` body the function being checked may contain.
+	cbodyOK ast.Expr
 	// indirect counts enclosing references/pointers while resolving a type;
 	// recursive instantiations behind one are finite and allowed.
 	indirect int
@@ -1131,6 +1148,57 @@ func (c *checker) tryCollectConst(d *ast.ConstDecl) bool {
 
 // --- body checking --------------------------------------------------------
 
+// cbodyOf returns the `c` body of a function body, when the block is nothing
+// but that body. Anything else (a body with other statements, or a C block in
+// the middle of an expression) is rejected where the block is checked.
+func cbodyOf(b *ast.Block) *ast.CBodyExpr {
+	if b == nil {
+		return nil
+	}
+	if cb, ok := b.Tail.(*ast.CBodyExpr); ok && len(b.Stmts) == 0 {
+		return cb
+	}
+	if len(b.Stmts) == 1 {
+		if es, ok := b.Stmts[0].(*ast.ExprStmt); ok {
+			if cb, ok := es.X.(*ast.CBodyExpr); ok {
+				return cb
+			}
+		}
+	}
+	return nil
+}
+
+// checkCBody validates a function whose body is written in C and records it for
+// codegen. The C body runs instead of generated code, so nothing would emit
+// drop glue for it: parameters and the result must therefore be values that
+// have no destructor to run (scalars, `str`, borrows, pointers, `#[copy]`
+// structs).
+func (c *checker) checkCBody(fn *Fn, cb *ast.CBodyExpr) {
+	if fn.Name == "main" {
+		c.errf(cb.Sp, "E0540", "`main` cannot have a `c` body: the runtime sets up the argument list there")
+		return
+	}
+	for i, p := range fn.Decl.Params {
+		pt := types.UnitT
+		if i < len(fn.Params) {
+			pt = fn.Params[i]
+		}
+		if !token.IsCIdentifier(p.Name) {
+			c.errf(p.Sp, "E0540", "parameter `%s` cannot be used in a `c` body: it is not a C identifier (rename it)", p.Name)
+			return
+		}
+		if pt.NeedsDrop() {
+			c.errf(p.Sp, "E0540", "parameter `%s` has type `%s`, which needs its destructor run; a `c` body cannot drop it, so take `&%s` instead", p.Name, pt, pt)
+			return
+		}
+	}
+	if fn.Ret.NeedsDrop() {
+		c.errf(cb.Sp, "E0540", "a `c` body cannot return `%s`: the value would never be dropped; return a scalar or a borrow", fn.Ret)
+		return
+	}
+	c.info.CBody[fn.Decl] = cb
+}
+
 func (c *checker) checkBodies() {
 	// A worklist: instantiating a generic call appends the concrete function to
 	// FnOrder, and it must be checked in turn. `len` is re-evaluated on every
@@ -1158,7 +1226,12 @@ func (c *checker) checkBodies() {
 		if fn.Ret.Kind != types.Unit {
 			want = fn.Ret
 		}
+		c.cbodyOK = cbodyOf(fn.Decl.Body)
 		bt := c.checkBlockWith(fn.Decl.Body, want)
+		if cb := cbodyOf(fn.Decl.Body); cb != nil && c.info.Types[cb] != nil && c.info.Types[cb].Kind != types.Invalid {
+			c.checkCBody(fn, cb)
+		}
+		c.cbodyOK = nil
 		if fn.Ret.Kind != types.Unit {
 			// An invalid body type has already been diagnosed; don't pile on.
 			if !c.exprAlwaysReturns(fn.Decl.Body) && bt.Kind != types.Never && bt.Kind != types.Invalid {
@@ -1380,6 +1453,18 @@ func (c *checker) bindPattern(p ast.Pattern, ty *types.Type) {
 
 // --- expression checking --------------------------------------------------
 
+// inferCBody accepts `c r"...\"` only where a C body is allowed — as the whole
+// body of the function being checked — and gives it type `never`, since a C
+// `return` leaves the function rather than producing a value here.
+func (c *checker) inferCBody(x *ast.CBodyExpr) *types.Type {
+	if c.cbodyOK != x {
+		c.errf(x.Sp, "E0540", "a `c` body must be the entire body of a function, not part of an expression")
+		return &types.Type{Kind: types.Invalid}
+	}
+	c.info.Types[x] = types.NeverT
+	return types.NeverT
+}
+
 func (c *checker) checkExpr(e ast.Expr, expected *types.Type) *types.Type {
 	t := c.infer(e, expected)
 	if t == nil {
@@ -1393,6 +1478,9 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 	switch x := e.(type) {
 	case *ast.LiteralExpr:
 		return c.inferLiteral(x, expected)
+
+	case *ast.CBodyExpr:
+		return c.inferCBody(x)
 
 	case *ast.IdentExpr:
 		return c.inferIdentExpr(x, expected)
@@ -1467,6 +1555,35 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		if dstT == nil {
 			return nil
 		}
+		// `&t as *T` (and `&mut t as *mut T`) is the one way to make a raw
+		// pointer from a borrow. The pointee must match: a cast is a spelling
+		// change, not a reinterpretation, so the C side sees the same type the
+		// language promised it.
+		if dstT.Kind == types.Ptr {
+			if e := pointerElem(srcT); e != nil && types.Equal(e, dstT.Elem) {
+				return dstT
+			}
+			// An integer that already holds an address (a C handle a library
+			// returns) can be turned back into a typed pointer.
+			if srcT.Kind.IsInt() {
+				return dstT
+			}
+			inner := srcT
+			if inner.Kind == types.Ref || inner.Kind == types.Ptr {
+				inner = inner.Elem
+			}
+			if inner != nil && inner.Kind == types.Slice {
+				c.errAt(x, "E0308", "cannot cast `%s` to `%s`: a slice is a pointer and a length, so there is no single address to take; cast an element (`&xs[i]`) instead", srcT, dstT)
+				return dstT
+			}
+			c.errAt(x, "E0308", "cannot cast `%s` to `%s`: a pointer cast keeps its pointee type", srcT, dstT)
+			return dstT
+		}
+		// A pointer can be observed as an integer address (for a handle, a hash,
+		// or a log line), but only by asking with `as`.
+		if srcT.Kind == types.Ptr && dstT.Kind.IsInt() {
+			return dstT
+		}
 		if !srcT.Kind.IsNumeric() && srcT.Kind != types.Char && srcT.Kind != types.Bool {
 			c.errAt(x.X, "E0308", "cannot cast `%s` with `as`", srcT)
 			return dstT
@@ -1526,6 +1643,28 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		return c.inferTry(x, expected)
 	}
 	c.errf(e.Span(), "E0900", "unsupported expression")
+	return nil
+}
+
+// pointerElem reports the element type a value of type t would point at if it
+// were cast to a raw pointer, or nil when t is not pointer-shaped. `&mut [u8]
+// as *u8` and `&mut [u8; 8] as *u8` both give a `u8` pointer (an array borrow
+// decays to its first element, exactly as in C), and `str as *u8` gives the
+// byte pointer the string already holds.
+func pointerElem(t *types.Type) *types.Type {
+	if t == nil {
+		return nil
+	}
+	switch t.Kind {
+	case types.Ref, types.Ptr:
+		e := t.Elem
+		if e != nil && e.Kind == types.Array {
+			return e.Elem
+		}
+		return e
+	case types.Str:
+		return types.U8T
+	}
 	return nil
 }
 
@@ -1950,6 +2089,23 @@ func isScalarText(t *types.Type) bool {
 	return t.Kind.IsNumeric() || t.Kind == types.Bool || t.Kind == types.Char
 }
 
+// comparableValue reports whether a value of type t (or of the type t points
+// at) can take part in a comparison, which is what makes reading through a
+// borrow meaningful.
+func comparableValue(t *types.Type) bool {
+	if t == nil {
+		return false
+	}
+	if t.Kind == types.Ref {
+		t = t.Elem
+	}
+	if t == nil {
+		return false
+	}
+	return t.Kind.IsNumeric() || t.Kind == types.Bool || t.Kind == types.Char ||
+		t.Kind == types.Str || t.Kind == types.StringKind
+}
+
 // isComparison reports whether op is one of the six comparison operators.
 func isComparison(op token.Kind) bool {
 	switch op {
@@ -1993,6 +2149,34 @@ func (c *checker) inferBinary(x *ast.BinExpr, expected *types.Type) *types.Type 
 		case isStrLike(lt) && (isStrLike(rt) || isScalarText(rt)),
 			isStrLike(rt) && isScalarText(lt):
 			return types.StringT
+		}
+	}
+	// A comparison reads through a borrow on either side: `n > 7` where
+	// `n: &i64`, or `s == "b"` where `s: &String`. The reference is peeled for
+	// the type check only — codegen emits the dereference — and only when the
+	// pointee is itself comparable, so comparing two pointers by address stays
+	// an error rather than silently becoming a value comparison.
+	if isComparison(x.Op) && (lt.Kind == types.Ref || rt.Kind == types.Ref) && comparableValue(lt) && comparableValue(rt) {
+		peel := func(t *types.Type) *types.Type {
+			if t.Kind == types.Ref && t.Elem != nil {
+				return t.Elem
+			}
+			return t
+		}
+		pl, pr := peel(lt), peel(rt)
+		switch {
+		case types.Equal(pl, pr):
+			lt, rt = pl, pr
+		case isStrLike(pl) && isStrLike(pr):
+			// `s == "b"` where `s: &String`: compare the text behind the borrow.
+			lt, rt = pl, pr
+		case isIntLiteral(x.R) && pl.Kind.IsNumeric():
+			// `n > 7` where `n: &i64`: the literal takes the pointee's type.
+			lt = pl
+			rt = c.checkExpr(x.R, pl)
+		case isIntLiteral(x.L) && pr.Kind.IsNumeric():
+			lt = c.checkExpr(x.L, pr)
+			rt = pr
 		}
 	}
 	// Comparison over any two string-like operands compares bytes, so `"a" < b`
@@ -2202,8 +2386,11 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		}
 		return nil
 	}
-	if name == "print" || name == "println" {
+	if name == "print" || name == "println" || name == "eprint" || name == "eprintln" {
 		return c.inferPrint(x)
+	}
+	if name == "panic" {
+		return c.inferPanic(x)
 	}
 	if name == "len" {
 		return c.inferLen(x)
@@ -2329,7 +2516,7 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		if t := c.inferBareVariantCtor(x, name, expected); t != nil {
 			return t
 		}
-		cands := []string{"print", "println", "len", "cstr", "from_cstr", "arg_count", "arg_at", "project_dir"}
+		cands := []string{"print", "println", "eprint", "eprintln", "panic", "len", "cstr", "from_cstr", "arg_count", "arg_at", "project_dir"}
 		for n := range c.info.Fns {
 			cands = append(cands, n)
 		}
@@ -3185,6 +3372,14 @@ func (c *checker) inferIndex(x *ast.IndexExpr) *types.Type {
 	if rt != nil && rt.Kind == types.Ref && rt.Elem != nil && rt.Elem.Kind == types.Slice {
 		rt = rt.Elem
 	}
+	// `&[T; N]` and `&mut [T; N]` index like the array they point at, so a
+	// buffer a C function filled can be read (and written) through the
+	// reference a signature declares. Without this, `out[i] = v` on an
+	// `&mut [u8; N]` parameter was E0608 — the one shape an FFI out-parameter
+	// arrives in.
+	if rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr) && rt.Elem != nil && rt.Elem.Kind == types.Array {
+		rt = rt.Elem
+	}
 	if rt == nil || (rt.Kind != types.Array && rt.Kind != types.Slice && rt.Kind != types.VecKind) {
 		c.errAt(x, "E0608", "cannot index a value of type `%s`", rt)
 		return nil
@@ -3778,6 +3973,150 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 // inferTry lowers `e?` to an ordinary match over the operand. The desugared
 // match is kept in Info.TryMatches so codegen (which never sees `?`) can emit
 // it.
+// inferPreludeMethod types the builtin methods of `Option` and `Result`, and
+// reports whether it handled the call. The tag tests lower to a single tag
+// comparison (so they borrow the receiver and never move it); the extractors
+// lower to the same ordinary `match` that `?` desugars to, which is what gives
+// them the move analysis and the once-only drop of the remainder for free —
+// `r.unwrap()` moves the payload out exactly like
+// `match r { Ok(v) => v, Err(_) => panic("...") }`.
+func (c *checker) inferPreludeMethod(x *ast.MethodCallExpr, base *types.Type) (*types.Type, bool) {
+	baseName := nominalBaseName(base)
+	isResult := baseName == "Result"
+	okName, errName := "Some", "None"
+	if isResult {
+		okName, errName = "Ok", "Err"
+	}
+	var payload *types.Type
+	if len(base.En.Args) > 0 {
+		payload = base.En.Args[0]
+	}
+	unitPayload := payload == nil || payload.Kind == types.Unit
+
+	// Tag tests read the discriminant, so they take the receiver by borrow.
+	tags := map[string]string{"is_some": "Some", "is_none": "None"}
+	if isResult {
+		tags = map[string]string{"is_ok": "Ok", "is_err": "Err"}
+	}
+	if variant, ok := tags[x.Name]; ok {
+		if len(x.Args) != 0 {
+			c.errAt(x, "E0061", "`%s` takes no arguments but %d were supplied", x.Name, len(x.Args))
+			for _, a := range x.Args {
+				c.checkExpr(a, nil)
+			}
+		}
+		if _, ok := base.En.Variant(variant); !ok {
+			c.errAt(x, "E0277", "`%s` needs a `%s::%s` variant", x.Name, baseName, variant)
+			return types.BoolT, true
+		}
+		c.info.PreludeTag[x] = variant
+		return types.BoolT, true
+	}
+
+	switch x.Name {
+	case "unwrap", "expect", "unwrap_or":
+	default:
+		return nil, false
+	}
+
+	sp := x.Sp
+	// The failing arm: `Err(_)` for a Result, bare `None` for an Option.
+	failPat := &ast.PathPat{Path: []string{baseName, errName}, Sp: sp}
+	if isResult {
+		// The error value is not needed, and binding it would move an owned
+		// error into an unused local; match it with a wildcard instead.
+		failPat.Sub = []ast.Pattern{&ast.WildcardPat{Sp: sp}}
+	}
+	var failBody ast.Expr
+	switch x.Name {
+	case "unwrap":
+		if len(x.Args) != 0 {
+			c.errAt(x, "E0061", "`unwrap` takes no arguments but %d were supplied", len(x.Args))
+			for _, a := range x.Args {
+				c.checkExpr(a, nil)
+			}
+		}
+		failBody = &ast.CallExpr{
+			Callee: &ast.IdentExpr{Name: "panic", Sp: sp},
+			Args:   []ast.Expr{&ast.LiteralExpr{Kind: token.KindString, Text: "called `unwrap` on a `" + errName + "` value", Sp: sp}},
+			Sp:     sp,
+		}
+	case "expect":
+		if len(x.Args) != 1 {
+			c.errAt(x, "E0061", "`expect` takes 1 argument but %d were supplied", len(x.Args))
+			for _, a := range x.Args {
+				c.checkExpr(a, nil)
+			}
+			return payload, true
+		}
+		at := c.checkExpr(x.Args[0], nil)
+		if !isPrintable(at) {
+			c.errAt(x.Args[0], "E0277", "`%s` cannot be printed", at)
+		}
+		failBody = &ast.CallExpr{
+			Callee: &ast.IdentExpr{Name: "panic", Sp: sp},
+			Args:   []ast.Expr{x.Args[0]},
+			Sp:     sp,
+		}
+	case "unwrap_or":
+		if len(x.Args) != 1 {
+			c.errAt(x, "E0061", "`unwrap_or` takes 1 argument but %d were supplied", len(x.Args))
+			for _, a := range x.Args {
+				c.checkExpr(a, nil)
+			}
+			return payload, true
+		}
+		at := c.checkExpr(x.Args[0], payload)
+		if payload != nil && !c.argAssignable(payload, at, false) {
+			// Already reported: building the match now would only add a second,
+			// less specific diagnostic about its arms.
+			c.errAt(x.Args[0], "E0308", "mismatched types: expected `%s`, found `%s`", payload, at)
+			return payload, true
+		}
+		failBody = x.Args[0]
+	}
+	if _, ok := base.En.Variant(errName); !ok {
+		c.errAt(x, "E0277", "`%s` needs a `%s::%s` variant", x.Name, baseName, errName)
+		return payload, true
+	}
+
+	// The succeeding arm yields the payload, or `()` when there is nothing to
+	// extract (a wildcard stands in for `Ok(())`, so no void local is declared).
+	var okPat ast.Pattern
+	var okBody ast.Expr
+	if unitPayload {
+		okPat = &ast.WildcardPat{Sp: sp}
+		okBody = &ast.TupleExpr{Sp: sp}
+	} else {
+		const bind = "__prelude_value"
+		okPat = &ast.PathPat{
+			Path: []string{baseName, okName},
+			Sub:  []ast.Pattern{&ast.BindPat{Name: bind, Sp: sp}},
+			Sp:   sp,
+		}
+		okBody = &ast.IdentExpr{Name: bind, Sp: sp}
+	}
+
+	m := &ast.MatchExpr{
+		Scrutinee: x.Recv,
+		// The failing arm comes first: a unit success arm is a wildcard, which
+		// would otherwise swallow the failure.
+		Arms: []ast.MatchArm{
+			{Pat: failPat, Body: failBody, Sp: sp},
+			{Pat: okPat, Body: okBody, Sp: sp},
+		},
+		Sp: sp,
+	}
+	c.info.PreludeMatches[x] = m
+	var want *types.Type
+	if x.Name != "unwrap_or" {
+		want = payload
+	}
+	ret := c.checkExpr(m, want)
+	c.info.Types[x] = ret
+	return ret, true
+}
+
 func (c *checker) inferTry(x *ast.TryExpr, expected *types.Type) *types.Type {
 	ret := c.cur.Ret
 	retBase := ""
@@ -4144,6 +4483,17 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 		}
 		return c.inferMapMethod(x, base)
 	}
+	// `Option` and `Result` carry builtin methods: the tag tests and the
+	// extractors. They cannot be `impl` blocks, because the prelude enums are
+	// templates the checker builds itself.
+	if base != nil && base.Kind == types.EnumKind && base.En != nil {
+		switch nominalBaseName(base) {
+		case "Result", "Option":
+			if t, handled := c.inferPreludeMethod(x, base); handled {
+				return t
+			}
+		}
+	}
 	// `len()` is also available directly on arrays, slices, and `str` values.
 	if x.Name == "len" && len(x.Args) == 0 && base != nil && (base.Kind == types.Array || base.Kind == types.Str || base.Kind == types.Slice) {
 		return types.UsizeT
@@ -4447,6 +4797,28 @@ func formatLiteral(args []ast.Expr) (string, bool) {
 // countFormatArgs returns the number of `{}` placeholders in a format string.
 func countFormatArgs(format string) int {
 	return strings.Count(format, "{}")
+}
+
+// inferPanic types `panic(msg)`: it never returns, so its type is `never` and it
+// is usable anywhere a value is expected — the reason it can stand in for an
+// arm body in the match that `unwrap`/`expect` desugar to.
+func (c *checker) inferPanic(x *ast.CallExpr) *types.Type {
+	switch len(x.Args) {
+	case 0:
+		return types.NeverT
+	case 1:
+		at := c.checkExpr(x.Args[0], nil)
+		if !isPrintable(at) {
+			c.errAt(x.Args[0], "E0277", "`%s` cannot be printed", at)
+		}
+		return types.NeverT
+	default:
+		c.errAt(x, "E0061", "`panic` takes at most one argument but %d were supplied", len(x.Args))
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return types.NeverT
+	}
 }
 
 func (c *checker) inferPrint(x *ast.CallExpr) *types.Type {
@@ -5083,6 +5455,10 @@ func isPrintable(t *types.Type) bool {
 	switch t.Kind {
 	case types.Str, types.Char, types.Bool, types.StringKind:
 		return true
+	case types.Ref:
+		// Reading through a borrow prints the value it points at, so a closure
+		// over `&T` can print what it was handed.
+		return isPrintable(t.Elem)
 	}
 	return t.Kind.IsNumeric()
 }

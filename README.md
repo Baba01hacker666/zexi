@@ -42,15 +42,21 @@ This repository contains the **initial design and specification** of Zexi: the v
 > or-patterns (`A | B`), and range patterns (`1..=9`, `'a'..='z'`);
 > **monomorphized generics** for functions, structs, enums, and impls, with
 > inference and turbofish (`id::<i64>`, `Pair::<i32, str>`); predeclared
-> **`Option<T>`/`Result<T, E>`** and the **`?` operator** (lowered to `match`,
-> with bare `Some`/`None`/`Ok`/`Err` from context); **owned enum payloads** with
+> **`Option<T>`/`Result<T, E>`** with their builtin helpers (`unwrap`, `expect`,
+> `unwrap_or`, `is_ok`/`is_err`/`is_some`/`is_none`) and the **`?` operator**
+> (all lowered to `match`, with bare `Some`/`None`/`Ok`/`Err` from context);
+> **`panic(msg)`** as a `never` expression that exits 101; **owned enum payloads** with
 > match move/drop glue;
 > **first-class arrays** with bounds-checked indexing, and **borrowed slices**
 > (`&[T]`/`&mut [T]` as a two-word view, `a[lo..hi]`, `for x in slice`, and
 > `String::push_bytes`/`as_bytes` bridging text and bytes);
 > a **use-after-move checker** for non-`Copy` values (opt into copying with
-> `#[copy]`); the built-in owning heap type **`String`** with **deterministic
-> destruction (`Drop`)**, string-parsing methods, and text-building sugar
+> `#[copy]`); **`&t as *T`** casts (an array borrow decays, the pointee must
+> match) so a C function can write through a borrow; **C function bodies** —
+> `fn dot(a: &[f32], b: &[f32]) -> f32 { c """...""" }` compiles the body in the
+> program's single translation unit, typed against the generated ABI and inlined
+> with no boundary; the built-in owning heap type **`String`** with
+> **deterministic destruction (`Drop`)**, string-parsing methods, and text-building sugar
 > (`"n = " + n`, `s += n`); **`extern "C"` FFI** for
 > calling libc; and compiling **several source files into one binary** — enough
 > to ship an HTTP client/server in [`lib/http.zx`](lib/http.zx), plus embedded
@@ -167,10 +173,52 @@ zexic run src/main.zx       # the root above src/ is searched for modules
 zexic build . -o app
 ```
 
+A project's `lib/` is also where `zexic add` installs packages, so `use sqlite;`
+resolves to the copy you can read and edit.
+
 Named imports are searched next to the importing file, in its `lib/`, at the
 project root, and in the root's `lib/`, before the embedded standard library.
 `use util;` where `util/` is a directory loads the **whole folder** (every `.zx`
 inside it) as one package; `--root=dir` pins the root explicitly.
+
+## C libraries: `zexic add`
+
+The standard library needs no external dependency. For the libraries it
+deliberately does not vendor, the compiler ships a catalog of ready-made bindings
+and installs one with a single command:
+
+```sh
+zexic add              # list what is available, with your system's status
+zexic add sqlite       # writes lib/sqlite.zx into this project
+```
+
+A package is **one `.zx` file** that carries its own `extern "C"` declarations,
+`c """..."""` glue, and an idiomatic Zexi API — no manifest, no lockfile, no
+download step, and no compiler change. `zexic add` compiles and links a probe to
+tell you whether the system half is installed:
+
+```
+package      category   what it gives you                          system
+sqlite       storage    embedded SQL database (libsqlite3)         ready
+crypto       security   SHA-256/512/1, MD5, HMAC-SHA256 (libcrypto) needs openssl/evp.h, libcrypto
+```
+
+<!-- fragment -->
+```zx
+use sqlite;
+
+fn main() -> i32 {
+    let mut db = sqlite::memory()?;
+    db.exec("create table notes(body text)")?;
+    db.exec("insert into notes values('hello')")?;
+    println(db.query("select body from notes")?);
+    0
+}
+```
+
+The catalog: `sqlite`, `zlib`, `crypto` (libcrypto), `curl`, `microhttpd`. Each
+module is written in the language it serves, so it can be read, edited, and
+committed with your project. See [`docs/19-modules.md`](docs/19-modules.md).
 
 ## Editor support (LSP)
 
@@ -258,6 +306,9 @@ for why, its real costs, and the plan to replace it with a native backend.
 - [`docs/12-generics.md`](docs/12-generics.md) — monomorphized generics, `Option`/`Result`, and `?`.
 - [`docs/13-mir.md`](docs/13-mir.md) — the mid-level IR: shape, instruction set, drops, lowering, and verification.
 - [`docs/14-json-and-html.md`](docs/14-json-and-html.md) — building websites: JSON values and safe HTML templating.
+- [`docs/17-extending.md`](docs/17-extending.md) — adding a capability as a library, not a compiler change.
+- [`docs/18-one-translation-unit.md`](docs/18-one-translation-unit.md) — measured: one C file or many, and why.
+- [`docs/19-modules.md`](docs/19-modules.md) — `zexic add`: the C-library catalog, and how to write a package.
 - [`examples/`](examples/) — ready-to-run Zexi programs plus focused feature examples.
 - [`tests/tour.zx`](tests/tour.zx) — the end-to-end program the test suite compiles and runs.
 - [`tests/syntax.zx`](tests/syntax.zx) — a runnable syntax tour; [`tests/pi.zx`](tests/pi.zx) — 30 digits of π.
@@ -278,6 +329,7 @@ internal/
   mir/                mid-level IR: CFG lowering, validator, dump, test oracle
   layout/             ABI table: sizes, alignments, field offsets, enum tags
   driver/             pipeline orchestration, imports/modules + C compiler invocation
+  registry/           `zexic add` catalog: embedded module sources + dependency probe
   diag/               diagnostics + source spans
 docs/                 the specification
 examples/             sample Zexi source

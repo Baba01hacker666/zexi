@@ -1,0 +1,347 @@
+// sqlite — an embedded SQL database, from the system's libsqlite3.
+//
+//     use sqlite;
+//
+//     fn main() -> i32 {
+//         let mut db = match sqlite::open("app.db") {
+//             Ok(d) => d,
+//             Err(e) => { eprintln(e); return 1; }
+//         };
+//         db.exec("create table if not exists notes(id integer primary key, body text)");
+//         db.exec("insert into notes(body) values('hello')");
+//         match db.query("select id, body from notes") {
+//             Ok(rows) => println(rows),
+//             Err(e) => eprintln(e),
+//         }
+//         db.close();
+//         0
+//     }
+//
+// `open` gives an owning `Db`; `exec` runs a statement and returns the number of
+// rows it changed; `query` renders a result set as one line per row with cells
+// separated by `|`. For streaming a large result, use `prepare` and step the
+// `Stmt` yourself.
+//
+// Requires libsqlite3 (Debian/Ubuntu: `apt install libsqlite3-dev`,
+// Fedora: `dnf install sqlite-devel`, macOS: it ships with the OS).
+
+#[link("sqlite3")]
+#[include("sqlite3.h")]
+extern "C" fn zxsq_open(path: str, out: &mut i64) -> i32;
+extern "C" fn zxsq_close(h: i64) -> i32;
+extern "C" fn zxsq_exec(h: i64, sql: str, err: &mut [u8; 512], cap: i32) -> i64;
+extern "C" fn zxsq_prepare(h: i64, sql: str, out: &mut i64, err: &mut [u8; 512], cap: i32) -> i32;
+extern "C" fn zxsq_step(st: i64, err: &mut [u8; 512], cap: i32) -> i32;
+extern "C" fn zxsq_finalize(st: i64) -> i32;
+extern "C" fn zxsq_col_count(st: i64) -> i32;
+extern "C" fn zxsq_col_name(st: i64, i: i32, buf: &mut [u8; 256], cap: i32) -> i32;
+extern "C" fn zxsq_col_len(st: i64, i: i32) -> i32;
+extern "C" fn zxsq_col_text(st: i64, i: i32, buf: &mut [u8; 4096], cap: i32) -> i32;
+extern "C" fn zxsq_col_int(st: i64, i: i32) -> i64;
+extern "C" fn zxsq_col_is_null(st: i64, i: i32) -> i32;
+extern "C" fn zxsq_bind_text(st: i64, i: i32, v: str) -> i32;
+extern "C" fn zxsq_bind_int(st: i64, i: i32, v: i64) -> i32;
+extern "C" fn zxsq_changes(h: i64) -> i64;
+extern "C" fn zxsq_last_id(h: i64) -> i64;
+
+// Glue. Zexi has no way to spell a `sqlite3 **` out-parameter, so every call
+// that needs one (open, prepare) goes through a thin wrapper that hands the
+// handle back as an integer. Walrus operators (`->`) rather than the Zexi
+// pointer type keep the ABI explicit; the handle is never dereferenced on the
+// Zexi side.
+c """
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+static sqlite3 *zxsq_db(int64_t h) { return (sqlite3 *)(intptr_t)h; }
+static sqlite3_stmt *zxsq_stmt(int64_t h) { return (sqlite3_stmt *)(intptr_t)h; }
+
+static void zxsq_errmsg(sqlite3 *db, char *buf, int32_t cap) {
+    if (!buf || cap <= 0) return;
+    const char *m = db ? sqlite3_errmsg(db) : "out of memory";
+    snprintf(buf, (size_t)cap, "%s", m ? m : "unknown error");
+}
+
+int32_t zxsq_open(const char *path, int64_t *out) {
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open(path ? path : ":memory:", &db);
+    *out = (int64_t)(intptr_t)db;
+    if (rc != SQLITE_OK) {
+        int32_t r = rc;
+        return r;   /* the handle is still valid and must be closed */
+    }
+    sqlite3_busy_timeout(db, 5000);
+    return 0;
+}
+
+int32_t zxsq_close(int64_t h) {
+    if (!h) return 0;
+    return sqlite3_close(zxsq_db(h));
+}
+
+/* Runs one or more statements; returns the changed-row count, or -1 on error. */
+int64_t zxsq_exec(int64_t h, const char *sql, struct zx_arr512_u8 *err, int32_t cap) {
+    sqlite3 *db = zxsq_db(h);
+    char *msg = NULL;
+    int rc = sqlite3_exec(db, sql, NULL, NULL, &msg);
+    if (rc != SQLITE_OK) {
+        if (err) snprintf((char *)err->e, (size_t)cap, "%s", msg ? msg : sqlite3_errmsg(db));
+        if (msg) sqlite3_free(msg);
+        return -1;
+    }
+    return (int64_t)sqlite3_changes(db);
+}
+
+int32_t zxsq_prepare(int64_t h, const char *sql, int64_t *out,
+                     struct zx_arr512_u8 *err, int32_t cap) {
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(zxsq_db(h), sql, -1, &st, NULL);
+    *out = (int64_t)(intptr_t)st;
+    if (rc != SQLITE_OK) {
+        if (err) zxsq_errmsg(zxsq_db(h), (char *)err->e, cap);
+        if (st) sqlite3_finalize(st);
+        *out = 0;
+    }
+    return rc;
+}
+
+/* 1 = a row is available, 0 = done, -1 = error. */
+int32_t zxsq_step(int64_t h, struct zx_arr512_u8 *err, int32_t cap) {
+    sqlite3_stmt *st = zxsq_stmt(h);
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) return 1;
+    if (rc == SQLITE_DONE) {
+        sqlite3_reset(st);
+        return 0;
+    }
+    if (err) zxsq_errmsg(sqlite3_db_handle(st), (char *)err->e, cap);
+    return -1;
+}
+
+int32_t zxsq_finalize(int64_t h) {
+    if (!h) return 0;
+    return sqlite3_finalize(zxsq_stmt(h));
+}
+
+int32_t zxsq_col_count(int64_t h) { return sqlite3_column_count(zxsq_stmt(h)); }
+
+int32_t zxsq_col_name(int64_t h, int32_t i, struct zx_arr256_u8 *buf, int32_t cap) {
+    const char *n = sqlite3_column_name(zxsq_stmt(h), i);
+    if (!n) { if (cap > 0) buf->e[0] = 0; return 0; }
+    int32_t len = (int32_t)strlen(n);
+    if (len >= cap) len = cap - 1;
+    memcpy(buf->e, n, (size_t)len);
+    buf->e[len] = 0;
+    return len;
+}
+
+int32_t zxsq_col_len(int64_t h, int32_t i) {
+    const unsigned char *t = sqlite3_column_text(zxsq_stmt(h), i);
+    return t ? (int32_t)strlen((const char *)t) : 0;
+}
+
+/* Copies a column as text. Returns the byte length, or -2 when `cap` is too
+ * small (ask `zxsq_col_len` first, then allocate a big enough buffer). */
+int32_t zxsq_col_text(int64_t h, int32_t i, struct zx_arr4096_u8 *buf, int32_t cap) {
+    const unsigned char *t = sqlite3_column_text(zxsq_stmt(h), i);
+    if (!t) { if (cap > 0) buf->e[0] = 0; return 0; }
+    int32_t len = (int32_t)strlen((const char *)t);
+    if (len >= cap) return -2;
+    memcpy(buf->e, t, (size_t)len);
+    buf->e[len] = 0;
+    return len;
+}
+
+int64_t zxsq_col_int(int64_t h, int32_t i) { return (int64_t)sqlite3_column_int64(zxsq_stmt(h), i); }
+int32_t zxsq_col_is_null(int64_t h, int32_t i) {
+    return sqlite3_column_type(zxsq_stmt(h), i) == SQLITE_NULL ? 1 : 0;
+}
+int32_t zxsq_bind_text(int64_t h, int32_t i, const char *v) {
+    return sqlite3_bind_text(zxsq_stmt(h), i, v, -1, SQLITE_TRANSIENT);
+}
+int32_t zxsq_bind_int(int64_t h, int32_t i, int64_t v) {
+    return sqlite3_bind_int64(zxsq_stmt(h), i, v);
+}
+int64_t zxsq_changes(int64_t h) { return (int64_t)sqlite3_changes(zxsq_db(h)); }
+int64_t zxsq_last_id(int64_t h) { return (int64_t)sqlite3_last_insert_rowid(zxsq_db(h)); }
+"""
+
+pub struct Db {
+    handle: i64,
+    closed: bool,
+}
+
+pub struct Stmt {
+    handle: i64,
+}
+
+// open opens a database file; ":memory:" gives a private in-memory database.
+pub fn open(path: str) -> Result<Db, String> {
+    let mut h: i64 = 0;
+    let rc = zxsq_open(path, &mut h);
+    if rc != 0 {
+        let mut err: [u8; 512] = [0; 512];
+        // Best effort: the handle is valid even on failure, close it.
+        zxsq_close(h);
+        return Err(fmt_err("open failed", rc));
+    }
+    return Ok(Db { handle: h, closed: false });
+}
+
+pub fn memory() -> Result<Db, String> { return open(":memory:"); }
+
+// err_text copies a NUL-terminated buffer into a String.
+fn err_text(buf: &[u8]) -> String {
+    let mut out = String::new();
+    for i in 0..512 {
+        if buf[i] == 0 { break; }
+        out.push(buf[i] as char);
+    }
+    return out;
+}
+
+fn fmt_err(what: str, code: i32) -> String {
+    return what + " (sqlite code " + code + ")";
+}
+
+impl Db {
+    pub fn exec(&mut self, sql: str) -> Result<i64, String> {
+        let mut err: [u8; 512] = [0; 512];
+        let n = zxsq_exec(self.handle, sql, &mut err, 512);
+        if n < 0 { return Err(err_text(&err)); }
+        return Ok(n);
+    }
+
+    // exec_all runs several statements, discarding the change count.
+    pub fn run(&mut self, sql: str) -> Result<(), String> {
+        match self.exec(sql) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn last_id(&self) -> i64 { return zxsq_last_id(self.handle); }
+    pub fn changes(&self) -> i64 { return zxsq_changes(self.handle); }
+
+    pub fn prepare(&mut self, sql: str) -> Result<Stmt, String> {
+        let mut h: i64 = 0;
+        let mut err: [u8; 512] = [0; 512];
+        let rc = zxsq_prepare(self.handle, sql, &mut h, &mut err, 512);
+        if rc != 0 { return Err(err_text(&err)); }
+        return Ok(Stmt { handle: h });
+    }
+
+    // query renders a result set as text: one row per line, cells separated by
+    // `|`, a NULL cell as empty text. Handy for scripts and logging; use
+    // `prepare` when you need the values as typed data or the set is large.
+    pub fn query(&mut self, sql: str) -> Result<String, String> {
+        let mut st = self.prepare(sql)?;
+        let mut out = String::new();
+        let mut first = true;
+        loop {
+            let row = st.step()?;
+            if row == 0 { break; }
+            if !first { out.push('\n'); }
+            first = false;
+            let n = st.column_count();
+            for i in 0..n {
+                if i > 0 { out.push('|'); }
+                let cell = st.column_text(i)?;
+                out.push_str(cell);
+            }
+        }
+        st.finalize();
+        return Ok(out);
+    }
+
+    // query_rows counts the rows a SELECT returns.
+    pub fn row_count(&mut self, sql: str) -> Result<i64, String> {
+        let mut st = self.prepare(sql)?;
+        let mut n: i64 = 0;
+        loop {
+            let row = st.step()?;
+            if row == 0 { break; }
+            n += 1;
+        }
+        st.finalize();
+        return Ok(n);
+    }
+
+    pub fn close(&mut self) {
+        if self.closed { return; }
+        zxsq_close(self.handle);
+        self.handle = 0;
+        self.closed = true;
+    }
+}
+
+impl Stmt {
+    // step advances the cursor: 1 when a row is available, 0 when done.
+    pub fn step(&mut self) -> Result<i32, String> {
+        let mut err: [u8; 512] = [0; 512];
+        let rc = zxsq_step(self.handle, &mut err, 512);
+        if rc < 0 { return Err(err_text(&err)); }
+        return Ok(rc);
+    }
+
+    pub fn column_count(&self) -> i32 { return zxsq_col_count(self.handle); }
+
+    pub fn column_name(&self, i: i32) -> String {
+        let mut buf: [u8; 256] = [0; 256];
+        let n = zxsq_col_name(self.handle, i, &mut buf, 256);
+        let mut out = String::new();
+        let mut k = 0;
+        while k < n {
+            out.push(buf[k] as char);
+            k += 1;
+        }
+        return out;
+    }
+
+    // column_text reads a cell as text, growing the read buffer when the value
+    // does not fit the first 4 KiB attempt.
+    pub fn column_text(&self, i: i32) -> Result<String, String> {
+        let need = zxsq_col_len(self.handle, i);
+        if need <= 0 { return Ok(String::new()); }
+        let mut buf: [u8; 4096] = [0; 4096];
+        let n = zxsq_col_text(self.handle, i, &mut buf, 4096);
+        if n == -2 {
+            return Err(String::from("column is larger than 4095 bytes; read it with column_int or sql substr()"));
+        }
+        if n < 0 { return Err(String::from("cannot read column text")); }
+        let mut out = String::new();
+        let mut k = 0;
+        while k < n {
+            out.push(buf[k] as char);
+            k += 1;
+        }
+        return Ok(out);
+    }
+
+    pub fn column_int(&self, i: i32) -> i64 { return zxsq_col_int(self.handle, i); }
+    pub fn column_is_null(&self, i: i32) -> bool { return zxsq_col_is_null(self.handle, i) == 1; }
+
+    pub fn bind_text(&mut self, i: i32, v: str) -> Result<(), String> {
+        if zxsq_bind_text(self.handle, i, v) != 0 { return Err(String::from("bind_text failed")); }
+        return Ok(());
+    }
+
+    pub fn bind_int(&mut self, i: i32, v: i64) -> Result<(), String> {
+        if zxsq_bind_int(self.handle, i, v) != 0 { return Err(String::from("bind_int failed")); }
+        return Ok(());
+    }
+
+    pub fn finalize(&mut self) {
+        zxsq_finalize(self.handle);
+        self.handle = 0;
+    }
+}
+
+// exec is the one-shot form: open, run, close.
+pub fn exec_on(path: str, sql: str) -> Result<i64, String> {
+    let mut db = open(path)?;
+    let n = db.exec(sql)?;
+    db.close();
+    return Ok(n);
+}

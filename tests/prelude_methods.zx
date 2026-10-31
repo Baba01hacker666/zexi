@@ -1,0 +1,54 @@
+// tests/prelude_methods.zx
+// The builtin methods of `Option` and `Result`: the tag tests borrow
+// (`is_ok`, `is_err`, `is_some`, `is_none`) and the extractors consume their
+// receiver (`unwrap`, `expect`, `unwrap_or`), exactly like the `match` they
+// desugar to. `panic(msg)` never returns, which is why it can be an arm body.
+//
+//     zexic run tests/prelude_methods.zx
+
+fn parse(n: i32) -> Result<i32, String> {
+    if n < 0 {
+        return Err(String::from("negative"));
+    }
+    return Ok(n * 2);
+}
+
+fn nickname(n: i32) -> Option<String> {
+    if n == 1 {
+        return Some(String::from("one"));
+    }
+    return None;
+}
+
+fn main() {
+    // Tag tests read the discriminant, so the value is still usable afterwards.
+    let ok = parse(21);
+    println(ok.is_ok());
+    println(ok.is_err());
+    println(ok.unwrap());
+
+    let bad = parse(-1);
+    println(bad.is_ok());
+    println(bad.is_err());
+
+    // unwrap_or supplies a fallback and consumes the receiver.
+    println(bad.unwrap_or(-1));
+    println(parse(3).unwrap_or(-1));
+
+    // Option: an owned payload moves out of `unwrap`, and `unwrap_or` gets the
+    // default lazily, in the failing arm.
+    let name = nickname(1);
+    println(name.is_some());
+    println(name.unwrap());
+
+    let missing = nickname(2);
+    println(missing.is_none());
+    println(missing.unwrap_or(String::from("anonymous")));
+
+    // expect() reports its own message; the success path is unchanged.
+    println(parse(5).expect("parse must succeed"));
+
+    // A unit payload unwraps to `()`, so nothing needs naming.
+    let unit: Result<(), String> = Ok(());
+    println(unit.is_ok());
+}

@@ -1,0 +1,7 @@
+// `unwrap_or`'s argument is the success type, so a `str` default for an `i32`
+// payload is a type error rather than a silent 0.
+
+fn main() {
+    let r: Result<i32, String> = Ok(1);
+    println(r.unwrap_or("text")); // error: E0308 mismatched types
+}

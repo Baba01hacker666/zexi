@@ -1,0 +1,39 @@
+// tests/vec_visit.zx
+// Visiting a `Vec` whose elements own memory. The closure takes the element by
+// reference (`|s: &String| ...`), so nothing is moved out of the vector and
+// nothing is copied; the element is borrowed in place, which is what an owning
+// element type needs.
+//
+//     zexic run tests/vec_visit.zx
+
+fn main() {
+    let mut words: Vec<String> = Vec::new();
+    words.push(String::from("alpha"));
+    words.push(String::from("b"));
+    words.push(String::from("gamma"));
+
+    // Predicates over a borrow.
+    println(words.count(|w: &String| w.len() > 1));
+    println(words.any(|w: &String| w.as_str() == "b"));
+    println(words.all(|w: &String| w.len() > 0));
+
+    // `each` visits in order; the vector is unchanged afterwards.
+    words.each(|w: &String| { println(w); });
+    println(words.len());
+    println(words[0].as_str());
+
+    // The same form works for `Copy` elements and for `char`.
+    let mut nums: Vec<i64> = Vec::new();
+    nums.push(7);
+    nums.push(8);
+    let mut sum = 0;
+    nums.each(|n: &i64| { println(n); });
+    println(nums.count(|n: &i64| n > 7));
+
+    let mut letters: Vec<char> = Vec::new();
+    letters.push('z');
+    letters.each(|c: &char| { println(c); });
+
+    // A by-value closure still works for `Copy` elements.
+    println(nums.count(|n: i64| n > 7));
+}

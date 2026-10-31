@@ -229,3 +229,48 @@ func TestUnterminatedTripleString(t *testing.T) {
 		t.Fatal("expected an unterminated-string diagnostic")
 	}
 }
+
+// TestFStringWithNestedLiterals checks that an interpolation hole may contain a
+// string or char literal. The scanner has to track hole depth and the nested
+// literal, otherwise the quote inside the hole closes the f-string early.
+func TestFStringWithNestedLiterals(t *testing.T) {
+	cases := []struct{ src, want string }{
+		{`f"a {"b"} c"`, `a {"b"} c`},
+		{`f"{f("x")}"`, `{f("x")}`},
+		{`f"{ if a { "y" } else { "n" } }"`, `{ if a { "y" } else { "n" } }`},
+		{`f"char {'}'} here"`, `char {'}'} here`},
+		{`f"{{literal}} {x}"`, `{{literal}} {x}`},
+		{`f"brace } and {x}"`, `brace } and {x}`},
+		{`f"esc \" then {x}"`, `esc \" then {x}`},
+	}
+	for _, tc := range cases {
+		lx := lexer.New(0, 0, []byte(tc.src))
+		toks := lx.All()
+		if len(lx.Errors()) > 0 {
+			t.Errorf("%s: unexpected lexer errors: %v", tc.src, lx.Errors())
+			continue
+		}
+		if toks[0].Kind != token.KindFString {
+			t.Errorf("%s: first token is %s, want f-string", tc.src, toks[0].Kind)
+			continue
+		}
+		if toks[0].Lit != tc.want {
+			t.Errorf("%s: literal is %q, want %q", tc.src, toks[0].Lit, tc.want)
+		}
+		if toks[1].Kind != token.KindEOF {
+			t.Errorf("%s: trailing token %s after the f-string", tc.src, toks[1].Kind)
+		}
+	}
+}
+
+// TestFStringUnterminatedStillReports checks the scanner still rejects a
+// genuinely unterminated f-string, including one left open inside a hole.
+func TestFStringUnterminatedStillReports(t *testing.T) {
+	for _, src := range []string{"f\"open end", "f\"open {x} end"} {
+		lx := lexer.New(0, 0, []byte(src))
+		lx.All()
+		if len(lx.Errors()) == 0 {
+			t.Fatalf("%q produced no diagnostic", src)
+		}
+	}
+}

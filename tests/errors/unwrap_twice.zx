@@ -1,0 +1,14 @@
+// `unwrap` consumes its receiver, exactly like the `match` it desugars to, so
+// a second unwrap is a use after move.
+
+fn value() -> Result<String, String> {
+    return Ok(String::from("payload"));
+}
+
+fn main() {
+    let r = value();
+    let a = r.unwrap();
+    println(a);
+    let b = r.unwrap(); // error: E0382 use of moved value `r`
+    println(b);
+}

@@ -1,0 +1,113 @@
+// tests/c_body.zx
+// A function body written in C. The C is compiled inside the program's single
+// translation unit, so it sees the Zexi ABI types of the parameters, is checked
+// against them by the C compiler, and is inlined into callers with no boundary.
+//
+//     zexic run tests/c_body.zx
+
+// Scalars map to their C widths; a borrow is the C pointer.
+fn fib(n: i32) -> i64 {
+    c """
+        int64_t a = 0, b = 1;
+        for (int32_t i = 0; i < n; i++) { int64_t t = a + b; a = b; b = t; }
+        return a;
+    """
+}
+
+// `&[T]` arrives as the two-word view: `.ptr` and `.len`.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    c """
+        float sum = 0.0f;
+        for (size_t i = 0; i < a.len; i++) sum += a.ptr[i] * b.ptr[i];
+        return sum;
+    """
+}
+
+// `&mut i64` arrives as `int64_t *`, so the C body can write through it.
+fn bump(p: &mut i64) -> i64 {
+    c """
+        *p += 1;
+        return *p;
+    """
+}
+
+// The body may write into a borrowed buffer; the caller keeps owning it.
+fn fill(buf: &mut [u8], n: i32) {
+    c """
+        for (int32_t i = 0; i < n && (size_t)i < buf.len; i++) {
+            buf.ptr[i] = (uint8_t)('a' + i);
+        }
+    """
+}
+
+// A `str` is a NUL-terminated `const char *`.
+fn first_byte(s: str) -> i32 {
+    c """
+        return s && s[0] ? (int32_t)(unsigned char)s[0] : -1;
+    """
+}
+
+// A generic body is emitted once per instantiation, so the C sees the concrete
+// type of `T`.
+fn bytes<T>(v: T) -> i64 {
+    c """
+        return (int64_t)sizeof(v);
+    """
+}
+
+// A method's receiver is `self`; `&self` arrives as a pointer to the struct,
+// whose C layout the generated typedef fixes.
+struct Pt {
+    x: f64,
+    y: f64,
+}
+
+impl Pt {
+    fn norm2(&self) -> f64 {
+        c """
+            return self->x * self->x + self->y * self->y;
+        """
+    }
+}
+
+// A C body may call back into Zexi through a `#[no_mangle]` function: both are
+// in the same translation unit, so no separate declaration is needed.
+#[no_mangle]
+fn zx_triple(n: i64) -> i64 {
+    n * 3
+}
+
+fn triple_sum(n: i64) -> i64 {
+    c """
+        int64_t total = 0;
+        for (int64_t i = 1; i <= n; i++) total += zx_triple(i);
+        return total;
+    """
+}
+
+fn main() {
+    println(fib(10));
+    println(fib(90));
+
+    let a: [f32; 3] = [1.0, 2.0, 3.0];
+    let b: [f32; 3] = [4.0, 5.0, 6.0];
+    println(dot(&a, &b));
+
+    let mut n: i64 = 41;
+    println(bump(&mut n));
+    println(n);
+
+    let mut buf: [u8; 8] = [0; 8];
+    fill(&mut buf, 4);
+    println(buf[0] as char, buf[3] as char, buf[4] as i32);
+
+    println(first_byte("zexi"));
+    println(first_byte(""));
+
+    println(bytes(1 as i32), bytes(1 as i64));
+
+    let p = Pt { x: 3.0, y: 4.0 };
+    println(p.norm2());
+
+    println(triple_sum(4));
+}

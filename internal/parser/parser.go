@@ -1281,6 +1281,13 @@ func (p *parser) parsePrimary() ast.Expr {
 		return p.parseFString()
 
 	case token.KindIdentifier:
+		// `c r"..."` in expression position is a C body: the whole body of a
+		// function, written in C, with the parameters in scope.
+		if (t.Lit == "c" || t.Lit == "c_source") && p.peekKind() == token.KindRawString {
+			p.bump() // `c`
+			body := p.bump().Lit
+			return &ast.CBodyExpr{Body: body, Sp: p.spanFrom(start)}
+		}
 		p.bump()
 		var typeArgs []ast.Type
 		if p.at(token.KindColonColon) && p.peekKind() == token.KindLt {

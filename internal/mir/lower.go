@@ -745,7 +745,21 @@ func (l *lowerer) exprInto(e ast.Expr, dest Place) error {
 	case *ast.CallExpr:
 		return l.callInto(x, dest)
 
+	case *ast.CBodyExpr:
+		// A function whose body is C has no Zexi-level lowering: the body is
+		// emitted verbatim into the C translation unit instead.
+		return unsupportedf(x.Sp, "a function body written in C")
+
 	case *ast.MethodCallExpr:
+		// The builtin `Option`/`Result` methods were already lowered by the
+		// checker: the extractors are an ordinary match, and a tag test is a
+		// discriminant comparison.
+		if m := l.info.PreludeMatches[x]; m != nil {
+			return l.matchInto(m, dest)
+		}
+		if variant, ok := l.info.PreludeTag[x]; ok {
+			return l.preludeTagInto(x, variant, dest)
+		}
 		return l.methodInto(x, dest)
 
 	case *ast.FieldExpr, *ast.IndexExpr:
@@ -1495,11 +1509,32 @@ func (l *lowerer) loopBody(b *ast.Block, dest Place) error {
 
 // --- calls ----------------------------------------------------------------
 
+// panicInto lowers the `panic(msg)` builtin. Control never returns, so the
+// call's successor block is unreachable — that is what lets a `panic` stand in
+// as an arm body of the match `unwrap`/`expect` desugar to.
+func (l *lowerer) panicInto(x *ast.CallExpr) error {
+	ops := make([]Operand, 0, len(x.Args))
+	for _, a := range x.Args {
+		op, err := l.expr(a)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, op)
+	}
+	dead := l.newBlock()
+	l.setTerm(&Call{Callee: FuncRef{Builtin: BnPanic}, Args: ops, Target: dead, Sp: x.Sp})
+	l.cur = dead
+	l.setTerm(&Unreachable{Sp: x.Sp})
+	return nil
+}
+
 func (l *lowerer) callInto(x *ast.CallExpr, dest Place) error {
 	if name, ok := calleeName(x.Callee); ok {
 		switch name {
 		case "print", "println":
 			return l.printInto(x, name == "println")
+		case "panic":
+			return l.panicInto(x)
 		case "len":
 			return l.lenInto(x, dest)
 		case "cstr", "from_cstr", "arg_count", "arg_at":
@@ -1832,6 +1867,44 @@ func (l *lowerer) lenInto(x *ast.CallExpr, dest Place) error {
 		return err
 	}
 	l.emit(&Assign{Place: dest, RV: &Len{Place: p, Ty: l.ty(x)}, Sp: x.Sp})
+	return nil
+}
+
+// preludeTagInto lowers `x.is_ok()` and friends to a comparison of the enum's
+// tag against the variant index.
+func (l *lowerer) preludeTagInto(x *ast.MethodCallExpr, variant string, dest Place) error {
+	rt := l.info.TypeOf(x.Recv)
+	base := rt
+	for base != nil && (base.Kind == types.Ref || base.Kind == types.Ptr) {
+		base = base.Elem
+	}
+	if base == nil || base.Kind != types.EnumKind || base.En == nil {
+		return unsupportedf(x.Sp, "tag test on a non-enum receiver")
+	}
+	v, ok := base.En.Variant(variant)
+	if !ok {
+		return unsupportedf(x.Sp, "tag test for variant `%s`", variant)
+	}
+	place, ok, err := l.placeOf(x.Recv)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		// A computed receiver still needs a place to read the tag from.
+		tmp := l.temp(rt)
+		if err := l.exprInto(x.Recv, Place{Local: tmp}); err != nil {
+			return err
+		}
+		place = Place{Local: tmp}
+	}
+	disc := l.temp(types.UsizeT)
+	l.emit(&Assign{Place: Place{Local: disc}, RV: &Discriminant{Place: place, Ty: types.UsizeT}, Sp: x.Sp})
+	l.emit(&Assign{Place: dest, RV: &BinOp{
+		Op: token.KindEqEq,
+		L:  Copy(Place{Local: disc}, types.UsizeT),
+		R:  Operand{Kind: OpConst, Const: IntConst(int64(v.Index)), Ty: types.UsizeT},
+		Ty: types.BoolT,
+	}, Sp: x.Sp})
 	return nil
 }
 

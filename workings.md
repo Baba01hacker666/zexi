@@ -211,6 +211,7 @@ Common commands:
 - `zexic run file.zx` — compile and run.
 - `zexic build file.zx -o out` — compile to binary.
 - `zexic emit file.zx` — print generated C (single unit).
+- `zexic add [pkg]` — list the C-library catalog, or install one into `lib/`.
 - `zexic bindgen header.h` — generate extern declarations.
 
 Key flags: `--jobs N` (parallel units), `--opt-level`, `--include`, `--csrc`,
@@ -228,6 +229,7 @@ Key flags: `--jobs N` (parallel units), `--opt-level`, `--include`, `--csrc`,
 | Types | `internal/types/` |
 | Sema / move check | `internal/sema/` |
 | Codegen | `internal/codegen/c/` |
+| `zexic add` catalog | `internal/registry/` |
 | MIR | `internal/mir/` |
 | ABI layout | `internal/layout/` |
 | Driver / build | `internal/driver/driver.go` |

@@ -299,27 +299,74 @@ func (l *Lexer) scanTripleString(startPos token.Position, startOff int) token.To
 func (l *Lexer) scanFString(startPos token.Position, startOff int) token.Token {
 	l.advance() // 'f'
 	l.advance() // opening quote
+	// The literal ends at the first unescaped `"` that is not inside a `{...}`
+	// hole. Inside a hole there may be a nested string or char literal whose
+	// own quotes (and braces) must not end the outer f-string, so the scanner
+	// tracks hole depth and, within a hole, the nested literal it is inside:
+	//
+	//     f"nested {"quoted"} works"      // the hole holds a string literal
+	//     f"{ if a { 1 } else { 2 } }"    // braces nest inside the hole
+	//
+	// `{{` and `}}` are literal braces and do not open a hole.
+	depth := 0
+	var inQuote byte // 0 when not inside a nested literal, else '"' or '\''
 	for {
 		if l.atEnd() {
 			l.errorf("E0001", startPos, "unterminated string literal")
 			break
 		}
 		c := l.advance()
-		if c == '\\' {
-			l.advance() // skip the escaped byte; decoding happens later
+		if inQuote != 0 {
+			if c == '\\' {
+				if !l.atEnd() {
+					l.advance()
+				}
+				continue
+			}
+			if byte(c) == inQuote {
+				inQuote = 0
+			}
 			continue
 		}
-		if c == '"' {
-			break
+		if depth > 0 {
+			switch c {
+			case '"', '\'':
+				inQuote = byte(c)
+			case '{':
+				depth++
+			case '}':
+				depth--
+			}
+			continue
 		}
-		if c == '\n' {
+		switch c {
+		case '\\':
+			l.advance() // skip the escaped byte; decoding happens later
+		case '"':
+			// Lit is the inner text (the `f"` prefix and closing quote excluded).
+			inner := l.safeSlice(startOff+2, l.off-1)
+			return l.tok(token.KindFString, inner, startPos)
+		case '\n':
 			l.errorf("E0001", startPos, "unterminated string literal")
-			break
+			inner := l.safeSlice(startOff+2, l.off-1)
+			return l.tok(token.KindFString, inner, startPos)
+		case '{':
+			if l.peek() == '{' {
+				l.advance() // `{{` is a literal brace, not a hole
+			} else {
+				depth = 1
+			}
 		}
 	}
-	// Lit is the inner text (the `f"` prefix and closing quote excluded).
-	inner := l.safeSlice(startOff+2, l.off-1)
+	inner := l.safeSlice(startOff+2, maxInt(l.off-1, startOff+2))
 	return l.tok(token.KindFString, inner, startPos)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // atRawString reports whether the cursor is at a raw string: `r"..."`,

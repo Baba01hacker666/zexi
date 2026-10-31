@@ -2,6 +2,7 @@ package driver_test
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	stdhttp "net/http"
@@ -68,7 +69,13 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/closures.zx",
 		"../../tests/cinline.zx",
 		"../../tests/slices.zx",
+		"../../tests/ref_array.zx",
 		"../../tests/std_bytes.zx",
+		"../../tests/fstring_nested.zx",
+		"../../tests/prelude_methods.zx",
+		"../../tests/c_body.zx",
+		"../../tests/pointer_cast.zx",
+		"../../tests/vec_visit.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -524,6 +531,81 @@ func TestRunPrograms(t *testing.T) {
 				"42", "42", "20", "101", "100", "42", "23", "n=9!", "14", "6", "8",
 				"0", "1", "4", "9", "16", "3", "true", "true", "30", "1030",
 				"42", "2", "3", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/ref_array.zx",
+			want: strings.Join([]string{"8", "140", "148", "10", "b", ""}, "\n"),
+		},
+		{
+			// Nested literals and braces inside f-string interpolation holes.
+			file: "../../tests/fstring_nested.zx",
+			want: strings.Join([]string{
+				"n = 3",
+				"n + 1 = 4",
+				"nested quoted works",
+				"call: hello, zexi!",
+				"short",
+				"brace {literal} and 3",
+				"char } inside a hole",
+				"doubly nested deep 3",
+				"",
+			}, "\n"),
+		},
+		{
+			// Visiting a Vec of owning elements by borrowing each one.
+			file: "../../tests/vec_visit.zx",
+			want: strings.Join([]string{
+				"2", "true", "true", // count, any, all over a borrow
+				"alpha", "b", "gamma",
+				"3", "alpha",
+				"7", "8", "1",
+				"z",
+				"1",
+				"",
+			}, "\n"),
+		},
+		{
+			// `&t as *T`: array decay, scalars, elements, and slices.
+			file: "../../tests/pointer_cast.zx",
+			want: strings.Join([]string{
+				"0 0 A",
+				"7",
+				"10",
+				"20",
+				"99",
+				"false",
+				"20",
+				"",
+			}, "\n"),
+		},
+		{
+			// Function bodies written in C see the Zexi ABI types directly.
+			file: "../../tests/c_body.zx",
+			want: strings.Join([]string{
+				"55",
+				"2880067194370816120",
+				"32",
+				"42", // bump() through &mut i64
+				"42",
+				"a d 0",     // fill() through &mut [u8]
+				"122", "-1", // str is `const char *`
+				"4 8", // a generic body sees the instantiated type
+				"25",  // &self is a pointer to the struct
+				"30",  // C body calling a #[no_mangle] fn
+				"",
+			}, "\n"),
+		},
+		{
+			// Option/Result builtin helpers: tag tests borrow, extractors move.
+			file: "../../tests/prelude_methods.zx",
+			want: strings.Join([]string{
+				"true", "false", "42",
+				"false", "true",
+				"-1", "6",
+				"true", "one",
+				"true", "anonymous",
+				"10", "true", "",
 			}, "\n"),
 		},
 		{
@@ -1493,7 +1575,7 @@ func TestParallelCUnitsMatchSingleFile(t *testing.T) {
 		t.Skip("no C compiler available")
 	}
 
-	for _, file := range []string{"../../tests/pi.zx", "../../tests/strings.zx", "../../tests/threads.zx"} {
+	for _, file := range []string{"../../tests/pi.zx", "../../tests/strings.zx", "../../tests/threads.zx", "../../tests/c_body.zx"} {
 		t.Run(filepath.Base(file), func(t *testing.T) {
 			dir := t.TempDir()
 			outputs := make([][]byte, 2)
@@ -3175,5 +3257,97 @@ fn main() -> i32 {
 	final := exchange([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"), 3*time.Second)
 	if !strings.Contains(final, "200 OK") {
 		t.Fatalf("server stopped serving after hostile input: %q (%s)", final, log.String())
+	}
+}
+
+// TestPanicReportsMessageAndExitCode checks that `panic(msg)` writes its
+// message to stderr, stops the program there, and exits with status 101.
+func TestPanicReportsMessageAndExitCode(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+
+	bin := filepath.Join(t.TempDir(), "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build("../../tests/panic_message.zx", bin, driver.Options{}, em); !ok {
+		t.Fatal("build failed")
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command(bin)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("program exited 0, want a non-zero status from panic")
+	}
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		t.Fatalf("running %s: %v", bin, err)
+	}
+	if code := exit.ExitCode(); code != 101 {
+		t.Fatalf("exit code = %d, want 101", code)
+	}
+	if got, want := stdout.String(), "3\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	wantMsg := "zexi panic: division by zero: 1\n"
+	if got := stderr.String(); got != wantMsg {
+		t.Fatalf("stderr = %q, want %q", got, wantMsg)
+	}
+}
+
+// TestCBodyIsEmittedVerbatim checks the shape of the generated C for a function
+// whose body is written in C: the parameters keep their source names, the
+// function stays `static` (so one translation unit can inline it into callers),
+// and the body text appears exactly as written.
+func TestCBodyIsEmittedVerbatim(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "prog.zx")
+	prog := `fn dot(a: &[f32], b: &[f32]) -> f32 {
+    c """
+        float sum = 0.0f;
+        for (size_t i = 0; i < a.len; i++) sum += a.ptr[i] * b.ptr[i];
+        return sum;
+    """
+}
+
+fn main() {
+    let a: [f32; 2] = [1.0, 2.0];
+    println(dot(&a, &a));
+}
+`
+	if err := os.WriteFile(src, []byte(prog), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	em := diag.NewEmitter()
+	art, ok := driver.FrontEndFiles([]string{src}, driver.Options{}, em)
+	if !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("front end reported errors")
+	}
+	csrc := art.CSrc
+	for _, want := range []string{
+		// Signature: `static` linkage and unmangled parameter names.
+		"static float zx_dot(zx_slice_f32 a, zx_slice_f32 b)",
+		// The body, verbatim.
+		"for (size_t i = 0; i < a.len; i++) sum += a.ptr[i] * b.ptr[i];",
+	} {
+		if !strings.Contains(csrc, want) {
+			t.Errorf("generated C is missing %q", want)
+		}
+	}
+	if got := strings.Count(csrc, "return sum;"); got != 1 {
+		t.Errorf("the body appears %d times, want exactly once", got)
+	}
+	for _, line := range strings.Split(csrc, "\n") {
+		if strings.Contains(line, "/* c body */") && strings.Contains(line, "zx_dot(") {
+			if strings.Contains(line, "zx_a") || strings.Contains(line, "zx_b") {
+				t.Errorf("parameters were mangled in %q; a C body refers to them by their source names", line)
+			}
+		}
 	}
 }

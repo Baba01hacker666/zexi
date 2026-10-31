@@ -1,0 +1,17 @@
+// tests/panic_message.zx
+// `panic` never returns: it reports a message on stderr and exits 101.
+//
+//     zexic run tests/panic_message.zx
+
+fn divide(a: i32, b: i32) -> i32 {
+    if b == 0 {
+        panic(f"division by zero: {a}");
+    }
+    return a / b;
+}
+
+fn main() {
+    println(divide(9, 3));
+    println(divide(1, 0));
+    println("unreachable");
+}

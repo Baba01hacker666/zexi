@@ -15,6 +15,9 @@ fn main() -> i32 {
 
 `//` line comments, `/* ... */` block comments (nesting), `///` doc comments.
 
+`println`/`print` write to stdout; `eprintln`/`eprint` are the same, to stderr
+(and flush stdout first, so interleaved output still reads in order).
+
 ## 7.2 Declarations
 
 ```zx
@@ -321,6 +324,10 @@ let t = s.clone();     // deep copy
 let u = s;             // move: `s` is unusable afterwards (E0382)
 ```
 
+A reference to a fixed array indexes like the array itself, which is the shape a C
+out-parameter arrives in: for `fn f(buf: &mut [u8; 64])`, `buf[i] = v` writes and
+`buf[i]` reads, both bounds-checked. A shared `&[T; N]` is read-only.
+
 A `String` may be passed wherever a borrowed `str` is expected (for example a
 function parameter, `push_str`, or `==`), so `.as_str()` is usually unnecessary.
 When a number, `bool`, or `char` is concatenated with `+` (or `+=`) it is
@@ -360,12 +367,35 @@ v.clear();
 when the `Vec` goes out of scope, is reassigned, or is truncated. Indexing is
 bounds-checked and panics rather than reading out of bounds.
 
-Two operations need a `Copy` element type, because there is no element-wise
-clone trait yet:
+`clone` needs a `Copy` element type, because there is no element-wise clone
+trait yet: `clone` on a `Vec<String>` is E0277 — build a new `Vec` and push each
+element.
 
-- `clone` on a `Vec<String>` is E0277 — build a new `Vec` and push each element.
-- `for x in v` borrows the elements, so it needs `Copy` too; iterating a
-  `Vec<String>` is E0507. Index with `v[i]` instead.
+The closure-taking helpers (`each`, `count`, `any`, `all`) take the element
+either by value (a copy, so only for `Copy` elements) or by reference:
+
+```zx
+let mut words: Vec<String> = Vec::new();
+words.push(String::from("alpha"));
+words.push(String::from("b"));
+
+words.count(|w: &String| w.len() > 1);      // 1  — borrowed in place
+words.any(|w: &String| w == "b");           // true
+words.each(|w: &String| { println(w); });   // the vector is unchanged
+
+let mut nums: Vec<i64> = Vec::new();
+nums.push(7);
+nums.count(|n: i64| n > 7);                 // 0  — a copy is fine here
+nums.count(|n: &i64| n > 7);                // 0  — so is a borrow
+```
+
+A borrow reads like the value it points at: a method call goes through it
+(`w.len()`), a comparison reads through it (`w == "b"`, `n > 7`), and `println`
+prints it. It is still a borrow — assigning to it is an error, and a `fold`
+accumulates by value, so its elements must be `Copy`.
+
+`for x in v` still copies each element, so iterating a `Vec<String>` is E0507;
+use `each` with a `&T` closure, or index with `v[i]`.
 
 Nested (`Vec<Vec<i64>>`) and struct-holding (`Vec<Item>`) vectors work, and a
 struct may hold a `Vec` field. See `tests/vec.zx` for a full tour.
@@ -388,7 +418,19 @@ println();            // just a newline
 let n = 65 as char;    // 'A'
 let m = big as i32;    // truncating integer cast
 let f = 3 as f64;
+
+// `as` is also how a borrow becomes a raw pointer for C to write through. The
+// pointee must match, and an array borrow decays to its first element.
+let p = &buf as *u8;            // &[u8; 8] decays to a u8 * of its first byte
+let q = &mut cell as *mut i64;  // the same borrow, mutable
+let t = "hi" as *u8;            // the bytes of a `str`
+let addr = p as usize;          // an address, for a handle or a log line
+let back = addr as *u8;         // ... and back again
 ```
+
+A pointer is deliberately not printable and cannot be dereferenced in safe
+code; it exists to cross into C, where its type is checked. A slice (`&[T]`)
+is a pointer *and* a length, so cast an element (`&xs[i] as *T`) instead.
 
 ## 7.13 Generics, `Option`, and `Result`
 
@@ -459,6 +501,62 @@ payloads move into the arm and are dropped once. A guarded arm copies for the
 guard and takes ownership only after it passes. Binding an owned payload out of
 a borrow is `E0507`.
 
+### Builtin methods on `Option` and `Result`
+
+The two prelude enums come with the usual Rust spellings, so you do not have to
+write the `match` out. `Option`/`Result` cannot have `impl` blocks; these are
+compiler builtins, defined as the desugarings shown here.
+
+| Method | Meaning | Desugars to |
+| --- | --- | --- |
+| `r.unwrap()` | the `Ok`/`Some` payload | `match r { Err(_) => panic("called `unwrap` on a `Err` value"), Ok(v) => v }` |
+| `r.expect(msg)` | the payload, or `panic(msg)` | same, with `panic(msg)` as the failing arm |
+| `r.unwrap_or(d)` | the payload, or `d` | failing arm evaluates `d` |
+| `r.is_ok()` / `r.is_err()` | is the `Ok` arm active? | tag comparison |
+| `o.is_some()` / `o.is_none()` | is the `Some` arm active? | tag comparison |
+
+```zx
+fn parse(s: str) -> Result<i32, String> {
+    if s == "" {
+        return Err(String::from("empty"));
+    }
+    return Ok(42);
+}
+
+fn main() {
+    let r = parse("42");
+    println(r.is_ok());                  // tag test: reads the discriminant
+    println(r.unwrap());                 // extractor: consumes r, so no second unwrap
+    println(parse("").unwrap_or(-1));    // failing arm provides the default
+}
+```
+
+```
+true
+42
+-1
+```
+
+Extractors **consume** their receiver — the same move a `match` performs — so
+`let a = r.unwrap(); r.unwrap();` is `E0382`. The tag tests only read, so
+`is_ok()` followed by `unwrap()` is fine. A unit payload (`Result<(), E>`)
+unwraps to `()`.
+
+### `panic`
+
+`panic(msg)` has type `never`, so it fits anywhere a value is expected —
+typically as the arm that cannot return. It prints `zexi panic: <msg>` to
+stderr and exits **101**.
+
+```zx
+fn divide(a: i32, b: i32) -> i32 {
+    if b == 0 { panic(f"division by zero: {a}"); }
+    return a / b;
+}
+
+panic();        // 0 arguments is allowed: reports "panic"
+```
+
 ## 7.14 Closures
 
 ```zx
@@ -512,6 +610,17 @@ fn greet() { println("hi") }   // no return type needed when returning ()
 - In `f"..."`, `{{` and `}}` are literal braces. Interpolated values are
   borrowed, never moved, and must be printable (numbers, `bool`, `char`,
   `str`, `String`).
+- A hole may hold any expression, including one containing its own string or
+  char literal, its own braces, or another f-string — quoting is tracked, so the
+  inner quotes do not end the outer literal:
+
+  ```zx
+  f"nested {"quoted"} works"             // nested quoted works
+  f"call: {greet("zexi")}"               // a call with a string argument
+  f"{ if n > 3 { "long" } else { "short" } }"
+  f"brace {{literal}} and {n}"           // brace {literal} and 3
+  f"char {'}'} inside a hole"            // char } inside a hole
+  ```
 
 Libraries: `use` and `import` load whole files into your program. Loaded
 declarations are available unqualified (the preview keeps a flat namespace), and
@@ -597,7 +706,8 @@ The embedded standard library (sources in `internal/driver/std/`) includes:
   a `String` never copies it.
 - `sys`, `io`, `fs`, and `random`: `sys` is the POSIX substrate (errno and
   `IoError`, byte I/O, files, environment, clocks); `io` provides console I/O
-  (`input(prompt = "")`, `read_line() -> Result<String, IoError>`, `eprintln`);
+  (`input(prompt = "")`, `read_line() -> Result<String, IoError>`); `eprintln` and
+  `eprint` are builtins, like `println` and `print`, and write to stderr;
   `fs` provides capped, binary-safe `read`/`write(path, &[u8])`/`copy`
   (32 MiB cap) plus `exists`, `metadata`, and `remove`. Random numbers are
   deterministic or libc-backed.
@@ -666,6 +776,39 @@ way. See [`17-extending.md`](17-extending.md).
 `#[link_dir("path")]` adds `-Lpath` and `#[include("header.h")]` emits
 `#include "header.h"` at the top of the generated C, so a binding can be
 written against a real header instead of re-declaring its types.
+
+### A whole function body in C
+
+When one function is the hot path, write the body itself in C. Parameters keep
+their names and arrive with the C types the language gives them (`&[T]` is
+`{ptr,len}`, `&mut T` is `T *`, `str` is `const char *`), and the body is
+compiled in the same translation unit as its callers, so `cc` checks the ABI and
+inlines it:
+
+```zx
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    c """
+        if (a.len != b.len) return 0.0f / 0.0f;
+        float sum = 0.0f;
+        for (size_t i = 0; i < a.len; i++) sum += a.ptr[i] * b.ptr[i];
+        return sum;
+    """
+}
+
+fn main() {
+    let a: [f32; 3] = [1.0, 2.0, 3.0];
+    let b: [f32; 3] = [4.0, 5.0, 6.0];
+    println(dot(&a, &b));   // 32
+}
+```
+
+```
+32
+```
+
+It must be the *whole* body, and parameters and the result must not need a
+destructor (`String`, `Vec<T>`, owning structs → `E0540`): there is no generated
+code left to drop them. Borrow instead (`&String`, `&mut [u8]`).
 
 ## 7.17 Not implemented yet (roadmap M1+)
 

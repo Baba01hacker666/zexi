@@ -69,6 +69,7 @@ type gen struct {
 	trapDepth  int  // compiler-generated constructs (matches) since the innermost loop
 	hasString  bool // whether the program uses the builtin `String`
 	hasChar    bool // whether a `char` value is printed (needs the UTF-8 helper)
+	hasEprint  bool // whether `eprint`/`eprintln` is used (needs the stderr sink)
 	// hasPanic marks that the program contains at least one run-time check
 	// that can fail, so `zx_panicf` must be defined in the unit.
 	hasPanic bool
@@ -430,6 +431,9 @@ func (g *gen) preamble() {
 	g.w.line("// Defined only when a `char` is printed.")
 	g.w.line("static int zx_print_char(uint32_t c);")
 	g.w.line("")
+	g.w.line("// Defined only when `eprint`/`eprintln` is used; `printf`'s stderr twin.")
+	g.w.line("static void zx_eprintf(const char *fmt, ...);")
+	g.w.line("")
 	g.w.line("// Defined only when the program can panic at run time.")
 	g.w.line("static ZX_NORETURN void zx_panicf(const char *fmt, ...);")
 	g.w.line("")
@@ -498,9 +502,29 @@ func (g *gen) closureRuntime() {
 // static copy; the linker drops the copies it does not use.
 func (g *gen) lateRuntime() {
 	g.charRuntime()
+	g.eprintRuntime()
 	if g.hasPanic {
 		g.panicHelper()
 	}
+}
+
+// eprintRuntime defines `zx_eprintf`, the stderr twin of `printf`. `print` and
+// `eprint` differ only in this sink, so the rest of the printing code does not
+// need to know which stream it is writing to.
+func (g *gen) eprintRuntime() {
+	if !g.hasEprint {
+		return
+	}
+	g.w.line("")
+	g.w.line("// Write to stderr with the same formatting as printf (stdout's twin).")
+	g.w.line("static void zx_eprintf(const char *fmt, ...) {")
+	g.w.line("    va_list ap;")
+	g.w.line("    fflush(stdout);")
+	g.w.line("    va_start(ap, fmt);")
+	g.w.line("    vfprintf(stderr, fmt, ap);")
+	g.w.line("    va_end(ap);")
+	g.w.line("    fflush(stderr);")
+	g.w.line("}")
 }
 
 // panicHelper defines `zx_panicf`, the single exit path for every run-time
@@ -1262,6 +1286,13 @@ func fnSignature(fn *sema.Fn) string {
 }
 
 func (g *gen) funcDef(fn *sema.Fn) {
+	// A function whose body is written in C is emitted verbatim: the C compiler
+	// sees the Zexi ABI types of the parameters in the same translation unit as
+	// every caller, so it checks the body against them and inlines it freely.
+	if cb := g.info.CBody[fn.Decl]; cb != nil && fn.Name != "main" {
+		g.cBodyDef(fn, cb)
+		return
+	}
 	ret := fn.Ret
 	savedRet := g.ret
 	g.ret = ret
@@ -1307,6 +1338,37 @@ func (g *gen) funcDef(fn *sema.Fn) {
 	g.closeDropFrame()
 	g.w.indent--
 	g.popScope()
+	g.w.line("}")
+	g.w.line("")
+}
+
+// cBodyDef emits a function whose body is the user's C. Parameters keep their
+// Zexi names — the C body refers to them directly — and the body is written out
+// exactly as it appears in the source, so preprocessor directives still start at
+// column 0.
+func (g *gen) cBodyDef(fn *sema.Fn, cb *ast.CBodyExpr) {
+	retC := ctype(fn.Ret)
+	params := make([]string, 0, len(fn.Decl.Params))
+	for i, p := range fn.Decl.Params {
+		pt := types.UnitT
+		if i < len(fn.Params) {
+			pt = fn.Params[i]
+		}
+		params = append(params, ctype(pt)+" "+p.Name)
+	}
+	if len(params) == 0 {
+		params = []string{"void"}
+	}
+	g.w.line("%s%s %s(%s) { /* c body */", g.staticPrefix(fn), retC, funcName(fn), strings.Join(params, ", "))
+	g.w.raw(cb.Body)
+	if !strings.HasSuffix(cb.Body, "\n") {
+		g.w.raw("\n")
+	}
+	if fn.Ret != nil && fn.Ret.Kind != types.Unit {
+		// A C function that falls off its end has undefined behaviour; the
+		// zero return is unreachable when the body returns as written.
+		g.w.line("    return %s;", zeroValue(fn.Ret))
+	}
 	g.w.line("}")
 	g.w.line("")
 }
@@ -2182,6 +2244,16 @@ func (g *gen) binValue(x *ast.BinExpr) string {
 			return "zx_string_concat(" + ps[0] + ", " + ps[1] + ")"
 		})
 	}
+	// A comparison that reads through a borrow: `n > 7` where `n: &i64`, or
+	// `s == "b"` where `s: &String`. The checker peeled the reference for its
+	// type check, so the dereference belongs here.
+	if isComparisonOp(x.Op) && (g.borrowsValue(x.L) || g.borrowsValue(x.R)) {
+		l, r := g.cmpOperand(x.L), g.cmpOperand(x.R)
+		if isStrType(g.peelRef(x.L)) && isStrType(g.peelRef(x.R)) {
+			return "(strcmp(" + l + ", " + r + ") " + x.Op.String() + " 0)"
+		}
+		return "(" + l + " " + x.Op.String() + " " + r + ")"
+	}
 	// String comparison compares bytes, not pointers, for any mix of `str` and
 	// `String`. Ordering follows strcmp's byte order, which is the same order
 	// Rust's Ord gives str.
@@ -2480,8 +2552,11 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 			name = c.Segments[0]
 		}
 	}
-	if name == "print" || name == "println" {
+	if name == "print" || name == "println" || name == "eprint" || name == "eprintln" {
 		return g.printfCall(x, name)
+	}
+	if name == "panic" {
+		return g.panicCall(x)
 	}
 	if name == "len" {
 		return g.lenValue(x)
@@ -2553,30 +2628,60 @@ func (g *gen) stringCtorValue(x *ast.CallExpr, name string) string {
 	})
 }
 
+// panicCall emits the builtin `panic(msg)`: report and stop through the one exit
+// path every run-time fault uses, so stdout is flushed and the exit status is
+// uniform. Its type is `never`, which is why an arm body can be a panic.
+func (g *gen) panicCall(x *ast.CallExpr) string {
+	g.hasPanic = true
+	if len(x.Args) == 0 {
+		return `zx_panicf("panic")`
+	}
+	t := g.info.TypeOf(x.Args[0])
+	if t != nil && t.Kind == types.StringKind {
+		if isPlaceExpr(x.Args[0]) {
+			return `zx_panicf("%s", zx_string_as_str(&` + g.value(x.Args[0]) + `))`
+		}
+		// A temporary owner: bind it so its buffer outlives the call, and let
+		// the panic exit without dropping it (the process is ending).
+		tm := g.tmpName()
+		return `({ zx_String ` + tm + ` = ` + g.value(x.Args[0]) + `; zx_panicf("%s", zx_string_as_str(&` + tm + `)); })`
+	}
+	format, cast := printFormat(t)
+	return `zx_panicf("` + format + `", ` + cast(g.value(x.Args[0])) + `)`
+}
+
 func (g *gen) printfCall(x *ast.CallExpr, name string) string {
 	nl := ""
-	if name == "println" {
+	if name == "println" || name == "eprintln" {
 		nl = `\n`
 	}
+	// `print` writes to stdout, `eprint` to stderr. The only difference is the
+	// sink function, so everything below is shared: `printOne` and
+	// `printFormat` take the sink to emit against.
+	sink := "printf"
+	if name == "eprint" || name == "eprintln" {
+		sink = "zx_eprintf"
+		g.hasEprint = true
+	}
 	if len(x.Args) == 0 {
-		return fmt.Sprintf(`printf("%s")`, nl)
+		return fmt.Sprintf(`%s("%s")`, sink, nl)
 	}
 	if format, ok := formatLiteralC(x.Args); ok {
-		return g.printFormat(x.Args[1:], format, nl)
+		return g.printFormat(x.Args[1:], format, nl, sink)
 	}
 	if len(x.Args) == 1 {
-		return g.printOne(x.Args[0], nl)
+		return g.printOne(x.Args[0], nl, sink)
 	}
 	// Several values are printed separated by a single space.
 	parts := make([]string, 0, len(x.Args)+1)
 	for i, arg := range x.Args {
 		if i > 0 {
-			parts = append(parts, `printf(" ")`)
+			parts = append(parts, sink+`(" ")`)
 		}
-		parts = append(parts, g.printOne(arg, ""))
+		parts = append(parts, g.printOne(arg, "", sink))
 	}
 	if nl != "" {
-		parts = append(parts, fmt.Sprintf(`printf("%s")`, nl))
+		parts = append(parts, fmt.Sprintf(`%s("%s")`, sink, nl))
 	}
 	return "({ " + strings.Join(parts, "; ") + "; (void)0; })"
 }
@@ -2624,34 +2729,51 @@ func splitFormat(format string) []string {
 // printFormat prints a `{}`-formatted string: literal segments are emitted
 // with `%s`, and each placeholder is printed with the same per-type lowering
 // `printOne` uses, so `String`, `char`, and numeric values all work.
-func (g *gen) printFormat(args []ast.Expr, format, nl string) string {
+func (g *gen) printFormat(args []ast.Expr, format, nl, sink string) string {
 	segs := splitFormat(format)
 	parts := make([]string, 0, len(segs)*2+1)
 	for i, seg := range segs {
 		if seg != "" {
-			parts = append(parts, `printf("%s", `+cString(seg)+`)`)
+			parts = append(parts, sink+`("%s", `+cString(seg)+`)`)
 		}
 		if i < len(args) {
-			parts = append(parts, g.printOne(args[i], ""))
+			parts = append(parts, g.printOne(args[i], "", sink))
 		}
 	}
 	if nl != "" {
-		parts = append(parts, fmt.Sprintf(`printf("%s")`, nl))
+		parts = append(parts, fmt.Sprintf(`%s("%s")`, sink, nl))
 	}
 	return "({ " + strings.Join(parts, "; ") + "; (void)0; })"
 }
 
 // printOne emits the printing of a single value, optionally followed by `nl`.
-func (g *gen) printOne(arg ast.Expr, nl string) string {
+func (g *gen) printOne(arg ast.Expr, nl, sink string) string {
 	t := g.info.TypeOf(arg)
+	if t != nil && t.Kind == types.Ref && t.Elem != nil {
+		// `println(s)` where `s: &T` prints the value behind the borrow.
+		inner := t.Elem
+		v := g.value(arg)
+		if inner.Kind == types.StringKind {
+			return fmt.Sprintf(`%s("%%s%s", zx_string_as_str(%s))`, sink, nl, v)
+		}
+		if inner.Kind == types.Char {
+			g.hasChar = true
+			if nl == "" {
+				return fmt.Sprintf(`zx_print_char(*%s)`, v)
+			}
+			return fmt.Sprintf(`({ zx_print_char(*%s); %s("%s"); })`, v, sink, nl)
+		}
+		format, cast := printFormat(inner)
+		return fmt.Sprintf(`%s("%s%s", %s)`, sink, format, nl, cast("(*"+v+")"))
+	}
 	if t != nil && t.Kind == types.StringKind {
 		if isPlaceExpr(arg) {
-			return fmt.Sprintf(`printf("%%s%s", zx_string_as_str(&%s))`, nl, g.value(arg))
+			return fmt.Sprintf(`%s("%%s%s", zx_string_as_str(&%s))`, sink, nl, g.value(arg))
 		}
 		// A temporary owner is released as soon as it has been printed.
 		tm := g.tmpName()
-		return fmt.Sprintf(`({ zx_String %s = %s; printf("%%s%s", zx_string_as_str(&%s)); zx_drop_String(&%s); (void)0; })`,
-			tm, g.value(arg), nl, tm, tm)
+		return fmt.Sprintf(`({ zx_String %s = %s; %s("%%s%s", zx_string_as_str(&%s)); zx_drop_String(&%s); (void)0; })`,
+			tm, g.value(arg), sink, nl, tm, tm)
 	}
 	v := g.value(arg)
 	if t != nil && t.Kind == types.Char {
@@ -2661,10 +2783,48 @@ func (g *gen) printOne(arg ast.Expr, nl string) string {
 		if nl == "" {
 			return fmt.Sprintf(`zx_print_char(%s)`, v)
 		}
-		return fmt.Sprintf(`({ zx_print_char(%s); printf("%s"); })`, v, nl)
+		return fmt.Sprintf(`({ zx_print_char(%s); %s("%s"); })`, v, sink, nl)
 	}
 	format, cast := printFormat(t)
-	return fmt.Sprintf(`printf("%s%s", %s)`, format, nl, cast(v))
+	return fmt.Sprintf(`%s("%s%s", %s)`, sink, format, nl, cast(v))
+}
+
+// borrowsValue reports whether e has a reference type, i.e. a comparison has to
+// read through it.
+func (g *gen) borrowsValue(e ast.Expr) bool {
+	t := g.info.TypeOf(e)
+	return t != nil && t.Kind == types.Ref && t.Elem != nil
+}
+
+// peelRef returns the type behind a reference, or t itself.
+func (g *gen) peelRef(e ast.Expr) *types.Type {
+	t := g.info.TypeOf(e)
+	if t != nil && t.Kind == types.Ref && t.Elem != nil {
+		return t.Elem
+	}
+	return t
+}
+
+// cmpOperand renders a comparison operand, dereferencing a borrow so the
+// comparison is over the value that was borrowed.
+func (g *gen) cmpOperand(e ast.Expr) string {
+	v := g.value(e)
+	t := g.info.TypeOf(e)
+	if t == nil || t.Kind != types.Ref || t.Elem == nil {
+		return v
+	}
+	if t.Elem.Kind == types.StringKind {
+		return "zx_string_as_str(" + v + ")"
+	}
+	return "(*" + v + ")"
+}
+
+func isComparisonOp(op token.Kind) bool {
+	switch op {
+	case token.KindEqEq, token.KindBangEq, token.KindLt, token.KindLe, token.KindGt, token.KindGe:
+		return true
+	}
+	return false
 }
 
 func printFormat(t *types.Type) (format string, cast func(string) string) {
@@ -2703,6 +2863,14 @@ func (g *gen) fieldValue(x *ast.FieldExpr) string {
 // methodCallValue emits a resolved method call, passing the receiver by value
 // or by address according to the method's `self` parameter.
 func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
+	// Builtin `Option`/`Result` methods: the tag tests compare the discriminant,
+	// the extractors are the `match` sema desugared them to.
+	if variant, ok := g.info.PreludeTag[x]; ok {
+		return g.preludeTagValue(x, variant)
+	}
+	if m := g.info.PreludeMatches[x]; m != nil {
+		return g.matchValue(m)
+	}
 	if base := recvBase(g.info.TypeOf(x.Recv)); base != nil && base.Kind == types.StringKind {
 		return g.stringMethodCall(x)
 	}
@@ -2776,6 +2944,26 @@ func (g *gen) methodCallValue(x *ast.MethodCallExpr) string {
 		args = append(args, ps...)
 		return funcName(m) + "(" + strings.Join(args, ", ") + ")"
 	})
+}
+
+// preludeTagValue emits an `is_ok`/`is_err`/`is_some`/`is_none` call as a
+// comparison against the variant's tag. It reads through the receiver, so a
+// `&self`-shaped call never moves the value.
+func (g *gen) preludeTagValue(x *ast.MethodCallExpr, variant string) string {
+	rt := g.info.TypeOf(x.Recv)
+	base := recvBase(rt)
+	if base == nil || base.En == nil {
+		return "0"
+	}
+	v, ok := base.En.Variant(variant)
+	if !ok {
+		return "0"
+	}
+	disc := g.value(x.Recv) + ".tag"
+	if rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr) {
+		disc = g.value(x.Recv) + "->tag"
+	}
+	return "(" + disc + " == " + strconv.Itoa(v.Index) + ")"
 }
 
 // stringMethodCall emits a builtin `String` method. Borrowing a place passes its
@@ -2994,6 +3182,11 @@ func (g *gen) indexValue(x *ast.IndexExpr) string {
 	idx := g.value(x.Index)
 	if rt != nil && rt.Kind == types.Array {
 		return "(" + recv + ").e[zx_bounds(" + idx + ", " + strconv.FormatInt(rt.Len, 10) + ")]"
+	}
+	// Indexing a reference to a fixed array reads through the pointer, so a
+	// buffer filled by C is readable (and writable) from Zexi.
+	if rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr) && rt.Elem != nil && rt.Elem.Kind == types.Array {
+		return "(" + recv + ")->e[zx_bounds(" + idx + ", " + strconv.FormatInt(rt.Elem.Len, 10) + ")]"
 	}
 	if base := recvBase(rt); base != nil && base.Kind == types.VecKind {
 		return vecIndex("("+g.vecReceiverValue(x.Recv)+")", idx)
@@ -3714,16 +3907,9 @@ func (g *gen) interpStrValue(x *ast.InterpStrExpr) string {
 
 // --- naming ---------------------------------------------------------------
 
-var cKeywords = map[string]bool{
-	"auto": true, "break": true, "case": true, "char": true, "const": true,
-	"continue": true, "default": true, "do": true, "double": true, "else": true,
-	"enum": true, "extern": true, "float": true, "for": true, "goto": true,
-	"if": true, "inline": true, "int": true, "long": true, "register": true,
-	"restrict": true, "return": true, "short": true, "signed": true,
-	"sizeof": true, "static": true, "struct": true, "switch": true,
-	"typedef": true, "union": true, "unsigned": true, "void": true,
-	"volatile": true, "while": true, "bool": true, "_Bool": true,
-}
+// cParams names a C body's parameters. Unlike generated locals they are not
+// mangled: the body refers to them by the names the source uses, and the checker
+// has already rejected anything that is not a plain C identifier.
 
 // funcName mangles a Zexi function name into C. `main` and `extern` functions
 // keep their names (the latter must, to match the C ABI); every other function
@@ -3777,7 +3963,7 @@ func safeIdent(name string) string {
 		}
 	}
 	s := b.String()
-	if cKeywords[s] {
+	if token.IsCKeyword(s) {
 		s = "z_" + s
 	}
 	return s

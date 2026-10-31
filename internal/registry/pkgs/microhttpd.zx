@@ -1,0 +1,260 @@
+// microhttpd — a native HTTP server using the GNU libmicrohttpd daemon.
+//
+// This package is for programs that want *libmicrohttpd* specifically (its
+// mature HTTP/1.1 parsing, keep-alive, and epoll backend). For a server with no
+// external dependency, use the compiler's own `http` module — it needs no
+// install and no headers.
+//
+//     use microhttpd;
+//
+//     // The daemon calls back into this function, so it must be `#[no_mangle]`
+//     // and have exactly this signature (docs/17 §17.3). It returns the HTTP
+//     // status code; the reply body is written into `out` and must be NUL
+//     // terminated, so responses are text.
+//     #[no_mangle]
+//     fn zxmhd_dispatch(method: str, path: str, body: str,
+//                       out: &mut [u8; 65536], cap: i32) -> i32 {
+//         let reply = if path == "/health" { "ok" } else { "not found" };
+//         let status = if path == "/health" { 200 } else { 404 };
+//         let b = reply.as_bytes();
+//         let mut i = 0;
+//         while i < len(b) && i + 1 < cap {
+//             out[i] = b[i];
+//             i += 1;
+//         }
+//         out[i] = 0;
+//         return status;
+//     }
+//
+//     fn main() -> i32 {
+//         let d = microhttpd::start(8080, 1048576);
+//         if d == 0 { eprintln("cannot start the daemon"); return 1; }
+//         println("listening on 8080 (ctrl-c to stop)");
+//         microhttpd::wait(d);
+//         0
+//     }
+//
+// `start` runs libmicrohttpd's internal polling thread and returns a handle;
+// `wait` blocks until `stop`. The handler is a plain `#[no_mangle]` function, so
+// nothing has to be boxed, captured, or reference-counted: it is the C-bridge
+// form described in docs/17 §17.3.
+//
+// Requires libmicrohttpd (Debian/Ubuntu: `apt install libmicrohttpd-dev`,
+// Fedora: `libmicrohttpd-devel`, macOS: `brew install libmicrohttpd`).
+
+#[link("microhttpd")]
+#[include("microhttpd.h")]
+extern "C" fn zxmhd_start(port: i32, max_body: i64, workers: i32) -> i64;
+extern "C" fn zxmhd_stop(daemon: i64);
+extern "C" fn zxmhd_wait(daemon: i64);
+extern "C" fn zxmhd_requests(daemon: i64) -> i64;
+extern "C" fn zxmhd_last_error(out: &mut [u8; 256], cap: i32) -> i32;
+
+// The dispatch function is *not* declared here: an `extern "C" fn` declaration
+// and the program's `#[no_mangle]` definition would be the same name twice. The
+// C block below carries the prototype instead, so the program supplies the one
+// definition and the compiler still checks the two against each other.
+
+c """
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* Defined by the program with `#[no_mangle]`, and checked against this
+ * prototype because both land in the same translation unit. It returns the HTTP
+ * status and writes a NUL-terminated body into `out`. */
+extern int32_t zxmhd_dispatch(const char *method, const char *path,
+                              const char *body, struct zx_arr65536_u8 *out,
+                              int32_t cap);
+
+#define ZXMHD_RESP_MAX 65536
+
+typedef struct {
+    char   *body;
+    size_t  body_len;
+    size_t  body_cap;
+    char    method[16];
+    char    path[1024];
+    int     ready;   /* request fully received */
+    int     headers_sent;
+    int     failed;
+} zxmhd_conn;
+
+typedef struct {
+    struct MHD_Daemon *daemon;
+    int64_t            requests;
+    int64_t            max_body;
+} zxmhd_server;
+
+/* One flag for the process: a program runs one daemon, and `wait` must stay
+ * valid even while `stop` is tearing the server down. */
+static volatile int zxmhd_stopping = 0;
+static char         zxmhd_err[256];
+
+static void zxmhd_conn_free(zxmhd_conn *cn) {
+    if (!cn) return;
+    free(cn->body);
+    free(cn);
+}
+
+/* The libmicrohttpd access handler: buffers the upload, then asks the Zexi
+ * dispatch function for a status code and a body, and queues that response. */
+static enum MHD_Result zxmhd_handler(void *cls, struct MHD_Connection *conn,
+                                     const char *url, const char *method,
+                                     const char *version, const char *upload,
+                                     size_t *upload_size, void **con_cls) {
+    zxmhd_server *srv = (zxmhd_server *)cls;
+    (void)version;
+    if (!*con_cls) {
+        zxmhd_conn *cn = (zxmhd_conn *)calloc(1, sizeof *cn);
+        if (!cn) return MHD_NO;
+        snprintf(cn->method, sizeof cn->method, "%s", method ? method : "GET");
+        snprintf(cn->path, sizeof cn->path, "%s", url ? url : "/");
+        *con_cls = cn;
+        return MHD_YES;
+    }
+    zxmhd_conn *cn = (zxmhd_conn *)*con_cls;
+    if (cn->failed) return MHD_NO;
+
+    if (*upload_size > 0) {
+        size_t n = *upload_size;
+        if (srv->max_body > 0 && (int64_t)(cn->body_len + n) > srv->max_body) {
+            cn->failed = 1;
+            return MHD_NO;   /* libmicrohttpd closes the connection */
+        }
+        if (cn->body_len + n + 1 > cn->body_cap) {
+            size_t want = cn->body_cap ? cn->body_cap : 4096;
+            while (want < cn->body_len + n + 1) want *= 2;
+            char *nb = (char *)realloc(cn->body, want);
+            if (!nb) { cn->failed = 1; return MHD_NO; }
+            cn->body = nb;
+            cn->body_cap = want;
+        }
+        memcpy(cn->body + cn->body_len, upload, n);
+        cn->body_len += n;
+        cn->body[cn->body_len] = 0;
+        *upload_size = 0;
+        return MHD_YES;
+    }
+
+    /* Upload complete: build the response exactly once. */
+    char *resp = (char *)calloc(1, ZXMHD_RESP_MAX);
+    if (!resp) return MHD_NO;
+    int32_t status = zxmhd_dispatch(cn->method, cn->path, cn->body ? cn->body : "",
+                                    (struct zx_arr65536_u8 *)resp, ZXMHD_RESP_MAX);
+    if (status < 100 || status > 599) status = 500;
+    resp[ZXMHD_RESP_MAX - 1] = 0;
+    size_t len = strlen(resp);
+    struct MHD_Response *r = MHD_create_response_from_buffer((size_t)len, resp, MHD_RESPMEM_MUST_COPY);
+    free(resp);
+    if (!r) return MHD_NO;
+    enum MHD_Result rc = MHD_queue_response(conn, (unsigned int)status, r);
+    MHD_destroy_response(r);
+    srv->requests++;
+    return rc;
+}
+
+static void zxmhd_request_completed(void *cls, struct MHD_Connection *conn,
+                                    void **con_cls,
+                                    enum MHD_RequestTerminationCode toe) {
+    (void)cls;
+    (void)conn;
+    (void)toe;
+    if (con_cls && *con_cls) {
+        zxmhd_conn_free((zxmhd_conn *)*con_cls);
+        *con_cls = NULL;
+    }
+}
+
+int64_t zxmhd_start(int32_t port, int64_t max_body, int32_t workers) {
+    unsigned int flags = MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG;
+    if (workers > 1) flags |= MHD_USE_THREAD_PER_CONNECTION;
+    zxmhd_server *srv = (zxmhd_server *)calloc(1, sizeof *srv);
+    if (!srv) return 0;
+    srv->max_body = max_body;
+    srv->daemon = MHD_start_daemon(flags, (unsigned short)port,
+                                   NULL, NULL,
+                                   zxmhd_handler, srv,
+                                   MHD_OPTION_NOTIFY_COMPLETED, zxmhd_request_completed, NULL,
+                                   MHD_OPTION_CONNECTION_TIMEOUT, (unsigned int)30,
+                                   MHD_OPTION_END);
+    if (!srv->daemon) {
+        snprintf(zxmhd_err, sizeof zxmhd_err,
+                 "MHD_start_daemon failed on port %d (already in use?)", (int)port);
+        free(srv);
+        return 0;
+    }
+    zxmhd_stopping = 0;
+    return (int64_t)(intptr_t)srv;
+}
+
+void zxmhd_stop(int64_t h) {
+    zxmhd_server *srv = (zxmhd_server *)(intptr_t)h;
+    zxmhd_stopping = 1;
+    if (!srv) return;
+    if (srv->daemon) MHD_stop_daemon(srv->daemon);
+    free(srv);
+}
+
+/* Blocks until another thread calls `stop`. libmicrohttpd serves in its own
+ * thread, so this is just a parked sleep loop. */
+void zxmhd_wait(int64_t h) {
+    zxmhd_server *srv = (zxmhd_server *)(intptr_t)h;
+    if (!srv || !srv->daemon) return;
+    while (!zxmhd_stopping) {
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 50 * 1000 * 1000;
+        nanosleep(&ts, NULL);
+    }
+}
+
+int64_t zxmhd_requests(int64_t h) {
+    zxmhd_server *srv = (zxmhd_server *)(intptr_t)h;
+    return srv ? srv->requests : 0;
+}
+
+int32_t zxmhd_last_error(struct zx_arr256_u8 *out, int32_t cap) {
+    if (out && cap > 0) {
+        size_t n = strlen(zxmhd_err);
+        if (n >= (size_t)cap) n = (size_t)cap - 1;
+        memcpy(out->e, zxmhd_err, n);
+        out->e[n] = 0;
+        return (int32_t)n;
+    }
+    return 0;
+}
+"""
+
+// start runs the daemon on `port`, capping request bodies at `max_body` bytes
+// (0 = no cap). It returns a handle, or 0 when the port cannot be bound.
+pub fn start(port: i32, max_body: i64) -> i64 {
+    return zxmhd_start(port, max_body, 1);
+}
+
+// start_workers gives each connection its own thread, for handlers that block.
+pub fn start_workers(port: i32, max_body: i64, workers: i32) -> i64 {
+    return zxmhd_start(port, max_body, workers);
+}
+
+// stop shuts the daemon down and releases the handle.
+pub fn stop(daemon: i64) { zxmhd_stop(daemon); }
+
+// wait blocks until `stop` is called, keeping the process (and the daemon
+// thread) alive.
+pub fn wait(daemon: i64) { zxmhd_wait(daemon); }
+
+// requests reports how many responses the daemon has queued.
+pub fn requests(daemon: i64) -> i64 { return zxmhd_requests(daemon); }
+
+// last_error renders the reason the most recent `start` failed.
+pub fn last_error() -> String {
+    let mut buf: [u8; 256] = [0; 256];
+    let n = zxmhd_last_error(&mut buf, 256);
+    let mut out = String::new();
+    let mut i = 0;
+    while i < n { out.push(buf[i] as char); i += 1; }
+    return out;
+}

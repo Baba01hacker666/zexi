@@ -1,0 +1,13 @@
+// A `c` body replaces the generated code, so nothing would run the destructor of
+// an owning parameter. Borrow it instead.
+
+// error: E0540 parameter `s` has type `String`
+fn consume_owned(s: String) -> i32 {
+    c """
+        return 0;
+    """
+}
+
+fn main() {
+    println(consume_owned(String::from("x")));
+}

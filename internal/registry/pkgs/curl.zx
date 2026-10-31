@@ -1,0 +1,252 @@
+// curl — an HTTP(S) client built on the system's libcurl.
+//
+//     use curl;
+//
+//     fn main() -> i32 {
+//         let r = match curl::get("https://example.com/") {
+//             Ok(r) => r,
+//             Err(e) => { eprintln(e); return 1; }
+//         };
+//         println(f"status={r.status} bytes={len(r.body)}");
+//         0
+//     }
+//
+// libcurl handles HTTPS, redirects, proxies, HTTP/2, and cookies, none of which
+// this language has to grow: the module is a thin, bounded layer over it. It
+// complements `net`/`http` (which are the compiler's own socket stack, no
+// external dependency) — reach for `curl` when you need TLS or a real server's
+// edge cases, and for `net` when you want zero dependencies.
+//
+// The response body is copied in bounded 4 KiB chunks through a fixed buffer, so
+// no pointer ever crosses the boundary and a huge response cannot exhaust the
+// program's memory by surprise: `max_bytes` is enforced by libcurl's own write
+// callback.
+//
+// Requires libcurl (Debian/Ubuntu: `apt install libcurl4-openssl-dev`, Fedora:
+// `libcurl-devel`; macOS ships it).
+
+#[link("curl")]
+#[include("curl/curl.h")]
+extern "C" fn zxc_fetch(method: str, url: str, body: str, ctype: str, max_bytes: i64, timeout_ms: i32) -> i32;
+extern "C" fn zxc_status() -> i32;
+extern "C" fn zxc_len() -> i64;
+extern "C" fn zxc_chunk(off: i64, out: &mut [u8; 4096], cap: i32) -> i32;
+extern "C" fn zxc_content_type(out: &mut [u8; 128], cap: i32) -> i32;
+extern "C" fn zxc_error(out: &mut [u8; 256], cap: i32) -> i32;
+
+// The response lives in one static buffer between calls: `zxc_fetch` fills it,
+// `zxc_chunk` hands it over 4 KiB at a time, and the next fetch replaces it.
+// That keeps the whole handoff pointer-free, which is what a `c` block can do
+// without the language needing pointer arithmetic.
+c """
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+static char   *zxc_buf = NULL;
+static size_t  zxc_buf_len = 0;   /* bytes used */
+static size_t  zxc_buf_cap = 0;   /* bytes allocated */
+static size_t  zxc_buf_max = 0;   /* ceiling for this request */
+static int32_t zxc_http_status = 0;
+static char    zxc_ctype[128];
+static char    zxc_err[256];
+static int     zxc_inited = 0;
+
+static void zxc_reset_state(void) {
+    zxc_buf_len = 0;
+    zxc_http_status = 0;
+    zxc_ctype[0] = 0;
+    zxc_err[0] = 0;
+}
+
+static size_t zxc_write_cb(char *data, size_t size, size_t nmemb, void *userdata) {
+    (void)userdata;
+    size_t n = size * nmemb;
+    /* Over the ceiling: refuse, which makes libcurl abort with CURLE_WRITE_ERROR. */
+    if (zxc_buf_max && zxc_buf_len + n > zxc_buf_max) {
+        snprintf(zxc_err, sizeof zxc_err, "response exceeds the %ld byte limit",
+                 (long)zxc_buf_max);
+        return 0;
+    }
+    if (zxc_buf_len + n + 1 > zxc_buf_cap) {
+        size_t want = zxc_buf_cap ? zxc_buf_cap : 8192;
+        while (want < zxc_buf_len + n + 1) want *= 2;
+        char *nb = (char *)realloc(zxc_buf, want);
+        if (!nb) {
+            snprintf(zxc_err, sizeof zxc_err, "out of memory");
+            return 0;
+        }
+        zxc_buf = nb;
+        zxc_buf_cap = want;
+    }
+    memcpy(zxc_buf + zxc_buf_len, data, n);
+    zxc_buf_len += n;
+    zxc_buf[zxc_buf_len] = 0;
+    return n;
+}
+
+/* Returns 0 on success, or the libcurl error code (-1 when libcurl was never
+ * initialised). The HTTP status is separate: a 404 is a successful transfer. */
+int32_t zxc_fetch(const char *method, const char *url, const char *body,
+                  const char *ctype, int64_t max_bytes, int32_t timeout_ms) {
+    zxc_reset_state();
+    if (!zxc_inited) {
+        if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return -1;
+        zxc_inited = 1;
+    }
+    zxc_buf_max = (size_t)(max_bytes > 0 ? max_bytes : 8388608);
+    CURL *h = curl_easy_init();
+    if (!h) { snprintf(zxc_err, sizeof zxc_err, "curl_easy_init failed"); return -1; }
+
+    struct curl_slist *hdrs = NULL;
+    curl_easy_setopt(h, CURLOPT_URL, url ? url : "");
+    curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, zxc_write_cb);
+    curl_easy_setopt(h, CURLOPT_WRITEDATA, NULL);
+    curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(h, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, (long)(timeout_ms > 0 ? timeout_ms : 15000));
+    curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, (long)(timeout_ms > 0 ? timeout_ms : 15000));
+    curl_easy_setopt(h, CURLOPT_USERAGENT, "zexi-curl/1.0");
+    curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+
+    if (method && strcmp(method, "HEAD") == 0) {
+        curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+    } else if (method && strcmp(method, "GET") != 0) {
+        if (strcmp(method, "POST") != 0) {
+            curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, method);
+        } else {
+            curl_easy_setopt(h, CURLOPT_POST, 1L);
+        }
+        curl_easy_setopt(h, CURLOPT_POSTFIELDS, body ? body : "");
+        curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE, (long)(body ? strlen(body) : 0));
+        if (ctype && ctype[0]) {
+            char line[160];
+            snprintf(line, sizeof line, "Content-Type: %s", ctype);
+            hdrs = curl_slist_append(hdrs, line);
+            curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
+        }
+    }
+
+    CURLcode rc = curl_easy_perform(h);
+    long status = 0;
+    curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &status);
+    zxc_http_status = (int32_t)status;
+    char *ct = NULL;
+    curl_easy_getinfo(h, CURLINFO_CONTENT_TYPE, &ct);
+    if (ct) snprintf(zxc_ctype, sizeof zxc_ctype, "%s", ct);
+    if (rc != CURLE_OK && !zxc_err[0]) {
+        snprintf(zxc_err, sizeof zxc_err, "%s", curl_easy_strerror(rc));
+    }
+    if (hdrs) curl_slist_free_all(hdrs);
+    curl_easy_cleanup(h);
+    return (int32_t)rc;
+}
+
+int32_t zxc_status(void) { return zxc_http_status; }
+int64_t zxc_len(void) { return (int64_t)zxc_buf_len; }
+
+int32_t zxc_chunk(int64_t off, struct zx_arr4096_u8 *out, int32_t cap) {
+    if (off < 0 || (size_t)off >= zxc_buf_len) return 0;
+    size_t n = zxc_buf_len - (size_t)off;
+    if (n > (size_t)cap) n = (size_t)cap;
+    memcpy(out->e, zxc_buf + off, n);
+    return (int32_t)n;
+}
+
+int32_t zxc_content_type(struct zx_arr128_u8 *out, int32_t cap) {
+    size_t n = strlen(zxc_ctype);
+    if (n >= (size_t)cap) n = (size_t)cap - 1;
+    memcpy(out->e, zxc_ctype, n);
+    out->e[n] = 0;
+    return (int32_t)n;
+}
+
+int32_t zxc_error(struct zx_arr256_u8 *out, int32_t cap) {
+    size_t n = strlen(zxc_err);
+    if (n >= (size_t)cap) n = (size_t)cap - 1;
+    memcpy(out->e, zxc_err, n);
+    out->e[n] = 0;
+    return (int32_t)n;
+}
+"""
+
+pub struct Response {
+    pub status: i32,
+    pub body: String,
+    pub content_type: String,
+}
+
+fn cstr(buf: &[u8]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < len(buf) {
+        if buf[i] == 0 { break; }
+        out.push(buf[i] as char);
+        i += 1;
+    }
+    return out;
+}
+
+// get fetches a URL. A non-2xx status is still an Ok response: check
+// `r.status`. Only transport failures (DNS, TLS, timeout, the byte ceiling)
+// are Err.
+pub fn get(url: str) -> Result<Response, String> {
+    return fetch_with("GET", url, "", "", 8388608, 15000);
+}
+
+// get_limit fetches with an explicit byte ceiling and timeout.
+pub fn get_limit(url: str, max_bytes: i64, timeout_ms: i32) -> Result<Response, String> {
+    return fetch_with("GET", url, "", "", max_bytes, timeout_ms);
+}
+
+// post sends `body` with a content type (default json when empty).
+pub fn post(url: str, body: str, content_type: str) -> Result<Response, String> {
+    let ct = if len(content_type) == 0 { "application/json" } else { content_type };
+    return fetch_with("POST", url, body, ct, 8388608, 15000);
+}
+
+// post_json is `post` for JSON with the conventional headers.
+pub fn post_json(url: str, body: str) -> Result<Response, String> {
+    return post(url, body, "application/json");
+}
+
+// head sends a HEAD request; `response.body` is empty.
+pub fn head(url: str) -> Result<Response, String> {
+    return fetch_with("HEAD", url, "", "", 0, 15000);
+}
+
+pub fn delete(url: str) -> Result<Response, String> {
+    return fetch_with("DELETE", url, "", "", 8388608, 15000);
+}
+
+pub fn fetch(method: str, url: str, body: str, content_type: str, max_bytes: i64, timeout_ms: i32) -> Result<Response, String> {
+    return fetch_with(method, url, body, content_type, max_bytes, timeout_ms);
+}
+
+fn fetch_with(method: str, url: str, body: str, ctype: str, max_bytes: i64, timeout_ms: i32) -> Result<Response, String> {
+    let rc = zxc_fetch(method, url, body, ctype, max_bytes, timeout_ms);
+    if rc != 0 {
+        let mut ebuf: [u8; 256] = [0; 256];
+        zxc_error(&mut ebuf, 256);
+        let msg = cstr(&ebuf);
+        if len(msg) == 0 { return Err(String::from("request failed")); }
+        return Err(msg);
+    }
+    let total = zxc_len();
+    let mut out = String::new();
+    let mut off: i64 = 0;
+    let mut chunk: [u8; 4096] = [0; 4096];
+    while off < total {
+        let n = zxc_chunk(off, &mut chunk, 4096);
+        if n <= 0 { break; }
+        out.push_bytes(&chunk[0..n as usize]);
+        off += n as i64;
+    }
+    let mut ctbuf: [u8; 128] = [0; 128];
+    zxc_content_type(&mut ctbuf, 128);
+    return Ok(Response {
+        status: zxc_status(),
+        body: out,
+        content_type: cstr(&ctbuf),
+    });
+}

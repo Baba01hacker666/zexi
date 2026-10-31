@@ -1,0 +1,151 @@
+// crypto — SHA-1, SHA-256, SHA-512, MD5, and HMAC-SHA256 from the system's
+// OpenSSL libcrypto.
+//
+//     use crypto;
+//
+//     fn main() -> i32 {
+//         println(crypto::sha256_hex("abc".as_bytes()));
+//         // ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+//         println(crypto::hmac_sha256_hex("key".as_bytes(), "message".as_bytes()));
+//         0
+//     }
+//
+// Every function takes borrowed bytes and returns a lowercase hex `String`, so
+// nothing has to be decoded to store or compare a digest. Use `*_bytes` when you
+// need the raw digest for a binary protocol or a signature.
+//
+// This wraps the *digests* only: it does not manage keys, certificates, or TLS.
+// For TLS, terminate it in front of your program (or link libcurl's DoH/HTTPS
+// path through the `curl` package).
+//
+// Requires libcrypto (Debian/Ubuntu: `apt install libssl-dev`, Fedora:
+// `openssl-devel`; macOS: `brew install openssl`).
+
+#[link("crypto")]
+#[include("openssl/evp.h")]
+#[include("openssl/hmac.h")]
+extern "C" fn zxc_digest(src: &[u8], kind: i32, out: &mut [u8; 64]) -> i32;
+extern "C" fn zxc_digest_hex(src: &[u8], kind: i32, out: &mut [u8; 128]) -> i32;
+extern "C" fn zxc_hmac_hex(key: &[u8], msg: &[u8], out: &mut [u8; 128]) -> i32;
+extern "C" fn zxc_hmac(key: &[u8], msg: &[u8], out: &mut [u8; 64]) -> i32;
+
+// 1 = SHA-256, 2 = SHA-512, 3 = SHA-1, 4 = MD5.
+c """
+#include <stdint.h>
+#include <string.h>
+
+static const EVP_MD *zxc_md(int32_t kind) {
+    switch (kind) {
+    case 2: return EVP_sha512();
+    case 3: return EVP_sha1();
+    case 4: return EVP_md5();
+    default: return EVP_sha256();
+    }
+}
+
+static void zxc_to_hex(const unsigned char *d, unsigned int n, struct zx_arr128_u8 *out) {
+    static const char hx[] = "0123456789abcdef";
+    unsigned int i;
+    for (i = 0; i < n && i * 2 + 1 < 128; i++) {
+        out->e[i * 2] = (uint8_t)hx[d[i] >> 4];
+        out->e[i * 2 + 1] = (uint8_t)hx[d[i] & 15];
+    }
+    if (i * 2 < 128) {
+        out->e[i * 2] = 0;
+    }
+}
+
+int32_t zxc_digest(zx_slice_u8 src, int32_t kind, struct zx_arr64_u8 *out) {
+    unsigned int n = 0;
+    if (!EVP_Digest(src.ptr, src.len, out->e, &n, zxc_md(kind), NULL)) return -1;
+    return (int32_t)n;
+}
+
+int32_t zxc_digest_hex(zx_slice_u8 src, int32_t kind, struct zx_arr128_u8 *out) {
+    unsigned char raw[64];
+    unsigned int n = 0;
+    if (!EVP_Digest(src.ptr, src.len, raw, &n, zxc_md(kind), NULL)) return -1;
+    zxc_to_hex(raw, n, out);
+    return (int32_t)(n * 2);
+}
+
+int32_t zxc_hmac(zx_slice_u8 key, zx_slice_u8 msg, struct zx_arr64_u8 *out) {
+    unsigned int n = 0;
+    if (!HMAC(EVP_sha256(), key.ptr, (int)key.len, msg.ptr, msg.len, out->e, &n)) return -1;
+    return (int32_t)n;
+}
+
+int32_t zxc_hmac_hex(zx_slice_u8 key, zx_slice_u8 msg, struct zx_arr128_u8 *out) {
+    unsigned char raw[64];
+    unsigned int n = 0;
+    if (!HMAC(EVP_sha256(), key.ptr, (int)key.len, msg.ptr, msg.len, raw, &n)) return -1;
+    zxc_to_hex(raw, n, out);
+    return (int32_t)(n * 2);
+}
+"""
+
+fn hex_string(buf: &[u8]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < len(buf) {
+        if buf[i] == 0 { break; }
+        out.push(buf[i] as char);
+        i += 1;
+    }
+    return out;
+}
+
+// sha256_hex renders the SHA-256 of `data` as 64 lowercase hex characters.
+pub fn sha256_hex(data: &[u8]) -> String { return digest_hex(data, 1); }
+pub fn sha512_hex(data: &[u8]) -> String { return digest_hex(data, 2); }
+pub fn sha1_hex(data: &[u8]) -> String { return digest_hex(data, 3); }
+pub fn md5_hex(data: &[u8]) -> String { return digest_hex(data, 4); }
+
+fn digest_hex(data: &[u8], kind: i32) -> String {
+    let mut buf: [u8; 128] = [0; 128];
+    let n = zxc_digest_hex(data, kind, &mut buf);
+    if n <= 0 { return String::new(); }
+    return hex_string(&buf);
+}
+
+// sha256_bytes is the raw 32-byte digest, for binary protocols.
+pub fn sha256_bytes(data: &[u8]) -> String {
+    let mut buf: [u8; 64] = [0; 64];
+    let n = zxc_digest(data, 1, &mut buf);
+    let mut out = String::new();
+    if n > 0 { out.push_bytes(&buf[0..n as usize]); }
+    return out;
+}
+
+// hmac_sha256_hex authenticates `msg` under `key` (the standard construct for
+// webhook signatures and API tokens).
+pub fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
+    let mut buf: [u8; 128] = [0; 128];
+    let n = zxc_hmac_hex(key, msg, &mut buf);
+    if n <= 0 { return String::new(); }
+    return hex_string(&buf);
+}
+
+// hmac_sha256_bytes is the raw 32-byte tag.
+pub fn hmac_sha256_bytes(key: &[u8], msg: &[u8]) -> String {
+    let mut buf: [u8; 64] = [0; 64];
+    let n = zxc_hmac(key, msg, &mut buf);
+    let mut out = String::new();
+    if n > 0 { out.push_bytes(&buf[0..n as usize]); }
+    return out;
+}
+
+// equal compares two hex digests without leaking where they differ, which is
+// what a webhook check should use instead of `==` on strings.
+pub fn equal(a: str, b: str) -> bool {
+    if len(a) != len(b) { return false; }
+    let mut diff = 0;
+    let mut i = 0;
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    while i < len(ab) {
+        diff |= (ab[i] ^ bb[i]) as i32;
+        i += 1;
+    }
+    return diff == 0;
+}

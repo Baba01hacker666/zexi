@@ -31,7 +31,7 @@ program namespace.
 | Byte | `b'A'`, `b'\n'` |
 | Char (a Unicode scalar) | `'A'`, `'\u{1F600}'` |
 | String (UTF-8, immutable) | `"hi\n"`, `"élan"` |
-| Interpolated string (`String`) | `f"hi {name}, {n + 1} pts"` (`{{`/`}}` are literal braces) |
+| Interpolated string (`String`) | `f"hi {name}, {n + 1} pts"` (`{{`/`}}` are literal braces; a hole may contain nested literals and braces: `f"{"inner"}"`) |
 | Raw string (no escapes) | `r"C:\path"`, `r#"say "hi""#`, `r##"a #" b"##` |
 | Triple-quoted raw string | `"""a "quoted" line\nand a second one"""` — the spelling to use for C, HTML, or SQL |
 | Boolean | `true`, `false` |
@@ -162,7 +162,8 @@ never               the type of `return`/`panic`; coerces to anything
 (T, U, ...)   tuple; () is the unit type
 str           immutable borrowed text (a C-ABI `const char *`, NUL-terminated;
               `str::as_bytes()` yields a `[u8]` view with an explicit length)
-*T *mut T     raw pointer (only usable in `unsafe`)
+*T *mut T     raw pointer (no `unsafe` block exists; it is created only by an
+              explicit `as` cast and exists to cross into C)
 &T &mut T     shared / exclusive references
 fn(A, B) -> R function pointer
 ```
@@ -286,6 +287,27 @@ types or const generics. Explicit arguments may appear on calls and types
 `Some(T)`/`None` and `Ok(T)`/`Err(E)`. The variant names may be written bare
 (`Ok(n)`, `None`) when the expected type makes the enum unambiguous.
 
+Both enums have a fixed set of **builtin methods**. They are not `impl` methods
+(the prelude enums are compiler templates and cannot be extended), but they are
+specified by their desugaring, so their move and evaluation semantics are the
+same as an explicit `match`:
+
+| Method | Type | Desugaring | Receiver |
+| --- | --- | --- | --- |
+| `r.unwrap()` | `T` | `match r { Err(_) => panic(..), Ok(v) => v }` | moved |
+| `r.expect(msg)` | `T` | same, with `panic(msg)` as the failing arm | moved |
+| `r.unwrap_or(d)` | `T` | failing arm evaluates `d` | moved |
+| `r.is_ok()` | `bool` | discriminant test | borrowed |
+| `r.is_err()` | `bool` | discriminant test | borrowed |
+| `o.is_some()` | `bool` | discriminant test | borrowed |
+| `o.is_none()` | `bool` | discriminant test | borrowed |
+
+The extractors consume their receiver, so unwrapping twice is `E0382`; the tag
+tests only read, so testing and then unwrapping is legal. Asking an `Option` for
+`is_ok`, a `Result` for `is_some`, or passing `unwrap_or` a value of the wrong
+type is an error (`E0599`/`E0308`), never a silently wrong answer. A unit payload
+(`Result<(), E>`) unwraps to `()`.
+
 ## 2.4 Type system rules
 
 - **Static, strong, nominal** for structs/enums; `dyn Trait` is structural.
@@ -310,8 +332,35 @@ types or const generics. Explicit arguments may appear on calls and types
   element reachable from it, taking `&mut` of it, or calling a `&mut self`
   method on it requires `let mut` (or a binding that is already a `&mut`/`*mut`
   handle). `&self` methods may not mutate the receiver.
-- **Null:** there is no null pointer value in safe code. Absence is `Option<T>`,
-  and `*T` is only dereferenceable in `unsafe`.
+- **Null:** there is no null pointer value in safe code. Absence is `Option<T>`.
+  A `*T` cannot be dereferenced from Zexi at all — it is produced by `as` and
+  consumed by `extern "C"` calls and `c` bodies, so the C side is where the
+  type is checked.
+
+### Casts
+
+`as` converts between numeric types, to and from `char`, and to and from raw
+pointers:
+
+| Cast | Rule |
+| --- | --- |
+| numeric ↔ numeric, numeric ↔ `char` | truncating/saturating as usual; no implicit conversion exists |
+| `&T` / `&mut T` → `*T` | the pointee must match (`&i64 as *u8` is `E0308`) |
+| `&[T; N]` / `&mut [T; N]` → `*T` | an array borrow decays to its first element, as in C |
+| `&[T]` → `*T` | rejected: a slice is a pointer *and* a length, so cast `&xs[i]` instead |
+| `str` → `*u8` | the string's byte pointer |
+| `*T` ↔ integer | an address as a number, for handles and log lines |
+
+Nothing else casts: strings, structs, and enums are not reinterpreted by `as`.
+
+### Reading through a borrow
+
+A `&T` behaves like the value it points at in the two places that matter for
+iteration and for `&self` methods: method calls resolve on the pointee, and a
+comparison reads through the borrow (`n > 7` for `n: &i64`, `s == "b"` for
+`s: &String`). Printing a `&T` prints the value. Nothing else is implicit: an
+assignment to a borrow is an error, and comparing two references compares the
+values they point at, never their addresses.
 
 ## 2.5 Control flow & expressions
 
@@ -370,7 +419,25 @@ an unknown name (E0061), a duplicated argument (E0062), or a missing
 required argument (E0061) is an error. A function whose return type is
 omitted returns `()`. An interpolated string `f"...{expr}..."` evaluates to
 an owning `String`; interpolated values are borrowed (never moved) and must
-be printable (numbers, `bool`, `char`, `str`, `String`).
+be printable (numbers, `bool`, `char`, `str`, `String`). A hole holds a full
+expression, so it may contain its own string or char literal, its own braces,
+or another interpolation — the scanner matches the inner quoting and bracket
+depth, and only a quote outside every hole ends the literal:
+
+```zexi
+fn main() {
+    let n = 3;
+    println(f"nested {"quoted"} works");
+    println(f"{ if n > 3 { "long" } else { "short" } }");
+    println(f"char {'}'} inside a hole");
+}
+```
+
+```
+nested quoted works
+short
+char } inside a hole
+```
 
 <!-- fragment -->
 ```zexi
@@ -447,9 +514,14 @@ No exceptions. Two mechanisms:
    operator works on `Option<T>` (yielding `Some`'s payload and returning
    `None`) inside a function that returns `Option`.
 
-2. **`panic`** for unrecoverable bugs; unwinds are **not** supported in M0 — a
-   panic aborts (or calls a user hook), keeping the binary small and behavior
+2. **`panic(msg)`** for unrecoverable bugs; unwinds are **not** supported in M0 —
+   a panic aborts (or calls a user hook), keeping the binary small and behavior
    predictable. Bounds-check failures and integer-overflow checks (debug) panic.
+   `panic` has type `never`, so it may stand where a value of any type is
+   expected — typically the arm of a `match` that cannot return. It writes
+   `zexi panic: <msg>` to standard error and exits with status **101**; the
+   argument is optional (`panic()` reports `panic`) and may be any printable
+   value.
 
 ## 2.8 Modules & packages
 
@@ -513,7 +585,13 @@ Two items let a module reach outside the language:
 - `extern "C" fn name(..) -> T;` declares a C function to call.
 - `c """ ... """` compiles a block of C with the program. The block is appended to
   the generated translation unit, so it can use the runtime types and call
-  `#[no_mangle]` functions.
+  `#[no_mangle]` functions. The same form as the **entire body of a function**
+  writes that function in C, with its parameters in scope under their source
+  names and carrying their Zexi C types (`&[T]` is `{ T *ptr; size_t len; }`,
+  `&mut T` is `T *`, `str` is `const char *`); see `17-extending.md` §17.3b. It
+  is rejected (`E0540`) unless it is the whole body, every parameter and the
+  result are free of drop glue, the parameter names are C identifiers, and the
+  function is not `main`.
 
 `#[link("m")]` on either item adds `-lname` to the link step (`"pthread"` also
 adds `-pthread`). Together they are how a library adds native code without a
