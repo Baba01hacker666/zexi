@@ -91,6 +91,11 @@ const DRAIN_MS: i32 = 100;
 // DEFAULT_MAX_REDIRECTS is how many redirect hops a client follows.
 const DEFAULT_MAX_REDIRECTS: i32 = 5;
 
+// SUBSTR_ALL is the sentinel length passed to `substr` when the caller wants
+// "the rest of the string". 2^32 - 1 is the largest value a `usize`-shaped
+// length argument can carry without overflowing.
+const SUBSTR_ALL: usize = 4294967295;
+
 // --- URLs ------------------------------------------------------------------
 
 pub struct Url {
@@ -156,7 +161,7 @@ pub fn parse_url(raw: str) -> Url {
         return empty_url("unsupported URL scheme");
     }
 
-    let after = s.substr((sep + 3) as usize, 4294967295);
+    let after = s.substr((sep + 3) as usize, SUBSTR_ALL);
     let hash = after.find("#");
     let rest = if hash < 0 { after } else { after.substr(0, hash as usize) };
 
@@ -171,7 +176,7 @@ pub fn parse_url(raw: str) -> Url {
         auth_end = qmark as usize;
     }
     let authority = rest.substr(0, auth_end);
-    let tail = rest.substr(auth_end, 4294967295);
+    let tail = rest.substr(auth_end, SUBSTR_ALL);
 
     if authority.len() == 0 {
         return empty_url("missing host in URL");
@@ -185,7 +190,7 @@ pub fn parse_url(raw: str) -> Url {
 
     let mut port: i32 = 80;
     if colon >= 0 {
-        let ps = authority.substr((colon + 1) as usize, 4294967295);
+        let ps = authority.substr((colon + 1) as usize, SUBSTR_ALL);
         let p = parse_dec(&ps);
         if p <= 0 || p > 65535 {
             return empty_url("invalid port in URL");
@@ -202,11 +207,11 @@ pub fn parse_url(raw: str) -> Url {
                 path = tail;
             } else {
                 path = tail.substr(0, q as usize);
-                query = tail.substr((q + 1) as usize, 4294967295);
+                query = tail.substr((q + 1) as usize, SUBSTR_ALL);
             }
         } else {
             // tail starts with "?": no path was given.
-            query = tail.substr(1, 4294967295);
+            query = tail.substr(1, SUBSTR_ALL);
         }
     }
     return Url { scheme: scheme, host: host, port: port, path: path, query: query, error: String::new() };
@@ -305,12 +310,12 @@ pub fn query_value(raw: &String, name: str) -> String {
     // The lookup compares bytes, so no key allocation is needed.
     let mut pos: usize = 0;
     while pos <= raw.len() {
-        let rest = raw.substr(pos, 4294967295);
+        let rest = raw.substr(pos, SUBSTR_ALL);
         let amp = rest.find("&");
         let pair = if amp < 0 { rest.clone() } else { rest.substr(0, amp as usize) };
         let eq = pair.find("=");
         let key_raw = if eq < 0 { pair.clone() } else { pair.substr(0, eq as usize) };
-        let val_raw = if eq < 0 { String::new() } else { pair.substr((eq + 1) as usize, 4294967295) };
+        let val_raw = if eq < 0 { String::new() } else { pair.substr((eq + 1) as usize, SUBSTR_ALL) };
         let key = url_decode(key_raw.as_str());
         if key.as_str() == name {
             return url_decode(val_raw.as_str());
@@ -413,7 +418,7 @@ impl Request {
         if q < 0 {
             return String::new();
         }
-        return self.path.substr((q + 1) as usize, 4294967295);
+        return self.path.substr((q + 1) as usize, SUBSTR_ALL);
     }
 
     // query returns a decoded query-string parameter.
@@ -428,14 +433,14 @@ impl Request {
         let want = String::from(name);
         let mut pos: usize = 0;
         while pos <= header.len() {
-            let rest = header.substr(pos, 4294967295);
+            let rest = header.substr(pos, SUBSTR_ALL);
             let semi = rest.find(";");
             let pair = if semi < 0 { rest.clone() } else { rest.substr(0, semi as usize) };
             let eq = pair.find("=");
             if eq >= 0 {
                 let key = pair.substr(0, eq as usize).trim();
                 if key.as_str() == want.as_str() {
-                    return pair.substr((eq + 1) as usize, 4294967295).trim();
+                    return pair.substr((eq + 1) as usize, SUBSTR_ALL).trim();
                 }
             }
             if semi < 0 {
@@ -473,20 +478,20 @@ impl Request {
         let want = String::from(name);
         let mut pos: usize = 0;
         while pos < self.params.len() {
-            let rest = self.params.substr(pos, 4294967295);
+            let rest = self.params.substr(pos, SUBSTR_ALL);
             let lead = rest.find("\x1f");
             if lead < 0 {
                 break;
             }
             pos = pos + (lead as usize) + 1;
-            let rest2 = self.params.substr(pos, 4294967295);
+            let rest2 = self.params.substr(pos, SUBSTR_ALL);
             let mid = rest2.find("\x1f");
             if mid < 0 {
                 break;
             }
             let key = rest2.substr(0, mid as usize);
             pos = pos + (mid as usize) + 1;
-            let rest3 = self.params.substr(pos, 4294967295);
+            let rest3 = self.params.substr(pos, SUBSTR_ALL);
             let next = rest3.find("\x1f");
             let val = if next < 0 { rest3 } else { rest3.substr(0, next as usize) };
             if key.as_str() == want.as_str() {
@@ -504,20 +509,20 @@ impl Request {
     pub fn collect_params(&self, out: &mut HashMap<String, String>) {
         let mut pos: usize = 0;
         while pos < self.params.len() {
-            let rest = self.params.substr(pos, 4294967295);
+            let rest = self.params.substr(pos, SUBSTR_ALL);
             let lead = rest.find("\x1f");
             if lead < 0 {
                 break;
             }
             pos = pos + (lead as usize) + 1;
-            let rest2 = self.params.substr(pos, 4294967295);
+            let rest2 = self.params.substr(pos, SUBSTR_ALL);
             let mid = rest2.find("\x1f");
             if mid < 0 {
                 break;
             }
             let key = rest2.substr(0, mid as usize);
             pos = pos + (mid as usize) + 1;
-            let rest3 = self.params.substr(pos, 4294967295);
+            let rest3 = self.params.substr(pos, SUBSTR_ALL);
             let next = rest3.find("\x1f");
             let val = if next < 0 { rest3 } else { rest3.substr(0, next as usize) };
             out.insert(key, val);
@@ -788,14 +793,14 @@ pub fn parse_request(raw: &String) -> Request {
     let line = raw.substr(0, end as usize);
     let sp1 = line.find(" ");
     let method = if sp1 < 0 { line.clone() } else { line.substr(0, sp1 as usize) };
-    let rest = if sp1 < 0 { String::new() } else { line.substr((sp1 + 1) as usize, 4294967295) };
+    let rest = if sp1 < 0 { String::new() } else { line.substr((sp1 + 1) as usize, SUBSTR_ALL) };
     let sp2 = rest.find(" ");
     let path = if sp2 < 0 { rest.clone() } else { rest.substr(0, sp2 as usize) };
-    let version = if sp2 < 0 { String::new() } else { rest.substr((sp2 + 1) as usize, 4294967295).trim() };
+    let version = if sp2 < 0 { String::new() } else { rest.substr((sp2 + 1) as usize, SUBSTR_ALL).trim() };
 
     let headers = header_block(raw);
     let he = head_end(raw);
-    let body = if he < 0 { String::new() } else { raw.substr(he as usize, 4294967295) };
+    let body = if he < 0 { String::new() } else { raw.substr(he as usize, SUBSTR_ALL) };
     return Request {
         method: method, path: path, version: version, headers: headers, body: body,
         params: String::new(), head_bytes: raw.len(), head_overflow: false,
@@ -1114,15 +1119,15 @@ pub fn parse_response(raw: &String) -> Response {
     }
     let line = raw.substr(0, end as usize);
     let sp1 = line.find(" ");
-    let rest = if sp1 < 0 { String::new() } else { line.substr((sp1 + 1) as usize, 4294967295) };
+    let rest = if sp1 < 0 { String::new() } else { line.substr((sp1 + 1) as usize, SUBSTR_ALL) };
     let sp2 = rest.find(" ");
     let code = if sp2 < 0 { rest.clone() } else { rest.substr(0, sp2 as usize) };
-    let reason = if sp2 < 0 { String::new() } else { rest.substr((sp2 + 1) as usize, 4294967295).trim() };
+    let reason = if sp2 < 0 { String::new() } else { rest.substr((sp2 + 1) as usize, SUBSTR_ALL).trim() };
 
     let headers = header_block(raw);
     let ct = header_value(&headers, "Content-Type");
     let he = head_end(raw);
-    let body = if he < 0 { String::new() } else { raw.substr(he as usize, 4294967295) };
+    let body = if he < 0 { String::new() } else { raw.substr(he as usize, SUBSTR_ALL) };
     return Response {
         status: parse_dec(&code) as i32, reason: reason, headers: headers, body: body,
         content_type: ct, error: String::new(), keep_alive: false,
@@ -1195,7 +1200,7 @@ fn dir_prefix(path: &String) -> String {
     let mut cut: usize = 0;
     let mut pos: usize = 0;
     while pos < path.len() {
-        let rest = path.substr(pos, 4294967295);
+        let rest = path.substr(pos, SUBSTR_ALL);
         let i = rest.find("/");
         if i < 0 {
             break;
@@ -1527,7 +1532,7 @@ impl Router {
                 m += 1;
             }
             if best >= 0 {
-                let rest = path.substr(best_len, 4294967295);
+                let rest = path.substr(best_len, SUBSTR_ALL);
                 res = serve_page(self.roots[best as usize], rest.as_str());
                 matched = true;
             }
@@ -2042,14 +2047,14 @@ pub fn serve_page(root: str, url_path: str) -> Response {
 pub fn collect_query_into(raw: &String, out: &mut HashMap<String, String>) {
     let mut pos: usize = 0;
     while pos <= raw.len() {
-        let rest = raw.substr(pos, 4294967295);
+        let rest = raw.substr(pos, SUBSTR_ALL);
         let amp = rest.find("&");
         let piece = if amp < 0 { rest.clone() } else { rest.substr(0, amp as usize) };
         if piece.len() > 0 {
             let eq = piece.find("=");
             if eq >= 0 {
                 let key = url_decode(piece.substr(0, eq as usize).as_str());
-                let value = url_decode(piece.substr((eq + 1) as usize, 4294967295).as_str());
+                let value = url_decode(piece.substr((eq + 1) as usize, SUBSTR_ALL).as_str());
                 if !out.contains_key(key.clone()) {
                     out.insert(key, value);
                 }
@@ -2165,7 +2170,7 @@ fn take_segment(s: &String, pos: &mut usize) -> String {
     if *pos >= s.len() {
         return String::new();
     }
-    let rest = s.substr(*pos, 4294967295);
+    let rest = s.substr(*pos, SUBSTR_ALL);
     let slash = rest.find("/");
     if slash < 0 {
         *pos = s.len();
@@ -2236,7 +2241,7 @@ fn last_colon(s: &String) -> i64 {
     let mut pos: usize = 0;
     let mut last: i64 = -1;
     while pos < s.len() {
-        let rest = s.substr(pos, 4294967295);
+        let rest = s.substr(pos, SUBSTR_ALL);
         let idx = rest.find(":");
         if idx < 0 {
             break;
@@ -2258,7 +2263,7 @@ pub fn parse_addr(raw: str) -> Addr {
     }
     let mut rest = trimmed;
     if rest.starts_with("http://") {
-        let after_scheme = rest.substr(7, 4294967295);
+        let after_scheme = rest.substr(7, SUBSTR_ALL);
         rest = after_scheme;
     }
     let slash = rest.find("/");
@@ -2274,7 +2279,7 @@ pub fn parse_addr(raw: str) -> Addr {
         if h.len() > 0 {
             host = h;
         }
-        port_s = rest.substr((colon + 1) as usize, 4294967295);
+        port_s = rest.substr((colon + 1) as usize, SUBSTR_ALL);
     }
     let p = parse_dec(&port_s);
     let mut ok = true;
@@ -2391,7 +2396,7 @@ pub fn serve_static(root: str, url_path: str) -> Response {
     let rel = if path.len() == 0 || path.as_str() == "/" {
         String::from("index.html")
     } else if path.starts_with("/") {
-        path.substr(1, 4294967295)
+        path.substr(1, SUBSTR_ALL)
     } else {
         path.clone()
     };
@@ -2558,7 +2563,7 @@ fn content_type_for(path: &String) -> str {
     if dot < 0 {
         return "application/octet-stream";
     }
-    let ext_raw = path.substr((dot + 1) as usize, 4294967295);
+    let ext_raw = path.substr((dot + 1) as usize, SUBSTR_ALL);
     let ext = http_lower(&ext_raw);
     if ext.as_str() == "html" || ext.as_str() == "htm" { return "text/html; charset=utf-8"; }
     if ext.as_str() == "css" { return "text/css; charset=utf-8"; }
@@ -2622,14 +2627,14 @@ fn header_value(headers: &String, name: str) -> String {
     let want = String::from(name);
     let mut pos: usize = 0;
     while pos < headers.len() {
-        let rest = headers.substr(pos, 4294967295);
+        let rest = headers.substr(pos, SUBSTR_ALL);
         let nl = rest.find("\r\n");
         let line = if nl < 0 { rest.clone() } else { rest.substr(0, nl as usize) };
         let colon = line.find(":");
         if colon > 0 {
             let key = line.substr(0, colon as usize).trim();
             if same_ignore_case(&key, &want) {
-                return line.substr((colon + 1) as usize, 4294967295).trim();
+                return line.substr((colon + 1) as usize, SUBSTR_ALL).trim();
             }
         }
         if nl < 0 {

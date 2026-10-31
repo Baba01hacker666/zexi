@@ -18,32 +18,67 @@
 // their bytes, and decoded output is an owning `String` (Zexi's byte buffer),
 // so NUL and high bytes survive a round trip.
 
+// --- ASCII digit helpers ---------------------------------------------------
+
+pub const ASCII_0: i64 = 48;
+pub const ASCII_9: i64 = 57;
+pub const ASCII_A: i64 = 65;
+pub const ASCII_F: i64 = 70;
+pub const ASCII_Z: i64 = 90;
+pub const ASCII_a: i64 = 97;
+pub const ASCII_f: i64 = 102;
+pub const ASCII_z: i64 = 122;
+
+// --- checksum algorithm constants ------------------------------------------
+
+// CRC-32 (IEEE 802.3 / zlib) uses a reflected polynomial; the magic value is
+// the bit-reversed form of x^32 + x^26 + x^23 + x^22 + x^16 + x^12 + x^11
+// + x^10 + x^8 + x^7 + x^5 + x^4 + x^2 + x^1 + x^0.
+pub const CRC32_POLY: i64 = 0xEDB88320;
+// 0xFFFFFFFF initial/final XOR: all-bits-set is the standard seed and final
+// flip that makes CRC-32 detect leading/trailing zero bytes.
+pub const CRC32_XOR: i64 = 0xFFFFFFFF;
+
+// FNV-1a 32-bit offset basis and prime (see http://www.isthe.com/chongo/tech/comp/fnv).
+pub const FNV1A32_BASIS: i64 = 0x811C9DC5;
+pub const FNV1A32_PRIME: i64 = 0x01000193;
+
+// FNV-1a 64-bit offset basis and prime.
+pub const FNV1A64_BASIS: u64 = 0xCBF29CE484222325;
+pub const FNV1A64_PRIME: u64 = 0x100000001B3;
+
+// DJB2 seed: the Bernstein hash starts from 5381.
+pub const DJB2_SEED: u64 = 5381;
+
+// Adler-32 prime modulus (largest prime under 65536).
+pub const ADLER32_MOD: i64 = 65521;
+
 // codec_hex_digit maps 0..15 to its lowercase ASCII digit byte.
 fn codec_hex_digit(d: i64) -> u8 {
     if d < 10 {
-        return (48 as u8) + (d as u8); // '0'
+        return (ASCII_0 as u8) + (d as u8); // '0'
     }
-    return (87 as u8) + (d as u8); // 'a' - 10
+    return ((ASCII_a - 10) as u8) + (d as u8); // 'a'
 }
 
 // codec_hex_digit_upper maps 0..15 to its uppercase ASCII digit byte.
 fn codec_hex_digit_upper(d: i64) -> u8 {
     if d < 10 {
-        return (48 as u8) + (d as u8); // '0'
+        return (ASCII_0 as u8) + (d as u8); // '0'
     }
-    return (55 as u8) + (d as u8); // 'A' - 10
+    return ((ASCII_A - 10) as u8) + (d as u8); // 'A'
 }
 
 // codec_hex_value is the numeric value of an ASCII hex digit, or -1.
 fn codec_hex_value(c: i64) -> i64 {
-    if c >= 48 && c <= 57 {
-        return c - 48; // 0-9
+    if c >= ASCII_0 && c <= ASCII_9 {
+        return c - ASCII_0; // 0-9
     }
-    if c >= 97 && c <= 102 {
-        return c - 87; // a-f
+    if c >= ASCII_a && c <= ASCII_f {
+        return c - (ASCII_a - 10); // a-f
     }
-    if c >= 65 && c <= 70 {
-        return c - 55; // A-F
+    if c >= ASCII_A && c <= ASCII_F {
+        return c - (ASCII_A - 10); // A-F
     }
     return -1;
 }
@@ -219,14 +254,14 @@ pub fn base64_encode_url(s: str) -> String {
 // codec_b64_value is the 6-bit value of a base64 character from either
 // alphabet, or -1.
 fn codec_b64_value(c: i64) -> i64 {
-    if c >= 65 && c <= 90 {
-        return c - 65; // A-Z
+    if c >= ASCII_A && c <= ASCII_Z {
+        return c - ASCII_A; // A-Z → 0..25
     }
-    if c >= 97 && c <= 122 {
-        return c - 71; // a-z
+    if c >= ASCII_a && c <= ASCII_z {
+        return c - (ASCII_a - 26); // a-z → 26..51
     }
-    if c >= 48 && c <= 57 {
-        return c + 4; // 0-9
+    if c >= ASCII_0 && c <= ASCII_9 {
+        return c - (ASCII_0 - 52); // 0-9 → 52..61
     }
     if c == 43 || c == 45 {
         return 62; // + or -
@@ -290,14 +325,14 @@ pub fn base64_decode(s: str) -> String {
 // crc32_bytes is the standard (zlib/IEEE 802.3) CRC-32 of data, as an unsigned
 // 32-bit value in an i64.
 pub fn crc32_bytes(data: &[u8]) -> i64 {
-    let mut crc: i64 = 4294967295; // 0xFFFFFFFF
+    let mut crc: i64 = CRC32_XOR;
     let mut i: usize = 0;
     while i < data.len() {
-        crc = (crc ^ (data[i] as i64)) & 4294967295;
+        crc = (crc ^ (data[i] as i64)) & CRC32_XOR;
         let mut k: i32 = 0;
         while k < 8 {
             if crc % 2 == 1 {
-                crc = ((crc / 2) ^ 3988292384) & 4294967295; // 0xEDB88320
+                crc = ((crc / 2) ^ CRC32_POLY) & CRC32_XOR;
             } else {
                 crc = crc / 2;
             }
@@ -305,7 +340,7 @@ pub fn crc32_bytes(data: &[u8]) -> i64 {
         }
         i += 1;
     }
-    return (crc ^ 4294967295) & 4294967295;
+    return (crc ^ CRC32_XOR) & CRC32_XOR;
 }
 
 // crc32 is the standard CRC-32 of s, as an unsigned 32-bit value in an i64.
@@ -325,8 +360,8 @@ pub fn adler32_bytes(data: &[u8]) -> i64 {
     let mut b: i64 = 0;
     let mut i: usize = 0;
     while i < data.len() {
-        a = (a + (data[i] as i64)) % 65521;
-        b = (b + a) % 65521;
+        a = (a + (data[i] as i64)) % ADLER32_MOD;
+        b = (b + a) % ADLER32_MOD;
         i += 1;
     }
     return b * 65536 + a;
@@ -345,10 +380,10 @@ pub fn adler32_hex(s: str) -> String {
 // fnv1a32_bytes is the 32-bit FNV-1a hash of data, as an unsigned 32-bit value
 // in an i64.
 pub fn fnv1a32_bytes(data: &[u8]) -> i64 {
-    let mut h: i64 = 0x811c9dc5;
+    let mut h: i64 = FNV1A32_BASIS;
     let mut i: usize = 0;
     while i < data.len() {
-        h = ((h ^ (data[i] as i64)) * 0x01000193) & 0xffffffff;
+        h = ((h ^ (data[i] as i64)) * FNV1A32_PRIME) & CRC32_XOR;
         i += 1;
     }
     return h;
@@ -366,10 +401,10 @@ pub fn fnv1a32_hex(s: str) -> String {
 
 // fnv1a64_bytes is the 64-bit FNV-1a hash of data.
 pub fn fnv1a64_bytes(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
+    let mut h: u64 = FNV1A64_BASIS;
     let mut i: usize = 0;
     while i < data.len() {
-        h = (h ^ (data[i] as u64)) * 0x100000001b3;
+        h = (h ^ (data[i] as u64)) * FNV1A64_PRIME;
         i += 1;
     }
     return h;
@@ -387,7 +422,7 @@ pub fn fnv1a64_hex(s: str) -> String {
 
 // djb2_bytes is Bernstein's djb2 hash of data over 64 bits.
 pub fn djb2_bytes(data: &[u8]) -> u64 {
-    let mut h: u64 = 5381;
+    let mut h: u64 = DJB2_SEED;
     let mut i: usize = 0;
     while i < data.len() {
         h = h * 33 + (data[i] as u64);

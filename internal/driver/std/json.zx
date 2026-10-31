@@ -959,21 +959,28 @@ int32_t zxj_parse_int(const char *s, int64_t *out) {
 /* zxj_utf8_encode writes the UTF-8 form of code point cp into buf and returns
  * its length (1..4), or 0 when cp is not a valid scalar value. Used for JSON
  * \uXXXX escapes. */
+#define ZXJ_UNICODE_MAX 0x10FFFF
+#define ZXJ_SURROGATE_LO 0xD800
+#define ZXJ_SURROGATE_HI 0xDFFF
+#define ZXJ_CP_2BYTE 0x80
+#define ZXJ_CP_3BYTE 0x800
+#define ZXJ_CP_4BYTE 0x10000
+
 int32_t zxj_utf8_encode(int32_t cp, zx_arr4_u8 *buf) {
     if (!buf) return 0;
     char *out = ZXJ_BYTES(buf);
-    if (cp < 0 || cp > 0x10FFFF) return 0;
-    if (cp >= 0xD800 && cp <= 0xDFFF) return 0; /* surrogate half */
-    if (cp < 0x80) {
+    if (cp < 0 || cp > ZXJ_UNICODE_MAX) return 0;
+    if (cp >= ZXJ_SURROGATE_LO && cp <= ZXJ_SURROGATE_HI) return 0; /* surrogate half */
+    if (cp < ZXJ_CP_2BYTE) {
         out[0] = (char)cp;
         return 1;
     }
-    if (cp < 0x800) {
+    if (cp < ZXJ_CP_3BYTE) {
         out[0] = (char)(0xC0 | (cp >> 6));
         out[1] = (char)(0x80 | (cp & 0x3F));
         return 2;
     }
-    if (cp < 0x10000) {
+    if (cp < ZXJ_CP_4BYTE) {
         out[0] = (char)(0xE0 | (cp >> 12));
         out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
         out[2] = (char)(0x80 | (cp & 0x3F));
