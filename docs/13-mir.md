@@ -4,13 +4,15 @@ This chapter describes `internal/mir`, the control-flow IR that the language
 front end produces and that backends are meant to consume (`docs/04 §4.3`,
 `docs/06 §6.5`).
 
-**Status: landed for the computational core, not yet on the production path.**
+**Status: landed for the computational core; the default backend is still C.**
 `zexic emit --emit=mir` lowers and prints MIR for 93% of the reachable functions
 in `tests/`, `examples/`, and `bench/`; every body it produces passes the
 invariants in `Validate`, and the subset it covers is checked for *semantic*
 equivalence against the C backend by a differential test. The C backend still
-walks the typed AST directly — MIR is a second, verified description of the same
-program, not yet the one the shipped compiler uses.
+walks the typed AST directly, so MIR is a second, verified description of the
+same program — and the opt-in **LLVM backend** (`zexic --backend=llvm`,
+`--emit=llvm`) is its first real consumer: it lowers the same MIR to LLVM IR
+and links through `clang`.
 
 ---
 

@@ -17,11 +17,16 @@ fn main() -> i32 {
 }
 ```
 
-## 11.1 Why arguments, not closures
+## 11.1 Arguments, captures, and the thread boundary
 
-Zexi does not have closures yet, so a spawned function cannot capture the
-variables around it. Instead a spawned function **takes its inputs as
-arguments** and **returns its result by joining**:
+A spawned function **takes its inputs as arguments** and **returns its result
+by joining**. Closures exist (see [`15-closures.md`](15-closures.md)) and a
+capturing closure may be passed in place of a plain `fn` — it captures by
+value, so `Thread::spawn(|x: i64| x + base, 5)` runs `5 + base` on the new
+thread. What does *not* cross the boundary is a shared reference: only `i64`
+arguments, `i64` return values, and `i64` handles (channels, atomics) are
+guaranteed to arrive intact — there is no `Send`/`Sync` check yet, so passing
+an owning value across threads is the programmer's responsibility:
 
 | Entry point | Runs on a new thread | Result |
 | --- | --- | --- |
@@ -47,6 +52,19 @@ fn main() -> i32 {
     let a = Thread::spawn2(range_sum, 0, 100);
     let b = Thread::spawn2(range_sum, 100, 200);
     println(a.join() + b.join());   // 19900
+    0
+}
+```
+
+A closure that captures by value is a legal `f` too:
+
+```zx
+import thread;
+
+fn main() -> i32 {
+    let base: i64 = 10;
+    let t = Thread::spawn(|x: i64| x + base, 5);   // captures `base` by value
+    println(t.join());                              // 15
     0
 }
 ```
@@ -82,8 +100,9 @@ fn main() -> i32 {
 }
 ```
 
-Because a worker cannot capture the `Chan` value, it receives the raw handle
-from `ch.id()` and uses the free functions. Both forms exist:
+Because a `Chan` is not `Copy`, sharing it with several workers goes through
+its raw `i64` handle: a worker receives `ch.id()` — an `i64`, which a closure
+can capture — and uses the free functions. Both forms exist:
 
 | Owning method | Free function (for workers) |
 | --- | --- |
@@ -161,9 +180,9 @@ fn main() -> i32 {
 }
 ```
 
-A job is `fn(i64) -> i64` plus one argument, because a worker cannot capture any
-Zexi value yet. For bigger fan-out, submit several jobs and collect their
-results by the sequence number `submit` returns:
+A job is `fn(i64) -> i64` plus one argument; the function may also be a closure
+that captures by value (e.g. `|x: i64| x + base`). For bigger fan-out, submit
+several jobs and collect their results by the sequence number `submit` returns:
 
 <!-- check-only -->
 ```zx

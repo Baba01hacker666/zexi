@@ -1,0 +1,7 @@
+// A variadic extern still requires its fixed parameters.
+extern "C" fn printf(fmt: str, ...) -> i32;
+
+fn main() -> i32 {
+    printf(); // error: E0061 takes at least 1 argument(s) but 0 were supplied
+    0
+}

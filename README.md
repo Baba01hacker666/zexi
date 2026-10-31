@@ -57,8 +57,10 @@ This repository contains the **initial design and specification** of Zexi: the v
 > program's single translation unit, typed against the generated ABI and inlined
 > with no boundary; the built-in owning heap type **`String`** with
 > **deterministic destruction (`Drop`)**, string-parsing methods, and text-building sugar
-> (`"n = " + n`, `s += n`); **`extern "C"` FFI** for
-> calling libc; and compiling **several source files into one binary** — enough
+> (`"n = " + n`, `s += n`, and variadic `s.push_str("a", "b", "c")`);
+> **`extern "C"` FFI** for calling libc — including **variadic** declarations
+> (`extern "C" fn printf(fmt: str, ...) -> i32;`), whose extra call arguments
+> pass through with C's default promotions — and compiling **several source files into one binary** — enough
 > to ship an HTTP client/server in [`lib/http.zx`](lib/http.zx), plus embedded
 > `net`/`http` modules (`import http.server;`) with URL parsing, redirects,
 > headers, query/form decoding, chunked bodies, timeouts, response builders,
@@ -146,9 +148,10 @@ Two lowerings consume the checked program. The shipped one emits C. The other is
 bounds-checked indexes ([`docs/13-mir.md`](docs/13-mir.md)): `--emit=mir` prints
 it, it covers 93% of this repository's reachable functions today, and its
 semantics are diffed against the C backend by a test that compiles each program
-natively, runs it, interprets the MIR, and compares the output. It is not yet the
-path the compiler takes — that is the next step toward a swappable native
-backend.
+natively, runs it, interprets the MIR, and compares the output. MIR also has a
+real consumer behind a flag: `--backend=llvm` / `--emit=llvm` lowers the same
+MIR to LLVM IR and links it with `clang` plus a small runtime shim — the first
+step toward a swappable native backend (C stays the default).
 
 ## Benchmarks
 
@@ -232,6 +235,15 @@ main.zx`) so program-level diagnostics are exact, and without one each open
 document is analyzed on its own (libraries included — the "no main" error is
 suppressed for files that don't declare one).
 
+## Requirements
+
+- **Go 1.22+** to build the compiler (`go.mod` says `go 1.22`). Any install
+  works; a quick one without a system package manager is
+  `pip install go-bin`, which drops a prebuilt Go toolchain on your `PATH`.
+- **A C compiler** (`cc`, i.e. gcc or clang) — Zexi lowers to C and invokes it
+  to produce the native binary. An optional `clang` also enables the
+  experimental LLVM backend (`--backend=llvm`).
+
 ## Try it
 
 ```sh
@@ -252,6 +264,7 @@ go run ./cmd/zexic run tests/html_lib.zx  # escaping, widgets, and templates
 go run ./cmd/zexic run tests/net_local.zx # loopback TCP/UDP, resolve, poll
 go run ./cmd/zexic run tests/recursive.zx # trees through Vec and HashMap
 go run ./cmd/zexic run tests/cinline.zx     # inline C, #[link], and #[no_mangle]
+go run ./cmd/zexic run tests/c_variadic.zx  # variadic extern "C" (printf-shaped)
 go run ./cmd/zexic run tests/formatting.zx # bases, grouping, units, alignment
 go run ./cmd/zexic run tests/encoding.zx   # hex, base64, and checksums
 go run ./cmd/zexic run tests/easy.zx      # the easy way: no semicolons, f-strings, defaults, libraries
@@ -306,6 +319,8 @@ for why, its real costs, and the plan to replace it with a native backend.
 - [`docs/12-generics.md`](docs/12-generics.md) — monomorphized generics, `Option`/`Result`, and `?`.
 - [`docs/13-mir.md`](docs/13-mir.md) — the mid-level IR: shape, instruction set, drops, lowering, and verification.
 - [`docs/14-json-and-html.md`](docs/14-json-and-html.md) — building websites: JSON values and safe HTML templating.
+- [`docs/15-closures.md`](docs/15-closures.md) — closures: capture by value, function values, `Vec` helpers.
+- [`docs/16-stdlib-reference.md`](docs/16-stdlib-reference.md) — the embedded standard library, module by module.
 - [`docs/17-extending.md`](docs/17-extending.md) — adding a capability as a library, not a compiler change.
 - [`docs/18-one-translation-unit.md`](docs/18-one-translation-unit.md) — measured: one C file or many, and why.
 - [`docs/19-modules.md`](docs/19-modules.md) — `zexic add`: the C-library catalog, and how to write a package.
@@ -325,7 +340,10 @@ internal/
   types/              semantic type representation
   sema/               name resolution, type inference, constant folding,
                       and the flow-sensitive move checker (own.go)
-  codegen/c/          M0 backend: typed program -> C11
+  codegen/c/          default backend: typed program -> C11
+  codegen/llvm/       opt-in backend (`--backend=llvm`): MIR -> LLVM IR -> clang
+  bindgen/            `zexic bindgen`: C header -> extern "C" declarations
+  lsp/                `zexic lsp`: JSON-RPC language server over stdio
   mir/                mid-level IR: CFG lowering, validator, dump, test oracle
   layout/             ABI table: sizes, alignments, field offsets, enum tags
   driver/             pipeline orchestration, imports/modules + C compiler invocation

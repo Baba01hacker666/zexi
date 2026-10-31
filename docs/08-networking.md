@@ -360,8 +360,8 @@ fn main() -> i32 {
 | `requests_served()`, `connections_served()` | pool-wide counters (C11 atomics, no lock) |
 | `stop_serving()`, `serving_stopped()`, `reset_stats()` | cooperative shutdown and counter reset |
 
-How a `Router` reaches a thread: a worker thread can only be handed integers
-(the language has no closures yet), so the pool **pins** the router — it copies
+How a `Router` reaches a thread: the pool's C worker loop is handed a small
+integer, not a Zexi value, so the pool **pins** the router — it copies
 the route table into a fixed, over-aligned slot in the C runtime and passes the
 slot number. The default mux already lives in slot 0, so it needs no copy. Three
 slots are available for explicit routers; if all are busy, `serve_workers*`

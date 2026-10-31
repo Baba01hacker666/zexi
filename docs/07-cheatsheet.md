@@ -84,6 +84,7 @@ direction, C and Zexi can call each other both ways:
 fn zexi_add(a: i64, b: i64) -> i64 { return a + b; }
 
 extern "C" fn run_c();           // defined in the .c file
+extern "C" fn printf(fmt: str, ...) -> i32;  // variadic: extra args get C's default promotions
 
 fn main() -> i32 { run_c(); 0 }
 ```
@@ -313,10 +314,11 @@ for x in xs {              // iterate the elements (element type must be `Copy`)
 ```zx
 let mut s = String::from("zexi");  // owning, heap-allocated, not `Copy`
 s.push_str("!");
+s.push_str("a", "b", "c");   // variadic: appends each argument in order
 s.push('?');
 s += " done";          // `+=` appends
-println(s);            // zexi!? done
-println(s.len());      // 11
+println(s);            // zexi!abc? done
+println(s.len());      // 14
 let greeting = "hi, " + s + "!";   // `+` concatenates any mix of `str`/`String`
 let report = "lines: " + 12 + " (" + true + ")";  // numbers/bool/char are rendered
 s += 3;                // `+=` appends; a number is rendered as text

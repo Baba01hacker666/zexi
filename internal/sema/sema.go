@@ -41,6 +41,11 @@ type Fn struct {
 	Recv       *types.Type // receiver type for methods (struct or enum), else nil
 	Extern     bool
 	ABI        string
+	// Variadic marks an `extern "C"` declaration whose parameter list ends
+	// with `...`: the fixed parameters are checked as usual, and any
+	// further arguments are passed through with C's default argument
+	// promotions (the C prototype's `...` applies them).
+	Variadic bool
 	// Inline records `#[inline]`; InlineNever records `#[inline(never)]`.
 	Inline      bool
 	InlineNever bool
@@ -1004,6 +1009,13 @@ func (c *checker) applyFnAttrs(fn *Fn, d *ast.FnDecl) {
 func (c *checker) makeFnInner(d *ast.FnDecl, recv *types.Type) *Fn {
 	fn := &Fn{Decl: d, Name: d.Name, Recv: recv}
 	c.applyFnAttrs(fn, d)
+	if d.Variadic {
+		if d.Extern == "" && d.Body != nil {
+			c.errf(d.Sp, "E0202", "`...` (a variadic parameter list) is only allowed in an `extern` declaration")
+		} else {
+			fn.Variadic = true
+		}
+	}
 	if recv != nil {
 		fn.QualName = nominalName(recv) + "::" + d.Name
 	} else {
@@ -2542,7 +2554,7 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 // callee's value parameters. When the call is already plain positional
 // with the right arity it is returned unchanged, so the caller's arity
 // diagnostic still fires for malformed calls.
-func (c *checker) resolveArgs(sp token.Span, args []ast.Expr, names []string, defaults []ast.Expr, label string) []ast.Expr {
+func (c *checker) resolveArgs(sp token.Span, args []ast.Expr, names []string, defaults []ast.Expr, label string, variadic bool) []ast.Expr {
 	hasNamed := false
 	for _, a := range args {
 		if _, ok := a.(*ast.NamedArgExpr); ok {
@@ -2551,7 +2563,10 @@ func (c *checker) resolveArgs(sp token.Span, args []ast.Expr, names []string, de
 		}
 	}
 	if !hasNamed {
-		if len(args) == len(names) {
+		if len(args) == len(names) || variadic && len(args) > len(names) {
+			// Variadic callees accept any number of extra positional
+			// arguments past the fixed parameters; the caller's arity
+			// check still fires when too few were supplied.
 			return args
 		}
 		if len(args) < len(names) {
@@ -2573,6 +2588,7 @@ func (c *checker) resolveArgs(sp token.Span, args []ast.Expr, names []string, de
 	}
 	out := make([]ast.Expr, len(names))
 	seen := make([]bool, len(names))
+	var extra []ast.Expr // positional arguments past the fixed parameters (variadic only)
 	pos := 0
 	for _, a := range args {
 		if na, ok := a.(*ast.NamedArgExpr); ok {
@@ -2597,7 +2613,12 @@ func (c *checker) resolveArgs(sp token.Span, args []ast.Expr, names []string, de
 		}
 		if pos >= len(names) {
 			// `out` always has len(names) entries, so the caller's arity
-			// check never sees a surplus — report it here.
+			// check never sees a surplus — report it here, unless the
+			// callee is variadic and takes the surplus as its `...` tail.
+			if variadic {
+				extra = append(extra, a)
+				continue
+			}
 			c.errf(a.Span(), "E0061", "%s takes %d argument(s) but more were supplied", label, len(names))
 			break
 		}
@@ -2608,6 +2629,10 @@ func (c *checker) resolveArgs(sp token.Span, args []ast.Expr, names []string, de
 			pos++
 		}
 		if pos >= len(names) {
+			if variadic {
+				extra = append(extra, a)
+				continue
+			}
 			c.errf(a.Span(), "E0061", "%s takes %d argument(s) but more were supplied", label, len(names))
 			break
 		}
@@ -2627,15 +2652,22 @@ func (c *checker) resolveArgs(sp token.Span, args []ast.Expr, names []string, de
 			out[i] = &ast.LiteralExpr{Kind: token.KindInteger, Text: "0", Sp: sp}
 		}
 	}
-	return out
+	return append(out, extra...)
 }
 
 // checkCallArgs records the resolved callee, checks a call's arguments against
 // its parameter list, and returns the callee's return type.
 func (c *checker) checkCallArgs(x *ast.CallExpr, fn *Fn, label string) *types.Type {
 	c.info.Resolved[x] = fn
-	x.Args = c.resolveArgs(x.Sp, x.Args, fn.ParamNames, fn.Defaults, label)
-	if len(x.Args) != len(fn.Params) {
+	x.Args = c.resolveArgs(x.Sp, x.Args, fn.ParamNames, fn.Defaults, label, fn.Variadic)
+	if fn.Variadic {
+		// A variadic callee fixes only its leading parameters; the `...`
+		// tail takes any number of further arguments, each checked
+		// against its own type below (want == nil for those).
+		if len(x.Args) < len(fn.Params) {
+			c.errAt(x, "E0061", "%s takes at least %d argument(s) but %d were supplied", label, len(fn.Params), len(x.Args))
+		}
+	} else if len(x.Args) != len(fn.Params) {
 		c.errAt(x, "E0061", "%s takes %d argument(s) but %d were supplied", label, len(fn.Params), len(x.Args))
 	}
 	for i, a := range x.Args {
@@ -2681,7 +2713,7 @@ func (c *checker) checkGenericCall(x *ast.CallExpr, tmpl *Fn, explicit []ast.Typ
 	if expected != nil {
 		c.unify(tmpl.Ret, expected, bindings)
 	}
-	x.Args = c.resolveArgs(x.Sp, x.Args, tmpl.ParamNames, tmpl.Defaults, label)
+	x.Args = c.resolveArgs(x.Sp, x.Args, tmpl.ParamNames, tmpl.Defaults, label, false)
 	if !allBound(tmpl.Generics, bindings) {
 		for i, a := range x.Args {
 			var hint *types.Type
@@ -3214,31 +3246,42 @@ func StringMethodParams(name string) []*types.Type {
 	return m.params
 }
 
+// StringMethodVariadic reports whether the builtin `String` method name accepts
+// extra arguments past its fixed parameters (each taking the last parameter's
+// type), as in `s.push_str("a", "b", "c")`.
+func StringMethodVariadic(name string) bool {
+	m, ok := stringMethods[name]
+	return ok && m.variadic
+}
+
 type stringMethodSig struct {
 	params []*types.Type
 	ret    *types.Type
 	mut    bool // takes `&mut self`
+	// variadic allows any number of extra arguments past params; each extra
+	// argument is checked against the last parameter's type (`push_str`).
+	variadic bool
 }
 
 var stringMethods = map[string]stringMethodSig{
-	"len":         {nil, types.UsizeT, false},
-	"is_empty":    {nil, types.BoolT, false},
-	"as_str":      {nil, types.StrT, false},
-	"clone":       {nil, types.StringT, false},
-	"clear":       {nil, types.UnitT, true},
-	"push":        {[]*types.Type{types.CharT}, types.UnitT, true},
-	"push_str":    {[]*types.Type{types.StrT}, types.UnitT, true},
-	"push_byte":   {[]*types.Type{types.U8T}, types.UnitT, true},
-	"push_bytes":  {[]*types.Type{{Kind: types.Ref, Elem: &types.Type{Kind: types.Slice, Elem: types.U8T}}}, types.UnitT, true},
-	"as_bytes":    {nil, &types.Type{Kind: types.Ref, Elem: &types.Type{Kind: types.Slice, Elem: types.U8T}}, false},
-	"byte_at":     {[]*types.Type{types.UsizeT}, types.I64T, false},
-	"find":        {[]*types.Type{types.StrT}, types.I64T, false},
-	"contains":    {[]*types.Type{types.StrT}, types.BoolT, false},
-	"starts_with": {[]*types.Type{types.StrT}, types.BoolT, false},
-	"ends_with":   {[]*types.Type{types.StrT}, types.BoolT, false},
-	"substr":      {[]*types.Type{types.UsizeT, types.UsizeT}, types.StringT, false},
-	"trim":        {nil, types.StringT, false},
-	"parse_i64":   {nil, types.I64T, false},
+	"len":         {params: nil, ret: types.UsizeT},
+	"is_empty":    {params: nil, ret: types.BoolT},
+	"as_str":      {params: nil, ret: types.StrT},
+	"clone":       {params: nil, ret: types.StringT},
+	"clear":       {params: nil, ret: types.UnitT, mut: true},
+	"push":        {params: []*types.Type{types.CharT}, ret: types.UnitT, mut: true},
+	"push_str":    {params: []*types.Type{types.StrT}, ret: types.UnitT, mut: true, variadic: true},
+	"push_byte":   {params: []*types.Type{types.U8T}, ret: types.UnitT, mut: true},
+	"push_bytes":  {params: []*types.Type{{Kind: types.Ref, Elem: &types.Type{Kind: types.Slice, Elem: types.U8T}}}, ret: types.UnitT, mut: true},
+	"as_bytes":    {params: nil, ret: &types.Type{Kind: types.Ref, Elem: &types.Type{Kind: types.Slice, Elem: types.U8T}}},
+	"byte_at":     {params: []*types.Type{types.UsizeT}, ret: types.I64T},
+	"find":        {params: []*types.Type{types.StrT}, ret: types.I64T},
+	"contains":    {params: []*types.Type{types.StrT}, ret: types.BoolT},
+	"starts_with": {params: []*types.Type{types.StrT}, ret: types.BoolT},
+	"ends_with":   {params: []*types.Type{types.StrT}, ret: types.BoolT},
+	"substr":      {params: []*types.Type{types.UsizeT, types.UsizeT}, ret: types.StringT},
+	"trim":        {params: nil, ret: types.StringT},
+	"parse_i64":   {params: nil, ret: types.I64T},
 }
 
 // inferStringMethod type-checks a builtin method call on a `String`.
@@ -3251,7 +3294,11 @@ func (c *checker) inferStringMethod(x *ast.MethodCallExpr) *types.Type {
 		}
 		return nil
 	}
-	if len(x.Args) != len(m.params) {
+	if m.variadic {
+		if len(x.Args) < len(m.params) {
+			c.errAt(x, "E0061", "method `String::%s` takes at least %d argument(s) but %d were supplied", x.Name, len(m.params), len(x.Args))
+		}
+	} else if len(x.Args) != len(m.params) {
 		c.errAt(x, "E0061", "method `String::%s` takes %d argument(s) but %d were supplied", x.Name, len(m.params), len(x.Args))
 	}
 	if m.mut {
@@ -3261,6 +3308,9 @@ func (c *checker) inferStringMethod(x *ast.MethodCallExpr) *types.Type {
 		var wt *types.Type
 		if i < len(m.params) {
 			wt = m.params[i]
+		} else if m.variadic && len(m.params) > 0 {
+			// Every extra argument of a variadic method takes the tail type.
+			wt = m.params[len(m.params)-1]
 		}
 		at := c.checkExpr(a, wt)
 		if wt != nil && !c.argAssignable(wt, at, false) {
@@ -4541,7 +4591,7 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 			names, defaults = names[1:], defaults[1:]
 		}
 	}
-	x.Args = c.resolveArgs(x.Sp, x.Args, names, defaults, fmt.Sprintf("method `%s::%s`", base, x.Name))
+	x.Args = c.resolveArgs(x.Sp, x.Args, names, defaults, fmt.Sprintf("method `%s::%s`", base, x.Name), false)
 	if len(x.Args) != len(want) {
 		c.errAt(x, "E0061", "method `%s::%s` takes %d argument(s) but %d were supplied", base, x.Name, len(want), len(x.Args))
 	}

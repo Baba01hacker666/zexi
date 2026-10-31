@@ -1279,7 +1279,12 @@ func fnSignature(fn *sema.Fn) string {
 		}
 		params = append(params, ctype(pt)+" "+localName(p.Name))
 	}
-	if len(params) == 0 {
+	if fn.Variadic {
+		// A variadic extern declares `...` in the C prototype; the C compiler
+		// then applies the default argument promotions (f32 -> double,
+		// narrow ints -> int) to the extra call arguments for free.
+		params = append(params, "...")
+	} else if len(params) == 0 {
 		params = []string{"void"}
 	}
 	return fmt.Sprintf("%s %s(%s)", ctype(fn.Ret), funcName(fn), strings.Join(params, ", "))
@@ -2975,9 +2980,17 @@ func (g *gen) stringMethodCall(x *ast.MethodCallExpr) string {
 	// Coerce `String` arguments passed to `str` parameters, binding temporaries
 	// so their buffers outlive the call.
 	wants := sema.StringMethodParams(x.Name)
+	variadic := sema.StringMethodVariadic(x.Name)
 	var specs, decls, drops []string
 	for i, a := range x.Args {
-		wantStr := i < len(wants) && wants[i] != nil && wants[i].Kind == types.Str
+		var want *types.Type
+		if i < len(wants) {
+			want = wants[i]
+		} else if variadic && len(wants) > 0 {
+			// An extra argument of a variadic method takes the tail type.
+			want = wants[len(wants)-1]
+		}
+		wantStr := want != nil && want.Kind == types.Str
 		t := g.info.TypeOf(a)
 		if wantStr && t != nil && t.Kind == types.StringKind {
 			if !isPlaceExpr(a) {
@@ -2989,10 +3002,6 @@ func (g *gen) stringMethodCall(x *ast.MethodCallExpr) string {
 			}
 			specs = append(specs, "zx_string_as_str(&"+g.value(a)+")")
 			continue
-		}
-		var want *types.Type
-		if i < len(wants) {
-			want = wants[i]
 		}
 		if want != nil && want.Kind == types.Ref && want.Elem != nil && want.Elem.Kind == types.Slice {
 			specs = append(specs, g.coerce(a, want))
@@ -3013,26 +3022,48 @@ func (g *gen) stringMethodCall(x *ast.MethodCallExpr) string {
 	recvIsPtr := recv != nil && (recv.Kind == types.Ref || recv.Kind == types.Ptr)
 
 	var core string
-	switch {
-	case recvIsPtr:
-		// A `&String` / `*String` receiver is already a pointer to the String.
-		core = fn + "(" + g.value(x.Recv) + rest + ")"
-	case isPlaceExpr(x.Recv):
-		core = fn + "(&" + g.value(x.Recv) + rest + ")"
-	default:
-		t := g.tmpName()
-		call := fn + "(&" + t + rest + ")"
-		prologue := "zx_String " + t + " = " + g.value(x.Recv) + "; "
+	if variadic && len(specs) > 1 {
+		// A variadic `String` method (`push_str`) chains one call per
+		// argument: `s.push_str("a", "b")` emits two zx_string_push_str calls.
+		var recvArg, prologue, epilogue string
 		switch {
-		case rt == nil || rt.Kind == types.Unit || rt.Kind == types.Never:
-			core = "({ " + prologue + call + "; zx_drop_String(&" + t + "); (void)0; })"
-		case x.Name == "as_str" || x.Name == "as_bytes":
-			// The result borrows the temporary's buffer, so the buffer cannot be
-			// released until the enclosing statement finishes (M0 limitation).
-			core = "({ " + prologue + call + "; })"
+		case recvIsPtr:
+			recvArg = g.value(x.Recv)
+		case isPlaceExpr(x.Recv):
+			recvArg = "&" + g.value(x.Recv)
 		default:
-			r := g.tmpName()
-			core = "({ " + prologue + ctype(rt) + " " + r + " = " + call + "; zx_drop_String(&" + t + "); " + r + "; })"
+			t := g.tmpName()
+			recvArg = "&" + t
+			prologue = "zx_String " + t + " = " + g.value(x.Recv) + "; "
+			epilogue = "zx_drop_String(&" + t + "); "
+		}
+		var calls strings.Builder
+		for _, s := range specs {
+			calls.WriteString(fn + "(" + recvArg + ", " + s + "); ")
+		}
+		core = "({ " + prologue + calls.String() + epilogue + "(void)0; })"
+	} else {
+		switch {
+		case recvIsPtr:
+			// A `&String` / `*String` receiver is already a pointer to the String.
+			core = fn + "(" + g.value(x.Recv) + rest + ")"
+		case isPlaceExpr(x.Recv):
+			core = fn + "(&" + g.value(x.Recv) + rest + ")"
+		default:
+			t := g.tmpName()
+			call := fn + "(&" + t + rest + ")"
+			prologue := "zx_String " + t + " = " + g.value(x.Recv) + "; "
+			switch {
+			case rt == nil || rt.Kind == types.Unit || rt.Kind == types.Never:
+				core = "({ " + prologue + call + "; zx_drop_String(&" + t + "); (void)0; })"
+			case x.Name == "as_str" || x.Name == "as_bytes":
+				// The result borrows the temporary's buffer, so the buffer cannot be
+				// released until the enclosing statement finishes (M0 limitation).
+				core = "({ " + prologue + call + "; })"
+			default:
+				r := g.tmpName()
+				core = "({ " + prologue + ctype(rt) + " " + r + " = " + call + "; zx_drop_String(&" + t + "); " + r + "; })"
+			}
 		}
 	}
 

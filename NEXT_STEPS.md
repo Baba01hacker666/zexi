@@ -195,18 +195,15 @@ extern declarations (`docs/19-modules.md`). `sqlite`, `zlib`, `crypto`, and
 `curl` are exercised against the real system libraries by
 `internal/registry`'s end-to-end tests.
 
-**Still open:** `extern "C"` variadics. `printf`-shaped APIs (`printf`,
-`snprintf`, `sqlite3_mprintf`, syslog) cannot be called directly, so a binding
-has to wrap them in a `c` block. The pieces needed:
-
-- parser: accept `...` as the last parameter of an `extern` declaration;
-- sema: mark the `Fn` variadic, drop the arity check for the tail, and check
-  each extra argument against its own type;
-- codegen: emit `...` in the prototype and pass the extra arguments through
-  with the usual C default promotions (`f32` → `double`, narrow ints → `int`).
-
-It is contained work with no design questions; it has simply not been needed by
-any binding in the catalog yet.
+**Done:** `extern "C"` variadics. `extern "C" fn printf(fmt: str, ...) -> i32;`
+declares a `printf`-shaped API directly: the parser accepts `...` as the last
+parameter of an `extern` declaration (E0202 elsewhere), sema marks the `Fn`
+variadic and requires only the fixed parameters (E0061 when missing) while
+checking each extra argument against its own type, and codegen emits `...` in
+the C prototype so the C compiler applies the default promotions (`f32` →
+`double`, narrow ints → `int`). `zexic bindgen` emits the `...` tail for
+variadic header functions too. Covered by `tests/c_variadic.zx` and the error
+fixtures in `tests/errors/`.
 
 ## 6. Language gaps worth closing
 
@@ -224,7 +221,7 @@ still open.
 | `Vec::fold` over owning elements | **open** — its accumulator is an element value and the generated loop cannot drop the values it replaces, so it stays `Copy`-only; fold into an owned accumulator with an index instead |
 | `for x in v` copies each element | **open** — iterating a `Vec<String>` is `E0507`; `v.each(|s: &String| …)` is the way today. A `for s in &v` form is the fix, and it needs the borrow-checked iterator idea below |
 | No `ref`-style pattern | **open** — an owning payload cannot be bound by reference out of a borrowed scrutinee (`Msg::Text(s) => …` on `&Msg` is `E0507`). A `ref s` pattern is the smallest fix; `_` is the workaround |
-| Variadic string building | **open** — `push_str` takes one argument, so a message is a chain of calls. An optional second and later `push_str` argument is a one-line widening of the builtin |
+| Variadic string building | **fixed** — `push_str` takes one or more arguments (`s.push_str("a", "b", "c")`); each is appended in order and a `String` argument is borrowed, not moved |
 | `io::read_line` does one `read` syscall per byte | **open** — a line needs a buffered-reader type (buffer + consumed mark); the type is the work, not the syscalls |
 | `str` is C-ABI-shaped at the boundary | **open, deliberate** — NUL-terminated with no independent length. Slices cover buffers and `str::as_bytes()` covers borrowing; length-prefixing `str` is an ABI change with no forcing need yet |
 | Pointer identity comparison | **not a gap by choice** — a comparison through a borrow compares values, never addresses; two `*T` cannot be compared at all. Use integer addresses if that is what you mean |

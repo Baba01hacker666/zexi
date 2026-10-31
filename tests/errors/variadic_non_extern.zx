@@ -1,0 +1,7 @@
+// `...` is only meaningful for `extern "C"` declarations; a plain function
+// with a body must have a fixed parameter list.
+fn f(x: i64, ...) -> i64 { return x; } // error: E0202 `...` (a variadic parameter list) is only allowed in an `extern` declaration
+
+fn main() -> i32 {
+    0
+}

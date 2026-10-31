@@ -14,18 +14,22 @@ Go and lives under `internal/` and `cmd/zexic/`.
 
 ```
 .zx source ──► lexer ──► parser ──► AST ──► sema/type-check ──► codegen (C) ──► cc ──► native binary
-                                             │
-                                             └──────────────► mir (CFG)   [--emit=mir]
+                                             │                     (default; --backend=c)
+                                             └──────────────► mir (CFG) ──┬─► --emit=mir (dump)
+                                                                           └─► codegen/llvm ──► clang ──► binary
+                                                                               (--backend=llvm, opt-in)
 ```
 
 The only runtime support is a tiny C helper library (`zx_*` functions) that
 handles strings, printing, arrays, and the standard library's C shims.
 
-Two lowerings consume the checked program. The shipped path is the C backend,
-which walks the typed AST. The other is `internal/mir`, which flattens each
-function into a control-flow graph of numbered locals (`docs/13-mir.md`); it is
-what a second backend will consume, and today it is printed by `--emit=mir` and
-checked against the C backend by the differential tests.
+Two lowerings consume the checked program. The shipped (default) path is the C
+backend, which walks the typed AST. The other is `internal/mir`, which flattens
+each function into a control-flow graph of numbered locals
+(`docs/13-mir.md`); it is printed by `--emit=mir`, checked against the C backend
+by the differential tests, and — since the LLVM backend landed — consumed for
+real by `internal/codegen/llvm` behind `--backend=llvm` (MIR → LLVM IR →
+`clang` → native binary, with a small C runtime shim).
 
 ---
 
@@ -59,9 +63,10 @@ checked against the C backend by the differential tests.
   `util/`) loads every `.zx` file in that folder as one aggregate package.
 - Imports create qualifiers: `as alias`, else the full path and its last
   segment; `mod` creates a qualifier too.
-- Items are then flattened into one program namespace for this M1-preview
-  stage (unqualified names stay visible and ignore `pub`), so scoped isolation
-  and visibility enforcement for *unqualified* names remain M1 work.
+- Items are then flattened into one program namespace at this M0-alpha stage
+  (unqualified names stay visible and ignore `pub`), so scoped isolation
+  and visibility enforcement for *unqualified* names remain roadmap work
+  (qualified access *is* checked — see `docs/05-roadmap.md`).
 
 ### 2.4 Semantic analysis (`internal/sema`)
 - Type checking, name resolution.
@@ -123,7 +128,10 @@ checked against the C backend by the differential tests.
 - Writes generated C to temp files.
 - Invokes `cc` with `-std=gnu11`, optimization, `-fwrapv` (defined signed
   integer wrapping), `-ffunction-sections`, `-fdata-sections`, and include dirs.
-- Links extra C sources (`--csrc`), embedded runtimes (net/sys/regex), and libs.
+- Links extra C sources (`--csrc`) and libraries (`--link`, `--lib-dir`,
+  `--include`). Standard-library modules that need C (`sys`, `net`, `regex`,
+  `json`, `http`, `thread`, …) carry that C **inline in their own `.zx` file**
+  as a `c """..."""` block, so the driver holds no library C at all.
 - `--gc-sections` / `-dead_strip` prunes unused functions (tree-shaking).
 
 ---
@@ -156,21 +164,23 @@ Embedded in the compiler under `internal/driver/std/`:
 | codec  | `codec.zx` | hex/base64 encode+decode and CRC-32/Adler-32/FNV-1a/djb2 checksums, each over `&[u8]` with a `str` wrapper; decoders return `Result` |
 | text   | `text.zx` | string helpers scanning a borrowed `&[u8]` (`find_bytes`, `match_at` are the primitives) |
 | random | `random.zx` | RNG |
-| regex  | `regex.zx` | POSIX-ERE search/full-match/find/replace (C shim `zxregex_c.txt`) |
+| regex  | `regex.zx` | POSIX-ERE search/full-match/find/replace (inline `c """..."""`) |
 | sys    | `sys.zx` | POSIX substrate: errno/`IoError`, byte I/O, files, env, clocks, pid |
-| net    | `net.zx` | TCP/UDP sockets, `resolve`, poll/bounded accept, shared file ABI (C shim `zxnet_c.txt`) |
+| net    | `net.zx` | TCP/UDP sockets, `resolve`, poll/bounded accept, shared file ABI (inline `c """..."""`) |
 | http   | `http.zx` | HTTP client/server, Router, worker-pool serving, serve/serve_dir helpers |
-| thread | `thread.zx` | OS threads, `i64` channels, `i64` atomics, task `Pool` (C shim `zxthread_c.txt`, links `-pthread`) |
-| json   | `json.zx` | parse/build/print JSON (C shim `zxjson_c.txt` for exact number conversion) |
+| thread | `thread.zx` | OS threads, `i64` channels, `i64` atomics, task `Pool` (inline `c """..."""`, links `-pthread`) |
+| json   | `json.zx` | parse/build/print JSON (inline `c """..."""` for exact number conversion) |
 | html   | `html.zx` | escaping (`escape_bytes`/`escape`), documents, widgets, `{{name}}` templates |
+| web    | `web.zx` | FastAPI-shaped site layer over `http`/`html`/`json`: `web::get`, `page`, `pages`, `params`, `json_pair` |
 
 Import with `use io;`, `use std::net;`, `use http;`, or Python-shaped
 `import http.server;`, `import io.fs;`, `import os;`, and `import text.regex;`.
 The linker prunes anything not called, so importing costs nothing unless used.
 
-Each module may pull in a C shim (`zxnet_c.txt`, `zxsys_c.txt`,
-`zxregex_c.txt`, `zxthread_c.txt`, `zxjson_c.txt`) which is appended to the build
-only when the module is used.
+A module that needs C carries it inline in its own `.zx` file as a
+`c """..."""` block, appended to the single translation unit only when the
+module is imported — the compiler itself ships no library C (a test,
+`TestStandardLibraryNeedsNoCompilerC`, fails if any moves back into the driver).
 
 ---
 
@@ -193,7 +203,9 @@ See `docs/08-networking.md`.
 
 ## 6. C bridge
 
-- `extern "C" fn ...` declares FFI functions.
+- `extern "C" fn ...` declares FFI functions; a trailing `...` makes the
+  declaration variadic (`extern "C" fn printf(fmt: str, ...) -> i32;`), with
+  the usual C default promotions applied to extra call arguments.
 - `zexic bindgen` generates declarations from C headers.
 - `--csrc` compiles extra C files; `--include`/`--libdir`/`--link` for
   headers/libs.
@@ -206,16 +218,23 @@ See `docs/09-c-bridge.md` and `examples/cbridge.zx`.
 
 ## 7. CLI (`cmd/zexic`)
 
-Common commands:
+Commands:
 
-- `zexic run file.zx` — compile and run.
-- `zexic build file.zx -o out` — compile to binary.
-- `zexic emit file.zx` — print generated C (single unit).
+- `zexic check file.zx` — parse, type-check, validate (no codegen).
+- `zexic run file.zx` — compile and run (a directory works too: it finds
+  `main.zx` / `src/main.zx` and pulls in every import — project mode).
+- `zexic build file.zx -o out` — compile to a standalone binary.
+- `zexic emit file.zx --emit=c|mir|llvm` — print an intermediate form.
+- `zexic tokenize file.zx` — print the token stream.
+- `zexic bindgen header.h -o out.zx` — generate `extern "C"` declarations
+  (variadic tails included) from a C header.
 - `zexic add [pkg]` — list the C-library catalog, or install one into `lib/`.
-- `zexic bindgen header.h` — generate extern declarations.
+- `zexic lsp [entry.zx]` — language server on stdio.
+- `zexic version` — print the compiler version.
 
-Key flags: `--jobs N` (parallel units), `--opt-level`, `--include`, `--csrc`,
-`--link`, `--cc`.
+Key flags: `--backend=c|llvm` (code generator; default `c`), `--jobs N`
+(parallel C units), `--opt-level`, `--root`, `--cc`, `--csrc`, `--link`,
+`--lib-dir`, `--include`, `--message-format=human|json`.
 
 ---
 
@@ -228,13 +247,15 @@ Key flags: `--jobs N` (parallel units), `--opt-level`, `--include`, `--csrc`,
 | AST | `internal/ast/` |
 | Types | `internal/types/` |
 | Sema / move check | `internal/sema/` |
-| Codegen | `internal/codegen/c/` |
+| Codegen (C, default) | `internal/codegen/c/` |
+| Codegen (LLVM, `--backend=llvm`) | `internal/codegen/llvm/` |
 | `zexic add` catalog | `internal/registry/` |
+| `zexic bindgen` | `internal/bindgen/` |
+| LSP | `internal/lsp/` |
 | MIR | `internal/mir/` |
 | ABI layout | `internal/layout/` |
 | Driver / build | `internal/driver/driver.go` |
-| Stdlib | `internal/driver/std/` |
-| C shims | `internal/driver/zxnet_c.txt`, `zxsys_c.txt`, `zxregex_c.txt`, `zxthread_c.txt`, `zxjson_c.txt` |
+| Stdlib (C lives inline in each `.zx`) | `internal/driver/std/` |
 | CLI | `cmd/zexic/main.go` |
 | Docs | `docs/` |
 | Examples | `examples/` |
@@ -247,8 +268,10 @@ Key flags: `--jobs N` (parallel units), `--opt-level`, `--include`, `--csrc`,
 1. Source is parsed into an AST.
 2. `use` declarations pull in more files / embedded stdlib.
 3. Sema type-checks and determines reachable functions.
-4. Codegen emits C (one or many units), or MIR is built for inspection/tests.
-5. `cc` compiles + links with runtime shims.
+4. Codegen emits C (one or many units) by default, or MIR is built and then
+   lowered to LLVM IR with `--backend=llvm` (also printable via `--emit=mir`).
+5. `cc` (or `clang`, for the LLVM path) compiles + links; stdlib C rides along
+   inline in the one translation unit.
 6. `--gc-sections` drops unused code, keeping binaries small.
 
 That's it — Zexi is "Rust-like safety, C-sized output, Go-written compiler."

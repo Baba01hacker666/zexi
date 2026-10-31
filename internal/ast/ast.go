@@ -44,6 +44,10 @@ type FnDecl struct {
 	Name     string
 	Generics []GenericParam
 	Params   []Param
+	// Variadic marks a trailing `...` in the parameter list. Only `extern`
+	// declarations may be variadic: C variadic functions (printf, ...) have
+	// no fixed arity for their tail.
+	Variadic bool
 	Ret      Type
 	Body     *Block // nil for `extern` declarations (no body)
 	Sp       token.Span

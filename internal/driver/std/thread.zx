@@ -1,7 +1,9 @@
 // thread — OS threads, i64 channels, and i64 atomics for Zexi.
 //
-// Zexi has no closures yet, so a spawned function takes its inputs as
-// arguments and returns its result by joining:
+// A spawned function takes its inputs as arguments and returns its result by
+// joining. A closure that captures by value may be passed in place of a plain
+// `fn` (see docs/15-closures.md), but only i64 arguments, results, and handles
+// are guaranteed across the thread boundary:
 //
 //     use thread;
 //
@@ -15,8 +17,9 @@
 //
 // Channels connect threads. A channel carries i64 values and blocks when it is
 // full (send) or empty (recv); close unblocks every waiter, and buffered values
-// stay readable until drained. Because a worker cannot capture a `Chan` value,
-// the free-function form takes the raw i64 handle that `Chan.id()` exposes:
+// stay readable until drained. A `Chan` is not `Copy`, so sharing it with
+// several workers goes through the raw i64 handle that `Chan.id()` exposes
+// (an i64 is exactly what a closure can capture):
 //
 //     fn producer(ch: i64) -> i64 {
 //         let mut i: i64 = 0;

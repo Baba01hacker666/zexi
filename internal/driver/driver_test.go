@@ -68,6 +68,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/web_lib.zx",
 		"../../tests/closures.zx",
 		"../../tests/cinline.zx",
+		"../../tests/c_variadic.zx",
 		"../../tests/slices.zx",
 		"../../tests/ref_array.zx",
 		"../../tests/std_bytes.zx",
@@ -180,7 +181,15 @@ func TestRunPrograms(t *testing.T) {
 			want: strings.Join([]string{
 				"3", "71", "-1", "true", "true", "true", "false", "/index.html",
 				"/index.html HTTP/1.1", "Content-Length: 1527", "1527", "1528",
-				"16", "",
+				"16", "abcd", "abcd!?!", "!", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/c_variadic.zx",
+			want: strings.Join([]string{
+				"int=42 str=hello float=3.14 char=Z",
+				"plain",
+				"60", "257", "4", "",
 			}, "\n"),
 		},
 		{

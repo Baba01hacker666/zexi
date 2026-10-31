@@ -65,7 +65,7 @@ None of these are acceptable as *permanent* properties. They are acceptable as
 | Option | Effort | Control | Notes |
 | --- | --- | --- | --- |
 | **Stay on C** | low | low | Fastest iteration; keeps the toolchain dependency and GNU-extension wart forever. |
-| **LLVM backend** | medium | high | Emit LLVM IR behind the MIR contract. Removes the C wart, keeps a large external dependency (and `llvm-dev`). |
+| **LLVM backend** | medium | high | Emit LLVM IR behind the MIR contract. Removes the C wart, keeps a large external dependency (and `llvm-dev`). **Landed experimentally** behind `--backend=llvm` (MIR → LLVM IR, linked with `clang` + a runtime shim); the C backend remains the default. |
 | **Native emitter** | high | total | We emit x86-64 / AArch64 ourselves (or use Cranelift). No external codegen dependency, full control of layout and size. This is the endgame for a self-respecting systems language. |
 | **Cranelift** | medium | high | A library backend; Rust-native, fast compiles, no C. A good middle path. |
 

@@ -33,6 +33,7 @@ typedef int myint;
 		`extern "C" fn random() -> isize;`,
 		`extern "C" fn strlen(s: str) -> usize;`,
 		`extern "C" fn puts(a0: str) -> i32;`,
+		`extern "C" fn logmsg(fmt: str, ...);`,
 	}
 	for _, want := range wantDecls {
 		if !strings.Contains(res.Source, want) {
@@ -42,14 +43,12 @@ typedef int myint;
 	if len(res.Bound) != len(wantDecls) {
 		t.Errorf("bound %d functions, want %d: %v", len(res.Bound), len(wantDecls), res.Bound)
 	}
-	// Variadic and unknown-type functions are skipped, with reasons.
-	if len(res.Skipped) != 2 {
-		t.Fatalf("skipped = %v, want 2 entries", res.Skipped)
+	// Unknown-type functions are skipped, with reasons; variadic functions
+	// are now bound with a `...` tail.
+	if len(res.Skipped) != 1 {
+		t.Fatalf("skipped = %v, want 1 entry", res.Skipped)
 	}
 	joined := strings.Join(res.Skipped, "\n")
-	if !strings.Contains(joined, "logmsg (variadic)") {
-		t.Errorf("expected a variadic skip note, got %v", res.Skipped)
-	}
 	if !strings.Contains(joined, "frobnicate") {
 		t.Errorf("expected a skip note for the unknown type, got %v", res.Skipped)
 	}

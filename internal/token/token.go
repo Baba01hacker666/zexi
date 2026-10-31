@@ -93,6 +93,7 @@ const (
 	KindDot
 	KindDotDot
 	KindDotDotEq
+	KindEllipsis
 	KindColonColon
 	KindColon
 	KindComma
@@ -251,6 +252,7 @@ var kindNames = map[Kind]string{
 	KindDot:        ".",
 	KindDotDot:     "..",
 	KindDotDotEq:   "..=",
+	KindEllipsis:   "...",
 	KindColonColon: "::",
 	KindColon:      ":",
 	KindComma:      ",",
