@@ -63,6 +63,11 @@ type Options struct {
 	// ok is false, so editor tooling can still answer queries over erroneous
 	// programs. The regular Compile path is unaffected.
 	CheckOnly bool
+	// Backend picks the code generator: "" or "c" (the default, native C
+	// backend), or "llvm" (MIR -> LLVM IR, linked with the backend's runtime
+	// shim). The LLVM backend covers the mirrored MIR subset and rejects a
+	// program that lowers to MIR outside it.
+	Backend string
 }
 
 // Artifacts is the result of a successful front end + codegen run.
@@ -93,6 +98,11 @@ type Artifacts struct {
 // FrontEnd runs lexing, parsing, type checking, and C generation. It returns
 // the artifacts and whether the program is error-free. Diagnostics are
 // reported to em; callers render them.
+// backendIsLLVM reports whether the options select the LLVM backend.
+func backendIsLLVM(opts Options) bool {
+	return opts.Backend == "llvm"
+}
+
 func FrontEnd(path string, opts Options, em *diag.Emitter) (*Artifacts, bool) {
 	return FrontEndFiles([]string{path}, opts, em)
 }
@@ -373,6 +383,14 @@ func BuildFiles(paths []string, outPath string, opts Options, em *diag.Emitter) 
 	}
 	if len(art.LinkDirs) > 0 {
 		opts.LibDirs = append(opts.LibDirs, art.LinkDirs...)
+	}
+	if backendIsLLVM(opts) {
+		_, err := CompileLLVM(art.Info, outPath, opts, false)
+		if err != nil {
+			em.Report(diag.New("E9003", "%v", err))
+			return "", false
+		}
+		return outPath, true
 	}
 	if len(art.CUnits) > 1 {
 		if err := CompileUnits(art.CHeader, art.CUnits, outPath, opts); err != nil {

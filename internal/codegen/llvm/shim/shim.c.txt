@@ -1,0 +1,206 @@
+// The LLVM backend's runtime shim. The emitter (irgen.go) lowers the MIR's
+// builtin intrinsics, panics, and owned-String operations down to calls into
+// this file, whose ABI mirrors the corresponding pieces of the C backend's
+// runtime (runtimc, vec.go): the same printed formats, the same panic
+// messages, and the same exit code.
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+// The emitted struct for an owned String is `{ ptr, len, cap }`; use the same
+// shape here so a `#[no_mangle]` inline-C function could touch it too.
+struct zxl_String {
+    void *ptr;
+    long long len;
+    long long cap;
+};
+
+// --- printing --------------------------------------------------------------
+
+void zxl_print_sep(void) { fputc(' ', stdout); }
+void zxl_print_nl(void) { fputc('\n', stdout); }
+
+void zxl_print_i64(long long v) { printf("%lld", v); }
+void zxl_print_u64(unsigned long long v) { printf("%llu", v); }
+void zxl_print_f64(double v) { printf("%g", v); }
+void zxl_print_f32(float v) { printf("%g", (double)v); }
+void zxl_print_bool(unsigned char v) { fputs(v ? "true" : "false", stdout); }
+
+// UTF-8 encodes c into out (at least four bytes) and returns its byte length.
+// Suprarenal patterns represent subranges of the same encoding.
+static int zxl_utf8(uint32_t c, unsigned char *out) {
+    if (c < 0x80) { out[0] = (unsigned char)c; return 1; }
+    if (c < 0x800) {
+        out[0] = (unsigned char)(0xC0 | (c >> 6));
+        out[1] = (unsigned char)(0x80 | (c & 0x3F));
+        return 2;
+    }
+    if (c < 0x10000) {
+        out[0] = (unsigned char)(0xE0 | (c >> 12));
+        out[1] = (unsigned char)(0x80 | ((c >> 6) & 0x3F));
+        out[2] = (unsigned char)(0x80 | (c & 0x3F));
+        return 3;
+    }
+    out[0] = (unsigned char)(0xF0 | (c >> 18));
+    out[1] = (unsigned char)(0x80 | ((c >> 12) & 0x3F));
+    out[2] = (unsigned char)(0x80 | ((c >> 6) & 0x3F));
+    out[3] = (unsigned char)(0x80 | (c & 0x3F));
+    return 4;
+}
+
+void zxl_print_char(uint32_t c) {
+    unsigned char buf[4];
+    fwrite(buf, 1, (size_t)zxl_utf8(c, buf), stdout);
+}
+
+// A borrowed str prints up to its first NUL (the interpreter's cString).
+void zxl_print_str(const char *s) {
+    if (s) {
+        size_t n = strnlen(s, (size_t)1 << 20);
+        fwrite(s, 1, n, stdout);
+    }
+}
+
+// --- panics ----------------------------------------------------------------
+
+// Panics write the message to stderr and exit 101, after flushing stdout so a
+// partially printed line is not lost.
+void zxl_panic_msg(const char *msg) {
+    fflush(stdout);
+    fprintf(stderr, "zexi panic: %s\n", msg ? msg : "");
+    exit(101);
+}
+
+// Bounds checks normalize a negative index against the length first, then
+// print the original index (as the C backend does).
+void zxl_panic_bounds(long long i, long long n) {
+    fflush(stdout);
+    fprintf(stderr, "zexi panic: index %lld out of bounds for length %lld\n", i, n);
+    exit(101);
+}
+
+// --- owned String operations -----------------------------------------------
+
+static void zxl_reserve(struct zxl_String *s, long long extra) {
+    long long need = s->len + extra + 1; // +1 for the trailing NUL
+    if (need <= s->cap) {
+        return;
+    }
+    long long cap = s->cap > 0 ? s->cap : 8;
+    while (cap < need) {
+        cap *= 2;
+    }
+    void *p = realloc(s->ptr, (size_t)cap);
+    if (!p) {
+        zxl_panic_msg("out of memory");
+    }
+    s->ptr = p;
+    s->cap = cap;
+}
+
+void zxl_string_from(const char *src, struct zxl_String *out) {
+    struct zxl_String s;
+    s.ptr = NULL;
+    s.len = 0;
+    s.cap = 0;
+    long long n = src ? (long long)strlen(src) : 0;
+    zxl_reserve(&s, n);
+    if (n > 0) {
+        memcpy(s.ptr, src, (size_t)n);
+    }
+    s.len = n;
+    ((char *)s.ptr)[n] = '\0';
+    *out = s;
+}
+
+void zxl_string_with_cap(long long cap, struct zxl_String *out) {
+    struct zxl_String s;
+    if (cap < 1) {
+        cap = 1;
+    }
+    s.ptr = malloc((size_t)cap);
+    if (!s.ptr) {
+        zxl_panic_msg("out of memory");
+    }
+    s.len = 0;
+    s.cap = cap;
+    ((char *)s.ptr)[0] = '\0';
+    *out = s;
+}
+
+void zxl_string_clone(const struct zxl_String *src, struct zxl_String *out) {
+    zxl_string_from(src && src->ptr ? (const char *)src->ptr : "", out);
+}
+
+// Destructor: frees the buffer and leaves the struct zeroed.
+void zxl_string_drop(struct zxl_String *s) {
+    if (s->ptr) {
+        free(s->ptr);
+        s->ptr = NULL;
+    }
+    s->len = 0;
+    s->cap = 0;
+}
+
+const char *zxl_string_as_str(struct zxl_String *s) {
+    return s->ptr ? (const char *)s->ptr : "";
+}
+
+void zxl_string_clear(struct zxl_String *s) {
+    s->len = 0;
+    if (s->ptr) {
+        ((char *)s->ptr)[0] = '\0';
+    }
+}
+
+void zxl_string_push_str(struct zxl_String *s, const char *x) {
+    if (!x) {
+        return;
+    }
+    long long n = (long long)strlen(x);
+    zxl_reserve(s, n);
+    if (n > 0) {
+        memcpy((char *)s->ptr + s->len, x, (size_t)n);
+    }
+    s->len += n;
+    ((char *)s->ptr)[s->len] = '\0';
+}
+
+void zxl_string_push(struct zxl_String *s, uint32_t c) {
+    unsigned char buf[4];
+    int n = zxl_utf8(c, buf);
+    zxl_reserve(s, n);
+    memcpy((char *)s->ptr + s->len, buf, (size_t)n);
+    s->len += n;
+    ((char *)s->ptr)[s->len] = '\0';
+}
+
+void zxl_string_push_i64(struct zxl_String *s, long long v) {
+    char buf[32];
+    int n = snprintf(buf, sizeof buf, "%lld", v);
+    zxl_reserve(s, n);
+    memcpy((char *)s->ptr + s->len, buf, (size_t)n);
+    s->len += n;
+    ((char *)s->ptr)[s->len] = '\0';
+}
+
+void zxl_string_push_u64(struct zxl_String *s, unsigned long long v) {
+    char buf[32];
+    int n = snprintf(buf, sizeof buf, "%llu", v);
+    zxl_reserve(s, n);
+    memcpy((char *)s->ptr + s->len, buf, (size_t)n);
+    s->len += n;
+    ((char *)s->ptr)[s->len] = '\0';
+}
+
+void zxl_string_push_f64(struct zxl_String *s, double v) {
+    char buf[512];
+    int n = snprintf(buf, sizeof buf, "%g", v);
+    zxl_reserve(s, n);
+    memcpy((char *)s->ptr + s->len, buf, (size_t)n);
+    s->len += n;
+    ((char *)s->ptr)[s->len] = '\0';
+}
+
+long long zxl_str_len(const char *s) { return s ? (long long)strlen(s) : 0; }

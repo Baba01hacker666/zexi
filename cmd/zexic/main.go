@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"zexi/internal/bindgen"
+	"zexi/internal/codegen/llvm"
 	"zexi/internal/diag"
 	"zexi/internal/driver"
 	"zexi/internal/lsp"
@@ -88,6 +89,9 @@ type cli struct {
 	emit       string
 	optLevel   string
 	cc         string
+	// backend selects the code generator for build/run: "c" (default) or
+	// "llvm" (--backend=llvm).
+	backend string
 	// root overrides the project root for named imports and `mod` (--root).
 	root string
 	// C bridge options.
@@ -130,6 +134,8 @@ func parseArgs(args []string) cli {
 			c.out = strings.TrimPrefix(a, "--output=")
 		case strings.HasPrefix(a, "--emit="):
 			c.emit = strings.TrimPrefix(a, "--emit=")
+		case strings.HasPrefix(a, "--backend="):
+			c.backend = strings.TrimPrefix(a, "--backend=")
 		case strings.HasPrefix(a, "--opt-level="):
 			c.optLevel = strings.TrimPrefix(a, "--opt-level=")
 		case strings.HasPrefix(a, "--message-format="):
@@ -180,6 +186,7 @@ func (c cli) opts() driver.Options {
 	return driver.Options{
 		OptLevel:    c.optLevel,
 		CC:          c.cc,
+		Backend:     c.backend,
 		Root:        c.root,
 		CFiles:      c.cFiles,
 		LinkLibs:    c.linkLibs,
@@ -200,6 +207,11 @@ func run(args []string) int {
 	case "", "human", "json":
 	default:
 		fmt.Fprintf(os.Stderr, "zexic: unknown --message-format=%q (want human or json)\n", c.msgFormat)
+		return 2
+	}
+
+	if c.backend != "" && c.backend != "c" && c.backend != "llvm" {
+		fmt.Fprintf(os.Stderr, "zexic: unknown --backend=%q (want c or llvm)\n", c.backend)
 		return 2
 	}
 
@@ -374,13 +386,16 @@ func cmdEmit(c cli) int {
 	if c.emit == "" {
 		c.emit = "c"
 	}
-	if c.emit != "c" && c.emit != "mir" {
-		fmt.Fprintf(os.Stderr, "zexic emit: --emit=%s is not supported yet (try `c` or `mir`)\n", c.emit)
+	if c.emit != "c" && c.emit != "mir" && c.emit != "llvm" {
+		fmt.Fprintf(os.Stderr, "zexic emit: --emit=%s is not supported yet (try `c`, `mir`, or `llvm`)\n", c.emit)
 		return 2
 	}
 	em := diag.NewEmitter()
 	if c.emit == "mir" {
 		return emitMIR(paths, c, em)
+	}
+	if c.emit == "llvm" {
+		return emitLLVM(paths, c, em)
 	}
 	opts := c.opts()
 	opts.Jobs = 1 // emit prints one translation unit
@@ -426,6 +441,43 @@ func emitMIR(paths []string, c cli, em *diag.Emitter) int {
 			fmt.Fprintf(os.Stderr, "  %s: %s\n", u.Fn, u.Feature)
 		}
 	}
+	return 0
+}
+
+// emitLLVM prints the LLVM IR module for the program: the same front end and
+// MIR the C backend consumes, emitted as LLVM IR by the LLVM backend. An
+// unsupported construct is reported rather than silently dropped.
+func emitLLVM(paths []string, c cli, em *diag.Emitter) int {
+	opts := c.opts()
+	opts.CheckOnly = true // no C is generated
+	art, ok := driver.FrontEndFiles(paths, opts, em)
+	if !ok {
+		renderDiags(c, em, emFileID(em))
+		return 1
+	}
+	res := mir.Lower(art.Info)
+	if len(res.Unsupported) > 0 {
+		fmt.Fprintf(os.Stderr, "zexic emit: MIR could not lower %d/%d functions:\n",
+			len(res.Unsupported), res.Total)
+		for i, u := range res.Unsupported {
+			if i == 10 {
+				fmt.Fprintf(os.Stderr, "  ... and %d more\n", len(res.Unsupported)-10)
+				break
+			}
+			fmt.Fprintf(os.Stderr, "  %s: %s\n", u.Fn, u.Feature)
+		}
+		return 1
+	}
+	if err := res.Prog.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "zexic emit: internal error: %v\n", err)
+		return 3
+	}
+	ir, err := llvm.Generate(res.Prog, llvm.Options{DebugChecks: opts.OptLevel == "0"})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "zexic emit: %v\n", err)
+		return 1
+	}
+	fmt.Print(ir)
 	return 0
 }
 
@@ -480,7 +532,7 @@ commands:
   check      parse, typecheck, and validate (no code generation)
   build      compile to a standalone native binary
   run        build to a temporary path and execute
-  emit       print an intermediate form (--emit=c)
+  emit       print an intermediate form (--emit=c, --emit=mir, --emit=llvm)
   tokenize   print the token stream
   bindgen    generate Zexi extern declarations from a C header
   add        install a C-library module into lib/ (no argument: list them)
@@ -503,8 +555,8 @@ An option this build does not know is an error, not a silent no-op.
 options:
   -o <path>                  output path for build (or for bindgen)
   --opt-level=<0|1|2|3|s|z>  optimization profile (default 2; also -O2, -Os)
-  --cc=<path>                C compiler to use (default $CC or cc)
-  --emit=<c>                 intermediate form to print
+  --cc=<path>                C compiler to use (default $CC or cc)   --emit=<c|mir|llvm>        intermediate form to print
+   --backend=<c|llvm>         code generator for build/run (default c)
   --root=<dir>               project root for named imports and mod
   --message-format=<human|json>
                              diagnostic output: rustc-like (default) or one
