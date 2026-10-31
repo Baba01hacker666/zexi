@@ -115,7 +115,7 @@ static enum MHD_Result zxmhd_handler(void *cls, struct MHD_Connection *conn,
         *con_cls = cn;
         return MHD_YES;
     }
-    zxmhd_conn *cn = (zxmhd_conn *)con_cls;
+    zxmhd_conn *cn = (zxmhd_conn *)*con_cls;
     if (cn->failed) return MHD_NO;
 
     if (*upload_size > 0) {
@@ -156,6 +156,18 @@ static enum MHD_Result zxmhd_handler(void *cls, struct MHD_Connection *conn,
     return rc;
 }
 
+static void zxmhd_request_completed(void *cls, struct MHD_Connection *conn,
+                                    void **con_cls,
+                                    enum MHD_RequestTerminationCode toe) {
+    (void)cls;
+    (void)conn;
+    (void)toe;
+    if (con_cls && *con_cls) {
+        zxmhd_conn_free((zxmhd_conn *)*con_cls);
+        *con_cls = NULL;
+    }
+}
+
 int64_t zxmhd_start(int32_t port, int64_t max_body, int32_t workers) {
     unsigned int flags = MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_ERROR_LOG;
     if (workers > 1) flags |= MHD_USE_THREAD_PER_CONNECTION;
@@ -165,6 +177,7 @@ int64_t zxmhd_start(int32_t port, int64_t max_body, int32_t workers) {
     srv->daemon = MHD_start_daemon(flags, (unsigned short)port,
                                    NULL, NULL,
                                    zxmhd_handler, srv,
+                                   MHD_OPTION_NOTIFY_COMPLETED, zxmhd_request_completed, NULL,
                                    MHD_OPTION_CONNECTION_TIMEOUT, (unsigned int)30,
                                    MHD_OPTION_END);
     if (!srv->daemon) {

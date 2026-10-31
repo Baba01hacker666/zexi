@@ -27,12 +27,20 @@ fi
 "$cc_bin" -std=gnu11 -O1 -g -fsanitize=address -o "$work/prog" "$work/out.c"
 
 set +e
-ASAN_OPTIONS=detect_leaks=1:exitcode=0 "$work/prog" > /dev/null 2> "$work/err.txt"
+"$work/prog" > /dev/null 2> "$work/err.txt"
+status=$?
 set -e
+
+if [ "$status" -ne 0 ]; then
+    echo "$prog: FAILED (exit $status)"
+    cat "$work/err.txt"
+    exit 1
+fi
 
 if grep -q "LeakSanitizer" "$work/err.txt"; then
     echo "$prog: leaks detected"
     grep -E "^(Direct|Indirect) leak|SUMMARY" "$work/err.txt"
+    exit 1
 else
     echo "$prog: clean (no leaks, no sanitizer errors)"
 fi

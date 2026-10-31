@@ -788,6 +788,7 @@ inlines it:
 ```zx
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     c """
+        if (a.len != b.len) return 0.0f / 0.0f;
         float sum = 0.0f;
         for (size_t i = 0; i < a.len; i++) sum += a.ptr[i] * b.ptr[i];
         return sum;

@@ -50,7 +50,9 @@ static void zxc_to_hex(const unsigned char *d, unsigned int n, struct zx_arr128_
         out->e[i * 2] = (uint8_t)hx[d[i] >> 4];
         out->e[i * 2 + 1] = (uint8_t)hx[d[i] & 15];
     }
-    out->e[i * 2] = 0;
+    if (i * 2 < 128) {
+        out->e[i * 2] = 0;
+    }
 }
 
 int32_t zxc_digest(zx_slice_u8 src, int32_t kind, struct zx_arr64_u8 *out) {
