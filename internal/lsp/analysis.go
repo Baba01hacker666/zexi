@@ -563,6 +563,12 @@ func sigOfFn(fn *sema.Fn) string {
 		}
 		b.WriteString(p.String())
 	}
+	if fn.Variadic {
+		if !first {
+			b.WriteString(", ")
+		}
+		b.WriteString("...")
+	}
 	b.WriteByte(')')
 	if fn.Decl != nil && fn.Decl.Ret != nil && fn.Ret != nil && fn.Ret.String() != "()" {
 		b.WriteString(" -> ")

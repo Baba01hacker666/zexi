@@ -460,7 +460,8 @@ func (l *Lexer) scanOperator(startPos token.Position, startOff int) token.Token 
 	}
 	// Longest-match first.
 	table := []entry{
-		{"<<=", token.KindShlEq}, {">>=", token.KindShrEq}, {"..=", token.KindDotDotEq},
+		{"<<=", token.KindShlEq}, {">>=", token.KindShrEq}, {"...", token.KindEllipsis},
+		{"..=", token.KindDotDotEq},
 		{"==", token.KindEqEq}, {"!=", token.KindBangEq}, {"<=", token.KindLe},
 		{">=", token.KindGe}, {"&&", token.KindAmpAmp}, {"||", token.KindPipePipe},
 		{"+=", token.KindPlusEq}, {"-=", token.KindMinusEq}, {"*=", token.KindStarEq},

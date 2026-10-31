@@ -1,0 +1,49 @@
+// bench/http_bench.zx — the server target for bench/http_load.py.
+//
+// Serves a tiny text page, a small JSON document, a 64 KiB body, and a POST
+// echo on 127.0.0.1, from a worker pool, and exits after a request budget so
+// the harness gets a deterministic shutdown and a server-side request count:
+//
+//     zexic run bench/http_bench.zx -- <port> <workers> <budget>
+//
+// `workers` 0 lets the pool pick (two threads per core). `budget` 0 serves
+// until killed.
+
+import http.server;
+
+fn hello(req: &Request) -> Response {
+    return Response::text(200, "hello from zexi\n");
+}
+
+fn json_route(req: &Request) -> Response {
+    return Response::json(200, "{\"ok\":true,\"name\":\"zexi\",\"n\":42}");
+}
+
+fn big(req: &Request) -> Response {
+    // A 64 KiB body, built once per request; exercises raw throughput.
+    let mut b = String::with_capacity(65536);
+    let mut i: i64 = 0;
+    while i < 65536 / 16 {
+        b.push_str("0123456789abcdef");
+        i += 1;
+    }
+    return Response::from_string(200, b);
+}
+
+fn echo(req: &Request) -> Response {
+    return Response::from_string(200, req.body.clone());
+}
+
+fn main() -> i32 {
+    let port: i32 = if arg_count() > 1 { arg_at(1).parse_i64() as i32 } else { 18090 };
+    let workers: i32 = if arg_count() > 2 { arg_at(2).parse_i64() as i32 } else { 0 };
+    let budget: i32 = if arg_count() > 3 { arg_at(3).parse_i64() as i32 } else { 0 };
+    handle_get("/", hello);
+    handle_get("/json", json_route);
+    handle_get("/big", big);
+    handle_post("/echo", echo);
+    let addr = f"127.0.0.1:{port}";
+    let rc = if budget > 0 { listen_workers_n(addr, workers, budget) } else { listen_workers(addr, workers) };
+    println("rc", rc, "requests", requests_served(), "conns", connections_served());
+    0
+}

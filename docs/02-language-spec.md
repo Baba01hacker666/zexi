@@ -72,7 +72,7 @@ item        = fn_item | struct_item | enum_item | const_item
 
 fn_item     = [ "pub" ] [ "unsafe" ] "fn" ident [ generics ]
               "(" [ params ] ")" [ "->" type ] ( block | ";" ) ;
-params      = param { "," param } ;
+params      = param { "," param } [ "," "..." ] ;   // `...` only in extern fn
 param       = [ "mut" ] ident ":" type ;
 generics    = "<" generic { "," generic } ">" ;
 generic     = ident [ ":" bound { "+" bound } ] ;
@@ -205,7 +205,7 @@ let t = s.clone();       // independent deep copy
 | `clone(&self)` | `-> String` | deep copy |
 | `clear(&mut self)` | | truncate to empty |
 | `push(&mut self, char)` | | append one code point (UTF-8) |
-| `push_str(&mut self, str)` | | append a string slice |
+| `push_str(&mut self, str, ...)` | | append one or more string slices, in order |
 | `push_byte(&mut self, u8)` | | append one raw byte (no UTF-8 encoding) |
 | `push_bytes(&mut self, &[u8])` | | append a whole byte slice |
 | `as_bytes(&self)` | `-> &[u8]` | borrow the contents as a byte slice |
@@ -582,7 +582,9 @@ not user-extensible macros.
 
 Two items let a module reach outside the language:
 
-- `extern "C" fn name(..) -> T;` declares a C function to call.
+- `extern "C" fn name(..) -> T;` declares a C function to call; the parameter
+  list may end with `...` for a variadic C function (printf-shaped), in which
+  case extra call arguments are passed through with C's default promotions.
 - `c """ ... """` compiles a block of C with the program. The block is appended to
   the generated translation unit, so it can use the runtime types and call
   `#[no_mangle]` functions. The same form as the **entire body of a function**
@@ -607,14 +609,15 @@ Deliberately tiny — a "core" that is largely in-language:
 - `os`/`sys` (opt-in): file, socket, process, time — thin libc or syscall
   wrappers, only linked when used.
 
-The shipped M1-preview helpers are embedded source modules: `io`, `fs`, `fmt`,
-`codec`, `math`, `text`, `regex`, `random`, `sys`/`os`, `net`, `http`, and
-`thread`. For example, `import text.regex;` selects the small POSIX-ERE facade,
+The shipped standard library is embedded source modules: `io`, `fs`, `fmt`,
+`codec`, `math`, `text`, `regex`, `random`, `sys`/`os`, `net`, `http`, `thread`,
+`json`, `html`, and `web`. For example, `import text.regex;` selects the small POSIX-ERE facade,
 `import os;` selects local environment/path/process helpers, `use fmt;` selects
 pure-Zexi number/value formatting, `use codec;` selects hex/base64 and
 checksums, and `use thread;` selects the pthread concurrency preview (threads,
 `i64` channels, `i64` atomics; see [`11-concurrency.md`](11-concurrency.md)).
-Their C shims are linked only if that module is selected.
+A module that needs C carries it inline in its own `.zx` file, so it is linked
+only if that module is selected.
 
 No `std` is linked by default; `#![no_std]` is the default rather than an
 opt-in, which is a key part of hitting the binary-size target.

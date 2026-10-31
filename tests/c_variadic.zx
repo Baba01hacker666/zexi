@@ -1,0 +1,43 @@
+// Variadic `extern "C"` functions: a `...` tail in the declaration, with the
+// C default argument promotions (narrow ints -> int, f32 -> double) applied
+// by the C compiler to the extra arguments.
+
+extern "C" fn printf(fmt: str, ...) -> i32;
+
+// Variadic helpers defined in C inside this same translation unit.
+c """
+#include <stdarg.h>
+int zx_sum_all(int n, ...) {
+    va_list ap; va_start(ap, n);
+    int s = 0;
+    for (int i = 0; i < n; i++) s += va_arg(ap, int);
+    va_end(ap);
+    return s;
+}
+double zx_sum_doubles(int n, ...) {
+    va_list ap; va_start(ap, n);
+    double s = 0;
+    for (int i = 0; i < n; i++) s += va_arg(ap, double);
+    va_end(ap);
+    return s;
+}
+"""
+
+extern "C" fn zx_sum_all(n: i32, ...) -> i32;
+extern "C" fn zx_sum_doubles(n: i32, ...) -> f64;
+
+fn main() -> i32 {
+    // printf-shaped call: fixed `fmt`, then any number of promoted arguments.
+    printf("int=%d str=%s float=%.2f char=%c\n", 42, "hello", 3.14159, 'Z');
+    // A variadic call may pass zero extra arguments.
+    printf("plain\n");
+    println(zx_sum_all(3, 10, 20, 30));   // 60
+    // i16 and u8 arguments promote to int.
+    let small: i16 = 7;
+    let tiny: u8 = 250;
+    println(zx_sum_all(2, small, tiny));  // 257
+    // An f32 argument promotes to double.
+    let f: f32 = 1.5;
+    println(zx_sum_doubles(2, f, 2.5));   // 4
+    0
+}

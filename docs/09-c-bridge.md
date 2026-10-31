@@ -13,7 +13,15 @@ Declare C functions with `extern "C"`; the name is used verbatim:
 ```zx
 extern "C" fn sqrt(x: f64) -> f64;
 extern "C" fn puts(s: str) -> i32;
+extern "C" fn printf(fmt: str, ...) -> i32;   // variadic: printf-shaped APIs
 ```
+
+A trailing `...` marks the declaration **variadic**: the fixed parameters are
+checked as usual, and any further call arguments are passed through with C's
+default argument promotions (`f32` → `double`, narrow integers → `int`), so
+`printf("%d %s\n", 42, "hi")` just works. `...` is only allowed on `extern`
+declarations (E0202 otherwise), and a variadic callee still requires its
+fixed arguments (E0061 if they are missing).
 
 Or generate the declarations from the library's header:
 
@@ -22,8 +30,9 @@ $ zexic bindgen /usr/include/math.h -o math_bindings.zx
 ```
 
 `bindgen` translates the portable subset of C — scalars, sized integers,
-`char *` strings, opaque pointers, array parameters — and lists anything
-it cannot map (variadic functions, function pointers, by-value structs)
+`char *` strings, opaque pointers, array parameters, and variadic tails
+(`...`, emitted as a trailing `...` parameter) — and lists anything
+it cannot map (function pointers, by-value structs)
 as comments at the top of the output, so you can finish those by hand.
 Use the result like any library file: `use "math_bindings.zx";`.
 

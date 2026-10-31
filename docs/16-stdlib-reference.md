@@ -291,5 +291,6 @@ input, while `hex_decode_bytes`/`base64_decode_bytes` return
 | `arg_count()` / `arg_at(i)` | command-line arguments (`arg_at` returns `String`) |
 | `project_dir()` | directory of the entry file, baked into the binary |
 | `String::from`, `Vec::new`, `HashMap::new` | container constructors |
+| `s.push_str(a, b, ...)` | append one or more `str` arguments in order (a `String` argument is borrowed) |
 | `HashMap::get_str(key: str)`, `HashMap::contains_str(key: str)` | borrowed-key lookups on `HashMap<String, V>` (no key allocation) |
 | closures (`\|x\| …`) | see [§15](15-closures.md) |

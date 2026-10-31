@@ -130,11 +130,11 @@ func (p *parser) parseItem() ast.Item {
 
 	switch p.cur().Kind {
 	case token.KindFn:
-		return p.parseFn(vis, attrs, start)
+		return p.parseFn(vis, attrs, start, false)
 	case token.KindUnsafe:
 		p.bump()
 		if p.at(token.KindFn) {
-			d := p.parseFn(vis, attrs, start)
+			d := p.parseFn(vis, attrs, start, false)
 			if f, ok := d.(*ast.FnDecl); ok {
 				f.Unsafe = true
 			}
@@ -234,7 +234,7 @@ func attrTokenText(t token.Token) string {
 	return t.Kind.String()
 }
 
-func (p *parser) parseFn(vis ast.Visibility, attrs []string, start token.Pos) ast.Item {
+func (p *parser) parseFn(vis ast.Visibility, attrs []string, start token.Pos, extern bool) ast.Item {
 	p.bump() // fn
 	name, ok := p.expectIdent("function name")
 	if !ok {
@@ -242,7 +242,11 @@ func (p *parser) parseFn(vis ast.Visibility, attrs []string, start token.Pos) as
 	}
 	fn := &ast.FnDecl{Vis: vis, Attrs: attrs, Name: name, Sp: p.spanFrom(start)}
 	fn.Generics = p.parseGenerics()
-	fn.Params = p.parseParams()
+	fn.Params, fn.Variadic = p.parseParams()
+	if fn.Variadic && !extern {
+		p.errf(p.cur(), "E0202", "`...` (a variadic parameter list) is only allowed in an `extern` declaration")
+		fn.Variadic = false
+	}
 	if p.accept(token.KindArrow) {
 		fn.Ret = p.parseType()
 	}
@@ -265,20 +269,33 @@ func (p *parser) parseExternFn(vis ast.Visibility, attrs []string, start token.P
 		p.errf(p.cur(), "E0202", "expected `fn` in `extern` declaration")
 		return nil
 	}
-	d := p.parseFn(vis, attrs, start)
+	d := p.parseFn(vis, attrs, start, true)
 	if f, ok := d.(*ast.FnDecl); ok {
 		f.Extern = abi
 	}
 	return d
 }
 
-func (p *parser) parseParams() []ast.Param {
+// parseParams parses `(a: i64, b: str = "x", ...)`. The second result is
+// true when the list ends with a variadic `...`, which must be the last
+// parameter.
+func (p *parser) parseParams() ([]ast.Param, bool) {
 	var params []ast.Param
+	variadic := false
 	if !p.expect(token.KindLParen, " to begin parameter list") {
-		return params
+		return params, false
 	}
 	for !p.at(token.KindRParen) && !p.at(token.KindEOF) {
 		start := p.cur().Pos.Offset
+		if p.at(token.KindEllipsis) {
+			p.bump() // ...
+			variadic = true
+			if !p.at(token.KindRParen) {
+				p.errf(p.cur(), "E0202", "`...` must be the last parameter")
+				p.skipTo(token.KindRParen)
+			}
+			break
+		}
 		if p.atSelfParam() {
 			pr := ast.Param{Self: true, Name: "self"}
 			if p.accept(token.KindAmp) {
@@ -324,7 +341,7 @@ func (p *parser) parseParams() []ast.Param {
 		}
 	}
 	p.expect(token.KindRParen, " to close parameter list")
-	return params
+	return params, variadic
 }
 
 func (p *parser) parseStruct(vis ast.Visibility, attrs []string, start token.Pos) ast.Item {
@@ -484,7 +501,7 @@ func (p *parser) parseImpl(start token.Pos) ast.Item {
 		attrs := p.parseAttributes()
 		vis := ast.Visibility(p.accept(token.KindPub))
 		if p.at(token.KindFn) {
-			if f, ok := p.parseFn(vis, attrs, p.cur().Pos.Offset).(*ast.FnDecl); ok {
+			if f, ok := p.parseFn(vis, attrs, p.cur().Pos.Offset, false).(*ast.FnDecl); ok {
 				d.Fns = append(d.Fns, f)
 			}
 		} else {

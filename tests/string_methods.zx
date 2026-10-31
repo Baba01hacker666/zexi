@@ -28,5 +28,15 @@ fn main() -> i32 {
     // The same methods work through a `&String` receiver.
     println(find_from_ref(&s, "HTTP")); // 16
 
+    // push_str takes one or more arguments: each is appended in order, and a
+    // `String` argument is borrowed, not moved.
+    let mut b = String::from("a");
+    b.push_str("b", "c", "d");
+    println(b);                       // abcd
+    let piece = String::from("!");
+    b.push_str(piece, "?", piece.as_str());
+    println(b);                       // abcd!?!
+    println(piece);                   // !   (push_str borrowed it)
+
     0
 }

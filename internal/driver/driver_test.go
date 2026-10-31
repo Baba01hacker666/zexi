@@ -68,6 +68,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/web_lib.zx",
 		"../../tests/closures.zx",
 		"../../tests/cinline.zx",
+		"../../tests/c_variadic.zx",
 		"../../tests/slices.zx",
 		"../../tests/ref_array.zx",
 		"../../tests/std_bytes.zx",
@@ -180,7 +181,15 @@ func TestRunPrograms(t *testing.T) {
 			want: strings.Join([]string{
 				"3", "71", "-1", "true", "true", "true", "false", "/index.html",
 				"/index.html HTTP/1.1", "Content-Length: 1527", "1527", "1528",
-				"16", "",
+				"16", "abcd", "abcd!?!", "!", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/c_variadic.zx",
+			want: strings.Join([]string{
+				"int=42 str=hello float=3.14 char=Z",
+				"plain",
+				"60", "257", "4", "",
 			}, "\n"),
 		},
 		{
@@ -1611,6 +1620,244 @@ func tcpPort(t *testing.T, ln net.Listener) int {
 
 // waitPort reports whether addr accepts a TCP connection within the startup
 // timeout used by the integration tests.
+// TestKeepAliveAndPartialHead drives the embedded http server with raw TCP:
+// two requests on one keep-alive connection must both be answered with
+// `Connection: keep-alive`, a `Connection: close` request must close the
+// connection, and a head that never ends (slowloris-style stall) must get a
+// prompt 400 and a close instead of holding the worker. The server runs with
+// a request budget of 3 (two keep-alive requests + one 400), so it exits by
+// itself and its own counter must agree.
+func TestKeepAliveAndPartialHead(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end network test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+
+	dir := t.TempDir()
+	src := `use http;
+
+fn hello(req: &Request) -> Response { return Response::text(200, "hi"); }
+fn pi(req: &Request) -> Response { return Response::text(200, "3.14"); }
+
+fn main() -> i32 {
+    let mut app = new_app();
+    app.get("/", hello);
+    app.get("/pi", pi);
+    let rc = serve_local_n(&app, 3, 18096);
+    println("rc", rc, "requests", requests_served());
+    0
+}
+`
+	mainPath := filepath.Join(dir, "main.zx")
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "srv")
+	em := diag.NewEmitter()
+	if _, ok := driver.BuildFiles([]string{mainPath}, bin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build the server")
+	}
+
+	var srvOut bytes.Buffer
+	server := exec.Command(bin)
+	server.Stdout = &srvOut
+	server.Stderr = &srvOut
+	if err := server.Start(); err != nil {
+		t.Fatalf("starting server: %v", err)
+	}
+	defer func() { _ = server.Process.Kill() }()
+	if !waitPort("127.0.0.1:18096") {
+		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
+	}
+
+	readResp := func(c net.Conn) (status string, connHdr string, body string) {
+		_ = c.SetReadDeadline(time.Now().Add(4 * time.Second))
+		buf := make([]byte, 0, 4096)
+		tmp := make([]byte, 4096)
+		for !bytes.Contains(buf, []byte("\r\n\r\n")) {
+			n, err := c.Read(tmp)
+			if n > 0 {
+				buf = append(buf, tmp[:n]...)
+			}
+			if err != nil {
+				t.Fatalf("reading response head: %v (got %q)", err, buf)
+			}
+		}
+		parts := bytes.SplitN(buf, []byte("\r\n\r\n"), 2)
+		head, rest := parts[0], []byte{}
+		if len(parts) > 1 {
+			rest = parts[1]
+		}
+		lines := bytes.Split(head, []byte("\r\n"))
+		status = strings.Fields(string(lines[0]))[1]
+		clen := 0
+		for _, l := range lines[1:] {
+			if bytes.HasPrefix(bytes.ToLower(l), []byte("content-length:")) {
+				clen, _ = strconv.Atoi(strings.TrimSpace(string(l[len("content-length:"):])))
+			}
+			if bytes.HasPrefix(bytes.ToLower(l), []byte("connection:")) {
+				connHdr = strings.TrimSpace(string(l[len("connection:"):]))
+			}
+		}
+		bodyBytes := append([]byte{}, rest...)
+		for len(bodyBytes) < clen {
+			n, err := c.Read(tmp)
+			if n > 0 {
+				bodyBytes = append(bodyBytes, tmp[:n]...)
+			}
+			if err != nil {
+				break
+			}
+		}
+		return status, connHdr, string(bodyBytes[:clen])
+	}
+
+	// One connection, two requests: both must be keep-alive.
+	c, err := net.DialTimeout("tcp", "127.0.0.1:18096", 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	st, ch, body := readResp(c)
+	if st != "200" || ch != "keep-alive" || body != "hi" {
+		t.Fatalf("first response = %s %q %q, want 200 keep-alive hi", st, ch, body)
+	}
+	if _, err := c.Write([]byte("GET /pi HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	st, ch, body = readResp(c)
+	if st != "200" || ch != "keep-alive" || body != "3.14" {
+		t.Fatalf("second response on same conn = %s %q %q, want 200 keep-alive 3.14", st, ch, body)
+	}
+	_ = c.Close()
+
+	// A stalled half-head must get a prompt 400 and a close (not a keep-alive
+	// idle hold): it counts as the third budgeted request, so the server exits.
+	c2, err := net.DialTimeout("tcp", "127.0.0.1:18096", 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if _, err := c2.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n")); err != nil { // no final CRLF
+		t.Fatal(err)
+	}
+	st, _, _ = readResp(c2)
+	if st != "400" {
+		t.Fatalf("partial head got status %s, want 400", st)
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("partial head answered after %s, want within the 1s head timeout", d)
+	}
+	_ = c2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c2.Read(make([]byte, 16)); !errors.Is(err, io.EOF) {
+		t.Fatalf("after 400 the connection should be closed, read err = %v", err)
+	}
+	_ = c2.Close()
+
+	done := make(chan struct{})
+	go func() { _ = server.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(8 * time.Second):
+		t.Fatal("server did not exit after its 3-request budget")
+	}
+	if got := srvOut.String(); !strings.Contains(got, "requests 3") {
+		t.Fatalf("server log = %q, want it to report 3 requests", got)
+	}
+}
+
+// TestPoolBudgetShutdownKeepAlive guards the pool shutdown race: with a
+// worker pool (workers > 1) the listener must be non-blocking, otherwise a
+// worker that loses the poll/accept race blocks in accept() forever and the
+// request budget never shuts the pool down. One keep-alive connection
+// carrying the whole budget is the sharpest repro.
+func TestPoolBudgetShutdownKeepAlive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end network test in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+
+	dir := t.TempDir()
+	src := `use http;
+
+fn hello(req: &Request) -> Response { return Response::text(200, "hi"); }
+
+fn main() -> i32 {
+    handle_get("/", hello);
+    let rc = listen_workers_n("127.0.0.1:18097", 4, 3);
+    println("rc", rc, "requests", requests_served());
+    0
+}
+`
+	mainPath := filepath.Join(dir, "main.zx")
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(dir, "srv")
+	em := diag.NewEmitter()
+	if _, ok := driver.BuildFiles([]string{mainPath}, bin, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build the pool server")
+	}
+
+	var srvOut bytes.Buffer
+	server := exec.Command(bin)
+	server.Stdout = &srvOut
+	server.Stderr = &srvOut
+	if err := server.Start(); err != nil {
+		t.Fatalf("starting server: %v", err)
+	}
+	defer func() { _ = server.Process.Kill() }()
+	if !waitPort("127.0.0.1:18097") {
+		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
+	}
+
+	// All 3 budgeted requests over ONE keep-alive connection.
+	c, err := net.DialTimeout("tcp", "127.0.0.1:18097", 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readOne := func() {
+		_ = c.SetReadDeadline(time.Now().Add(4 * time.Second))
+		buf := make([]byte, 0, 4096)
+		tmp := make([]byte, 4096)
+		for !bytes.Contains(buf, []byte("\r\n\r\n")) {
+			n, err := c.Read(tmp)
+			if n > 0 {
+				buf = append(buf, tmp[:n]...)
+			}
+			if err != nil {
+				t.Fatalf("reading response: %v (got %q)", err, buf)
+			}
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := c.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		readOne()
+	}
+	_ = c.Close()
+
+	done := make(chan struct{})
+	go func() { _ = server.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(6 * time.Second):
+		t.Fatal("worker pool did not exit after its 3-request budget (blocking-accept race)")
+	}
+	if got := srvOut.String(); !strings.Contains(got, "requests 3") {
+		t.Fatalf("server log = %q, want it to report 3 requests", got)
+	}
+}
+
 func waitPort(addr string) bool {
 	const timeout = 5 * time.Second
 	deadline := time.Now().Add(timeout)

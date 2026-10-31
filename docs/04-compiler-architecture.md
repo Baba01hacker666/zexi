@@ -69,11 +69,11 @@ a debugging/testing aid (the golden-file test corpus uses it).
         ┌──────────┴───────────┐
         ▼                      ▼
   ┌───────────┐         ┌────────────┐
-  │ codegen/c │         │ codegen/   │   (M2) codegen/llvm (optional)
-  └─────┬─────┘         │ x86_64     │
+  │ codegen/c │         │ codegen/   │
+  └─────┬─────┘         │ llvm       │   MIR → LLVM IR + runtime shim
         │               └─────┬──────┘
         ▼                     ▼
-   foo.c ──cc──▶ a.out     object files ──ld──▶ a.out
+   foo.c ──cc──▶ a.out     foo.ll ──clang──▶ a.out
                 (standalone native binary)
 ```
 
@@ -109,10 +109,12 @@ formatting (`zexi fmt`), and the LSP.
 **Implemented** in `internal/mir` (`docs/13-mir.md`): the IR, a lowering from
 `sema.Info`, a validator, a textual dump (`--emit=mir`), and a reference
 interpreter used as a test oracle. It covers the computational core — 93% of the
-reachable functions in this repository lower today. Not yet on the production
-path: the C backend still walks the typed AST, so nothing consumes MIR outside
-the MIR tests. Deliberate deviations from the plan above, recorded so they are
-choices rather than drift:
+reachable functions in this repository lower today. The default path is still
+the C backend walking the typed AST, but MIR now has a real consumer: the
+**LLVM backend** (`internal/codegen/llvm`, behind `--backend=llvm` /
+`--emit=llvm`) lowers MIR to LLVM IR and links it with `clang` plus a runtime
+shim, rejecting anything outside the mirrored MIR subset. Deliberate deviations
+from the plan above, recorded so they are choices rather than drift:
 
 - **No separate HIR.** The checker's `sema.Info` is the typed, monomorphized,
   desugared program (`?` and `if let` are already lowered; generics are already

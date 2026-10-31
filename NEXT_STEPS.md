@@ -92,11 +92,26 @@ forward most. Ordered by value per unit of risk, not by ambition.
   wraps: it banks its results at the real wrap point, measured against the
   queue's actual occupancy (including jobs an earlier caller left queued).
 
-## 1. A connection engine that cannot be stalled — open, not started
+## 1. A connection engine that cannot be stalled — keep-alive landed, fairness open
 
-Today one slow client holds one worker until its head deadline. That is bounded
-but not fair: *n* half-sent heads delay a new request by about *n / workers ×
-timeout*.
+Landed (2026-10-31, measured in `bench/http-results.md` on a 2-core box):
+HTTP/1.1 keep-alive in every serve loop (≈2–4× close-mode throughput at
+concurrency ≥ 8; 33k–54k req/s tiny-body across runs), `TCP_NODELAY` on
+all sockets (fixed a 40 ms delayed-ACK stall: 23 req/s → 12k+ req/s at c=1),
+prompt `400` + close for a stalled partial head (was: answer, then a 5 s
+keep-alive idle hold), request-counted pool budgets with a non-blocking listener
+(fixed a poll/accept race that hung budget shutdown with workers > 1), and a
+repeatable harness (`bench/http_load.py` + `bench/http_bench.zx`).
+
+Compared against a raw C twin (`bench/http_bench.c`, `--server c`): same
+throughput ballpark and same ~1 MiB RSS, but the zexi server uses ~1.8× more
+CPU per request (0.76 vs 0.42 cores sustained at ~40k req/s) — the parser/
+`String`/dispatch overhead the microbenchmarks measure in isolation
+(`bench/http-c-results.md`, docs/08 §8.7).
+
+Still open — one slow client holds one worker until its head deadline (1 s):
+8 stalled heads delayed a normal request by ~1.1 s at 8 workers, ~4.4 s at
+2 workers, i.e. about *n / workers × timeout*. Bounded, but not fair.
 
 - Keep a per-worker list of half-read heads (fd, bytes so far, deadline) and
   `poll_read(fd, 0)` over it between accepts, so a connection that is not ready
@@ -105,10 +120,9 @@ timeout*.
   partial buffer, so a head can be resumed across calls.
 - Expire pending entries at their deadline with a `408 Request Timeout`.
 - Only then decide between this and a thread-per-connection mode; the numbers
-  here should pick the answer, not taste.
+  in `bench/http-results.md` should pick the answer, not taste.
 
-Nothing in the language blocks this; it is `net`-side work, and the fairness
-claim needs a benchmark before it is worth the complexity.
+Nothing in the language blocks this; it is `net`-side work.
 
 ## 2. Free what we allocate — open, measured
 
@@ -195,18 +209,15 @@ extern declarations (`docs/19-modules.md`). `sqlite`, `zlib`, `crypto`, and
 `curl` are exercised against the real system libraries by
 `internal/registry`'s end-to-end tests.
 
-**Still open:** `extern "C"` variadics. `printf`-shaped APIs (`printf`,
-`snprintf`, `sqlite3_mprintf`, syslog) cannot be called directly, so a binding
-has to wrap them in a `c` block. The pieces needed:
-
-- parser: accept `...` as the last parameter of an `extern` declaration;
-- sema: mark the `Fn` variadic, drop the arity check for the tail, and check
-  each extra argument against its own type;
-- codegen: emit `...` in the prototype and pass the extra arguments through
-  with the usual C default promotions (`f32` → `double`, narrow ints → `int`).
-
-It is contained work with no design questions; it has simply not been needed by
-any binding in the catalog yet.
+**Done:** `extern "C"` variadics. `extern "C" fn printf(fmt: str, ...) -> i32;`
+declares a `printf`-shaped API directly: the parser accepts `...` as the last
+parameter of an `extern` declaration (E0202 elsewhere), sema marks the `Fn`
+variadic and requires only the fixed parameters (E0061 when missing) while
+checking each extra argument against its own type, and codegen emits `...` in
+the C prototype so the C compiler applies the default promotions (`f32` →
+`double`, narrow ints → `int`). `zexic bindgen` emits the `...` tail for
+variadic header functions too. Covered by `tests/c_variadic.zx` and the error
+fixtures in `tests/errors/`.
 
 ## 6. Language gaps worth closing
 
@@ -224,7 +235,7 @@ still open.
 | `Vec::fold` over owning elements | **open** — its accumulator is an element value and the generated loop cannot drop the values it replaces, so it stays `Copy`-only; fold into an owned accumulator with an index instead |
 | `for x in v` copies each element | **open** — iterating a `Vec<String>` is `E0507`; `v.each(|s: &String| …)` is the way today. A `for s in &v` form is the fix, and it needs the borrow-checked iterator idea below |
 | No `ref`-style pattern | **open** — an owning payload cannot be bound by reference out of a borrowed scrutinee (`Msg::Text(s) => …` on `&Msg` is `E0507`). A `ref s` pattern is the smallest fix; `_` is the workaround |
-| Variadic string building | **open** — `push_str` takes one argument, so a message is a chain of calls. An optional second and later `push_str` argument is a one-line widening of the builtin |
+| Variadic string building | **fixed** — `push_str` takes one or more arguments (`s.push_str("a", "b", "c")`); each is appended in order and a `String` argument is borrowed, not moved |
 | `io::read_line` does one `read` syscall per byte | **open** — a line needs a buffered-reader type (buffer + consumed mark); the type is the work, not the syscalls |
 | `str` is C-ABI-shaped at the boundary | **open, deliberate** — NUL-terminated with no independent length. Slices cover buffers and `str::as_bytes()` covers borrowing; length-prefixing `str` is an ABI change with no forcing need yet |
 | Pointer identity comparison | **not a gap by choice** — a comparison through a borrow compares values, never addresses; two `*T` cannot be compared at all. Use integer addresses if that is what you mean |

@@ -1,9 +1,9 @@
 // Package bindgen generates Zexi `extern "C"` declarations from a C
 // header file. It understands the common, portable subset of C —
-// scalar types, `char *` strings, opaque pointers, sized integers — and
-// politely skips what it cannot map (variadic functions, function
-// pointers, by-value structs), listing every skip in the output so a
-// human can finish the job by hand.
+// scalar types, `char *` strings, opaque pointers, sized integers, and
+// variadic tails (`...`) — and politely skips what it cannot map
+// (function pointers, by-value structs), listing every skip in the
+// output so a human can finish the job by hand.
 //
 // The generated declarations are only half of the C bridge: link the
 // implementation with `zexic build app.zx --csrc=glue.c --link=m`.
@@ -173,12 +173,16 @@ func translate(stmt string) (decl, name, skipReason string) {
 	}
 
 	var params []string
+	variadic := false
 	paramsText = strings.TrimSpace(paramsText)
 	if paramsText != "" && paramsText != "void" {
 		for j, raw := range strings.Split(paramsText, ",") {
 			raw = strings.TrimSpace(raw)
 			if raw == "..." {
-				return "", "", name + " (variadic)"
+				// A variadic tail maps to Zexi's `...` in an extern
+				// declaration; C requires it to be the last parameter.
+				variadic = true
+				continue
 			}
 			if strings.Contains(raw, "(") {
 				return "", "", name + " (function-pointer parameter)"
@@ -189,6 +193,9 @@ func translate(stmt string) (decl, name, skipReason string) {
 			}
 			params = append(params, pname+": "+pty)
 		}
+	}
+	if variadic {
+		params = append(params, "...")
 	}
 
 	var b strings.Builder
