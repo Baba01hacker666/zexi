@@ -38,6 +38,35 @@ are built with `cc -std=gnu11 -O2 -fwrapv`, the flags `zexic` itself passes
 to the C compiler. Results land in [`results.md`](results.md) with the
 machine's details — compare rows only on the machine they name.
 
+## HTTP server load test
+
+`http_bench.zx` is a small dependency-free HTTP/1.1 server (GET `/`, `/json`,
+`/big` 64 KiB, POST `/echo`) used to measure how much the stdlib server in
+`internal/driver/std/http.zx` can handle at scale. It serves with a worker pool
+and a request budget so every run exits deterministically:
+
+```sh
+zexic build bench/http_bench.zx -o build/bench/http_bench
+./build/bench/http_bench 18200 4 100000   # <port> <workers> <request budget>
+```
+
+`http_load.py` drives it over raw sockets (no client-side keep-alive reuse
+unless asked) and writes a markdown report:
+
+```sh
+python3 bench/http_load.py                                  # full sweep
+python3 bench/http_load.py --quick --total 2000             # smoke run
+python3 bench/http_load.py --concurrency 1,8,32,128 --workers 1,4 --total 8000 \
+    --out bench/http-results.md
+```
+
+Phases: keep-alive throughput vs concurrency × workers (with per-request
+p50/p95/p99 and a server-side request-count cross-check), close-mode
+comparison, 64 KiB GET, 1 KiB POST echo, a slowloris probe (stalled half-sent
+heads vs one normal request), and abuse probes (431/400/silent). Results land
+in [`http-results.md`](http-results.md); compare rows only on the machine they
+name.
+
 ## What the numbers mean (and do not)
 
 Zexi compiles to C, so the honest expectation is **near-C speed**: the

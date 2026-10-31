@@ -65,8 +65,11 @@ This repository contains the **initial design and specification** of Zexi: the v
 > `net`/`http` modules (`import http.server;`) with URL parsing, redirects,
 > headers, query/form decoding, chunked bodies, timeouts, response builders,
 > cookies, static-file serving with MIME detection, downloads, and a
-> fixed-capacity router built on function values. Go-style servers are a few
-> lines: `handle_get("/users/{id}", user); listen(":8080")` registers on a
+> fixed-capacity router built on function values — served with HTTP/1.1
+> keep-alive, `TCP_NODELAY` on every socket, and a thread pool
+> (`listen_workers(":8080", 8)`), measured at 33k–54k req/s tiny-body on a
+> 2-core box ([bench/http-results.md](bench/http-results.md)). Go-style servers are a
+> few lines: `handle_get("/users/{id}", user); listen(":8080")` registers on a
 > default mux with `{name}` route parameters and `use_before`/`use_after`
 > middleware. High-level `serve(&app, 8000)`, `serve_dir(root, 8000)`,
 > `new_app()`, and `listen_n(addr, count)` cover explicit and bounded servers;

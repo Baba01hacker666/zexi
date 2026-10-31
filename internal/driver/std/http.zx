@@ -88,6 +88,11 @@ const FIRST_BYTE_MS: i32 = 250;
 // DRAIN_MS bounds the pre-close drain, which keeps a reset from destroying the
 // response the peer has not read yet.
 const DRAIN_MS: i32 = 100;
+// KEEPALIVE_IDLE_MS is how long a persistent (keep-alive) connection may sit
+// idle between requests before the server closes it. HTTP/1.1 defaults to
+// persistent connections, so this — not the first-byte deadline — bounds an
+// idle keep-alive socket.
+const KEEPALIVE_IDLE_MS: i32 = 5000;
 // DEFAULT_MAX_REDIRECTS is how many redirect hops a client follows.
 const DEFAULT_MAX_REDIRECTS: i32 = 5;
 
@@ -346,6 +351,10 @@ pub struct Request {
     head_bytes: usize,
     // head_overflow reports a head that did not end within MAX_HEAD bytes.
     head_overflow: bool,
+    // head_incomplete reports a head that never reached its terminating blank
+    // line (timeout or EOF mid-head): it is answered with 400 and the
+    // connection is closed, never kept alive.
+    head_incomplete: bool,
 }
 
 pub struct Response {
@@ -787,7 +796,7 @@ pub fn parse_request(raw: &String) -> Request {
         return Request {
             method: String::new(), path: String::new(), version: String::new(),
             headers: String::new(), body: String::new(), params: String::new(),
-            head_bytes: raw.len(), head_overflow: false,
+            head_bytes: raw.len(), head_overflow: false, head_incomplete: false,
         };
     }
     let line = raw.substr(0, end as usize);
@@ -804,12 +813,29 @@ pub fn parse_request(raw: &String) -> Request {
     return Request {
         method: method, path: path, version: version, headers: headers, body: body,
         params: String::new(), head_bytes: raw.len(), head_overflow: false,
+        head_incomplete: false,
     };
 }
 
 // read_request reads a request head and then its body, using Content-Length
 // when the client declared one. Connections that send nothing (readiness
 // probes) yield an invalid request with an empty method and body.
+// request_keep_alive reports whether the client wants the connection kept
+// open after this request: HTTP/1.1 defaults to persistent unless the
+// request says `Connection: close`; HTTP/1.0 defaults to close unless it
+// says `Connection: keep-alive`.
+fn request_keep_alive(req: &Request) -> bool {
+    let conn_hdr = req.header("Connection");
+    let conn = http_lower(&conn_hdr);
+    if conn.contains("close") {
+        return false;
+    }
+    if conn.contains("keep-alive") {
+        return true;
+    }
+    return req.version.as_str() == "HTTP/1.1";
+}
+
 pub fn read_request(c: &Conn) -> Request {
     let head = c.read_head();
     let mut req = parse_request(&head);
@@ -817,6 +843,7 @@ pub fn read_request(c: &Conn) -> Request {
     // read_head stops one byte short of its buffer, so the last possible
     // length is MAX_HEAD - 1.
     req.head_overflow = head.len() >= MAX_HEAD - 1 && head_end(&head) < 0;
+    req.head_incomplete = head_end(&head) < 0;
     // The head deadline is short; a body is being sent by a client that already
     // spoke, so it gets the ordinary I/O timeout.
     c.set_timeout(DEFAULT_TIMEOUT_MS);
@@ -1553,9 +1580,16 @@ impl Router {
 
     // serve reads one request from c, dispatches it, and writes the response.
     // It returns false when the peer sent nothing usable (a probe or EOF).
-    pub fn serve(&self, c: &Conn) -> bool {
-        if !c.wait_readable(FIRST_BYTE_MS) {
-            return false;
+    // serve_one handles exactly one request on the connection and reports
+    // what happened: 1 = a request was served and the connection stays open
+    // (keep-alive), 0 = a request was served and the connection must close,
+    // -1 = nothing arrived (a probe or a clean EOF) and nothing was sent.
+    fn serve_one(&self, c: &Conn, first: bool) -> i32 {
+        // The first byte of a fresh connection gets the short deadline; a
+        // keep-alive connection gets the idle deadline between requests.
+        let wait_ms = if first { FIRST_BYTE_MS } else { KEEPALIVE_IDLE_MS };
+        if !c.wait_readable(wait_ms) {
+            return -1;
         }
         c.set_timeout(self.header_timeout_ms);
         let mut req = read_request(c);
@@ -1563,37 +1597,89 @@ impl Router {
             let too_big = Response::empty(431);
             send_response(c, &too_big);
             c.drain(DRAIN_MS);
-            return true;
+            return 0;
         }
         if !req.valid() {
             // Nothing arrived: a readiness probe or an immediate EOF, so there
             // is nobody to answer. A peer that did send bytes gets a 400.
             if req.head_bytes == 0 {
-                return false;
+                return -1;
             }
             let bad = Response::empty(400);
             send_response(c, &bad);
             c.drain(DRAIN_MS);
-            return true;
+            return 0;
+        }
+        if req.head_incomplete {
+            // The head never ended (timeout or EOF mid-head). Answer 400 and
+            // close: a stalled sender must not be answered as a request and
+            // then hold the connection open.
+            let bad = Response::empty(400);
+            send_response(c, &bad);
+            c.drain(DRAIN_MS);
+            return 0;
         }
         if req.body_too_large() {
             let too_large = Response::empty(413);
             send_response(c, &too_large);
-            return true;
+            return 0;
         }
         if !req.body_complete() {
             let bad = Response::empty(400);
             send_response(c, &bad);
-            return true;
+            return 0;
         }
-        let res = self.dispatch(&mut req);
+        // A chunked request body is not consumed byte-exact, so the connection
+        // cannot be reused safely: answer, drain, and close.
+        let keep = request_keep_alive(&req) && !req.chunked();
+        let mut res = self.dispatch(&mut req);
+        res.keep_alive = keep;
         send_response(c, &res);
         if req.chunked() {
             // A malformed chunked body can leave bytes in the socket; draining
             // makes close() send FIN, so the status line survives.
             c.drain(DRAIN_MS);
+            return 0;
         }
-        return true;
+        if keep {
+            return 1;
+        }
+        return 0;
+    }
+
+    // serve handles one connection, following keep-alive: it serves requests
+    // until the client asks to close, goes idle past KEEPALIVE_IDLE_MS, or
+    // disconnects, and reports whether it served at least one request.
+    pub fn serve(&self, c: &Conn) -> bool {
+        return self.serve_count(c) > 0;
+    }
+
+    // serve_count is serve with the number of requests served on the
+    // connection (a keep-alive connection can serve many), so request budgets
+    // count requests rather than connections.
+    pub fn serve_count(&self, c: &Conn) -> i64 {
+        let mut served: i64 = 0;
+        let mut first = true;
+        loop {
+            let r = self.serve_one(c, first);
+            if r < 0 {
+                break;
+            }
+            first = false;
+            served += 1;
+            zxh_count_requests(1);
+            let budget = zxh_budget();
+            if budget > 0 && zxh_requests_served() >= budget {
+                // Pool-wide budget reached: answer this request, then stop
+                // without waiting for the connection to go idle.
+                zxh_stop();
+                break;
+            }
+            if r == 0 {
+                break;
+            }
+        }
+        return served;
     }
 }
 
@@ -1729,22 +1815,32 @@ pub fn serve_n(router: &Router, max_requests: i32, port: i32 = 8000, host: str =
     if !listener.ok() {
         return 1;
     }
-    let mut served: i32 = 0;
-    while served < max_requests {
+    // The budget counts requests, not connections: serve_count checks the
+    // pool-wide counter after every answer, so a single keep-alive connection
+    // that carries the whole budget still stops the server right after the
+    // last answer instead of waiting for the connection to go idle.
+    zxh_stats_reset();
+    zxh_set_budget(max_requests as i64);
+    loop {
+        if zxh_stopping() == 1 {
+            break;
+        }
         let mut conn = listener.accept();
         if !conn.ok() {
             if accept_retryable() {
                 continue;
             }
             listener.close();
+            zxh_set_budget(0);
+            zxh_clear_stop();
             return 1;
         }
-        if router.serve(&conn) {
-            served += 1;
-        }
+        router.serve_count(&conn);
         conn.close();
     }
     listener.close();
+    zxh_set_budget(0);
+    zxh_clear_stop();
     return 0;
 }
 
@@ -1773,6 +1869,7 @@ extern "C" fn zxh_mux_claim() -> i32;
 extern "C" fn zxh_mux_release(slot: i32);
 extern "C" fn zxh_count_conn();
 extern "C" fn zxh_count_request();
+extern "C" fn zxh_count_requests(n: i64);
 extern "C" fn zxh_stats_reset();
 extern "C" fn zxh_conns_served() -> i64;
 extern "C" fn zxh_requests_served() -> i64;
@@ -1851,14 +1948,7 @@ fn drain(mux: *Router, listener_fd: i64) -> i64 {
             continue;
         }
         zxh_count_conn();
-        if mux.serve(&conn) {
-            zxh_count_request();
-            served += 1;
-            let budget = zxh_budget();
-            if budget > 0 && zxh_requests_served() >= budget {
-                zxh_stop();
-            }
-        }
+        served += mux.serve_count(&conn);
         conn.close();
     }
     return served;
@@ -1936,10 +2026,7 @@ fn drain_until_budget(mux: *Router, listener_fd: i64, max_requests: i64) {
             continue;
         }
         zxh_count_conn();
-        if mux.serve(&conn) {
-            zxh_count_request();
-            served += 1;
-        }
+        served += mux.serve_count(&conn);
         conn.close();
     }
 }
@@ -2095,6 +2182,11 @@ pub fn listen_workers(addr: str = "0.0.0.0:8000", workers: i32 = 0) -> i32 {
     if !listener.ok() {
         return 1;
     }
+    // Non-blocking listener: several workers poll it, and without this the
+    // loser of a poll/accept race blocks in accept() forever, so a bounded
+    // pool (listen_workers_n) would never shut down. Accepted sockets stay
+    // blocking.
+    listener.set_nonblocking(true);
     zxh_stats_reset();
     let rc = run_pool(listener.fd() as i64, workers, 0, worker_default, 0);
     listener.close();
@@ -2111,6 +2203,10 @@ pub fn listen_workers_n(addr: str, workers: i32, max_requests: i32) -> i32 {
     if !listener.ok() {
         return 1;
     }
+    // Non-blocking listener, same race as listen_workers: without it a
+    // worker that loses the poll/accept race blocks in accept() forever and
+    // the budget shutdown never completes.
+    listener.set_nonblocking(true);
     zxh_stats_reset();
     let rc = run_pool(listener.fd() as i64, workers, max_requests as i64, worker_default, 0);
     listener.close();
@@ -2865,6 +2961,7 @@ void zxh_stats_reset(void) {
 void zxh_count_conn(void) { atomic_fetch_add(&zxh_conns, 1); }
 
 void zxh_count_request(void) { atomic_fetch_add(&zxh_requests, 1); }
+void zxh_count_requests(int64_t n) { atomic_fetch_add(&zxh_requests, n); }
 
 int64_t zxh_conns_served(void) { return atomic_load(&zxh_conns); }
 

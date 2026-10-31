@@ -92,11 +92,20 @@ forward most. Ordered by value per unit of risk, not by ambition.
   wraps: it banks its results at the real wrap point, measured against the
   queue's actual occupancy (including jobs an earlier caller left queued).
 
-## 1. A connection engine that cannot be stalled — open, not started
+## 1. A connection engine that cannot be stalled — keep-alive landed, fairness open
 
-Today one slow client holds one worker until its head deadline. That is bounded
-but not fair: *n* half-sent heads delay a new request by about *n / workers ×
-timeout*.
+Landed (2026-10-31, measured in `bench/http-results.md` on a 2-core box):
+HTTP/1.1 keep-alive in every serve loop (≈2–4× close-mode throughput at
+concurrency ≥ 8; 33k–54k req/s tiny-body across runs), `TCP_NODELAY` on
+all sockets (fixed a 40 ms delayed-ACK stall: 23 req/s → 12k+ req/s at c=1),
+prompt `400` + close for a stalled partial head (was: answer, then a 5 s
+keep-alive idle hold), request-counted pool budgets with a non-blocking listener
+(fixed a poll/accept race that hung budget shutdown with workers > 1), and a
+repeatable harness (`bench/http_load.py` + `bench/http_bench.zx`).
+
+Still open — one slow client holds one worker until its head deadline (1 s):
+8 stalled heads delayed a normal request by ~1.1 s at 8 workers, ~4.4 s at
+2 workers, i.e. about *n / workers × timeout*. Bounded, but not fair.
 
 - Keep a per-worker list of half-read heads (fd, bytes so far, deadline) and
   `poll_read(fd, 0)` over it between accepts, so a connection that is not ready
@@ -105,10 +114,9 @@ timeout*.
   partial buffer, so a head can be resumed across calls.
 - Expire pending entries at their deadline with a `408 Request Timeout`.
 - Only then decide between this and a thread-per-connection mode; the numbers
-  here should pick the answer, not taste.
+  in `bench/http-results.md` should pick the answer, not taste.
 
-Nothing in the language blocks this; it is `net`-side work, and the fairness
-claim needs a benchmark before it is worth the complexity.
+Nothing in the language blocks this; it is `net`-side work.
 
 ## 2. Free what we allocate — open, measured
 

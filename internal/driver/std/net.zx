@@ -560,6 +560,7 @@ extern char *realpath(const char *, char *);
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -632,6 +633,7 @@ int zxn_connect(int fd, const char *host, int port, int timeout_ms) {
         return -1;
     }
     if (flags >= 0) fcntl(fd, F_SETFL, flags);
+    zxn_set_nodelay(fd);
     return 0;
 }
 
@@ -658,10 +660,21 @@ int zxn_bind(int fd, const char *host, int port) {
 
 int zxn_listen(int fd, int backlog) { return listen(fd, backlog); }
 
+/* zxn_set_nodelay disables Nagle on a socket. A server writes the response
+ * head and body as two small sends; without TCP_NODELAY the second send waits
+ * for the peer's delayed ACK (~40 ms on Linux), which caps a keep-alive
+ * connection at ~23 req/s. Loopback benchmarks and interactive clients both
+ * want the bytes now. */
+int zxn_set_nodelay(int fd) {
+    int one = 1;
+    return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+}
+
 int zxn_accept(int fd) {
     for (;;) {
         int c = accept(fd, NULL, NULL);
         if (c < 0 && errno == EINTR) continue;
+        if (c >= 0) zxn_set_nodelay(c);
         return c;
     }
 }
@@ -762,7 +775,7 @@ int zxn_accept_timeout(int fd, int ms) {
     if (ready < 0) return -1;
     for (;;) {
         int c = accept(fd, NULL, NULL);
-        if (c >= 0) return c;
+        if (c >= 0) { zxn_set_nodelay(c); return c; }
         if (errno == EINTR) continue;
         if (errno == EAGAIN || errno == EWOULDBLOCK) return -2;
         return -1;
