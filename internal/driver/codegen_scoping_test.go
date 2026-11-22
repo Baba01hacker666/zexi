@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	zenc "zexi/internal/codegen/c"
 	"zexi/internal/diag"
 	"zexi/internal/driver"
 )
@@ -50,6 +51,122 @@ func wantOutput(t *testing.T, name, src, want string) {
 	}
 	if got != want {
 		t.Fatalf("%s output mismatch\n got: %q\nwant: %q", name, got, want)
+	}
+}
+
+// TestBoundsCheckElimination checks the conservative subset: a fixed array
+// indexed by a `for i in 0..N` variable, and a shared slice indexed by a
+// `for i in 0..s.len()` variable, need no run-time check. The counters must
+// agree with the emitted C.
+func TestBoundsCheckElimination(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "bce.zx")
+	prog := `fn main() -> i32 {
+    let mut a: [i64; 16] = [0; 16];
+    for i in 0..16 {
+        a[i] = i as i64;
+    }
+    let s: &[i64] = &a;
+    let mut n: i64 = 0;
+    for i in 0..s.len() {
+        n += s[i];
+    }
+    println(n);
+    0
+}
+`
+	if err := os.WriteFile(src, []byte(prog), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stats zenc.BoundsStats
+	em := diag.NewEmitter()
+	art, ok := driver.FrontEndFiles([]string{src}, driver.Options{Bounds: &stats}, em)
+	if !ok {
+		var sb strings.Builder
+		em.Render(&sb, em.FirstFileID())
+		t.Fatalf("front end reported errors:\n%s", sb.String())
+	}
+	if stats.Elided != 2 || stats.Checked != 0 {
+		t.Fatalf("bounds stats = %d elided, %d kept; want 2 and 0", stats.Elided, stats.Checked)
+	}
+	// One occurrence is the helper's definition; a second would be a call.
+	if got := strings.Count(art.CSrc, "zx_bounds("); got != 1 {
+		t.Fatalf("generated C has %d zx_bounds occurrences, want only the definition", got)
+	}
+}
+
+// TestBoundsCheckRequiresSameObject is the aliasing guard: a fact about
+// `s.len()` where s views a different array must not elide the check on `a`.
+func TestBoundsCheckRequiresSameObject(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "bce_alias.zx")
+	prog := `fn main() -> i32 {
+    let a: [i64; 2] = [0; 2];
+    let b: [i64; 4] = [0; 4];
+    let s: &[i64] = &b;
+    for i in 0..s.len() {
+        println(a[i]);
+    }
+    0
+}
+`
+	if err := os.WriteFile(src, []byte(prog), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stats zenc.BoundsStats
+	em := diag.NewEmitter()
+	if _, ok := driver.FrontEndFiles([]string{src}, driver.Options{Bounds: &stats}, em); !ok {
+		var sb strings.Builder
+		em.Render(&sb, em.FirstFileID())
+		t.Fatalf("front end reported errors:\n%s", sb.String())
+	}
+	if stats.Elided != 0 || stats.Checked != 1 {
+		t.Fatalf("bounds stats = %d elided, %d kept; want 0 and 1", stats.Elided, stats.Checked)
+	}
+}
+
+// TestBoundsCheckStaysAfterAssignment makes sure the proof is dropped when the
+// loop variable is written inside the body, and that a genuinely dynamic index
+// still panics rather than reading out of bounds.
+func TestBoundsCheckStaysAfterAssignment(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "bce_mut.zx")
+	prog := `fn main() -> i32 {
+    let mut a: [i64; 4] = [0; 4];
+    for i in 0..4 {
+        a[i] = 0;
+        i = 9;
+        a[i] = 1;
+    }
+    0
+}
+`
+	if err := os.WriteFile(src, []byte(prog), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stats zenc.BoundsStats
+	em := diag.NewEmitter()
+	if _, ok := driver.FrontEndFiles([]string{src}, driver.Options{Bounds: &stats}, em); !ok {
+		var sb strings.Builder
+		em.Render(&sb, em.FirstFileID())
+		t.Fatalf("front end reported errors:\n%s", sb.String())
+	}
+	if stats.Elided != 1 || stats.Checked != 1 {
+		t.Fatalf("bounds stats = %d elided, %d kept; want 1 and 1", stats.Elided, stats.Checked)
+	}
+
+	got, ee := buildAndRun(t, "bce_oob", `fn main() -> i32 {
+    let a: [i64; 4] = [0; 4];
+    let i: i64 = 9;
+    println(a[i as usize]);
+    0
+}
+`, driver.Options{})
+	if ee == nil {
+		t.Fatalf("out-of-bounds index did not fail; output %q", got)
+	}
+	if !strings.Contains(got, "index 9 out of bounds for length 4") {
+		t.Fatalf("missing bounds panic, got %q", got)
 	}
 }
 

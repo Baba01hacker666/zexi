@@ -39,6 +39,16 @@ type Options struct {
 	// into the binary for the `project_dir()` builtin. Empty means "unknown",
 	// and `project_dir()` then yields "".
 	ProjectDir string
+	// Bounds, when non-nil, receives how many statically known index checks
+	// were emitted and how many were elided by conservative bounds-check
+	// elimination. It is a diagnostic counter, not a compilation input.
+	Bounds *BoundsStats
+}
+
+// BoundsStats counts bounds-checked indexes in the generated program.
+type BoundsStats struct {
+	Checked int // zx_bounds(...) calls emitted
+	Elided  int // indexes proven in range and emitted unchecked
 }
 
 type gen struct {
@@ -96,6 +106,22 @@ type gen struct {
 	// ret is the declared return type of the function being emitted, used to
 	// coerce a returned array borrow into a slice.
 	ret *types.Type
+	// boundsFacts are loop-variable ranges proven while their loop body is
+	// being emitted. A fact is dropped when the loop ends, and killed if the
+	// variable (or the slice whose length it was compared against) is
+	// assigned or borrowed exclusively inside the body.
+	boundsFacts []boundsFact
+}
+
+// boundsFact records that loop variable `cvar` is in `[0, hi)` throughout the
+// current loop body. When `sliceC` is set, the body's exclusive bound is also
+// the length of that local slice, so indexing `sliceC` with the variable is in
+// range too.
+type boundsFact struct {
+	cvar   string
+	hi     int64
+	sliceC string
+	dead   bool
 }
 
 // pendingMove is an owned pattern binding whose move out of the scrutinee is
@@ -1658,11 +1684,13 @@ func (g *gen) forStmt(x *ast.LoopExpr) string {
 	name := g.bindLoopVar(x.Pat)
 	g.w.line("for (%s %s = %s; %s %s %s; %s++) {", ctype(lt), name, lo, name, op, hi, name)
 	g.w.indent++
+	g.pushBoundsFact(rng, name)
 	res := g.loopResult(x)
 	brk, cont := g.openLoop(res)
 	g.blockStmts(x.Body, nil)
 	g.closeLoop()
 	g.endLoopBody(cont)
+	g.popBoundsFact()
 	g.w.indent--
 	g.w.line("}")
 	g.w.line("%s: ;", brk)
@@ -1978,6 +2006,126 @@ func (g *gen) lambdaValue(x *ast.LambdaExpr) string {
 
 // --- expressions ----------------------------------------------------------
 
+const (
+	maxInt64 = int64(1<<63 - 1)
+	minInt64 = -maxInt64 - 1
+)
+
+// constInt folds an integer constant expression far enough to compare a loop
+// bound with an array length. Anything it cannot prove returns false, which
+// only means the bounds check stays.
+func (g *gen) constInt(e ast.Expr) (int64, bool) {
+	switch x := e.(type) {
+	case *ast.LiteralExpr:
+		if x.Kind != token.KindInteger {
+			return 0, false
+		}
+		return parseIntLiteral(x.Text)
+	case *ast.IdentExpr:
+		return g.constIntName(x.Name)
+	case *ast.PathExpr:
+		if len(x.Segments) == 1 {
+			return g.constIntName(x.Segments[0])
+		}
+	case *ast.UnExpr:
+		if x.Op == token.KindMinus {
+			if v, ok := g.constInt(x.X); ok && v != minInt64 {
+				return -v, true
+			}
+		}
+	case *ast.CastExpr:
+		return g.constInt(x.X)
+	case *ast.BinExpr:
+		a, ok := g.constInt(x.L)
+		if !ok {
+			return 0, false
+		}
+		b, ok := g.constInt(x.R)
+		if !ok {
+			return 0, false
+		}
+		switch x.Op {
+		case token.KindPlus:
+			if (b > 0 && a > maxInt64-b) || (b < 0 && a < minInt64-b) {
+				return 0, false
+			}
+			return a + b, true
+		case token.KindMinus:
+			if (b < 0 && a > maxInt64+b) || (b > 0 && a < minInt64+b) {
+				return 0, false
+			}
+			return a - b, true
+		case token.KindStar:
+			c := a * b
+			if a != 0 && c/a != b {
+				return 0, false
+			}
+			return c, true
+		}
+	case *ast.MethodCallExpr:
+		if x.Name == "len" && len(x.Args) == 0 {
+			return g.constArrayLen(x.Recv)
+		}
+	case *ast.CallExpr:
+		if id, ok := x.Callee.(*ast.IdentExpr); ok && id.Name == "len" && len(x.Args) == 1 {
+			return g.constArrayLen(x.Args[0])
+		}
+	}
+	return 0, false
+}
+
+func (g *gen) constIntName(name string) (int64, bool) {
+	cn := g.info.Consts[name]
+	if cn == nil || cn.Val.Ty == nil || !cn.Val.Ty.Kind.IsInt() {
+		return 0, false
+	}
+	if cn.Val.Ty.Kind.IsSigned() {
+		return cn.Val.Int, true
+	}
+	if cn.Val.Uint > uint64(maxInt64) {
+		return 0, false
+	}
+	return int64(cn.Val.Uint), true
+}
+
+func (g *gen) constArrayLen(e ast.Expr) (int64, bool) {
+	t := g.info.TypeOf(e)
+	if t == nil {
+		return 0, false
+	}
+	if t.Kind == types.Array {
+		return t.Len, true
+	}
+	if (t.Kind == types.Ref || t.Kind == types.Ptr) && t.Elem != nil && t.Elem.Kind == types.Array {
+		return t.Elem.Len, true
+	}
+	return 0, false
+}
+
+// parseIntLiteral parses a Zexi integer literal (decimal, 0x, 0o, 0b, with
+// optional underscores).
+func parseIntLiteral(text string) (int64, bool) {
+	s := strings.ReplaceAll(text, "_", "")
+	base := 10
+	if len(s) > 2 && s[0] == '0' {
+		switch s[1] {
+		case 'x', 'X':
+			base, s = 16, s[2:]
+		case 'o', 'O':
+			base, s = 8, s[2:]
+		case 'b', 'B':
+			base, s = 2, s[2:]
+		}
+	}
+	if v, err := strconv.ParseInt(s, base, 64); err == nil {
+		return v, true
+	}
+	if v, err := strconv.ParseUint(s, base, 64); err == nil && v <= uint64(maxInt64) {
+		return int64(v), true
+	}
+	return 0, false
+}
+
 // value emits e as a C expression. Compound expressions that contain
 // statements are wrapped in a GNU statement expression, `({ ... })`.
 func (g *gen) value(e ast.Expr) string {
@@ -2039,6 +2187,11 @@ func (g *gen) value(e ast.Expr) string {
 			}
 			return "(*" + g.value(x.X) + ")"
 		case token.KindAmp:
+			if x.Mut {
+				// An exclusive borrow can write the local, so any proven range
+				// for it (or for the slice it names) no longer holds.
+				g.killBoundsFact(x.X)
+			}
 			if t := g.info.TypeOf(x); t != nil && t.Kind == types.Ref && isSliceLike(t) {
 				return g.value(x.X)
 			}
@@ -3414,20 +3567,35 @@ func (g *gen) arrayLitValue(x *ast.ArrayLitExpr) string {
 	return "((" + name + "){ .e = { " + strings.Join(vals, ", ") + " } })"
 }
 
-// indexValue emits a bounds-checked array index.
+// indexValue emits a bounds-checked array index. A conservative subset of
+// checks is elided: when the index is a loop variable whose `for i in 0..hi`
+// range is known and the receiver is a fixed-length array of at least `hi`
+// elements, or a shared slice whose length is that very bound, the check
+// cannot fail and is left out. Everything else is still checked.
 func (g *gen) indexValue(x *ast.IndexExpr) string {
 	rt := g.info.TypeOf(x.Recv)
 	recv := g.value(x.Recv)
 	idx := g.value(x.Index)
 	if rt != nil && rt.Kind == types.Array {
+		if g.indexInRange(x.Index, rt, "") {
+			g.noteBounds(true)
+			return "(" + recv + ").e[" + idx + "]"
+		}
+		g.noteBounds(false)
 		return "(" + recv + ").e[zx_bounds(" + idx + ", " + strconv.FormatInt(rt.Len, 10) + ")]"
 	}
 	// Indexing a reference to a fixed array reads through the pointer, so a
 	// buffer filled by C is readable (and writable) from Zexi.
 	if rt != nil && (rt.Kind == types.Ref || rt.Kind == types.Ptr) && rt.Elem != nil && rt.Elem.Kind == types.Array {
+		if g.indexInRange(x.Index, rt, "") {
+			g.noteBounds(true)
+			return "(" + recv + ")->e[" + idx + "]"
+		}
+		g.noteBounds(false)
 		return "(" + recv + ")->e[zx_bounds(" + idx + ", " + strconv.FormatInt(rt.Elem.Len, 10) + ")]"
 	}
 	if base := recvBase(rt); base != nil && base.Kind == types.VecKind {
+		g.noteBounds(false)
 		return vecIndex("("+g.vecReceiverValue(x.Recv)+")", idx)
 	}
 	if isSliceLike(rt) {
@@ -3435,14 +3603,162 @@ func (g *gen) indexValue(x *ast.IndexExpr) string {
 			// Keep the element expression an lvalue so `buf[i] = v` and
 			// `&buf[i]` work. A place receiver has no side effects, so reading
 			// it twice costs nothing observable.
+			if g.indexInRange(x.Index, rt, recv) {
+				g.noteBounds(true)
+				return "(" + recv + ").ptr[" + idx + "]"
+			}
+			g.noteBounds(false)
 			return "(" + recv + ").ptr[zx_bounds(" + idx + ", (int64_t)(" + recv + ").len)]"
 		}
 		// Bind the slice once: its receiver may have side effects.
+		g.noteBounds(false)
 		s := g.tmpName()
 		return "({ " + ctype(rt) + " " + s + " = " + recv + "; " + s +
 			".ptr[zx_bounds(" + idx + ", (int64_t)" + s + ".len)]; })"
 	}
 	return "(" + recv + ")[" + idx + "]"
+}
+
+// noteBounds records one index site for --report-bounds.
+func (g *gen) noteBounds(elided bool) {
+	if g.opts.Bounds == nil {
+		return
+	}
+	if elided {
+		g.opts.Bounds.Elided++
+	} else {
+		g.opts.Bounds.Checked++
+	}
+}
+
+// indexInRange reports whether `idx` is a loop variable whose proven range
+// covers the fixed array (recvLen > 0) or the shared slice whose C expression
+// is recvC. `idx` may be wrapped in integer casts (`i as usize`).
+func (g *gen) indexInRange(idx ast.Expr, recvTy *types.Type, recvC string) bool {
+	base := idx
+	for {
+		c, ok := base.(*ast.CastExpr)
+		if !ok {
+			break
+		}
+		base = c.X
+	}
+	id, ok := base.(*ast.IdentExpr)
+	if !ok {
+		return false
+	}
+	cvar, ok := g.lookupLocal(id.Name)
+	if !ok {
+		return false
+	}
+	for i := len(g.boundsFacts) - 1; i >= 0; i-- {
+		f := &g.boundsFacts[i]
+		if f.dead || f.cvar != cvar || (f.hi <= 0 && f.sliceC == "") {
+			continue
+		}
+		switch {
+		case recvTy != nil && recvTy.Kind == types.Array:
+			// A slice-length fact says nothing about this array (the slice
+			// may view a different object), so only a constant range counts.
+			if f.hi > 0 {
+				return f.hi <= recvTy.Len
+			}
+		case recvTy != nil && (recvTy.Kind == types.Ref || recvTy.Kind == types.Ptr) && recvTy.Elem != nil && recvTy.Elem.Kind == types.Array:
+			if f.hi > 0 {
+				return f.hi <= recvTy.Elem.Len
+			}
+		case recvC != "" && f.sliceC != "" && f.sliceC == recvC:
+			return true
+		}
+	}
+	return false
+}
+
+// pushBoundsFact records the range proven by a `for i in lo..hi` loop. Only
+// `lo == 0` is used: a nonzero lower bound would need the index check to stay
+// (the fact is about the upper bound alone).
+func (g *gen) pushBoundsFact(rng *ast.BinExpr, cvar string) {
+	if v, ok := g.constInt(rng.L); !ok || v != 0 {
+		return
+	}
+	f := boundsFact{cvar: cvar}
+	if rng.Op == token.KindDotDotEq {
+		v, ok := g.constInt(rng.R)
+		if !ok || v == maxInt64 {
+			return
+		}
+		f.hi = v + 1
+	} else if v, ok := g.constInt(rng.R); ok {
+		f.hi = v
+	} else if recv, ok := sliceLenArg(rng.R); ok {
+		// `for i in 0..s.len()` over a shared slice `s`: the bound is the
+		// runtime length, so only the same local place can use it, and only
+		// while it is not reassigned (assignValue kills the fact).
+		id, ok := recv.(*ast.IdentExpr)
+		if !ok {
+			return
+		}
+		t := g.info.TypeOf(recv)
+		if t == nil {
+			return
+		}
+		shared := t.Kind == types.Slice ||
+			(t.Kind == types.Ref && !t.Mut && t.Elem != nil && t.Elem.Kind == types.Slice)
+		if !shared {
+			return
+		}
+		c, ok := g.lookupLocal(id.Name)
+		if !ok {
+			return
+		}
+		f.sliceC = c
+	} else {
+		return
+	}
+	if f.hi == 0 && f.sliceC == "" {
+		return
+	}
+	g.boundsFacts = append(g.boundsFacts, f)
+}
+
+func (g *gen) popBoundsFact() {
+	if n := len(g.boundsFacts); n > 0 {
+		g.boundsFacts = g.boundsFacts[:n-1]
+	}
+}
+
+// killBoundsFact invalidates any fact that mentions `lhs` after it is assigned
+// (or borrowed exclusively), so a reassigned loop variable or slice never
+// keeps a stale range.
+func (g *gen) killBoundsFact(lhs ast.Expr) {
+	id, ok := lhs.(*ast.IdentExpr)
+	if !ok {
+		return
+	}
+	c, ok := g.lookupLocal(id.Name)
+	if !ok {
+		return
+	}
+	for i := range g.boundsFacts {
+		f := &g.boundsFacts[i]
+		if f.cvar == c || (f.sliceC != "" && f.sliceC == c) {
+			f.dead = true
+		}
+	}
+}
+
+// sliceLenArg returns the receiver of a length expression: `x.len()` or
+// `len(x)`.
+func sliceLenArg(e ast.Expr) (ast.Expr, bool) {
+	if m, ok := e.(*ast.MethodCallExpr); ok && m.Name == "len" && len(m.Args) == 0 {
+		return m.Recv, true
+	}
+	if c, ok := e.(*ast.CallExpr); ok {
+		if id, ok := c.Callee.(*ast.IdentExpr); ok && id.Name == "len" && len(c.Args) == 1 {
+			return c.Args[0], true
+		}
+	}
+	return nil, false
 }
 
 // sliceValue emits a Python-style slice `s[lo:hi]` as an owning String.
@@ -4546,6 +4862,9 @@ func (g *gen) emitReturn(val ast.Expr) {
 // assignValue emits an assignment; for resource-owning targets the old value is
 // dropped first, and resource-owning sources are moved.
 func (g *gen) assignValue(x *ast.AssignExpr) string {
+	// A loop variable (or the slice whose length bounded the loop) that is
+	// written anywhere in the body invalidates the range proven at the top.
+	g.killBoundsFact(x.Lhs)
 	if x.Op == token.KindPlusEq {
 		if lt := g.info.TypeOf(x.Lhs); lt != nil && lt.Kind == types.StringKind {
 			lhs := g.value(x.Lhs)

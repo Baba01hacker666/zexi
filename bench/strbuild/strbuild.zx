@@ -1,11 +1,16 @@
-// bench/strbuild/strbuild.zx — owning String growth: 200k formatted appends,
-// then a byte-by-byte hash of the result. The C twin is strbuild.c; both must
-// print the same `strbuild <len> <hash>` line.
+// bench/strbuild/strbuild.zx — owning String growth: 800k formatted appends
+// per size unit, then a byte-by-byte hash of the result. argv[1] is the scale
+// (default 1). The C and Rust twins are strbuild.c and strbuild.rs; all three
+// print the same `strbuild <scale> <len> <hash>` line.
 
 fn main() -> i32 {
+    let mut scale: i64 = if arg_count() > 1 { arg_at(1).parse_i64() } else { 1 };
+    if scale < 1 {
+        scale = 1;
+    }
     let mut s = String::new();
     let mut i: i64 = 0;
-    while i < 800000 {
+    while i < 800000 * scale {
         s.push_str("item ");
         s += i;
         s.push('\n');
@@ -17,6 +22,6 @@ fn main() -> i32 {
         h = (h * 131 + s.byte_at(k)) % 2147483647;
         k += 1;
     }
-    println("strbuild", s.len(), h);
+    println("strbuild", scale, s.len(), h);
     0
 }

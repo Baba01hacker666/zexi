@@ -1,5 +1,7 @@
-// bench/fib/fib.zx — recursive call overhead: naive fibonacci, three runs.
-// The C twin is fib.c; both must print `fib 17108661`.
+// bench/fib/fib.zx — recursive call overhead: naive fibonacci, 12 runs per
+// size unit. argv[1] scales the number of runs (default 1). The C and Rust
+// twins are fib.c and fib.rs; all three must print the same
+// `fib <scale> <checksum>` line.
 
 fn fib(n: i64) -> i64 {
     if n < 2 {
@@ -9,12 +11,19 @@ fn fib(n: i64) -> i64 {
 }
 
 fn main() -> i32 {
+    let mut scale: i64 = if arg_count() > 1 { arg_at(1).parse_i64() } else { 1 };
+    if scale < 1 {
+        scale = 1;
+    }
+    // Keep the argument runtime-derived so no compiler can fold the
+    // whole recursive call away (and so all three twins do the same work).
+    let n: i64 = 34 + scale % 2;
     let mut acc: i64 = 0;
     let mut i: i64 = 0;
-    while i < 12 {
-        acc += fib(34);
+    while i < 12 * scale {
+        acc += fib(n);
         i += 1;
     }
-    println("fib", acc);
+    println("fib", scale, acc);
     0
 }

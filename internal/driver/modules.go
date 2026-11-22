@@ -197,6 +197,23 @@ func newLoader(em *diag.Emitter) *loader {
 
 // loadDiskFile loads one file from disk and everything it imports, returning
 // the file's id in the emitter's table.
+// diskPaths returns the absolute paths of every on-disk file the loader read,
+// sorted. Inline `mod { ... }` blocks and embedded standard-library modules
+// are not files and are deliberately absent.
+func (l *loader) diskPaths() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range l.order {
+		if !strings.HasPrefix(m.key, "file:") || seen[m.key] {
+			continue
+		}
+		seen[m.key] = true
+		out = append(out, strings.TrimPrefix(m.key, "file:"))
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (l *loader) loadDiskFile(filePath string) int {
 	m := l.loadDisk(filePath)
 	if m == nil {

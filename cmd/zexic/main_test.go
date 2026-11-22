@@ -38,6 +38,18 @@ func TestParseArgsOptimizationShorthand(t *testing.T) {
 	}
 }
 
+// TestParseArgsCacheAndBounds checks the flags that change diagnostics and
+// `run`'s caching without changing the program.
+func TestParseArgsCacheAndBounds(t *testing.T) {
+	c := parseArgs([]string{"--report-bounds", "--no-cache", "main.zx"})
+	if !c.reportBounds || !c.noCache {
+		t.Fatalf("reportBounds=%v noCache=%v, want both true", c.reportBounds, c.noCache)
+	}
+	if len(c.unknown) != 0 {
+		t.Fatalf("flags were reported as unknown: %v", c.unknown)
+	}
+}
+
 // TestParseArgsAdd checks the module-manager flags.
 func TestParseArgsAdd(t *testing.T) {
 	c := parseArgs([]string{"sqlite", "--force", "--dir=vendor"})

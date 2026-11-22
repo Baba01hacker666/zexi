@@ -1,14 +1,16 @@
 # Zexi benchmarks
 
-Small, honest benchmarks: each one exists as a Zexi program and as the same
-program in plain C, both compiled by the same C compiler at `-O2`, both
-required to print the same checksum. The harness (`run_bench.py`) refuses to
-rank a pair whose outputs differ — a faster program that computes something
-else is not a result.
+Small, honest benchmarks. Each one exists as a Zexi program and as the same
+program in plain C, with a Rust twin where the toolchain is present. Every
+implementation is built by its own compiler at the same optimization level and
+must print the same checksum line at the same size. The harness
+(`run_bench.py`) refuses to rank a row whose outputs differ — a faster program
+that computes something else is not a result.
 
-The rules are strict on purpose: whole-process wall time (startup included;
-the programs are sized so it is a rounding error), checksum agreement between
-implementations, and the same toolchain for every row.
+The rules are strict on purpose: whole-process wall time (startup included),
+one untimed warmup run per binary before the timed rounds, per-process peak
+RSS from `wait4`, checksum agreement between implementations, and the same
+numbers for the Zexi and C rows.
 
 ## Benchmarks
 
@@ -20,23 +22,52 @@ implementations, and the same toolchain for every row.
 | `matmul` | f64 matrix multiply over flat arrays |
 | `strbuild` | owning `String` growth: repeated formatted appends |
 | `match` | `match` dispatch in a hot state machine |
+| `bounds` | `for i in 0..len` indexing over a fixed array and a shared slice |
 
-Each directory holds `<name>.zx` and `<name>.c`, with the checksum rule
-written at the top of both.
+Each directory holds `<name>.zx` and `<name>.c`, plus `<name>.rs` when a Rust
+twin exists, with the checksum rule written at the top of the sources.
+
+`fib` deliberately has no Rust twin: LLVM rewrites that exponential recursion
+into a linear loop, so the Rust build would print the same checksum while doing
+a small fraction of the work. The C and Zexi builds keep the recursion.
+
+## Sizes
+
+Every program takes an optional first argument, the **scale factor**, and
+repeats its workload that many times. The default is 1, so the checksums in the
+source comments describe the default run; each size prints
+`<name> <scale> <checksum>`. This keeps memory use fixed while time scales,
+which is what the harness needs to compare rows at different sizes.
 
 ## Running
 
 ```sh
-python3 bench/run_bench.py                # build, verify, time, write results.md
-python3 bench/run_bench.py --only fib     # one benchmark
-python3 bench/run_bench.py --reps 5       # more timing rounds
-python3 bench/run_bench.py --exe ./zexic  # a prebuilt compiler
+python3 bench/run_bench.py                     # sizes 1,2,4, three timed rounds
+python3 bench/run_bench.py --only fib,sort     # a subset
+python3 bench/run_bench.py --sizes 1,3         # chosen scale factors
+python3 bench/run_bench.py --reps 5            # more timing rounds
+python3 bench/run_bench.py --warmup 2          # more warmup runs
+python3 bench/run_bench.py --exe ./zexic       # a prebuilt compiler
 ```
 
 `zexic` is built once with `go build` unless `--exe` is given; the C twins
 are built with `cc -std=gnu11 -O2 -fwrapv`, the flags `zexic` itself passes
-to the C compiler. Results land in [`results.md`](results.md) with the
-machine's details — compare rows only on the machine they name.
+to the C compiler. Rust twins are built with `rustc -O` when `rustc` is on
+`PATH` (or `--rustc` names one); without it those columns stay empty. Results
+land in [`results.md`](results.md) and [`results.json`](results.json), both
+recording the machine's details — compare rows only on the machine they name.
+`results.json` carries the same rows with per-implementation best/median
+milliseconds, peak RSS, and checksum, for tooling.
+
+## Bounds-check elimination
+
+`bench/bounds` is the target of the conservative bounds-check elimination in
+the C backend: the accumulation loop indexes a shared slice with
+`for i in 0..s.len()`, which the compiler can prove in range without the C
+optimizer's help. `zexic build bench/bounds/bounds.zx --report-bounds` reports
+`2 elided, 0 kept`. At `-O0` this is a large win (the helper call disappears);
+at `-O2` GCC already removes the check from this shape, so the row measures
+the same work either way.
 
 ## HTTP server load test
 

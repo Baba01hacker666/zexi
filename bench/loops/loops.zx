@@ -1,10 +1,15 @@
 // bench/loops/loops.zx — integer loop arithmetic with a running modulo.
-// The C twin is loops.c; both must print the same `loops <n>` line.
+// argv[1] scales the outer loop (default 1). The C and Rust twins are
+// loops.c and loops.rs; all three print the same `loops <scale> <checksum>`.
 
 fn main() -> i32 {
+    let mut scale: i64 = if arg_count() > 1 { arg_at(1).parse_i64() } else { 1 };
+    if scale < 1 {
+        scale = 1;
+    }
     let mut acc: i64 = 0;
     let mut i: i64 = 0;
-    while i < 5000 {
+    while i < 5000 * scale {
         let mut j: i64 = 0;
         while j < 5000 {
             acc = (acc + (i * 31 + j) % 1000003) % 1000003;
@@ -12,6 +17,6 @@ fn main() -> i32 {
         }
         i += 1;
     }
-    println("loops", acc);
+    println("loops", scale, acc);
     0
 }

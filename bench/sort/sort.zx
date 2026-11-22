@@ -1,6 +1,7 @@
 // bench/sort/sort.zx — in-place quicksort of an i64 array, four rounds of
-// (fill by LCG, sort, checksum). The C twin is sort.c; both must print the
-// same `sort <n>` line.
+// (fill by LCG, sort, checksum) per size unit. argv[1] scales the rounds
+// (default 1). The C and Rust twins are sort.c and sort.rs; all three must
+// print the same `sort <scale> <checksum>` line.
 
 const N: i64 = 400000;
 
@@ -29,10 +30,14 @@ fn quicksort(a: &mut [i64; 400000], lo: i64, hi: i64) {
 }
 
 fn main() -> i32 {
+    let mut scale: i64 = if arg_count() > 1 { arg_at(1).parse_i64() } else { 1 };
+    if scale < 1 {
+        scale = 1;
+    }
     let mut a: [i64; 400000] = [0; 400000];
     let mut checksum: i64 = 0;
     let mut round: i64 = 0;
-    while round < 4 {
+    while round < 4 * scale {
         let mut x: i64 = 12345 + round;
         let mut i: i64 = 0;
         while i < N {
@@ -49,6 +54,6 @@ fn main() -> i32 {
         }
         round += 1;
     }
-    println("sort", checksum);
+    println("sort", scale, checksum);
     0
 }

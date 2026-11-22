@@ -193,7 +193,24 @@ seam.
 - Inheritance.
 - Reflection/RTTI.
 
-## 5.6 Risks & mitigations
+## 5.6 Steps to maturity
+
+`NEXT_STEPS.md` §0 carries the ordered, measurable plan; this is the summary so
+the roadmap and the working notes cannot drift apart. Each gate closes only
+when its check runs in CI, not when the feature lands.
+
+| Gate | Promise | Exit criterion |
+| --- | --- | --- |
+| 1 | The test signal is trustworthy | `go test ./...` and `-race` green on amd64 and arm64, including the loopback HTTP tests; doc-example and sanitizer gates in CI |
+| 2 | Long-running processes do not grow | ASan corpus sweep reports 0 leaked bytes; closure environments and statement-scoped temporary drops are released |
+| 3 | Safe code cannot reach undefined behavior | 24 h differential fuzz between the C backend and the MIR interpreter with no mismatch or sanitizer report; every fixed soundness bug has a regression test |
+| 4 | Concurrency degrades fairly | A stalled head costs a poll, not a worker for its deadline; `-race` clean on server and pool tests; `Send` boundary decided |
+| 5 | The language surface is closed enough to document | `docs/02-language-spec.md` is normative and matches the compiler; `for s in &v` and owning `Vec::fold` either land or are documented as out of 1.0 |
+| 6 | Performance is tracked, not remembered | Checked-in `bench/results.json` baseline with a tolerance; every row within 1.25× of its C twin at `-O2`, or a written cause |
+| 7 | A stranger can install and debug it | `zexi fmt`, complete LSP, source-mapped debug info, tagged binaries with an install path; Windows supported or plainly declared unsupported |
+| 8 | 1.0 means something | CLI and language frozen; stability and security policies published; `v1.0.0` tagged only when gates 1–7 are closed |
+
+## 5.7 Risks & mitigations
 
 | Risk | Mitigation |
 | --- | --- |

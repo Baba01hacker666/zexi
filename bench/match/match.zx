@@ -1,11 +1,16 @@
 // bench/match/match.zx — match dispatch: a state machine with eight arms,
-// stepped 50 million times. The C twin is match.c; both must print the same
-// `match <n>` line.
+// 50 million steps per size unit. argv[1] is the scale (default 1). The C and
+// Rust twins are match.c and match.rs; all three print the same
+// `match <scale> <checksum>` line.
 
 fn main() -> i32 {
+    let mut scale: i64 = if arg_count() > 1 { arg_at(1).parse_i64() } else { 1 };
+    if scale < 1 {
+        scale = 1;
+    }
     let mut acc: i64 = 1;
     let mut k: i64 = 0;
-    while k < 50000000 {
+    while k < 50000000 * scale {
         let v = (k * 7 + 13) % 101;
         match k & 7 {
             0 => acc = acc + v,
@@ -19,6 +24,6 @@ fn main() -> i32 {
         }
         k += 1;
     }
-    println("match", acc);
+    println("match", scale, acc);
     0
 }

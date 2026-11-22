@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"zexi/internal/bindgen"
+	zenc "zexi/internal/codegen/c"
 	"zexi/internal/codegen/llvm"
 	"zexi/internal/diag"
 	"zexi/internal/driver"
@@ -113,6 +114,11 @@ type cli struct {
 	// unknown collects flags this version does not know, so they are reported
 	// instead of silently changing nothing.
 	unknown []string
+	// reportBounds prints how many index checks the C backend elided and how
+	// many it kept, on stderr, without changing the built program.
+	reportBounds bool
+	// noCache disables the `run` warm-build cache for this invocation.
+	noCache bool
 }
 
 func parseArgs(args []string) cli {
@@ -165,6 +171,10 @@ func parseArgs(args []string) cli {
 			// The classic spellings, so `zexic build -O2 x.zx` does not need
 			// --opt-level=.
 			c.optLevel = a[2:]
+		case a == "--report-bounds":
+			c.reportBounds = true
+		case a == "--no-cache":
+			c.noCache = true
 		case a == "--force":
 			c.force = true
 		case a == "--list":
@@ -180,6 +190,25 @@ func parseArgs(args []string) cli {
 		}
 	}
 	return c
+}
+
+// optsWithBounds returns the driver options, plus the counter object that
+// --report-bounds asks the C backend to fill.
+func (c cli) optsWithBounds() (driver.Options, *zenc.BoundsStats) {
+	o := c.opts()
+	if !c.reportBounds {
+		return o, nil
+	}
+	s := &zenc.BoundsStats{}
+	o.Bounds = s
+	return o, s
+}
+
+// reportBounds prints the C backend's counters when --report-bounds was given.
+func reportBounds(c cli, s *zenc.BoundsStats) {
+	if c.reportBounds && s != nil {
+		fmt.Fprintf(os.Stderr, "bounds checks: %d elided, %d kept\n", s.Elided, s.Checked)
+	}
 }
 
 func (c cli) opts() driver.Options {
@@ -330,11 +359,13 @@ func cmdBuild(c cli) int {
 	}
 	c.root = root
 	em := diag.NewEmitter()
-	out, ok := driver.BuildFiles(paths, c.out, c.opts(), em)
+	opts, stats := c.optsWithBounds()
+	out, ok := driver.BuildFiles(paths, c.out, opts, em)
 	if !ok {
 		renderDiags(c, em, emFileID(em))
 		return 1
 	}
+	reportBounds(c, stats)
 	fmt.Printf("built %s\n", out)
 	return 0
 }
@@ -348,6 +379,34 @@ func cmdRun(c cli) int {
 	// Arguments after a `--` separator belong to the program, not to the
 	// compiler: `zexic run app.zx -- arg1 arg2` runs app with arg1 arg2.
 	progArgs := c.progArgs
+	opts, stats := c.optsWithBounds()
+
+	// Warm path: a check-only front end names every file the program reads,
+	// which is enough to address an already-built binary. The front end is
+	// cheap; the C compile and link are what this avoids. --report-bounds
+	// bypasses it, because the counters describe codegen and a cache hit
+	// never reaches codegen.
+	var cacheDir, cacheKey string
+	if !c.noCache && !c.reportBounds {
+		checkOpts := opts
+		checkOpts.CheckOnly = true
+		checkOpts.Bounds = nil
+		checkEm := diag.NewEmitter()
+		art, ok := driver.FrontEndFiles(paths, checkOpts, checkEm)
+		if !ok {
+			renderDiags(c, checkEm, checkEm.FirstFileID())
+			return 1
+		}
+		if dir, ok := runCacheDir(); ok {
+			if key, ok := runCacheKey(art.Files, opts); ok {
+				cacheDir, cacheKey = dir, key
+				if bin, ok := cacheLookup(dir, key); ok {
+					return executeProgram(bin, progArgs)
+				}
+			}
+		}
+	}
+
 	em := diag.NewEmitter()
 	dir, err := os.MkdirTemp("", "zexic-run-")
 	if err != nil {
@@ -357,12 +416,23 @@ func cmdRun(c cli) int {
 	defer func() { _ = os.RemoveAll(dir) }()
 
 	out := filepath.Join(dir, driver.DefaultOutput(paths[0]))
-	if _, ok := driver.BuildFiles(paths, out, c.opts(), em); !ok {
+	if _, ok := driver.BuildFiles(paths, out, opts, em); !ok {
 		renderDiags(c, em, emFileID(em))
 		return 1
 	}
+	reportBounds(c, stats)
+	if cacheDir != "" {
+		if bin, ok := cacheStore(cacheDir, cacheKey, out); ok {
+			out = bin
+		}
+	}
+	return executeProgram(out, progArgs)
+}
 
-	child := exec.Command(out, progArgs...)
+// executeProgram runs a built program with the user's stdio and turns its exit
+// status into the compiler's.
+func executeProgram(path string, args []string) int {
+	child := exec.Command(path, args...)
 	child.Stdin = os.Stdin
 	child.Stdout = os.Stdout
 	child.Stderr = os.Stderr
@@ -397,13 +467,14 @@ func cmdEmit(c cli) int {
 	if c.emit == "llvm" {
 		return emitLLVM(paths, c, em)
 	}
-	opts := c.opts()
+	opts, stats := c.optsWithBounds()
 	opts.Jobs = 1 // emit prints one translation unit
 	art, ok := driver.FrontEndFiles(paths, opts, em)
 	if !ok {
 		renderDiags(c, em, emFileID(em))
 		return 1
 	}
+	reportBounds(c, stats)
 	fmt.Print(art.CSrc)
 	return 0
 }
@@ -531,7 +602,7 @@ usage:
 commands:
   check      parse, typecheck, and validate (no code generation)
   build      compile to a standalone native binary
-  run        build to a temporary path and execute
+  run        build (cached) and execute
   emit       print an intermediate form (--emit=c, --emit=mir, --emit=llvm)
   tokenize   print the token stream
   bindgen    generate Zexi extern declarations from a C header
@@ -555,6 +626,8 @@ An option this build does not know is an error, not a silent no-op.
 options:
   -o <path>                  output path for build (or for bindgen)
   --opt-level=<0|1|2|3|s|z>  optimization profile (default 2; also -O2, -Os)
+  --report-bounds            print index checks elided/kept by the C backend
+  --no-cache                 do not reuse run's cached binary
   --cc=<path>                C compiler to use (default $CC or cc)   --emit=<c|mir|llvm>        intermediate form to print
    --backend=<c|llvm>         code generator for build/run (default c)
   --root=<dir>               project root for named imports and mod

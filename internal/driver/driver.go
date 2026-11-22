@@ -68,6 +68,10 @@ type Options struct {
 	// shim). The LLVM backend covers the mirrored MIR subset and rejects a
 	// program that lowers to MIR outside it.
 	Backend string
+	// Bounds, when non-nil, is filled with the C backend's bounds-check
+	// counters (checks emitted and checks elided). The C backend is the only
+	// one that performs the elimination today.
+	Bounds *zenc.BoundsStats
 }
 
 // Artifacts is the result of a successful front end + codegen run.
@@ -93,6 +97,11 @@ type Artifacts struct {
 	// LinkDirs are directories the program asked for with `#[link_dir("path")]`,
 	// appended to Options.LibDirs.
 	LinkDirs []string
+	// Files lists the on-disk source files the loader read (the entry points
+	// plus every `use`/`import`/`mod` it reached), sorted. It is set even for
+	// a CheckOnly front end, so a caller can hash a program's inputs before
+	// deciding to build it.
+	Files []string
 }
 
 // FrontEnd runs lexing, parsing, type checking, and C generation. It returns
@@ -153,18 +162,18 @@ func FrontEndFiles(paths []string, opts Options, em *diag.Emitter) (*Artifacts, 
 	em.Report(semaDiags...)
 	if em.HasErrors() {
 		if opts.CheckOnly {
-			return &Artifacts{Info: info, FileID: l.firstID}, false
+			return &Artifacts{Info: info, FileID: l.firstID, Files: l.diskPaths()}, false
 		}
 		return nil, false
 	}
 	if opts.CheckOnly {
-		return &Artifacts{Info: info, FileID: l.firstID}, true
+		return &Artifacts{Info: info, FileID: l.firstID, Files: l.diskPaths()}, true
 	}
 
-	art := &Artifacts{Info: info, FileID: l.firstID}
+	art := &Artifacts{Info: info, FileID: l.firstID, Files: l.diskPaths()}
 	// Debug builds check integer overflow; release builds wrap (see
 	// docs/03-memory-model.md). Division by zero panics in both.
-	cgOpts := zenc.Options{DebugChecks: opts.OptLevel == "0", ProjectDir: l.root}
+	cgOpts := zenc.Options{DebugChecks: opts.OptLevel == "0", ProjectDir: l.root, Bounds: opts.Bounds}
 	if jobs := splitJobs(opts, len(info.FnOrder)); jobs > 1 {
 		header, units, cerr := zenc.GenerateSplit(info, cgOpts, jobs)
 		if cerr != nil {

@@ -1,0 +1,738 @@
+{
+  "generated": "2026-11-22T12:43:40",
+  "machine": "Linux x86_64",
+  "cc": "cc",
+  "rustc": "/home/baba01hacker/.cargo/bin/rustc",
+  "reps": 3,
+  "warmup": 1,
+  "sizes": [
+    1,
+    2,
+    4
+  ],
+  "results": [
+    {
+      "benchmark": "fib",
+      "size": 1,
+      "checksum": [
+        "fib 1 110729580"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "fib 1 110729580"
+          ],
+          "best_ms": 297.38407395780087,
+          "median_ms": 309.4171741977334,
+          "rss_kb": 1064,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "fib 1 110729580"
+          ],
+          "best_ms": 276.7419507727027,
+          "median_ms": 277.39263232797384,
+          "rss_kb": 1060,
+          "ratio_vs_zexi": 1.074589787083102
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "fib",
+      "size": 2,
+      "checksum": [
+        "fib 2 136869288"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "fib 2 136869288"
+          ],
+          "best_ms": 402.91418228298426,
+          "median_ms": 403.54412281885743,
+          "rss_kb": 1076,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "fib 2 136869288"
+          ],
+          "best_ms": 376.6899327747524,
+          "median_ms": 382.80107034370303,
+          "rss_kb": 1060,
+          "ratio_vs_zexi": 1.0696176011794643
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "fib",
+      "size": 4,
+      "checksum": [
+        "fib 4 273738576"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "fib 4 273738576"
+          ],
+          "best_ms": 813.9505269937217,
+          "median_ms": 839.9998489767313,
+          "rss_kb": 1076,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "fib 4 273738576"
+          ],
+          "best_ms": 748.4951899386942,
+          "median_ms": 755.953773856163,
+          "rss_kb": 1084,
+          "ratio_vs_zexi": 1.0874492420724688
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "loops",
+      "size": 1,
+      "checksum": [
+        "loops 1 1218"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "loops 1 1218"
+          ],
+          "best_ms": 81.65688486769795,
+          "median_ms": 83.01284210756421,
+          "rss_kb": 1100,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "loops 1 1218"
+          ],
+          "best_ms": 81.81741088628769,
+          "median_ms": 82.66824623569846,
+          "rss_kb": 1168,
+          "ratio_vs_zexi": 0.9980379968413711
+        },
+        "rust": {
+          "checksum": [
+            "loops 1 1218"
+          ],
+          "best_ms": 85.34443704411387,
+          "median_ms": 85.57498035952449,
+          "rss_kb": 1172,
+          "ratio_vs_zexi": 0.9567921202115394
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "loops",
+      "size": 2,
+      "checksum": [
+        "loops 2 377472"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "loops 2 377472"
+          ],
+          "best_ms": 162.92732767760754,
+          "median_ms": 163.94409025087953,
+          "rss_kb": 1084,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "loops 2 377472"
+          ],
+          "best_ms": 167.38468734547496,
+          "median_ms": 168.58689906075597,
+          "rss_kb": 1088,
+          "ratio_vs_zexi": 0.9733705649031824
+        },
+        "rust": {
+          "checksum": [
+            "loops 2 377472"
+          ],
+          "best_ms": 170.23990582674742,
+          "median_ms": 171.4392900466919,
+          "rss_kb": 1260,
+          "ratio_vs_zexi": 0.9570454523360589
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "loops",
+      "size": 4,
+      "checksum": [
+        "loops 4 255082"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "loops 4 255082"
+          ],
+          "best_ms": 330.4021768271923,
+          "median_ms": 332.28011801838875,
+          "rss_kb": 1168,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "loops 4 255082"
+          ],
+          "best_ms": 327.1804046817124,
+          "median_ms": 327.7454930357635,
+          "rss_kb": 1104,
+          "ratio_vs_zexi": 1.0098470816081242
+        },
+        "rust": {
+          "checksum": [
+            "loops 4 255082"
+          ],
+          "best_ms": 337.1851211413741,
+          "median_ms": 339.83463887125254,
+          "rss_kb": 1196,
+          "ratio_vs_zexi": 0.9798836191489664
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "sort",
+      "size": 1,
+      "checksum": [
+        "sort 1 82802822"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "sort 1 82802822"
+          ],
+          "best_ms": 149.00033874437213,
+          "median_ms": 149.6999696828425,
+          "rss_kb": 4072,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "sort 1 82802822"
+          ],
+          "best_ms": 134.7263902425766,
+          "median_ms": 136.53270294889808,
+          "rss_kb": 4240,
+          "ratio_vs_zexi": 1.1059476801545347
+        },
+        "rust": {
+          "checksum": [
+            "sort 1 82802822"
+          ],
+          "best_ms": 126.82170514017344,
+          "median_ms": 131.12485501915216,
+          "rss_kb": 5116,
+          "ratio_vs_zexi": 1.1748804242908193
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "sort",
+      "size": 2,
+      "checksum": [
+        "sort 2 165562169"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "sort 2 165562169"
+          ],
+          "best_ms": 298.22941636666656,
+          "median_ms": 298.45277685672045,
+          "rss_kb": 4092,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "sort 2 165562169"
+          ],
+          "best_ms": 268.80889711901546,
+          "median_ms": 270.58000722900033,
+          "rss_kb": 4204,
+          "ratio_vs_zexi": 1.1094477138330177
+        },
+        "rust": {
+          "checksum": [
+            "sort 2 165562169"
+          ],
+          "best_ms": 251.92668195813894,
+          "median_ms": 255.46348001807928,
+          "rss_kb": 5120,
+          "ratio_vs_zexi": 1.1837944835720953
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "sort",
+      "size": 4,
+      "checksum": [
+        "sort 4 331116141"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "sort 4 331116141"
+          ],
+          "best_ms": 595.733305439353,
+          "median_ms": 599.3724088184536,
+          "rss_kb": 4124,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "sort 4 331116141"
+          ],
+          "best_ms": 543.22942905128,
+          "median_ms": 544.6311859413981,
+          "rss_kb": 4180,
+          "ratio_vs_zexi": 1.096651384443159
+        },
+        "rust": {
+          "checksum": [
+            "sort 4 331116141"
+          ],
+          "best_ms": 499.97499166056514,
+          "median_ms": 516.491670627147,
+          "rss_kb": 5196,
+          "ratio_vs_zexi": 1.1915262070623696
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "matmul",
+      "size": 1,
+      "checksum": [
+        "matmul 1 6039418360"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "matmul 1 6039418360"
+          ],
+          "best_ms": 100.99636111408472,
+          "median_ms": 102.01131831854582,
+          "rss_kb": 2524,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "matmul 1 6039418360"
+          ],
+          "best_ms": 99.51908187940717,
+          "median_ms": 103.51980198174715,
+          "rss_kb": 2752,
+          "ratio_vs_zexi": 1.014844180701623
+        },
+        "rust": {
+          "checksum": [
+            "matmul 1 6039418360"
+          ],
+          "best_ms": 90.7025239430368,
+          "median_ms": 92.2056520357728,
+          "rss_kb": 3628,
+          "ratio_vs_zexi": 1.1134900852098966
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "matmul",
+      "size": 2,
+      "checksum": [
+        "matmul 2 12078836720"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "matmul 2 12078836720"
+          ],
+          "best_ms": 199.88795602694154,
+          "median_ms": 204.68019507825375,
+          "rss_kb": 3056,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "matmul 2 12078836720"
+          ],
+          "best_ms": 201.3269430026412,
+          "median_ms": 203.95205589011312,
+          "rss_kb": 2756,
+          "ratio_vs_zexi": 0.9928524868344085
+        },
+        "rust": {
+          "checksum": [
+            "matmul 2 12078836720"
+          ],
+          "best_ms": 181.6008137539029,
+          "median_ms": 183.42028185725212,
+          "rss_kb": 3624,
+          "ratio_vs_zexi": 1.1006996714112776
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "matmul",
+      "size": 4,
+      "checksum": [
+        "matmul 4 24157673440"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "matmul 4 24157673440"
+          ],
+          "best_ms": 407.7611230313778,
+          "median_ms": 429.4711258262396,
+          "rss_kb": 2520,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "matmul 4 24157673440"
+          ],
+          "best_ms": 401.38909593224525,
+          "median_ms": 414.2025248147547,
+          "rss_kb": 2760,
+          "ratio_vs_zexi": 1.0158749382175747
+        },
+        "rust": {
+          "checksum": [
+            "matmul 4 24157673440"
+          ],
+          "best_ms": 367.3290889710188,
+          "median_ms": 375.3089578822255,
+          "rss_kb": 3608,
+          "ratio_vs_zexi": 1.1100703300509613
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "strbuild",
+      "size": 1,
+      "checksum": [
+        "strbuild 1 9488890 1705800086"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "strbuild 1 9488890 1705800086"
+          ],
+          "best_ms": 194.61947493255138,
+          "median_ms": 195.56447491049767,
+          "rss_kb": 10728,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "strbuild 1 9488890 1705800086"
+          ],
+          "best_ms": 160.8735197223723,
+          "median_ms": 162.06802381202579,
+          "rss_kb": 10904,
+          "ratio_vs_zexi": 1.2097669975047243
+        },
+        "rust": {
+          "checksum": [
+            "strbuild 1 9488890 1705800086"
+          ],
+          "best_ms": 112.68156440928578,
+          "median_ms": 114.39633183181286,
+          "rss_kb": 11492,
+          "ratio_vs_zexi": 1.727163409141605
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "strbuild",
+      "size": 2,
+      "checksum": [
+        "strbuild 2 19688890 1608600750"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "strbuild 2 19688890 1608600750"
+          ],
+          "best_ms": 385.04157261922956,
+          "median_ms": 394.1456936299801,
+          "rss_kb": 20808,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "strbuild 2 19688890 1608600750"
+          ],
+          "best_ms": 343.89533707872033,
+          "median_ms": 347.5832766853273,
+          "rss_kb": 20692,
+          "ratio_vs_zexi": 1.119647552915469
+        },
+        "rust": {
+          "checksum": [
+            "strbuild 2 19688890 1608600750"
+          ],
+          "best_ms": 228.91554702073336,
+          "median_ms": 235.8245039358735,
+          "rss_kb": 21260,
+          "ratio_vs_zexi": 1.682024561592383
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "strbuild",
+      "size": 4,
+      "checksum": [
+        "strbuild 4 40488890 1993407522"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "strbuild 4 40488890 1993407522"
+          ],
+          "best_ms": 682.8664550557733,
+          "median_ms": 789.5146789960563,
+          "rss_kb": 40988,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "strbuild 4 40488890 1993407522"
+          ],
+          "best_ms": 662.9565949551761,
+          "median_ms": 689.6783253178,
+          "rss_kb": 41036,
+          "ratio_vs_zexi": 1.030031921021833
+        },
+        "rust": {
+          "checksum": [
+            "strbuild 4 40488890 1993407522"
+          ],
+          "best_ms": 414.6662959828973,
+          "median_ms": 456.63154404610395,
+          "rss_kb": 41564,
+          "ratio_vs_zexi": 1.6467855277148875
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "match",
+      "size": 1,
+      "checksum": [
+        "match 1 -2375962546044384073"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "match 1 -2375962546044384073"
+          ],
+          "best_ms": 399.3068370036781,
+          "median_ms": 402.00049290433526,
+          "rss_kb": 1084,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "match 1 -2375962546044384073"
+          ],
+          "best_ms": 410.3354178369045,
+          "median_ms": 415.73793068528175,
+          "rss_kb": 1072,
+          "ratio_vs_zexi": 0.9731230102159742
+        },
+        "rust": {
+          "checksum": [
+            "match 1 -2375962546044384073"
+          ],
+          "best_ms": 389.60995292291045,
+          "median_ms": 458.30520102754235,
+          "rss_kb": 1176,
+          "ratio_vs_zexi": 1.024888697036665
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "match",
+      "size": 2,
+      "checksum": [
+        "match 2 -1851445699538411986"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "match 2 -1851445699538411986"
+          ],
+          "best_ms": 671.399706043303,
+          "median_ms": 713.0596442148089,
+          "rss_kb": 1096,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "match 2 -1851445699538411986"
+          ],
+          "best_ms": 805.1011236384511,
+          "median_ms": 813.4693945758045,
+          "rss_kb": 1160,
+          "ratio_vs_zexi": 0.8339321438393748
+        },
+        "rust": {
+          "checksum": [
+            "match 2 -1851445699538411986"
+          ],
+          "best_ms": 725.8910108357668,
+          "median_ms": 729.4253292493522,
+          "rss_kb": 1180,
+          "ratio_vs_zexi": 0.9249318369024514
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "match",
+      "size": 4,
+      "checksum": [
+        "match 4 1184204275092194976"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "match 4 1184204275092194976"
+          ],
+          "best_ms": 1461.3389717414975,
+          "median_ms": 1482.7684238553047,
+          "rss_kb": 1160,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "match 4 1184204275092194976"
+          ],
+          "best_ms": 1410.350994206965,
+          "median_ms": 1471.59832296893,
+          "rss_kb": 1080,
+          "ratio_vs_zexi": 1.0361526866318855
+        },
+        "rust": {
+          "checksum": [
+            "match 4 1184204275092194976"
+          ],
+          "best_ms": 1611.2089226953685,
+          "median_ms": 1745.600614696741,
+          "rss_kb": 1196,
+          "ratio_vs_zexi": 0.9069829189481178
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "bounds",
+      "size": 1,
+      "checksum": [
+        "bounds 1 1610603712"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "bounds 1 1610603712"
+          ],
+          "best_ms": 12.099756393581629,
+          "median_ms": 12.596180196851492,
+          "rss_kb": 5132,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "bounds 1 1610603712"
+          ],
+          "best_ms": 9.93850501254201,
+          "median_ms": 9.940069168806076,
+          "rss_kb": 5276,
+          "ratio_vs_zexi": 1.217462423001468
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "bounds",
+      "size": 2,
+      "checksum": [
+        "bounds 2 3221207424"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "bounds 2 3221207424"
+          ],
+          "best_ms": 22.078566253185272,
+          "median_ms": 23.860765155404806,
+          "rss_kb": 5176,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "bounds 2 3221207424"
+          ],
+          "best_ms": 17.94977579265833,
+          "median_ms": 18.24896316975355,
+          "rss_kb": 5268,
+          "ratio_vs_zexi": 1.230019054734693
+        }
+      },
+      "note": ""
+    },
+    {
+      "benchmark": "bounds",
+      "size": 4,
+      "checksum": [
+        "bounds 4 6442414848"
+      ],
+      "implementations": {
+        "zexi": {
+          "checksum": [
+            "bounds 4 6442414848"
+          ],
+          "best_ms": 41.43119137734175,
+          "median_ms": 42.579272761940956,
+          "rss_kb": 5156,
+          "ratio_vs_zexi": 1.0
+        },
+        "c": {
+          "checksum": [
+            "bounds 4 6442414848"
+          ],
+          "best_ms": 31.955039128661156,
+          "median_ms": 32.78308594599366,
+          "rss_kb": 5252,
+          "ratio_vs_zexi": 1.296546413557079
+        }
+      },
+      "note": ""
+    }
+  ]
+}

@@ -224,7 +224,7 @@ consistent "did you mean" hint.
 
 ```
 zexi build [file.zx] [flags]      compile to a native binary
-zexi run   [file.zx] [flags]      build to a temp path and execute
+zexi run   [file.zx] [flags]      build (warm-cached) and execute
 zexi check [file.zx]              parse + typecheck + borrowck only
 zexi fmt   [file.zx]              format source
 zexi doc   ...                    generate docs (M2)
@@ -240,6 +240,8 @@ Options:
   --no-std             freestanding (default for libs)
   --edition=2026
   --emit               dump an intermediate form
+  --report-bounds      count index checks elided/kept by the C backend
+  --no-cache           do not reuse `run`'s content-addressed binary
 ```
 
 Exit codes: `0` ok, `1` diagnostics, `2` I/O or toolchain error. Diagnostics are

@@ -1,5 +1,7 @@
-/* bench/sort/sort.c — the same benchmark in plain C. */
+/* bench/sort/sort.c — the same benchmark in plain C. argv[1] is the scale.
+   Must print the same `sort <scale> <checksum>` line as sort.zx and sort.rs. */
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 
 #define N 400000
@@ -25,19 +27,21 @@ static void quicksort(int64_t *a, int64_t lo, int64_t hi) {
     quicksort(a, i + 1, hi);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    int64_t scale = argc > 1 ? atoll(argv[1]) : 1;
+    if (scale < 1) scale = 1;
     static int64_t a[N];
     int64_t checksum = 0;
-    for (int64_t round = 0; round < 4; round++) {
+    for (int64_t round = 0; round < 4 * scale; round++) {
         int64_t x = 12345 + round;
         for (int64_t i = 0; i < N; i++) {
             x = x * INT64_C(6364136223846793005) + INT64_C(1442695040888963407);
-            a[i] = (x & 0x7fffffffffffffff) % 1000000;
+            a[i] = (x & INT64_C(0x7fffffffffffffff)) % 1000000;
         }
         quicksort(a, 0, N - 1);
         checksum += a[0] + a[N / 2] + a[N - 1];
         for (int64_t i = 0; i < N; i++) checksum += a[i] % 97;
     }
-    printf("sort %lld\n", (long long)checksum);
+    printf("sort %lld %lld\n", (long long)scale, (long long)checksum);
     return 0;
 }

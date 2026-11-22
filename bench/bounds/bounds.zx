@@ -1,0 +1,28 @@
+// bench/bounds/bounds.zx — indexing in `for i in 0..len` loops, over a slice
+// whose length is a runtime value (so the C compiler cannot prove the index
+// in range on its own). argv[1] scales the number of passes (default 1). The
+// C twin is bounds.c; both print the same `bounds <scale> <checksum>` line.
+
+const N: usize = 524288;
+
+fn main() -> i32 {
+    let mut scale: i64 = if arg_count() > 1 { arg_at(1).parse_i64() } else { 1 };
+    if scale < 1 {
+        scale = 1;
+    }
+    let mut a: [i64; 524288] = [0; 524288];
+    for i in 0..N {
+        a[i] = (i as i64) % 97;
+    }
+    let s: &[i64] = &a;
+    let mut acc: i64 = 0;
+    let mut pass: i64 = 0;
+    while pass < 64 * scale {
+        for i in 0..s.len() {
+            acc += s[i];
+        }
+        pass += 1;
+    }
+    println("bounds", scale, acc);
+    0
+}

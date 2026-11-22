@@ -84,8 +84,15 @@ automatically. Lifetimes are erased before codegen.
 
 - `[T]` is `(ptr, len)`; indexing `xs[i]` **bounds-checks** and panics on
   failure.
-- Checks are **elided** when the compiler proves `i < len` (loop-range
-  reasoning, M2). Elision is an optimization; soundness never depends on it.
+- Checks are **elided** when the compiler proves `i < len`. The current C
+  backend proves a conservative subset: a `for i in 0..hi` loop (with a
+  constant `hi`, or `hi` being the length of a shared slice `s` in the same
+  scope) indexing a fixed array of at least `hi` elements, or that same `s`.
+  The fact is dropped if the loop variable or the slice is assigned or
+  borrowed exclusively inside the body, so a reassignment re-checks. `zexic
+  build|run|emit --report-bounds` prints how many checks were elided and how
+  many stayed. Elision is an optimization; soundness never depends on it — an
+  unprovable index still panics.
 - Integer arithmetic **checks overflow in debug** (panic) and wraps in release;
   `+%`/`Wrapping<T>` would opt into wrap everywhere. Unsigned arithmetic wraps
   by definition — there is no "overflow" to report — so only signed overflow is
