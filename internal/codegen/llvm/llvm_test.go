@@ -181,6 +181,40 @@ fn main() -> i32 {
     println(len(a), sum, a[0], a[7]);
     0
 }`,
+		"float_casts": `
+fn main() -> i32 {
+    let a = 3.9;
+    println(a as i64, (-3.9) as i64, 255.9 as u8);
+    let f: f32 = 3.5;
+    println(f as i32, f as f64);
+    0
+}`,
+		"float_cast_panics": `
+fn main() -> i32 {
+    let f: f64 = 1e300;
+    println("before");
+    println(f as i64);
+    0
+}`,
+		"ref_pattern": `
+enum M { A(i64, i64), P }
+fn pick(m: &M) -> i64 {
+    match m { M::A(ref a, ref b) => *a + *b, M::P => -1 }
+}
+fn pick_deref(m: &M) -> i64 {
+    match *m { M::A(ref a, ref b) => *a + *b, M::P => -1 }
+}
+fn whole_val(m: &M) -> i64 {
+    match m { ref x => match x { M::A(a, b) => a + b, M::P => -1 } }
+}
+fn main() -> i64 {
+    let m = M::A(3, 4);
+    let p = M::P;
+    println(pick(&m), pick(&p));
+    println(pick_deref(&m), pick_deref(&p));
+    println(whole_val(&m), whole_val(&p));
+    0
+}`,
 		"references_and_mutation": `
 fn bump(p: &mut i64, by: i64) { *p = *p + by; }
 fn main() -> i32 {

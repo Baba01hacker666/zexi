@@ -7,6 +7,13 @@
 
 use sys;
 
+// The C shim below owns a small buffer for standard input. One `read` fills it
+// and `read_line`/`read_byte` consume from memory, so a long input costs one
+// syscall per buffer instead of one per byte.
+extern "C" fn zxio_getbyte() -> i32;
+extern "C" fn zxio_read(buf: &mut [u8]) -> i64;
+extern "C" fn zxio_error() -> i32;
+
 pub const STDIN: i32 = 0;
 pub const STDOUT: i32 = 1;
 pub const STDERR: i32 = 2;
@@ -14,16 +21,14 @@ pub const STDERR: i32 = 2;
 // read_byte reads exactly one byte. End of input is `Err(IoError::Eof)` rather
 // than a magic value, so an empty read and an error can never be confused.
 pub fn read_byte() -> Result<u8, IoError> {
-    let mut buf: [u8; 1] = [0; 1];
-    match sys::read_fd(STDIN, &mut buf) {
-        Ok(n) => {
-            if n == 0 {
-                return Err(IoError::Eof);
-            }
-            return Ok(buf[0]);
-        }
-        Err(e) => return Err(e),
+    let b = zxio_getbyte();
+    if b >= 0 {
+        return Ok(b as u8);
     }
+    if b == -2 {
+        return Err(IoError::Eof);
+    }
+    return Err(sys::error_of(zxio_error()));
 }
 
 // read_line reads one line from standard input without its trailing newline.
@@ -67,20 +72,18 @@ pub fn read_all() -> Result<String, IoError> {
     let mut out = String::with_capacity(4096);
     let mut buf: [u8; 4096] = [0; 4096];
     loop {
-        match sys::read_fd(STDIN, &mut buf) {
-            Ok(n) => {
-                if n == 0 {
-                    return Ok(out);
-                }
-                out.push_bytes(buf[0..n]);
-            }
-            Err(e) => {
-                match e {
-                    IoError::Interrupted => { /* retry */ }
-                    _ => return Err(e),
-                }
-            }
+        let n = zxio_read(&mut buf);
+        if n == 0 {
+            return Ok(out);
         }
+        if n < 0 {
+            let e = zxio_error();
+            if e == sys::EINTR {
+                continue;
+            }
+            return Err(sys::error_of(e));
+        }
+        out.push_bytes(buf[0..n as usize]);
     }
 }
 
@@ -105,6 +108,62 @@ pub fn eprintln(s: str) {
     eprint(s);
     eprint("\n");
 }
+
+// The buffered reader for standard input. A single 8 KiB window keeps
+// `read_line` and `read_byte` consistent: bytes read ahead by one are still
+// visible to the other, and to `read_all`.
+c """
+#include <errno.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+
+static unsigned char zxio_buf[8192];
+static size_t zxio_pos, zxio_len;
+static int zxio_saved_errno;
+
+/* Refill the window from fd 0. Returns 1 on data, 0 at EOF, -1 on error. */
+static int zxio_fill(void) {
+    ssize_t n;
+    do {
+        n = read(0, zxio_buf, sizeof zxio_buf);
+    } while (n < 0 && errno == EINTR);
+    if (n <= 0) {
+        zxio_saved_errno = n < 0 ? errno : 0;
+        return (int)n;
+    }
+    zxio_pos = 0;
+    zxio_len = (size_t)n;
+    return 1;
+}
+
+/* One byte: 0..255, -1 on error, -2 at end of input. */
+int32_t zxio_getbyte(void) {
+    if (zxio_pos == zxio_len && zxio_fill() <= 0) {
+        return zxio_saved_errno != 0 ? -1 : -2;
+    }
+    return (int32_t)zxio_buf[zxio_pos++];
+}
+
+/* Drain the window first, then read from the descriptor directly. */
+int64_t zxio_read(zx_slice_u8 buf) {
+    size_t have = zxio_len - zxio_pos;
+    if (have > 0) {
+        size_t n = have < buf.len ? have : buf.len;
+        memcpy(buf.ptr, zxio_buf + zxio_pos, n);
+        zxio_pos += n;
+        return (int64_t)n;
+    }
+    ssize_t n;
+    do {
+        n = read(0, buf.ptr, buf.len);
+    } while (n < 0 && errno == EINTR);
+    zxio_saved_errno = n < 0 ? errno : 0;
+    return (int64_t)n;
+}
+
+int32_t zxio_error(void) { return (int32_t)zxio_saved_errno; }
+"""
 
 // input prints an optional prompt (no newline), then reads a line.
 pub fn input(prompt: str = "") -> Result<String, IoError> {

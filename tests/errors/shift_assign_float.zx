@@ -1,0 +1,5 @@
+// `<<=` and `>>=` follow the same integer-only rule as the binary operators.
+fn main() {
+    let mut f: f64 = 1.0;
+    f <<= 2; // error: E0308 shift operators require integers, found `f64`
+}

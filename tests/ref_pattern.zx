@@ -1,0 +1,199 @@
+// tests/ref_pattern.zx
+// `ref` / `ref mut` bindings in match patterns: borrow a payload in place
+// instead of moving it out of a borrowed scrutinee. A shared `ref` works on
+// any match; `ref mut` needs an exclusive path (a `&mut` reference).
+//
+//     zexic run tests/ref_pattern.zx
+
+enum Msg {
+    Text(String),
+    Size(i64, i64),
+    Ping,
+}
+
+enum Cmd {
+    Write(str),
+}
+
+enum Inner {
+    One(i64),
+    Two,
+}
+
+enum Outer {
+    W(Inner),
+    X,
+}
+
+struct Holder { msg: Msg }
+
+impl Msg {
+    fn tag_len(&self) -> usize {
+        match self {
+            Msg::Text(ref s) => s.len(),
+            Msg::Size(ref w, ref h) => (*w + *h) as usize,
+            Msg::Ping => 1,
+        }
+    }
+
+    fn rename(&mut self, t: str) {
+        match self {
+            Msg::Text(ref mut s) => { *s = String::from(t); },
+            Msg::Size(ref mut w, ref mut h) => { *w += 1; *h += 1; },
+            Msg::Ping => {},
+        }
+    }
+}
+
+fn identity_mut(m: &mut Msg) -> &mut Msg {
+    m
+}
+
+fn show(h: &Holder) {
+    match h.msg {
+        Msg::Text(ref s) => println(s),
+        Msg::Size(ref a, ref b) => println((*a) * (*b)),
+        Msg::Ping => println("ping"),
+    }
+}
+
+fn first_word(m: &Msg) -> usize {
+    match m {
+        Msg::Text(ref s) => s.len(),
+        Msg::Size(ref a, _) => *a as usize,
+        Msg::Ping => 0,
+    }
+}
+
+fn main() {
+    // A borrowed scrutinee: the payload is read, not moved.
+    let m = Msg::Text(String::from("hello"));
+    println(m.tag_len());          // 5
+    println(first_word(&m));       // 5
+    println(m.tag_len());          // payload still owned: 5 again
+
+    // `&mut` scrutinee: `ref mut` reborrows exclusively, so writes stick.
+    let mut n = Msg::Text(String::from("small"));
+    n.rename("grown");
+    println(n.tag_len());          // 5
+
+    let mut k = Msg::Size(3, 4);
+    k.rename("ignored");
+    match &k {
+        Msg::Size(ref w, ref h) => println(*w + *h),   // 9
+        _ => println(0),
+    }
+
+    // `ref` works through a field of a borrowed struct too.
+    let holder = Holder { msg: Msg::Size(6, 7) };
+    show(&holder);                 // 42
+
+    // `ref` works in `if let` / `while let` (they desugar to matches).
+    if let Msg::Text(ref s) = &m {
+        println(s);                // hello
+    }
+
+    // `ref` on the whole scrutinee binds a reference to it.
+    match &m {
+        ref x => println(x.tag_len()),   // 5
+    }
+
+    // An owning match borrows its payload too; the value still moves into
+    // the match, so nothing here is usable afterwards — but the payload
+    // binding is a reference, not a move.
+    let o = Msg::Size(10, 20);
+    match o {
+        Msg::Size(ref a, ref b) => println(*a + *b),   // 30
+        Msg::Ping => println(-1),
+        _ => println(0),
+    }
+
+    // A Copy payload borrows just as well.
+    let p = Msg::Ping;
+    match &p {
+        Msg::Ping => println("ping-borrow"),         // ping-borrow
+        _ => println("no"),
+    }
+
+    // Two `ref` bindings into one borrowed value see the same storage.
+    let text = Msg::Text(String::from("shared"));
+    match &text {
+        Msg::Text(ref s) => {
+            let first = s.as_str();
+            println(first);          // shared
+            println(s.len());        // 6
+        },
+        _ => println("no"),
+    }
+
+    // Whole-value `ref` in an owning match: the binding is a reference
+    // into the consumed value for the duration of the match.
+    let whole = Msg::Size(7, 8);
+    match whole {
+        ref x => println(x.tag_len()),   // 15
+    }
+
+    // `ref` works for a `str` payload.
+    let cmd = Cmd::Write("hi");
+    match &cmd {
+        Cmd::Write(ref s) => println(s),          // hi
+    }
+
+    // An rvalue reference scrutinee (`match identity_mut(&mut q)`) reborrows
+    // what the function returned, including exclusively.
+    let mut q = Msg::Text(String::from("rvalue"));
+    match identity_mut(&mut q) {
+        Msg::Text(ref mut s) => { *s = String::from("rwritten"); },
+        _ => {},
+    }
+    println(q.tag_len());          // 8
+
+    // A guard sees the `ref` binding; a failing guard falls through.
+    let guard_m = Msg::Text(String::from("hello"));
+    match &guard_m {
+        Msg::Text(ref s) if s.len() > 4 => println("long"),   // long
+        Msg::Text(ref s) => println("short"),
+        _ => println("no"),
+    }
+    let guard_n = Msg::Text(String::from("hi"));
+    match &guard_n {
+        Msg::Text(ref s) if s.len() > 4 => println("long"),
+        Msg::Text(ref s) => println(s),                      // hi
+        _ => println("no"),
+    }
+
+    // `ref` borrows payloads of nested enums, in place.
+    let nested = Outer::W(Inner::One(9));
+    match &nested {
+        Outer::W(ref inner) => {
+            match inner {
+                Inner::One(ref n) => println(*n),             // 9
+                Inner::Two => println("twotwo"),
+            }
+        },
+        Outer::X => println("x"),
+    }
+
+    // `ref mut` writes through a nested exclusive path.
+    let mut nested2 = Outer::W(Inner::One(9));
+    match &mut nested2 {
+        Outer::W(ref mut inner) => {
+            match inner {
+                Inner::One(ref mut n) => { *n = 100; },
+                Inner::Two => {},
+            }
+        },
+        Outer::X => {},
+    }
+    match &nested2 {
+        Outer::W(ref inner) => {
+            match inner {
+                Inner::One(ref n) => println(*n),             // 100
+                Inner::Two => println("twotwo"),
+            }
+        },
+        Outer::X => println("x"),
+    }
+
+    0
+}

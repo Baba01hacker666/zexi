@@ -16,6 +16,7 @@ import (
 
 	"zexi/internal/ast"
 	"zexi/internal/diag"
+	"zexi/internal/suggest"
 )
 
 // itemsOf returns the top-level items owned by m. Inline modules carry their
@@ -359,6 +360,21 @@ func (s moduleScope) moduleForPrefix(segs []string) (*importBinding, int) {
 	return bind, best
 }
 
+// moduleItemNames lists every top-level name a module declares (public or
+// private), for a spelling suggestion at a qualified lookup. A private name is
+// included because a typo next to a private item is usually about that item;
+// naming it exactly reports E0603 instead.
+func moduleItemNames(m *module) []string {
+	if m == nil {
+		return nil
+	}
+	out := make([]string, 0, len(m.symbols))
+	for name := range m.symbols {
+		out = append(out, name)
+	}
+	return out
+}
+
 // resolvePath rewrites a path to the internal name of the symbol it names.
 // It returns nil when the path names no module symbol (a builtin, a local, or
 // an enum variant segment), in which case the caller leaves it untouched.
@@ -370,21 +386,25 @@ func (s moduleScope) resolvePath(segs []string, sp ast.Node) []string {
 		rest := segs[n:]
 		modName := strings.Join(bind.prefix, "::")
 		if len(rest) == 0 {
-			s.l.em.Report(diag.New("E0433", "`%s` is a module and cannot be used as a value or type", modName).WithSpan(sp.Span()))
+			s.l.em.Report(diag.New("E0433", "`%s` is a module and cannot be used as a value or type", modName).
+				WithSpan(sp.Span()).
+				WithHelp("name the item you want, such as `%s::item`", modName))
 			return nil
 		}
 		pub, known := bind.target.exports[rest[0]]
 		if !known {
-			s.l.em.Report(diag.New("E0412", "module `%s` has no item named `%s`", modName, rest[0]).WithSpan(sp.Span()))
+			s.l.em.Report(diag.New("E0412", "module `%s` has no item named `%s`%s", modName, rest[0], suggest.Name(rest[0], moduleItemNames(bind.target))).WithSpan(sp.Span()))
 			return nil
 		}
 		if !pub {
-			s.l.em.Report(diag.New("E0603", "item `%s::%s` is private", modName, rest[0]).WithSpan(sp.Span()))
+			s.l.em.Report(diag.New("E0603", "item `%s::%s` is private", modName, rest[0]).
+				WithSpan(sp.Span()).
+				WithHelp("mark the declaration `pub`, or re-export it with `pub use`"))
 			return nil
 		}
 		sym := bind.target.exportSyms[rest[0]]
 		if sym == nil {
-			s.l.em.Report(diag.New("E0412", "module `%s` has no item named `%s`", modName, rest[0]).WithSpan(sp.Span()))
+			s.l.em.Report(diag.New("E0412", "module `%s` has no item named `%s`%s", modName, rest[0], suggest.Name(rest[0], moduleItemNames(bind.target))).WithSpan(sp.Span()))
 			return nil
 		}
 		out := make([]string, 0, len(rest))
@@ -399,7 +419,9 @@ func (s moduleScope) resolvePath(segs []string, sp ast.Node) []string {
 		return out
 	}
 	if mods := s.describeAmbiguity(segs[0]); len(mods) > 1 {
-		s.l.em.Report(diag.New("E0659", "`%s` is ambiguous; it is exported by %s", segs[0], strings.Join(mods, " and ")).WithSpan(sp.Span()))
+		s.l.em.Report(diag.New("E0659", "`%s` is ambiguous; it is exported by %s", segs[0], strings.Join(mods, " and ")).
+			WithSpan(sp.Span()).
+			WithHelp("import one under an alias (`use pkg as alias;`) and call `alias::%s`", segs[0]))
 	}
 	return nil
 }
@@ -413,7 +435,9 @@ func (s moduleScope) resolveIdent(name string, sp ast.Node) (string, bool) {
 		}
 	}
 	if mods := s.describeAmbiguity(name); len(mods) > 1 {
-		s.l.em.Report(diag.New("E0659", "`%s` is ambiguous; it is exported by %s", name, strings.Join(mods, " and ")).WithSpan(sp.Span()))
+		s.l.em.Report(diag.New("E0659", "`%s` is ambiguous; it is exported by %s", name, strings.Join(mods, " and ")).
+			WithSpan(sp.Span()).
+			WithHelp("import one under an alias (`use pkg as alias;`) and call `alias::%s`", name))
 		return "", false
 	}
 	if s.m != nil {

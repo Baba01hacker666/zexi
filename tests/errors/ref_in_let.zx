@@ -1,0 +1,6 @@
+// `ref` bindings are only supported in `match` arms so far; a `let` does not
+// reborrow by default.
+fn main() -> i64 {
+    let ref x = 42; // error: E0900 `ref` patterns are only supported in `match` arms
+    0
+}

@@ -735,13 +735,25 @@ func binop(op token.Kind, l, r Value, resTy, opTy *types.Type) (Value, error) {
 		return intValue(a | b), nil
 	case token.KindCaret:
 		return intValue(a ^ b), nil
-	case token.KindShl:
-		return intValue(a << (b & 63)), nil
-	case token.KindShr:
-		if signed {
-			return intValue(uint64(sa >> (b & 63))), nil
+	case token.KindShl, token.KindShr:
+		// Out-of-range counts are a compile error at the front end (and the
+		// generated C and LLVM back ends panic at run time); the interpreter
+		// matches the range check so a reference run cannot disagree with
+		// the back ends about the result of `a << huge`.
+		w := 64
+		if opTy != nil && opTy.Kind.IsInt() {
+			w = opTy.Kind.Bits()
 		}
-		return intValue(a >> (b & 63)), nil
+		if b >= uint64(w) {
+			return Value{}, fmt.Errorf("interp: shift count %d is out of range for width %d", b, w)
+		}
+		if op == token.KindShl {
+			return intValue(a << b), nil
+		}
+		if signed {
+			return intValue(uint64(sa >> b)), nil
+		}
+		return intValue(a >> b), nil
 	case token.KindEqEq:
 		return boolValue(a == b), nil
 	case token.KindBangEq:

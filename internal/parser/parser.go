@@ -798,6 +798,19 @@ func (p *parser) parsePattern() ast.Pattern {
 func (p *parser) parseSinglePattern() ast.Pattern {
 	start := p.cur().Pos.Offset
 	switch p.cur().Kind {
+	case token.KindRef:
+		p.bump()
+		refMut := p.accept(token.KindMut)
+		if p.at(token.KindIdentifier) {
+			name := p.bump().Lit
+			if p.at(token.KindColonColon) || p.at(token.KindLParen) || p.at(token.KindLBrace) {
+				p.errf(p.cur(), "E0202", "`ref` cannot precede a variant pattern")
+				return p.finishPathPattern(false, name, start)
+			}
+			return &ast.BindPat{Ref: true, RefMut: refMut, Name: name, Sp: p.spanFrom(start)}
+		}
+		p.errf(p.cur(), "E0202", "expected a binding name after `ref` in a pattern")
+		return &ast.WildcardPat{Sp: p.spanFrom(start)}
 	case token.KindMut:
 		p.bump()
 		if p.at(token.KindIdentifier) {

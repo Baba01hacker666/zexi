@@ -1,0 +1,180 @@
+// zxutils — a BusyBox-style multicall binary made of small Unix tools.
+//
+// This is an example, not a replacement for the real utilities: `ls` sorts but
+// also shows hidden files, `cat` streams bytes, and `grep` does literal
+// substring matching, not regular expressions.
+//
+// Run:
+//   zexic run examples/zxutils -- ls examples
+//   zexic run examples/zxutils -- cat README.md
+//   zexic run examples/zxutils -- grep "fn main" examples/args.zx
+//   zexic run examples/zxutils -- wc README.md
+//   zexic run examples/zxutils -- find examples/zxutils
+//
+// Each tool is its own sibling module. This file only parses the command line,
+// chooses the tool, and dispatches.
+
+use common;
+use io;
+
+mod cat;
+mod find;
+mod grep;
+mod head;
+mod ls;
+mod sort;
+mod tail;
+mod uniq;
+mod wc;
+
+fn usage() {
+    io::eprintln("usage: zxutils <command> ...");
+    io::eprintln("  ls [path]                 list a directory");
+    io::eprintln("  cat <file>...             write files to standard output");
+    io::eprintln("  grep <text> [file]        print lines containing text");
+    io::eprintln("  find [path]               recursively list paths");
+    io::eprintln("  wc [file]                 count lines, words, and bytes");
+    io::eprintln("  head [-n N] [file]        print the first N lines (default 10)");
+    io::eprintln("  tail [-n N] [file]        print the last N lines (default 10)");
+    io::eprintln("  sort [file]               sort lines");
+    io::eprintln("  uniq [file]               collapse adjacent duplicate lines");
+    io::eprintln("  echo [arg]...             print arguments separated by spaces");
+}
+
+// run_page handles head and tail, which share `[-n N] [file]` parsing and read
+// standard input when no file is named.
+fn run_page(tool: str) -> i32 {
+    let mut count: i64 = 10;
+    let mut index: i32 = 2;
+    if arg_count() > index {
+        let first = arg_at(index);
+        if first.as_str() == "-n" {
+            if arg_count() <= index + 1 {
+                common::report(tool, "missing line count after -n");
+                return 2;
+            }
+            let number = arg_at(index + 1);
+            count = common::parse_count(number.as_str());
+            if count < 0 {
+                common::report(tool, "invalid line count");
+                return 2;
+            }
+            index += 2;
+        }
+    }
+
+    let mut path = String::new();
+    let mut use_stdin = true;
+    if arg_count() > index {
+        path = arg_at(index);
+        use_stdin = false;
+    }
+
+    if tool == "head" {
+        return head::run(count, path.as_str(), use_stdin);
+    }
+    return tail::run(count, path.as_str(), use_stdin);
+}
+
+fn main() -> i32 {
+    if arg_count() < 2 {
+        usage();
+        return 2;
+    }
+
+    let command = arg_at(1);
+    let name = command.as_str();
+
+    if name == "ls" {
+        let mut target = String::from(".");
+        if arg_count() > 2 {
+            target = arg_at(2);
+        }
+        return ls::run(target.as_str());
+    }
+
+    if name == "cat" {
+        if arg_count() < 3 {
+            common::report("cat", "missing file operand");
+            return 2;
+        }
+        let mut i: i32 = 2;
+        while i < arg_count() {
+            let path = arg_at(i);
+            let code = cat::run(path.as_str());
+            if code != 0 {
+                return code;
+            }
+            i += 1;
+        }
+        return 0;
+    }
+
+    if name == "grep" {
+        if arg_count() < 3 {
+            common::report("grep", "usage: grep <text> [file]");
+            return 2;
+        }
+        let pattern = arg_at(2);
+        let mut path = String::new();
+        let mut use_stdin = true;
+        if arg_count() > 3 {
+            path = arg_at(3);
+            use_stdin = false;
+        }
+        return grep::run(pattern.as_str(), path.as_str(), use_stdin);
+    }
+
+    if name == "find" {
+        let mut root = String::from(".");
+        if arg_count() > 2 {
+            root = arg_at(2);
+        }
+        return find::run(root.as_str());
+    }
+
+    if name == "wc" {
+        if arg_count() < 3 {
+            return wc::run("", true);
+        }
+        let path = arg_at(2);
+        return wc::run(path.as_str(), false);
+    }
+
+    if name == "head" || name == "tail" {
+        return run_page(name);
+    }
+
+    if name == "sort" {
+        if arg_count() < 3 {
+            return sort::run("", true);
+        }
+        let path = arg_at(2);
+        return sort::run(path.as_str(), false);
+    }
+
+    if name == "uniq" {
+        if arg_count() < 3 {
+            return uniq::run("", true);
+        }
+        let path = arg_at(2);
+        return uniq::run(path.as_str(), false);
+    }
+
+    if name == "echo" {
+        let mut i: i32 = 2;
+        while i < arg_count() {
+            if i > 2 {
+                print(" ");
+            }
+            print(arg_at(i).as_str());
+            i += 1;
+        }
+        print("\n");
+        return 0;
+    }
+
+    common::report("zxutils", "unknown command");
+    usage();
+    return 2;
+}

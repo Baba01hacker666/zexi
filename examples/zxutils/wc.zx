@@ -1,0 +1,92 @@
+// wc: count newlines, whitespace-delimited words, and bytes. It streams in
+// 64 KiB chunks, so unlike the stdlib's whole-file `fs::read` it has no 32 MiB
+// cap and keeps constant memory on large inputs. Reads standard input when no
+// file is named, and prints a file name only for a real file.
+
+use common;
+use io;
+use sys;
+
+struct Counts {
+    lines: i64,
+    words: i64,
+    bytes: i64,
+    in_word: bool,
+}
+
+fn scan(fd: i32, counts: &mut Counts) -> Result<(), IoError> {
+    let mut buf: [u8; 65536] = [0; 65536];
+    loop {
+        match sys::read_fd(fd, &mut buf) {
+            Ok(n) => {
+                if n == 0 {
+                    return Ok(());
+                }
+                counts.bytes += n as i64;
+                let mut i: usize = 0;
+                while i < n {
+                    let c = buf[i];
+                    if c == 10 {
+                        counts.lines += 1;
+                    }
+                    let space = c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12;
+                    if space {
+                        counts.in_word = false;
+                    } else if !counts.in_word {
+                        counts.words += 1;
+                        counts.in_word = true;
+                    }
+                    i += 1;
+                }
+            }
+            Err(e) => {
+                match e {
+                    IoError::Interrupted => { /* retry */ }
+                    _ => return Err(e),
+                }
+            }
+        }
+    }
+}
+
+pub fn run(path: str, use_stdin: bool) -> i32 {
+    let mut counts = Counts { lines: 0, words: 0, bytes: 0, in_word: false };
+    if use_stdin {
+        match scan(io::STDIN, &mut counts) {
+            Ok(_) => {
+                println(counts.lines, counts.words, counts.bytes);
+                return 0;
+            }
+            Err(e) => {
+                common::report_io("wc", e);
+                return 1;
+            }
+        }
+    }
+
+    let fd = match sys::open_read(path) {
+        Ok(fd) => fd,
+        Err(e) => {
+            common::report_io("wc", e);
+            return 1;
+        }
+    };
+    match scan(fd, &mut counts) {
+        Ok(_) => {
+            match sys::close_fd(fd) {
+                Ok(_) => {}
+                Err(e) => {
+                    common::report_io("wc", e);
+                    return 1;
+                }
+            }
+            println(counts.lines, counts.words, counts.bytes, path);
+            return 0;
+        }
+        Err(e) => {
+            let closed = sys::close_fd(fd);
+            common::report_io("wc", e);
+            return 1;
+        }
+    }
+}

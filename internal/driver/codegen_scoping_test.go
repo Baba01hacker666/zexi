@@ -53,6 +53,53 @@ func wantOutput(t *testing.T, name, src, want string) {
 	}
 }
 
+// TestStdTextCounters covers the text helpers used by wc-style tools,
+// including the no-trailing-newline case and ASCII whitespace runs.
+func TestStdTextCounters(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	src := `use text;
+fn main() {
+    println(text::count_lines(""));
+    println(text::count_lines("a"));
+    println(text::count_lines("a\n"));
+    println(text::count_lines("a\nb\n"));
+    println(text::count_lines("a\nb"));
+    println(text::count_words(""));
+    println(text::count_words("  \n\t"));
+    println(text::count_words("a b\nc"));
+    println(text::count_words("a  b"));
+}
+`
+	wantOutput(t, "text_counters", src, "0\n0\n1\n2\n1\n0\n0\n3\n2\n")
+}
+
+// TestPrintBorrowedStringTemporary covers the print path that binds a
+// `String` temporary behind `as_str()` and drops it after printing. The value
+// has to be printed correctly, and the generated code must release the receiver
+// rather than leaking it.
+func TestPrintBorrowedStringTemporary(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	src := `fn main() {
+    println((String::from("a") + "bc").as_str());
+    println(f"value={(String::from("x") + "yz").as_str()}");
+}
+`
+	wantOutput(t, "borrowed_temporary", src, "abc\nvalue=xyz\n")
+
+	// The same expression must still produce a valid result when it escapes
+	// as a `str`; that path intentionally keeps the temporary alive.
+	escape := `fn make() -> str {
+    return (String::from("a") + "bc").as_str();
+}
+fn main() { println(make()); }
+`
+	wantOutput(t, "borrowed_escape", escape, "abc\n")
+}
+
 // TestNestedLoopVariablesKeepTheirScope is a regression test for a
 // miscompilation: `for` lowering bound a placeholder name before the real loop
 // variable, which recorded that placeholder in the loop's scope. A nested loop
@@ -129,6 +176,25 @@ fn main() -> i32 {
 }
 `
 	wantOutput(t, "match_shadow", src, "100 99\n5 1\n5\n")
+}
+
+// TestFloatToIntCastInRange checks that the guard on float-to-integer casts
+// accepts every value whose truncation fits, including negative fractions and
+// the top of an unsigned range, for both float widths.
+func TestFloatToIntCastInRange(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	src := `fn main() -> i32 {
+    println(3.9 as i64);
+    println(-3.9 as i64);
+    println(255.9 as u8);
+    let f: f32 = 3.5;
+    println(f as i32);
+    0
+}
+`
+	wantOutput(t, "float_cast", src, "3\n-3\n255\n3\n")
 }
 
 // TestRuntimePanics checks that a run-time fault reports itself, keeps the
@@ -215,6 +281,66 @@ func TestRuntimePanics(t *testing.T) {
 }
 `,
 			want: "before\nzexi panic: attempt to divide with overflow\n",
+		},
+		{
+			name: "compound_shift_count",
+			src: `fn main() -> i32 {
+    let mut x: i64 = 1;
+    let n = arg_count() as i64 + 63;
+    println("before");
+    x <<= n;
+    println(x);
+    0
+}
+`,
+			want: "before\nzexi panic: attempt to shift left with overflow\n",
+		},
+		{
+			name: "compound_shift_count_right",
+			src: `fn main() -> i32 {
+    let mut x: i64 = 1;
+    let n = arg_count() as i64 + 63;
+    println("before");
+    x >>= n;
+    println(x);
+    0
+}
+`,
+			want: "before\nzexi panic: attempt to shift right with overflow\n",
+		},
+		{
+			name: "float_to_int_out_of_range",
+			src: `fn main() -> i32 {
+    let f: f64 = 1e300;
+    println("before");
+    println(f as i64);
+    0
+}
+`,
+			want: "before\nzexi panic: attempt to cast a float out of range\n",
+		},
+		{
+			name: "float_to_float_overflow",
+			src: `fn main() -> i32 {
+    let f: f64 = 1e300;
+    println("before");
+    let g = f as f32;
+    println(g);
+    0
+}
+`,
+			want: "before\nzexi panic: attempt to cast a float out of range\n",
+		},
+		{
+			name: "float_to_int_nan",
+			src: `fn main() -> i32 {
+    let f: f64 = 0.0 / 0.0;
+    println("before");
+    println(f as i64);
+    0
+}
+`,
+			want: "before\nzexi panic: attempt to cast a float out of range\n",
 		},
 		{
 			name: "vec_capacity_overflow",

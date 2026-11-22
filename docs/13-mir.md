@@ -211,10 +211,12 @@ only.
 
 ## 13.7 What is not lowered yet
 
-As of this writing, `tests/`+`examples/`+`bench/` lower 413 of 444 reachable
-functions. Interpolation removed eight previous blockers; four functions that
-previously lowered are now reported because their partial moves could otherwise
-double-drop. The remaining causes include:
+`tests/`+`examples/`+`bench/` lower most reachable functions; the
+unsupported list is the progress metric, and lowering reports the exact count
+per program (`zexic emit --emit=mir <file>`). A `match` reached through a
+borrow now lowers (a pointer to the referent is matched in place, and `ref`
+bindings arrive as `Ref{Place: ..}` over a deref projection); the remaining
+causes include:
 
 | Cause | Notes |
 | --- | --- |

@@ -646,11 +646,16 @@ type Pattern interface {
 	patternNode()
 }
 
-// BindPat is `name` or `mut name`.
+// BindPat is `name`, `mut name`, `ref name`, or `ref mut name`. A `ref`
+// binding binds a reference to the payload rather than moving it out of a
+// borrowed scrutinee; it never takes ownership and is always usable, even for
+// an owning payload type.
 type BindPat struct {
-	Mut  bool
-	Name string
-	Sp   token.Span
+	Mut    bool
+	Ref    bool
+	RefMut bool
+	Name   string
+	Sp     token.Span
 }
 
 func (*BindPat) patternNode()       {}
@@ -722,3 +727,24 @@ type RangePat struct {
 
 func (*RangePat) patternNode()       {}
 func (p *RangePat) Span() token.Span { return p.Sp }
+
+// IsPlace reports whether e denotes an addressable place: a local, a field or
+// element of one, a slice of one, or a dereferenced pointer. The checker uses
+// it to reject assignment to a temporary and to decide whether a `ref mut`
+// pattern has somewhere to borrow from; the backend uses the same answer so the
+// two halves cannot disagree about what is addressable.
+func IsPlace(e Expr) bool {
+	switch x := e.(type) {
+	case *IdentExpr:
+		return x.Name != "_"
+	case *FieldExpr:
+		return IsPlace(x.Recv)
+	case *IndexExpr:
+		return IsPlace(x.Recv)
+	case *SliceExpr:
+		return IsPlace(x.Recv)
+	case *UnExpr:
+		return x.Op == token.KindStar
+	}
+	return false
+}

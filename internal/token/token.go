@@ -47,6 +47,7 @@ const (
 	KindMod
 	KindMut
 	KindPub
+	KindRef
 	KindReturn
 	KindStruct
 	KindTrue
@@ -136,6 +137,7 @@ var keywords = map[string]Kind{
 	"mod":      KindMod,
 	"mut":      KindMut,
 	"pub":      KindPub,
+	"ref":      KindRef,
 	"return":   KindReturn,
 	"struct":   KindStruct,
 	"true":     KindTrue,
@@ -208,6 +210,7 @@ var kindNames = map[Kind]string{
 	KindMod:        "mod",
 	KindMut:        "mut",
 	KindPub:        "pub",
+	KindRef:        "ref",
 	KindReturn:     "return",
 	KindStruct:     "struct",
 	KindTrue:       "true",

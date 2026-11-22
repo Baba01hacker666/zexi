@@ -1,0 +1,24 @@
+// A `ref mut` binding cannot write through a `&self` receiver either: the
+// path from `self` crosses a shared reference before reaching the payload.
+enum M {
+    T(String),
+    P,
+}
+
+struct S {
+    m: M,
+}
+
+impl S {
+    fn g(&self) {
+        match self.m {
+            M::T(ref mut s) => { *s = String::from("x"); }, // error: E0596 cannot mutably borrow `s` through a shared reference
+            M::P => {},
+        }
+    }
+}
+
+fn main() {
+    let s = S { m: M::T(String::from("y")) };
+    s.g();
+}

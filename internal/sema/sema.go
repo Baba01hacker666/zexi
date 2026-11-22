@@ -10,14 +10,15 @@ package sema
 
 import (
 	"fmt"
+	"math"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	"zexi/internal/ast"
 	"zexi/internal/diag"
+	"zexi/internal/suggest"
 	"zexi/internal/token"
 	"zexi/internal/types"
 )
@@ -1449,6 +1450,10 @@ func exprHasJump(e ast.Expr) bool {
 func (c *checker) bindPattern(p ast.Pattern, ty *types.Type) {
 	switch pt := p.(type) {
 	case *ast.BindPat:
+		if pt.Ref {
+			c.errf(pt.Sp, "E0900", "`ref` patterns are only supported in `match` arms so far; bind by value or add an explicit `&` in the binding type")
+			return
+		}
 		if pt.Name == "" {
 			return
 		}
@@ -1508,7 +1513,7 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 		if len(x.Segments) == 2 {
 			en, ok := c.info.Enums[x.Segments[0]]
 			if !ok {
-				c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope", x.Segments[0])
+				c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope%s", x.Segments[0], suggest.Name(x.Segments[0], c.typeNames()))
 				return nil
 			}
 			if en.Generic {
@@ -1526,7 +1531,7 @@ func (c *checker) infer(e ast.Expr, expected *types.Type) *types.Type {
 			}
 			v, ok := en.Variant(x.Segments[1])
 			if !ok {
-				c.errf(x.Sp, "E0599", "no variant `%s` on enum `%s`", x.Segments[1], en.Name)
+				c.errf(x.Sp, "E0599", "no variant `%s` on enum `%s`%s", x.Segments[1], en.Name, suggest.Name(x.Segments[1], variantNames(en)))
 				return nil
 			}
 			if len(v.Fields) > 0 {
@@ -1758,66 +1763,6 @@ func (c *checker) inferLiteral(x *ast.LiteralExpr, expected *types.Type) *types.
 	return nil
 }
 
-// editDistance is the Levenshtein distance between two names, for
-// "did you mean" suggestions.
-func editDistance(a, b string) int {
-	ra, rb := []rune(a), []rune(b)
-	prev := make([]int, len(rb)+1)
-	for j := range prev {
-		prev[j] = j
-	}
-	for i := 1; i <= len(ra); i++ {
-		cur := make([]int, len(rb)+1)
-		cur[0] = i
-		for j := 1; j <= len(rb); j++ {
-			cost := 0
-			if ra[i-1] != rb[j-1] {
-				cost = 1
-			}
-			cur[j] = min3(cur[j-1]+1, prev[j]+1, prev[j-1]+cost)
-		}
-		prev = cur
-	}
-	return prev[len(rb)]
-}
-
-func min3(a, b, c int) int {
-	if a < b {
-		if a < c {
-			return a
-		}
-		return c
-	}
-	if b < c {
-		return b
-	}
-	return c
-}
-
-// suggestName returns " (did you mean `x`?)" when one of the candidates
-// is within edit distance 2 of name, and "" otherwise. Candidates are
-// sorted first so a tie between two equally-distant suggestions resolves
-// to the same one every run (callers build the list by ranging over Go
-// maps, whose iteration order is randomized).
-func suggestName(name string, candidates []string) string {
-	sorted := make([]string, len(candidates))
-	copy(sorted, candidates)
-	sort.Strings(sorted)
-	best, bestD := "", 3
-	for _, cand := range sorted {
-		if cand == name {
-			continue
-		}
-		if d := editDistance(name, cand); d < bestD {
-			best, bestD = cand, d
-		}
-	}
-	if best == "" {
-		return ""
-	}
-	return fmt.Sprintf(" (did you mean `%s`?)", best)
-}
-
 // adoptInt retypes a binding that was defaulted from a bare integer literal
 // when a use demands a concrete integer type. It mutates the type instance in
 // place, so every use of the binding (including aliases created by
@@ -2018,7 +1963,7 @@ func (c *checker) inferIdent(name string, sp token.Span) *types.Type {
 	for n := range c.info.Fns {
 		cands = append(cands, n)
 	}
-	c.errf(sp, "E0425", "cannot find `%s` in this scope%s", name, suggestName(name, cands))
+	c.errf(sp, "E0425", "cannot find `%s` in this scope%s", name, suggest.Name(name, cands))
 	return nil
 }
 
@@ -2238,7 +2183,14 @@ func (c *checker) inferBinary(x *ast.BinExpr, expected *types.Type) *types.Type 
 			c.errAt(x, "E0308", "cannot order values of type `%s`", lt)
 		}
 		return types.BoolT
-	case token.KindShl, token.KindShr, token.KindAmp, token.KindPipe, token.KindCaret:
+	case token.KindShl, token.KindShr:
+		if !lt.Kind.IsInt() {
+			c.errAt(x, "E0308", "shift operators require integers, found `%s`", lt)
+			return lt
+		}
+		c.checkShiftCount(x.R, lt)
+		return lt
+	case token.KindAmp, token.KindPipe, token.KindCaret:
 		if !lt.Kind.IsInt() {
 			c.errAt(x, "E0308", "bitwise operators require integers, found `%s`", lt)
 		}
@@ -2255,6 +2207,36 @@ func (c *checker) inferBinary(x *ast.BinExpr, expected *types.Type) *types.Type 
 		return lt
 	}
 	return lt
+}
+
+// checkShiftCount rejects a shift whose count is a constant outside the width
+// of the shifted type. C leaves such a shift undefined (the count must be
+// non-negative and less than the width), and a mistake that can be seen before
+// run time should not become a run-time check or, worse, silent UB.
+func (c *checker) checkShiftCount(count ast.Expr, t *types.Type) {
+	if t == nil || !t.Kind.IsInt() {
+		return
+	}
+	cv, ok := c.evalConst(count)
+	if !ok || cv.IsFloat || cv.IsBool || cv.IsStr {
+		return
+	}
+	var n int64
+	if t.Kind.IsUnsigned() {
+		// A `u64` literal above math.MaxInt64 has a negative Int but a
+		// correct Uint; the magnitude is what matters here.
+		if cv.Uint > math.MaxInt64 {
+			c.errAt(count, "E0073", "shift count `%d` is out of range for `%s` (0..%d)",
+				cv.Uint, t, t.Kind.Bits())
+			return
+		}
+		n = int64(cv.Uint)
+	} else {
+		n = cv.Int
+	}
+	if n < 0 || n >= int64(t.Kind.Bits()) {
+		c.errAt(count, "E0073", "shift count `%d` is out of range for `%s` (0..%d)", n, t, t.Kind.Bits())
+	}
 }
 
 func (c *checker) inferAssign(x *ast.AssignExpr) *types.Type {
@@ -2276,6 +2258,16 @@ func (c *checker) inferAssign(x *ast.AssignExpr) *types.Type {
 			if !isStrLike(rt) && !isScalarText(rt) {
 				c.errAt(x.Rhs, "E0308", "cannot append `%s` to a `String`", rt)
 			}
+		case x.Op == token.KindShlEq || x.Op == token.KindShrEq:
+			if !lt.Kind.IsInt() {
+				c.errAt(x, "E0308", "shift operators require integers, found `%s`", lt)
+			} else {
+				c.checkShiftCount(x.Rhs, lt)
+			}
+		case x.Op == token.KindAmpEq || x.Op == token.KindPipeEq || x.Op == token.KindCaretEq:
+			if !lt.Kind.IsInt() {
+				c.errAt(x, "E0308", "bitwise operators require integers, found `%s`", lt)
+			}
 		case x.Op == token.KindPercentEq && !lt.Kind.IsInt():
 			c.errAt(x, "E0308", "`%%=` requires integers, found `%s`", lt)
 		case !lt.Kind.IsNumeric():
@@ -2286,21 +2278,7 @@ func (c *checker) inferAssign(x *ast.AssignExpr) *types.Type {
 }
 
 // isPlace reports whether e is a valid assignment target.
-func (c *checker) isPlace(e ast.Expr) bool {
-	switch x := e.(type) {
-	case *ast.IdentExpr:
-		return x.Name != "_"
-	case *ast.UnExpr:
-		return x.Op == token.KindStar
-	case *ast.FieldExpr:
-		return c.isPlace(x.Recv)
-	case *ast.IndexExpr:
-		return c.isPlace(x.Recv)
-	case *ast.SliceExpr:
-		return c.isPlace(x.Recv)
-	}
-	return false
-}
+func (c *checker) isPlace(e ast.Expr) bool { return ast.IsPlace(e) }
 
 // isCallableName reports whether the callee is a plain name (identifier or
 // path), which the other branches of inferCall handle.
@@ -2532,7 +2510,7 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		for n := range c.info.Fns {
 			cands = append(cands, n)
 		}
-		c.errAt(x.Callee, "E0425", "cannot find function `%s` in this scope%s", name, suggestName(name, cands))
+		c.errAt(x.Callee, "E0425", "cannot find function `%s` in this scope%s", name, suggest.Name(name, cands))
 		for _, a := range x.Args {
 			c.checkExpr(a, nil)
 		}
@@ -2600,7 +2578,7 @@ func (c *checker) resolveArgs(sp token.Span, args []ast.Expr, names []string, de
 				}
 			}
 			if idx < 0 {
-				c.errf(na.Sp, "E0061", "%s has no parameter named `%s`", label, na.Name)
+				c.errf(na.Sp, "E0061", "%s has no parameter named `%s`%s", label, na.Name, suggest.Name(na.Name, names))
 				continue
 			}
 			if seen[idx] {
@@ -3296,6 +3274,15 @@ type stringMethodSig struct {
 	variadic bool
 }
 
+// stringMethodNames lists the builtin String methods for a spelling suggestion.
+func stringMethodNames() []string {
+	out := make([]string, 0, len(stringMethods))
+	for name := range stringMethods {
+		out = append(out, name)
+	}
+	return out
+}
+
 var stringMethods = map[string]stringMethodSig{
 	"len":         {params: nil, ret: types.UsizeT},
 	"is_empty":    {params: nil, ret: types.BoolT},
@@ -3321,7 +3308,7 @@ var stringMethods = map[string]stringMethodSig{
 func (c *checker) inferStringMethod(x *ast.MethodCallExpr) *types.Type {
 	m, ok := stringMethods[x.Name]
 	if !ok {
-		c.errAt(x, "E0599", "no method `%s` on type `String`", x.Name)
+		c.errAt(x, "E0599", "no method `%s` on type `String`%s", x.Name, suggest.Name(x.Name, stringMethodNames()))
 		for _, a := range x.Args {
 			c.checkExpr(a, nil)
 		}
@@ -3697,7 +3684,7 @@ func (c *checker) inferBareUnitVariant(x *ast.IdentExpr, expected *types.Type) *
 func (c *checker) inferVariantCtor(x *ast.CallExpr, p *ast.PathExpr, expected *types.Type) *types.Type {
 	tmpl, ok := c.info.Enums[p.Segments[0]]
 	if !ok {
-		c.errf(p.Sp, "E0412", "cannot find type `%s` in this scope", p.Segments[0])
+		c.errf(p.Sp, "E0412", "cannot find type `%s` in this scope%s", p.Segments[0], suggest.Name(p.Segments[0], c.typeNames()))
 		for _, a := range x.Args {
 			c.checkExpr(a, nil)
 		}
@@ -3723,7 +3710,7 @@ func (c *checker) inferVariantCtor(x *ast.CallExpr, p *ast.PathExpr, expected *t
 func (c *checker) checkVariantCtor(x *ast.CallExpr, p *ast.PathExpr, en *types.Enum) *types.Type {
 	v, ok := en.Variant(p.Segments[1])
 	if !ok {
-		c.errf(p.Sp, "E0599", "no variant `%s` on enum `%s`", p.Segments[1], en.Name)
+		c.errf(p.Sp, "E0599", "no variant `%s` on enum `%s`%s", p.Segments[1], en.Name, suggest.Name(p.Segments[1], variantNames(en)))
 		for _, a := range x.Args {
 			c.checkExpr(a, nil)
 		}
@@ -3987,7 +3974,7 @@ func (c *checker) inferMatch(x *ast.MatchExpr, expected *types.Type) *types.Type
 		}
 		c.pushScope()
 		borrowed := c.info.PlaceThroughBorrow(x.Scrutinee)
-		c.checkPattern(arm.Pat, st, borrowed)
+		c.checkPattern(arm.Pat, st, borrowed, x.Scrutinee)
 		if pp, ok := arm.Pat.(*ast.PathPat); ok && !guarded {
 			if v := c.info.PatVariant[pp]; v != nil {
 				if !dead && covered[v.Name] {
@@ -4307,18 +4294,51 @@ func (c *checker) inferTry(x *ast.TryExpr, expected *types.Type) *types.Type {
 }
 
 // checkPattern type-checks a pattern against the scrutinee type and declares its
-// bindings in the current scope.
-func (c *checker) checkPattern(p ast.Pattern, st *types.Type, borrowed bool) {
+// bindings in the current scope. place is the scrutinee expression itself; a
+// `ref mut` binding borrows exclusively out of it, so the path it designates
+// must stay exclusive too.
+func (c *checker) checkPattern(p ast.Pattern, st *types.Type, borrowed bool, place ast.Expr) {
 	switch pt := p.(type) {
 	case *ast.WildcardPat:
 		return
 	case *ast.BindPat:
-		if pt.Name != "_" {
-			if borrowed && st != nil && st.NeedsDrop() {
-				c.errf(pt.Sp, "E0507", "cannot move the owned value `%s` out of a borrowed scrutinee", pt.Name)
-			}
-			c.declare(pt.Name, st)
+		if pt.Name == "_" {
+			return
 		}
+		if pt.Ref {
+			// A `ref` binding borrows the payload in place: it never moves
+			// the value out, so an owning payload is fine even through a
+			// borrowed scrutinee. The binding is a reference, not the value.
+			elem := st
+			if elem != nil && (elem.Kind == types.Ref || elem.Kind == types.Ptr) {
+				// `ref x` on a reference scrutinee binds a reborrow
+				// (`&T`), not `&&T`.
+				elem = elem.Elem
+			}
+			bindTy := types.RefTo(elem, pt.RefMut)
+			if pt.RefMut && borrowed {
+				root := c.info.TypeOf(place)
+				rootIsRef := root != nil && (root.Kind == types.Ref || root.Kind == types.Ptr)
+				switch {
+				case !rootIsRef && !ast.IsPlace(place):
+					c.errf(pt.Sp, "E0596", "cannot mutably borrow `%s`: the scrutinee is not an addressable place", pt.Name)
+				case !c.refMutPlaceOK(place):
+					c.errf(pt.Sp, "E0596", "cannot mutably borrow `%s` through a shared reference", pt.Name)
+				}
+			}
+			c.declare(pt.Name, bindTy)
+			if !pt.RefMut {
+				// A shared reference handle cannot be used to mutate: it is
+				// an immutable binding even though other match bindings are
+				// permissive.
+				c.markMut(pt.Name, false)
+			}
+			return
+		}
+		if borrowed && st != nil && st.NeedsDrop() {
+			c.errf(pt.Sp, "E0507", "cannot move the owned value `%s` out of a borrowed scrutinee", pt.Name)
+		}
+		c.declare(pt.Name, st)
 		return
 	case *ast.OrPat:
 		for _, alt := range pt.Alts {
@@ -4327,7 +4347,7 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type, borrowed bool) {
 				// binds nothing for an or-pattern arm.
 				c.errf(alt.Span(), "E0900", "or-pattern alternatives cannot bind variables; match on the whole value and destructure in the arm body instead")
 			}
-			c.checkPattern(alt, st, borrowed)
+			c.checkPattern(alt, st, borrowed, place)
 		}
 		return
 	case *ast.RangePat:
@@ -4375,7 +4395,7 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type, borrowed bool) {
 		name := pt.Path[len(pt.Path)-1]
 		v, ok := base.En.Variant(name)
 		if !ok {
-			c.errf(pt.Sp, "E0599", "no variant `%s` on enum `%s`", name, base.En.Name)
+			c.errf(pt.Sp, "E0599", "no variant `%s` on enum `%s`%s", name, base.En.Name, suggest.Name(name, variantNames(base.En)))
 			return
 		}
 		c.info.PatVariant[pt] = v
@@ -4387,12 +4407,12 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type, borrowed bool) {
 				break
 			}
 			c.rejectNestedPat(sub)
-			c.checkPattern(sub, v.Fields[i].Ty, borrowed)
+			c.checkPattern(sub, v.Fields[i].Ty, borrowed, place)
 		}
 		for _, fp := range pt.Fields {
 			f, ok := variantField(v, fp.Name)
 			if !ok {
-				c.errf(fp.Sp, "E0026", "variant `%s` has no field named `%s`", v.Name, fp.Name)
+				c.errf(fp.Sp, "E0026", "variant `%s` has no field named `%s`%s", v.Name, fp.Name, suggest.Name(fp.Name, variantFieldNames(v)))
 				continue
 			}
 			sub := fp.Pat
@@ -4400,11 +4420,60 @@ func (c *checker) checkPattern(p ast.Pattern, st *types.Type, borrowed bool) {
 				sub = &ast.BindPat{Name: fp.Name, Sp: fp.Sp}
 			}
 			c.rejectNestedPat(sub)
-			c.checkPattern(sub, f.Ty, borrowed)
+			c.checkPattern(sub, f.Ty, borrowed, place)
 		}
 		return
 	default:
 		c.errf(p.Span(), "E0900", "this pattern is not supported by the compiler yet (roadmap M0)")
+	}
+}
+
+// refMutPlaceOK reports whether a `ref mut` binding may borrow exclusively
+// out of place: every reference dereferenced along the path must be `&mut`
+// (or a raw pointer), and no step may cross a shared `&T`. A binding rooted
+// at a plain value is not routed here (the match owns the value).
+func (c *checker) refMutPlaceOK(e ast.Expr) bool {
+	switch x := e.(type) {
+	case *ast.UnExpr:
+		if x.Op == token.KindStar {
+			t := c.info.TypeOf(x.X)
+			if t == nil || (t.Kind != types.Ref && t.Kind != types.Ptr) {
+				return false
+			}
+			if t.Kind == types.Ref && !t.Mut {
+				return false
+			}
+			return c.refMutPlaceOK(x.X)
+		}
+		// An address-of expression is exclusive only when it creates an
+		// exclusive reference (`&mut x`); the source's own mutability was
+		// checked where the reference was taken.
+		if x.Op == token.KindAmp {
+			return x.Mut
+		}
+		return false
+	case *ast.IdentExpr:
+		// A `&T` binding is an immutable handle to borrowed data: it may not
+		// be reborrowed mutably even if the binding itself cannot be
+		// reassigned. A `&mut T` handle may be reborrowed mutably.
+		if t := c.lookupType(x.Name); t != nil && t.Kind == types.Ref && !t.Mut {
+			return false
+		}
+		return true
+	case *ast.FieldExpr:
+		return c.refMutPlaceOK(x.Recv)
+	case *ast.IndexExpr:
+		return c.refMutPlaceOK(x.Recv)
+	case *ast.SliceExpr:
+		return c.refMutPlaceOK(x.Recv)
+	default:
+		// A call producing a reference carries its mutability in the return
+		// type; a by-value temporary is owned by the match and may be
+		// borrowed exclusively.
+		if t := c.info.TypeOf(e); t != nil && t.Kind == types.Ref {
+			return t.Mut
+		}
+		return true
 	}
 }
 
@@ -4545,10 +4614,89 @@ func (c *checker) inferField(x *ast.FieldExpr) *types.Type {
 	}
 	f, ok := base.St.Field(x.Field)
 	if !ok {
-		c.errAt(x, "E0609", "no field `%s` on type `%s`", x.Field, base)
+		c.errAt(x, "E0609", "no field `%s` on type `%s`%s", x.Field, base, suggest.Name(x.Field, structFieldNames(base.St)))
 		return nil
 	}
 	return f.Ty
+}
+
+// structFieldNames lists a struct's fields for a spelling suggestion. The list
+// is rebuilt at the diagnostic site rather than cached: the field set is small
+// and an error path does not deserve an index that could go stale.
+func structFieldNames(st *types.Struct) []string {
+	if st == nil {
+		return nil
+	}
+	out := make([]string, 0, len(st.Fields))
+	for _, f := range st.Fields {
+		out = append(out, f.Name)
+	}
+	return out
+}
+
+// variantNames lists an enum's variants for a spelling suggestion.
+func variantNames(en *types.Enum) []string {
+	if en == nil {
+		return nil
+	}
+	out := make([]string, 0, len(en.Variants))
+	for _, v := range en.Variants {
+		out = append(out, v.Name)
+	}
+	return out
+}
+
+// variantFieldNames lists one variant's fields for a spelling suggestion.
+func variantFieldNames(v *types.Variant) []string {
+	if v == nil {
+		return nil
+	}
+	out := make([]string, 0, len(v.Fields))
+	for _, f := range v.Fields {
+		out = append(out, f.Name)
+	}
+	return out
+}
+
+// methodNames lists the methods of the named struct for a spelling suggestion.
+func (c *checker) methodNames(structName string) []string {
+	out := make([]string, 0, len(c.info.Methods[structName]))
+	for name := range c.info.Methods[structName] {
+		out = append(out, name)
+	}
+	return out
+}
+
+// typeNames lists every type name an unqualified lookup could have named:
+// builtins, declared structs/enums (including their generic bases), aliases,
+// and type parameters in scope. Generic instantiations are represented by their
+// base name so `Pair` is suggested for `Pair<i64, str>` sites.
+func (c *checker) typeNames() []string {
+	var out []string
+	for name := range types.Builtins {
+		out = append(out, name)
+	}
+	for name, st := range c.info.Structs {
+		if st.Base != "" {
+			out = append(out, st.Base)
+		} else {
+			out = append(out, name)
+		}
+	}
+	for name, en := range c.info.Enums {
+		if en.Base != "" {
+			out = append(out, en.Base)
+		} else {
+			out = append(out, name)
+		}
+	}
+	for name := range c.aliasDecls {
+		out = append(out, name)
+	}
+	for name := range c.typeEnv {
+		out = append(out, name)
+	}
+	return out
 }
 
 func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
@@ -4594,7 +4742,7 @@ func (c *checker) inferMethodCall(x *ast.MethodCallExpr) *types.Type {
 	}
 	m, ok := c.info.Methods[nominalBaseName(base)][x.Name]
 	if !ok {
-		c.errAt(x, "E0599", "no method `%s` on type `%s`", x.Name, base)
+		c.errAt(x, "E0599", "no method `%s` on type `%s`%s", x.Name, base, suggest.Name(x.Name, c.methodNames(nominalBaseName(base))))
 		for _, a := range x.Args {
 			c.checkExpr(a, nil)
 		}
@@ -4651,7 +4799,7 @@ func (c *checker) inferStructLit(x *ast.StructLitExpr, expected *types.Type) *ty
 	}
 	tmpl, ok := c.info.Structs[x.Path[0]]
 	if !ok {
-		c.errAt(x, "E0412", "cannot find type `%s` in this scope", x.Path[0])
+		c.errAt(x, "E0412", "cannot find type `%s` in this scope%s", x.Path[0], suggest.Name(x.Path[0], c.typeNames()))
 		for _, fi := range x.Fields {
 			c.checkExpr(fi.Val, nil)
 		}
@@ -4683,7 +4831,7 @@ func (c *checker) checkStructLitFields(x *ast.StructLitExpr, st *types.Struct) *
 	for _, fi := range x.Fields {
 		f, ok := st.Field(fi.Name)
 		if !ok {
-			c.errf(fi.Sp, "E0560", "struct `%s` has no field named `%s`", st.Name, fi.Name)
+			c.errf(fi.Sp, "E0560", "struct `%s` has no field named `%s`%s", st.Name, fi.Name, suggest.Name(fi.Name, structFieldNames(st)))
 			c.checkExpr(fi.Val, nil)
 			continue
 		}
@@ -4766,7 +4914,7 @@ func (c *checker) structFieldPattern(tmpl *types.Struct, fieldName string) *type
 func (c *checker) inferEnumStructLit(x *ast.StructLitExpr, expected *types.Type) *types.Type {
 	tmpl, ok := c.info.Enums[x.Path[0]]
 	if !ok {
-		c.errAt(x, "E0412", "cannot find type `%s` in this scope", x.Path[0])
+		c.errAt(x, "E0412", "cannot find type `%s` in this scope%s", x.Path[0], suggest.Name(x.Path[0], c.typeNames()))
 		for _, fi := range x.Fields {
 			c.checkExpr(fi.Val, nil)
 		}
@@ -4824,7 +4972,7 @@ func (c *checker) inferEnumStructLit(x *ast.StructLitExpr, expected *types.Type)
 func (c *checker) checkEnumStructLitFields(x *ast.StructLitExpr, en *types.Enum) *types.Type {
 	v, ok := en.Variant(x.Path[1])
 	if !ok {
-		c.errAt(x, "E0599", "no variant `%s` on enum `%s`", x.Path[1], en.Name)
+		c.errAt(x, "E0599", "no variant `%s` on enum `%s`%s", x.Path[1], en.Name, suggest.Name(x.Path[1], variantNames(en)))
 		return nil
 	}
 	c.info.Ctors[x] = &Ctor{Enum: en, Variant: v}
@@ -4832,7 +4980,7 @@ func (c *checker) checkEnumStructLitFields(x *ast.StructLitExpr, en *types.Enum)
 	for _, fi := range x.Fields {
 		f, ok := variantField(v, fi.Name)
 		if !ok {
-			c.errf(fi.Sp, "E0560", "variant `%s::%s` has no field named `%s`", en.Name, v.Name, fi.Name)
+			c.errf(fi.Sp, "E0560", "variant `%s::%s` has no field named `%s`%s", en.Name, v.Name, fi.Name, suggest.Name(fi.Name, variantFieldNames(v)))
 			c.checkExpr(fi.Val, nil)
 			continue
 		}
@@ -5211,7 +5359,7 @@ func (c *checker) resolveType(t ast.Type) *types.Type {
 				c.errf(x.Sp, "E0107", "type alias `%s` is not generic", name)
 				return c.resolveAlias(name, x.Sp)
 			}
-			c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope", name)
+			c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope%s", name, suggest.Name(name, c.typeNames()))
 			return nil
 		}
 		if bt, ok := types.Builtins[name]; ok {
@@ -5232,7 +5380,7 @@ func (c *checker) resolveType(t ast.Type) *types.Type {
 		if _, ok := c.aliasDecls[name]; ok {
 			return c.resolveAlias(name, x.Sp)
 		}
-		c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope", name)
+		c.errf(x.Sp, "E0412", "cannot find type `%s` in this scope%s", name, suggest.Name(name, c.typeNames()))
 		return nil
 	case *ast.RefType:
 		c.indirect++

@@ -1,0 +1,34 @@
+// grep: print lines containing a literal substring. Returns 0 when at least
+// one line matched, 1 when nothing matched, and 2 on an I/O error, matching the
+// usual grep exit codes.
+
+use common;
+use text;
+
+pub fn run(pattern: str, path: str, use_stdin: bool) -> i32 {
+    match common::read_input(path, use_stdin) {
+        Ok(data) => {
+            let lines = text::lines(data.as_str());
+            let mut matched = false;
+            let mut i: usize = 0;
+            while i < lines.len() {
+                // A file ending in '\n' has one final empty piece; it is not a
+                // line of its own.
+                let trailing = i + 1 == lines.len() && lines[i].len() == 0;
+                if !trailing && text::contains(lines[i].as_str(), pattern) {
+                    println(lines[i].as_str());
+                    matched = true;
+                }
+                i += 1;
+            }
+            if matched {
+                return 0;
+            }
+            return 1;
+        }
+        Err(e) => {
+            common::report_io("grep", e);
+            return 2;
+        }
+    }
+}

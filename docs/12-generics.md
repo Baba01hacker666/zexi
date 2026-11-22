@@ -355,12 +355,13 @@ every owning instantiation.
 
 **Borrowed scrutinees.** A scrutinee reached through a borrow — `match *e` with
 `e: &E`, or `match self.field`/`match (*p).field` where the receiver is a
-reference or pointer — is never consumed or dropped: codegen copies the value
-shallowly for the switch and the caller keeps ownership. `Info.PlaceThroughBorrow`
-(shared by sema's `inferMatch` and codegen's `matchOwnsScrutinee`) recognizes
-the bare reference/pointer case, a dereference of one, and a field/element
-reached by auto-dereferencing one. Binding an owned payload in such a match is
-`E0507`, because a borrow cannot transfer ownership.
+reference or pointer — is never consumed or dropped: codegen binds a pointer to
+the borrowed referent instead of copying the enum. `Info.PlaceThroughBorrow`
+(shared by sema's `inferMatch` and codegen's match lowering) recognizes the
+bare reference/pointer case, a dereference of one, and a field/element reached
+by auto-dereferencing one. Binding an owned payload in such a match reports
+`E0507`, because a borrow cannot transfer ownership; bind it with `ref s` (or
+`ref mut s` through a `&mut`) to borrow it in place.
 
 ## 12.8 Codegen changes
 
@@ -488,9 +489,10 @@ Known limits (deliberate for M1):
   payload and match again, or match the inner enum directly.
 - `?` cannot convert between error types; the error type must match the
   enclosing function exactly.
-- Borrowed payloads cannot be moved (`E0507`); bind by value or ignore them.
-  This includes matching through `match *e` and `match self.field` in a
-  `&self` method, which are otherwise safe (the caller keeps ownership).
+- Borrowed payloads cannot be moved (`E0507`); bind them by reference with
+  `ref`/`ref mut`, or ignore them. This includes matching through `match *e`
+  and `match self.field` in a `&self` method, which are otherwise safe (the
+  caller keeps ownership).
 - The ASan leak/double-free check could not run in the Alpine/musl CI image
   (no libasan/clang). Drop behavior is covered by the runtime tests in
   `tests/generics.zx`, `tests/enums.zx`, `tests/option_result.zx`, and

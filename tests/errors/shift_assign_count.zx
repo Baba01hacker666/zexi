@@ -1,0 +1,7 @@
+// `<<=` and `>>=` reject a constant count outside the type's width, just like
+// the binary operators: C leaves such a shift undefined.
+fn main() -> i64 {
+    let mut n: i64 = 1;
+    n <<= 64; // error: E0073 shift count `64` is out of range for `i64`
+    n
+}

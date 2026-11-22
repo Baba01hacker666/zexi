@@ -305,7 +305,7 @@ func (g *gen) vecMethodCall(x *ast.MethodCallExpr) string {
 	vn := vecTypeName(t)
 	recv := g.vecReceiverValue(x.Recv)
 	var prologue, epilogue string
-	if !isPlaceExpr(x.Recv) && !vecBorrowedReceiver(g.info.TypeOf(x.Recv)) {
+	if !ast.IsPlace(x.Recv) && !vecBorrowedReceiver(g.info.TypeOf(x.Recv)) {
 		tm := g.tmpName()
 		prologue = ctype(t) + " " + tm + " = " + recv + "; "
 		recv = tm
@@ -487,7 +487,7 @@ func (g *gen) vecForLoop(x *ast.LoopExpr) string {
 		return ""
 	}
 	recv := g.vecReceiverValue(x.Iter)
-	if !isPlaceExpr(x.Iter) && !vecBorrowedReceiver(g.info.TypeOf(x.Iter)) {
+	if !ast.IsPlace(x.Iter) && !vecBorrowedReceiver(g.info.TypeOf(x.Iter)) {
 		// Materialize the temporary and register it in the *enclosing* drop
 		// frame, so a `break` out of the loop still frees it at scope exit.
 		tm := g.tmpName()
@@ -518,7 +518,7 @@ func (g *gen) vecLenValue(x *ast.CallExpr) string {
 	if len(x.Args) != 1 {
 		return "0"
 	}
-	if isPlaceExpr(x.Args[0]) || vecBorrowedReceiver(g.info.TypeOf(x.Args[0])) {
+	if ast.IsPlace(x.Args[0]) || vecBorrowedReceiver(g.info.TypeOf(x.Args[0])) {
 		return "(" + g.vecReceiverValue(x.Args[0]) + ").len"
 	}
 	t := g.info.TypeOf(x.Args[0])

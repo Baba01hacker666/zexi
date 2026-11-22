@@ -1,0 +1,38 @@
+// ls: list a directory, marking directories with a trailing slash. A file
+// argument is printed as its own name, like the real tool.
+
+use common;
+use fs;
+
+pub fn run(target: str) -> i32 {
+    if fs::is_dir(target) {
+        match fs::list_dir(target) {
+            Ok(found) => {
+                let mut names = found;
+                common::sort_names(&mut names);
+                let mut i: usize = 0;
+                while i < names.len() {
+                    let full = common::join_path(target, names[i].as_str());
+                    print(names[i].as_str());
+                    if fs::is_dir(full.as_str()) {
+                        print("/");
+                    }
+                    print("\n");
+                    i += 1;
+                }
+                return 0;
+            }
+            Err(e) => {
+                common::report_io("ls", e);
+                return 1;
+            }
+        }
+    }
+
+    if fs::exists(target) {
+        println(target);
+        return 0;
+    }
+    common::report("ls", "no such file or directory");
+    return 1;
+}

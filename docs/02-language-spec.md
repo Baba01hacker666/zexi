@@ -45,7 +45,7 @@ also adopt a float context. There are no implicit numeric conversions (see 2.4).
 ```
 as      break   const   continue  defer   else    elif    enum    extern
 false   fn      for     if        impl    import  in      let     loop
-match   mod     mut     pub       return  struct  true    type
+match   mod     mut     pub       ref     return  struct  true    type
 unsafe  until   use     while   i8 i16 i32 i64 isize u8 u16 u32 u64 usize f32 f64
 bool    char    str     never
 ```
@@ -61,6 +61,10 @@ bool    char    str     never
 Precedence (tightest → loosest): unary (`- ! & *`) → `as` → `* / %` →
 `+ -` → `<< >>` → `&` → `^` → `|` → `.. ..=` → comparisons → `&&` → `||` →
 `=` (right-assoc). `?` binds tighter than unary postfix on an expression.
+
+Shift operators are integers-only (`f64 << 2` is `E0308`), and the shift count
+must lie in `0..width`: a constant outside the type's width is `E0073`, and a
+runtime count outside it panics (see `03-memory-model.md` §3.6).
 
 ## 2.2 Grammar (EBNF, selected)
 
@@ -129,7 +133,7 @@ primary     = literal | ident | path
 if_expr     = "if" expr block { "elif" expr block } [ "else" ( if_expr | block ) ]
             | "if" "let" pattern "=" expr block [ "else" ( if_expr | block ) ] ;
 pattern     = single_pat { "|" single_pat } ;
-single_pat  = "_" | "mut"? ident | path [ "(" patterns ")" | "{" field_pats "}" ]
+single_pat  = "_" | "ref"? "mut"? ident | path [ "(" patterns ")" | "{" field_pats "}" ]
             | literal | "-" number | literal ( ".." | "..=" ) literal ;
 struct_lit  = "{" [ field_init { "," field_init } ] "}" ;
 path        = ident { "::" ident } ;
@@ -353,6 +357,32 @@ pointers:
 
 Nothing else casts: strings, structs, and enums are not reinterpreted by `as`.
 
+A float-to-integer cast is checked at run time: the truncated value must fit the
+integer type, or the program panics instead of running into C's undefined
+behaviour (NaN and the infinities do not fit). A narrowing `f64 as f32` cast is
+likewise checked when a finite value is outside `f32`'s range; infinities and
+NaN are representable and pass through. An integer-to-float cast rounds, and an
+integer-to-integer cast truncates, both as C defines them.
+
+### Checked operations and undefined behaviour
+
+Safe Zexi code does not reach a C operation whose result is undefined. The
+compiler chooses a defined lowering, or inserts a check that panics:
+
+| Operation | Lowering |
+| --- | --- |
+| `+ - *` and unary `-` on signed integers | checked in debug builds (panic on overflow); release builds wrap in two's complement, as `-fwrapv` defines |
+| `/` and `%` | divisor zero and the signed `min / -1` case panic in every profile |
+| `<<` / `>>` / `<<=` / `>>=` | count must be `0..width`; a constant count outside it is a compile error (`E0073`), a run-time count is checked and panics. A left shift wraps in the unsigned domain, and a signed right shift is an arithmetic shift spelled out rather than left to the implementation |
+| bitwise operators and their compound forms | integer operands only (`E0308`); no floating-point bitwise operation exists |
+| array / slice index | bounds-checked always (`E`-free at compile time, panic at run time) |
+| float → integer `as` cast | checked, as described above |
+| `f64 → f32` `as` cast | checked for a finite value outside `f32`'s range; `inf`/NaN pass |
+
+Raw pointers (`*T`) are the deliberate exception: they are produced only by an
+explicit `as` cast and consumed by C, and Zexi does not dereference them, so the
+safety argument stops at the FFI boundary rather than silently continuing.
+
 ### Reading through a borrow
 
 A `&T` behaves like the value it points at in the two places that matter for
@@ -395,7 +425,9 @@ the first non-match. Patterns in `match` arms and `let`-patterns may be
 combined with `|` (or-patterns, whose alternatives may not bind variables),
 may be inclusive/exclusive ranges over integer or `char` literals
 (`1..=9`, `'a'..'z'`; an empty range is an error), and a binding may be marked
-`mut` (`Step::More(mut v)`).
+`mut` (`Step::More(mut v)`) or borrow its value with `ref` (`Step::More(ref v)`,
+`ref mut v` through an exclusive path), which is how an owning payload is read
+out of a match on a borrowed scrutinee.
 
 `defer expr;` evaluates `expr` when the enclosing block scope exits — by
 falling off the end or via `return`/`break`/`continue` — in LIFO order per

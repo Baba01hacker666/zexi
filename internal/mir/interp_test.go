@@ -251,6 +251,56 @@ fn main() -> i32 {
     println(b, d, f, (a as i32));
     0
 }`,
+		"ref_pattern": `
+enum M { T(String), Size(i64, i64), P }
+fn describe(m: &M) -> i64 {
+    match m {
+        M::T(ref s) => s.len() as i64,
+        M::Size(ref a, ref b) => *a + *b,
+        M::P => -1,
+    }
+}
+fn describe_d(m: &M) -> i64 {
+    match *m {
+        M::T(ref s) => s.len() as i64,
+        M::Size(ref a, ref b) => *a + *b,
+        M::P => -1,
+    }
+}
+fn grow(m: &mut M) {
+    match m {
+        M::T(ref mut s) => { *s = String::from("grown"); },
+        _ => {},
+    }
+}
+fn main() -> i64 {
+    let a = M::T(String::from("abcd"));
+    let b = M::Size(3, 4);
+    let c = M::P;
+    println(describe(&a), describe(&b), describe(&c));
+    println(describe_d(&a), describe_d(&b), describe_d(&c));
+    match &a {
+        M::T(ref s) => println(s),
+        _ => println("no"),
+    }
+    let mut t = M::T(String::from("small"));
+    grow(&mut t);
+    match &t {
+        M::T(ref s) => println(s),
+        _ => println("no"),
+    }
+    0
+}`,
+		"owned_ref_bind": `
+enum E { A(String, i64), B }
+fn main() -> i64 {
+    let e = E::A(String::from("x"), 41);
+    match e {
+        E::A(ref s, ref n) => println(s, *n + 1),
+        E::B => println(0),
+    }
+    0
+}`,
 		"nested_loops": `
 fn main() -> i32 {
     let mut count: i64 = 0;

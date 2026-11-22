@@ -32,6 +32,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../examples/static_server.zx",
 		"../../examples/regex.zx",
 		"../../examples/local_tools.zx",
+		"../../examples/zxutils/main.zx",
 		"../../examples/math_tools.zx",
 		"../../examples/result.zx",
 		"../../examples/enum_match.zx",
@@ -77,6 +78,8 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/c_body.zx",
 		"../../tests/pointer_cast.zx",
 		"../../tests/vec_visit.zx",
+		"../../tests/ref_pattern.zx",
+		"../../tests/shift.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -562,6 +565,15 @@ func TestRunPrograms(t *testing.T) {
 			}, "\n"),
 		},
 		{
+			// `ref` / `ref mut` bindings borrow payloads in place.
+			file: "../../tests/ref_pattern.zx",
+			want: strings.Join([]string{
+				"5", "5", "5", "5", "9", "42", "hello", "5", "30",
+				"ping-borrow", "shared", "6", "15", "hi", "8",
+				"long", "hi", "9", "100", "",
+			}, "\n"),
+		},
+		{
 			// Visiting a Vec of owning elements by borrowing each one.
 			file: "../../tests/vec_visit.zx",
 			want: strings.Join([]string{
@@ -621,6 +633,12 @@ func TestRunPrograms(t *testing.T) {
 			file: "../../tests/slices.zx",
 			want: strings.Join([]string{
 				"4", "10", "5", "3", "10", "hello", "3", "5", "hello", "",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/shift.zx",
+			want: strings.Join([]string{
+				"16", "-2", "9223372036854775808", "16", "0", "12", "6", "",
 			}, "\n"),
 		},
 		{
@@ -1983,6 +2001,101 @@ fn main() -> i32 {
 	}
 }
 
+// TestZxutilsExample runs the multicall example end to end: directory listing
+// with markers, byte-preserving cat, grep exit codes, wc/head/tail, recursive
+// find, sort/uniq, echo, and the stdin paths shared by the line tools.
+func TestZxutilsExample(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	entry, root, err := driver.ResolveEntry("../../examples/zxutils")
+	if err != nil {
+		t.Fatalf("ResolveEntry: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "zxutils")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(entry, out, driver.Options{Root: root}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("zxutils example build failed")
+	}
+
+	listDir := t.TempDir()
+	listFile := filepath.Join(listDir, "a.txt")
+	if err := os.Mkdir(filepath.Join(listDir, "dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(listFile, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	dataDir := t.TempDir()
+	data := filepath.Join(dataDir, "data.txt")
+	content := "alpha\nbeta\ngamma\n"
+	if err := os.WriteFile(data, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	second := filepath.Join(dataDir, "second.txt")
+	if err := os.WriteFile(second, []byte("two"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sortFile := filepath.Join(dataDir, "sort.txt")
+	if err := os.WriteFile(sortFile, []byte("b\na\nc\na\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	uniqFile := filepath.Join(dataDir, "uniq.txt")
+	if err := os.WriteFile(uniqFile, []byte("a\na\nb\na\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name     string
+		args     []string
+		stdin    string
+		want     string
+		wantCode int
+	}{
+		{"ls", []string{"ls", listDir}, "", "a.txt\ndir/\n", 0},
+		{"cat", []string{"cat", data, second}, "", content + "two", 0},
+		{"grep match", []string{"grep", "beta", data}, "", "beta\n", 0},
+		{"grep no match", []string{"grep", "zzzz", data}, "", "", 1},
+		{"wc", []string{"wc", data}, "", "3 3 17 " + data + "\n", 0},
+		{"head", []string{"head", "-n", "2", data}, "", "alpha\nbeta\n", 0},
+		{"tail", []string{"tail", "-n", "2", data}, "", "beta\ngamma\n", 0},
+		{"find", []string{"find", listDir}, "", listDir + "\n" + listFile + "\n" + filepath.Join(listDir, "dir") + "\n", 0},
+		{"sort", []string{"sort", sortFile}, "", "a\na\nb\nc\n", 0},
+		{"uniq", []string{"uniq", uniqFile}, "", "a\nb\na\n", 0},
+		{"echo", []string{"echo", "hello", "zexi"}, "", "hello zexi\n", 0},
+		{"stdin wc", []string{"wc"}, "a b\nc\n", "2 3 6\n", 0},
+		{"stdin grep", []string{"grep", "ok"}, "ok\nno\nok\n", "ok\nok\n", 0},
+		{"stdin sort", []string{"sort"}, "b\na\n", "a\nb\n", 0},
+		{"stdin head", []string{"head", "-n", "1"}, "x\ny\n", "x\n", 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command(out, tc.args...)
+			if tc.stdin != "" {
+				cmd.Stdin = strings.NewReader(tc.stdin)
+			}
+			raw, err := cmd.Output()
+			code := 0
+			if err != nil {
+				ee, ok := err.(*exec.ExitError)
+				if !ok {
+					t.Fatalf("run: %v", err)
+				}
+				code = ee.ExitCode()
+			}
+			if code != tc.wantCode {
+				t.Fatalf("exit = %d, want %d", code, tc.wantCode)
+			}
+			if string(raw) != tc.want {
+				t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), tc.want)
+			}
+		})
+	}
+}
+
 // TestProgramArgs builds a program that echoes its command line through
 // arg_count()/arg_at(i) and checks the output.
 func TestProgramArgs(t *testing.T) {
@@ -2039,6 +2152,89 @@ fn main() -> i32 {
 	}
 	if want := "prompt> got: hello zexi (10)\n"; string(raw) != want {
 		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
+	}
+}
+
+// TestBufferedStdin checks that read_line, read_byte, and read_all share one
+// buffer: bytes read ahead by one are still visible to the next, and CRLF input
+// is normalized.
+func TestBufferedStdin(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	src := `use io;
+fn main() -> i32 {
+    let first = match io::read_line() { Ok(s) => s, Err(e) => String::new() };
+    let b = match io::read_byte() { Ok(x) => x, Err(e) => 0 };
+    let rest = match io::read_all() { Ok(s) => s, Err(e) => String::new() };
+    let eof = match io::read_line() { Ok(s) => s, Err(e) => String::new() };
+    println(first.len(), b, rest.len(), eof.len());
+    0
+}
+`
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("buffered stdin build failed")
+	}
+	cmd := exec.Command(out)
+	cmd.Stdin = strings.NewReader("one\r\ntwo\nrest")
+	raw, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("running buffered stdin program: %v", err)
+	}
+	if want := "3 116 7 0\n"; string(raw) != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", string(raw), want)
+	}
+}
+
+// TestStdFSMetadataAndRename covers the small predicates and rename wrapper
+// added to the filesystem module.
+func TestStdFSMetadataAndRename(t *testing.T) {
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.zx")
+	src := `use fs;
+fn main() -> i32 {
+    let from = arg_at(1);
+    let to = arg_at(2);
+    let ignored = fs::write(from.as_str(), "abc".as_bytes());
+    println(fs::is_file(from.as_str()), fs::is_dir(from.as_str()), fs::file_len(from.as_str()).unwrap());
+    match fs::rename(from.as_str(), to.as_str()) {
+        Ok(_) => println(fs::exists(from.as_str()), fs::is_file(to.as_str())),
+        Err(e) => println(false, false),
+    }
+    let data = match fs::read(to.as_str()) { Ok(s) => s, Err(e) => String::new() };
+    println(data.as_str());
+    let gone = fs::remove(to.as_str());
+    0
+}
+`
+	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(mainPath, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("fs metadata build failed")
+	}
+	from := filepath.Join(dir, "from.txt")
+	to := filepath.Join(dir, "to.txt")
+	raw, err := exec.Command(out, from, to).Output()
+	if err != nil {
+		t.Fatalf("running fs metadata program: %v", err)
+	}
+	if got, want := string(raw), "true false 3\nfalse true\nabc\n"; got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
 	}
 }
 
@@ -2570,6 +2766,35 @@ fn main() -> i32 {
 	}
 }
 
+// TestExampleProjectRuns keeps the multi-file example honest: a sibling `mod`
+// and a folder package with a facade must build and run from the directory.
+func TestExampleProjectRuns(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	entry, root, err := driver.ResolveEntry("../../examples/project")
+	if err != nil {
+		t.Fatalf("ResolveEntry: %v", err)
+	}
+	bin := filepath.Join(t.TempDir(), "project")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(entry, bin, driver.Options{Root: root}, em); !ok {
+		var buf bytes.Buffer
+		em.Render(&buf, em.FirstFileID())
+		t.Fatalf("build failed:\n%s", buf.String())
+	}
+	out, err := exec.Command(bin).CombinedOutput()
+	if err != nil {
+		t.Fatalf("run: %v\n%s", err, out)
+	}
+	if got := string(out); got != "big: 50\n" {
+		t.Fatalf("output = %q, want %q", got, "big: 50\n")
+	}
+}
+
 // TestProjectDirectoryEntry covers convention-only project builds: a directory
 // entry (`main.zx` or `src/main.zx`), a project root derived from it, and named
 // imports that reach modules at the root from a file in `src/`.
@@ -3021,6 +3246,61 @@ func TestModuleQualifiedDiagnostics(t *testing.T) {
 			em.Render(&buf, em.FirstFileID())
 			if !strings.Contains(buf.String(), tc.code) {
 				t.Fatalf("expected %s, got:\n%s", tc.code, buf.String())
+			}
+		})
+	}
+}
+
+// TestModuleDiagnosticsSuggestFixes checks the module layer's messages: a
+// misspelled item and a misspelled import both name the likely target, and a
+// privacy error says how to export it.
+func TestModuleDiagnosticsSuggestFixes(t *testing.T) {
+	files := map[string]string{
+		"math.zx": "pub fn double(n: i64) -> i64 { n * 2 }\nfn hidden() -> i64 { 1 }\n",
+	}
+	cases := []struct {
+		name, src string
+		want      []string
+	}{
+		{
+			name: "item-typo",
+			src:  "mod math;\nfn main() -> i32 { println(math::doulbe(2)); 0 }\n",
+			want: []string{"E0412", "did you mean `double`"},
+		},
+		{
+			name: "private-item",
+			src:  "mod math;\nfn main() -> i32 { println(math::hidden()); 0 }\n",
+			want: []string{"E0603", "mark the declaration `pub`"},
+		},
+		{
+			name: "import-typo",
+			src:  "use mat;\nfn main() -> i32 { 0 }\n",
+			want: []string{"E9022", "did you mean `math`"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			caseDir := t.TempDir()
+			for name, src := range files {
+				if err := os.WriteFile(filepath.Join(caseDir, name), []byte(src), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			mainPath := filepath.Join(caseDir, "main.zx")
+			if err := os.WriteFile(mainPath, []byte(tc.src), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			em := diag.NewEmitter()
+			if _, ok := driver.FrontEnd(mainPath, driver.Options{}, em); ok {
+				t.Fatalf("expected diagnostics for:\n%s", tc.src)
+			}
+			var buf bytes.Buffer
+			em.Render(&buf, em.FirstFileID())
+			got := buf.String()
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Fatalf("expected %q in diagnostics, got:\n%s", want, got)
+				}
 			}
 		})
 	}

@@ -87,8 +87,26 @@ automatically. Lifetimes are erased before codegen.
 - Checks are **elided** when the compiler proves `i < len` (loop-range
   reasoning, M2). Elision is an optimization; soundness never depends on it.
 - Integer arithmetic **checks overflow in debug** (panic) and wraps in release;
-  `+%`, `+%`-family or `Wrapping<T>` opt into wrap everywhere. (Div-by-zero and
-  `isize::MIN / -1` always trap.)
+  `+%`/`Wrapping<T>` would opt into wrap everywhere. Unsigned arithmetic wraps
+  by definition — there is no "overflow" to report — so only signed overflow is
+  checked, and only in debug. (Div-by-zero and `isize::MIN / -1` always trap.)
+- Shift counts are **checked in every profile**: a count that is a compile-time
+  constant outside `0..width` is the error `E0073`, and a runtime count outside
+  that range panics — for `<<`/`>>` and for `<<=`/`>>=` alike (a C shift on an
+  out-of-range or negative count is undefined). Signed left shifts are computed
+  in the unsigned domain so they wrap; signed right shifts are arithmetic.
+  Bitwise operators are integer-only, so no floating-point value ever reaches a
+  C bitwise operation.
+- **Float casts are checked where C's conversion is undefined.** A float →
+  integer cast (`3.9 as i64`) panics when the truncated value does not fit the
+  destination integer (NaN and infinities included); a narrowing `f64 as f32`
+  cast panics for a finite value outside `f32`'s range. This is what lets the C
+  and LLVM backends agree on a defined result instead of inheriting each
+  target's undefined-behaviour corner.
+- `scripts/ubsan.sh` sweeps every shipped program's generated C through
+  UBSan and AddressSanitizer at both optimization levels, so a lowering that
+  reintroduces undefined behaviour fails a command rather than waiting for a
+  miscompilation.
 - `char` is a valid Unicode scalar; `str` is guaranteed valid UTF-8 at the type
   boundary.
 
@@ -145,8 +163,30 @@ match m {
 A payload cannot be moved out through a borrow: matching through a reference
 (a `&Enum`, `match *e`, or a field of a borrowed struct such as `match
 self.kind`) and binding an owned payload reports `E0507`. Such a match reads
-the value and leaves the owner intact. Match by value, or use a non-owning
-pattern.
+the value and leaves the owner intact. Match by value, or bind the payload by
+reference with a `ref` pattern.
+
+<!-- fragment -->
+```zexi
+fn show(m: &Msg) {
+    match m {
+        Msg::Text(ref s) => println(s),  // `s: &String`, borrows in place
+        Msg::Ping => {},
+    }
+}
+```
+
+`ref s` binds a shared reference to the payload; it works on any match, owned
+or borrowed, and it is the right tool whenever the owner outlives the arm.
+`ref mut s` binds an exclusive reference and is allowed when the path to the
+scrutinee stays exclusive: a `&mut` reference along the way (or a raw pointer,
+or the match itself, which owns its scrutinee). A shared `&T` anywhere on the
+path rejects the reborrow with `E0596`, as does a scrutinee that is not an
+addressable place (`ref mut` through an rvalue temporary). The reference binds
+the payload's storage in place — the enum is not copied for the match. Like
+every borrow today, a `ref` binding is not region-tracked: do not stash it
+past the point the scrutinee's owner goes away (that is the borrow checker's
+job, and it has not landed yet — see the spec's ownership section).
 
 ## 3.10 The runtime (or lack of one)
 

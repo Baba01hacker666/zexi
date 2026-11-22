@@ -2100,6 +2100,43 @@ func (l *lowerer) constUint(e ast.Expr) (uint64, error) {
 // branches to its body or to the next arm's test.
 func (l *lowerer) matchInto(x *ast.MatchExpr, dest Place) error {
 	scrutTy := l.ty(x.Scrutinee)
+	exit := l.newBlock()
+	// A match reached through a borrow selects the referent in place: the
+	// place is a borrow, so it is never consumed and never dropped. MIR
+	// bindings `ref` operands arrive here as Ref{Place: ..} over a DerefProj,
+	// exactly what the C backend emits.
+	if l.info.PlaceThroughBorrow(x.Scrutinee) {
+		p, ok, err := l.placeOf(x.Scrutinee)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			// The scrutinee is an rvalue (a call producing a reference):
+			// materialize the reference in a local, then match through it.
+			if scrutTy != nil && (scrutTy.Kind == types.Ref || scrutTy.Kind == types.Ptr) {
+				tmp := l.addLocal("", scrutTy, LocalTemp)
+				if err := l.exprInto(x.Scrutinee, Place{Local: tmp}); err != nil {
+					return err
+				}
+				p, ok = Place{Local: tmp}, true
+			} else {
+				return unsupportedf(x.Sp, "`match` through a borrow that is not an addressable place")
+			}
+		}
+		base, elemTy, err := l.autoDeref(p, x.Sp)
+		if err != nil {
+			return err
+		}
+		if switchable(x, elemTy) {
+			if err := l.matchSwitch(x, base, elemTy, dest, exit); err != nil {
+				return err
+			}
+		} else if err := l.matchChain(x, base, elemTy, dest, exit); err != nil {
+			return err
+		}
+		l.cur = exit
+		return nil
+	}
 	// The scrutinee gets its own local without the automatic drop registration
 	// of temp(), because an arm may move a payload out of it and the residual
 	// must then not be dropped again.
@@ -2111,7 +2148,6 @@ func (l *lowerer) matchInto(x *ast.MatchExpr, dest Place) error {
 		l.registerDrop(scrutLocal, scrutTy)
 	}
 	scrut := Place{Local: scrutLocal}
-	exit := l.newBlock()
 	if switchable(x, scrutTy) {
 		if err := l.matchSwitch(x, scrut, scrutTy, dest, exit); err != nil {
 			return err
@@ -2202,9 +2238,14 @@ func (l *lowerer) matchSwitch(x *ast.MatchExpr, scrut Place, scrutTy *types.Type
 	if !hasDefault {
 		def = l.newBlock()
 	}
-	disc := l.temp(types.UsizeT)
-	l.emit(&Assign{Place: Place{Local: disc}, RV: &Discriminant{Place: scrut, Ty: types.UsizeT}, Sp: x.Sp})
-	l.setTerm(&SwitchInt{Discr: Copy(Place{Local: disc}, types.UsizeT), Cases: cases, Otherwise: def, Sp: x.Sp})
+	if len(cases) == 0 {
+		// One catch-all arm covers the whole type: there is nothing to test.
+		l.gotoBlock(def, x.Sp)
+	} else {
+		disc := l.temp(types.UsizeT)
+		l.emit(&Assign{Place: Place{Local: disc}, RV: &Discriminant{Place: scrut, Ty: types.UsizeT}, Sp: x.Sp})
+		l.setTerm(&SwitchInt{Discr: Copy(Place{Local: disc}, types.UsizeT), Cases: cases, Otherwise: def, Sp: x.Sp})
+	}
 
 	for i, arm := range x.Arms {
 		l.cur = bodies[i]
@@ -2511,6 +2552,24 @@ func (l *lowerer) bindPattern(p ast.Pattern, src Place, ty *types.Type, sp token
 		return nil
 	case *ast.BindPat:
 		if pt.Name == "_" {
+			return nil
+		}
+		if pt.Ref {
+			if ty == nil {
+				return unsupportedf(sp, "`ref` binding without a type")
+			}
+			elem := ty
+			if elem.Kind == types.Ref || elem.Kind == types.Ptr {
+				// `ref x` on a reference scrutinee binds a reborrow.
+				elem = elem.Elem
+			}
+			rt := types.RefTo(elem, pt.RefMut)
+			id := l.addLocal(pt.Name, rt, LocalUser)
+			l.body.Locals[id].Mut = pt.RefMut
+			l.emit(&Assign{Place: Place{Local: id}, RV: &Ref{Mut: pt.RefMut, Place: src, Ty: rt}, Sp: sp})
+			l.declare(pt.Name, id)
+			// The binding is a reference: it takes no ownership and has no
+			// destructor.
 			return nil
 		}
 		id := l.addLocal(pt.Name, ty, LocalUser)

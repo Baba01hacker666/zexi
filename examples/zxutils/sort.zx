@@ -1,0 +1,69 @@
+// sort: sort lines lexicographically. The sort keeps an index vector and sorts
+// that, so it never copies or shifts the owning line buffers; comparisons are
+// still done through the stdlib's text::compare.
+
+use common;
+use text;
+
+fn sort_range(order: &mut Vec<usize>, lines: &Vec<String>, lo: i64, hi: i64) {
+    if lo >= hi {
+        return;
+    }
+    let mid = ((lo + hi) / 2) as usize;
+    let pivot = lines[order[mid]].clone();
+    let mut i = lo;
+    let mut j = hi;
+    while i <= j {
+        while i <= hi && text::compare(lines[order[i as usize]].as_str(), pivot.as_str()) < 0 {
+            i += 1;
+        }
+        while j >= lo && text::compare(lines[order[j as usize]].as_str(), pivot.as_str()) > 0 {
+            j -= 1;
+        }
+        if i <= j {
+            let swap = order[i as usize];
+            order[i as usize] = order[j as usize];
+            order[j as usize] = swap;
+            i += 1;
+            j -= 1;
+        }
+    }
+    if lo < j {
+        sort_range(order, lines, lo, j);
+    }
+    if i < hi {
+        sort_range(order, lines, i, hi);
+    }
+}
+
+pub fn run(path: str, use_stdin: bool) -> i32 {
+    let data = match common::read_input(path, use_stdin) {
+        Ok(data) => data,
+        Err(e) => {
+            common::report_io("sort", e);
+            return 1;
+        }
+    };
+    let lines = text::lines(data.as_str());
+    let mut end = lines.len();
+    if end > 0 && lines[end - 1].len() == 0 {
+        end -= 1;
+    }
+
+    let mut order: Vec<usize> = Vec::with_capacity(end);
+    let mut i: usize = 0;
+    while i < end {
+        order.push(i);
+        i += 1;
+    }
+    if order.len() > 1 {
+        sort_range(&mut order, &lines, 0, order.len() as i64 - 1);
+    }
+
+    i = 0;
+    while i < order.len() {
+        println(lines[order[i]].as_str());
+        i += 1;
+    }
+    return 0;
+}

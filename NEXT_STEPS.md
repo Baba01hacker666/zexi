@@ -86,6 +86,35 @@ forward most. Ordered by value per unit of risk, not by ambition.
 - **Borrowed map lookups.** `HashMap<String, V>` has `get_str`/`contains_str`
   that hash and compare over the borrowed bytes, so a template lookup no
   longer allocates a key for every `{{name}}`.
+- **A `match` on a borrowed enum binds a pointer, not a copy.** `match self`
+  through `&self` (or any `&T`/`*T` scrutinee, a dereference, or a field of one)
+  now matches the referent in place: `ref s` in a pattern borrows the payload
+  instead of moving it out (`E0507`), `ref mut s` borrows exclusively through a
+  `&mut`/raw-pointer path (`E0596` otherwise, like a `&mut` method call), and
+  `ref` works in `if let` and `while let` too. The old lowering shallow-copied
+  the enum per match; the discard-per-arm copy is gone entirely.
+- **A function's locals are dropped before its implicit `return 0`.** A `main`
+  (or any valued function ending by falling off its end) had its destructors
+  emitted *after* the implicit `return` as unreachable C, leaking every
+  owning local at exit — caught by `scripts/leaks.sh`. A function body that
+  reaches an explicit `return` always runs its destructors there first; the
+  closing frames then re-emit the drops as dead code after the `return`
+  (unreachable C, harmless).
+- **A project is a tree of files, and diagnostics help you name the right one.**
+  `mod`, `use`, `import`, aliases, `pub` re-exports, inline modules, and folder
+  packages are one loader; a directory entry (`zexic run .`) derives the project
+  root and loads only what is reachable. Spelling mistakes now get a consistent
+  "did you mean" hint for files, module items, functions, fields, methods,
+  variants, and types, and privacy/import errors say what to change. See
+  `docs/20-projects-and-modules.md` and `examples/project/`.
+- **Safe code has a defined lowering.** Integer shifts are checked in every
+  profile (`E0073` for a constant count outside the width, a panic for a
+  run-time one) and `<<=`/`>>=` use the same check; bitwise operators are
+  integer-only; division, remainder, and the signed `min / -1` case panic
+  instead of trapping; float → integer and narrowing `f64 as f32` casts panic
+  when C's conversion would be undefined. `scripts/ubsan.sh` sweeps every
+  shippable program's generated C through UBSan at `-O0` and `-O2` and fails
+  on the first runtime error.
 - **Verification in place:** unit tests, an end-to-end demo site, ASan/UBSan
   builds, a truncation fuzzer over every `.zx` file, and adversarial socket
   probes. The worker pool's `map` no longer loses a batch when the queue
@@ -137,52 +166,53 @@ $ scripts/leaks.sh tests/closures.zx
 tests/closures.zx: leaks detected
 Direct leak of 184 byte(s) in 7 object(s) allocated from:
     #1 zx_clo_alloc
-Direct leak of 6 byte(s) in 1 object(s) allocated from:
-    #1 zx_string_reserve
-    #2 zx_string_push_str
-SUMMARY: AddressSanitizer: 190 byte(s) leaked in 8 allocation(s).
+SUMMARY: AddressSanitizer: 184 byte(s) leaked in 7 allocation(s).
 ```
 
 So the picture is narrower than "every allocation": `String`, `Vec`, `HashMap`,
 struct fields, and the emitted drop glue are clean on the paths the corpus
 exercises — `tests/vec.zx`, `tests/tour.zx`, `tests/strings.zx`,
 `tests/std_bytes.zx`, `tests/prelude_methods.zx`, `examples/hello.zx`, and
-`examples/result.zx` all report `clean`. What leaks is
+`examples/result.zx` all report `clean`. What leaks is now only the closure environment:
 
 - **closure environments** — `zx_clo_alloc` has no release path at all, so every
   function value that captures an owning value leaks its environment (184 bytes
-  for `tests/closures.zx`);
-- **a `String` borrowed out of a temporary.** The second allocation is a real,
-  reproducible bug and it is not about closures:
+  for `tests/closures.zx`). The environment is intentionally heap-allocated
+  because a closure may outlive the frame that built it, and `fn(..)` values are
+  `Copy`, so a release path has to know whether a pointer is a shared static
+  record (`rc = -1`) or a heap environment and must not free one twice.
 
-  ```sh
-  $ echo 'fn main() { println((String::from("a") + "bc").as_str()); }' > /tmp/l.zx
-  $ scripts/leaks.sh /tmp/l.zx
-  /tmp/l.zx: leaks detected
-  Direct leak of 4 byte(s) in 1 object(s) ...
-  ```
+The common borrowed-temporary case is fixed: a `String` temporary behind
+`as_str()` in a print position is bound inside the print expression and dropped
+immediately after it, so this is clean:
 
-  `println(t.as_str())` with `t` a temporary `String` leaks `t`'s buffer:
-  `as_str` hands out a borrow of a temporary that the enclosing statement owns,
-  and no drop is emitted for it. `println(t)` and `let s = t; println(s.as_str())`
-  are both clean, so the owner exists — it is the statement-scoped temporary
-  list, not the drop glue, that is missing.
+```sh
+$ echo 'fn main() { println((String::from("a") + "bc").as_str()); }' > /tmp/l.zx
+$ scripts/leaks.sh /tmp/l.zx
+/tmp/l.zx: clean (no leaks, no sanitizer errors)
+```
 
-The work, in order:
+Other positions (`let s = t.as_str()` with a temporary `t`, or returning
+`t.as_str()`) still keep the temporary alive. That is deliberate until lifetimes
+are tracked: dropping at the end of the enclosing scope would turn a leak into a
+dangling `str` for a borrow that escapes the statement, which is worse. A
+general fix needs statement-scoped temporary drops plus escape information.
 
-1. Give the closure record a real release path (`zx_clo_release`, called from the
-   `Drop` glue for `fn(..)` values), then let captured values free through the
-   drop glue the compiler already emits for their types. This is the big one and
-   the prerequisite for the rest.
-2. Fix the borrowed-temporary case: a method returning a borrow of a temporary
-   receiver (`as_str`, `as_bytes`, and anything like them) needs the receiver's
-   drop scheduled at the end of the enclosing statement instead of being lost.
-   That is a small, well-scoped change in `stringMethodCall` plus a test that
-   `scripts/leaks.sh` runs over both shapes.
-3. Only then tune `Vec`/`HashMap` (shrink on `clear`, free the table on scope
-   exit) — they are not the current leak.
-4. Keep `scripts/leaks.sh` in the loop, and add a corpus sweep so the number
-   cannot grow unnoticed.
+The remaining work:
+
+1. Give the closure record a real release path (`zx_clo_release`), then let
+   captured values free through the drop glue the compiler already emits for
+   their types. The open design question is ownership of a copied `fn` value:
+   either `fn` becomes non-`Copy` (moves null the source) or copies bump the
+   environment count. Decide this before writing the destructor, because a
+   half-refcounted pointer will double-free.
+2. Keep `scripts/leaks.sh` in the loop (it now prefers the local build, so a
+   stale installed `zexic` cannot hide a regression), and add a corpus sweep so
+   the number cannot grow unnoticed.
+3. Replace the print-only temporary fix with statement-scoped drops once the
+   compiler can tell whether a borrowed temporary escapes its statement.
+4. Then tune `Vec`/`HashMap` (shrink on `clear`, free the table on scope exit) —
+   they are already leak-clean, so this is about peak RSS, not correctness.
 
 ## 3. Errors that a request handler can return — done
 
@@ -222,8 +252,9 @@ fixtures in `tests/errors/`.
 ## 6. Language gaps worth closing
 
 Collected while writing the library, each small, each has bitten. Each row was
-re-checked against the current compiler rather than trusted: one was fixed this
-round, two turned out to be stale claims (they already work), and the rest are
+re-checked against the current compiler rather than trusted: some were fixed
+this round (`Vec` closure helpers, variadic `push_str`, and the `ref` binding),
+two turned out to be stale claims (they already work), and the rest are
 still open.
 
 | Gap | State |
@@ -234,7 +265,7 @@ still open.
 | `HashMap::get` allocated a key per lookup | **fixed earlier** — `get_str`/`contains_str` hash the borrowed bytes |
 | `Vec::fold` over owning elements | **open** — its accumulator is an element value and the generated loop cannot drop the values it replaces, so it stays `Copy`-only; fold into an owned accumulator with an index instead |
 | `for x in v` copies each element | **open** — iterating a `Vec<String>` is `E0507`; `v.each(|s: &String| …)` is the way today. A `for s in &v` form is the fix, and it needs the borrow-checked iterator idea below |
-| No `ref`-style pattern | **open** — an owning payload cannot be bound by reference out of a borrowed scrutinee (`Msg::Text(s) => …` on `&Msg` is `E0507`). A `ref s` pattern is the smallest fix; `_` is the workaround |
+| No `ref`-style pattern | **fixed** — `ref s` binds a shared reference and `ref mut s` an exclusive one, borrowing the payload in place; `ref mut` needs a `&mut` (or raw pointer, or the match's own ownership) along the path, `E0596` otherwise. A borrowed match now binds a pointer to the referent instead of copying the enum, and `ref` works in `if let` / `while let` too. `let ref` and `for ref` are still rejected (`E0900`) |
 | Variadic string building | **fixed** — `push_str` takes one or more arguments (`s.push_str("a", "b", "c")`); each is appended in order and a `String` argument is borrowed, not moved |
 | `io::read_line` does one `read` syscall per byte | **open** — a line needs a buffered-reader type (buffer + consumed mark); the type is the work, not the syscalls |
 | `str` is C-ABI-shaped at the boundary | **open, deliberate** — NUL-terminated with no independent length. Slices cover buffers and `str::as_bytes()` covers borrowing; length-prefixing `str` is an ABI change with no forcing need yet |
@@ -275,9 +306,12 @@ zexic run tests/c_body.zx         # a function body written in C
 zexic run tests/pointer_cast.zx   # &t as *T
 zexic run tests/vec_visit.zx      # visiting a Vec<String> by borrow
 zexic run tests/prelude_methods.zx  # unwrap / is_ok / panic
+zexic run tests/ref_pattern.zx   # ref / ref mut bindings borrow payloads
 
 scripts/leaks.sh tests/closures.zx   # ASan + LeakSanitizer summary
 scripts/leaks.sh tests/vec.zx        # ... and a clean control
+scripts/ubsan.sh                     # UBSan sweep over every shipped program
+scripts/ubsan.sh tests/shift.zx      # ... or one program
 ```
 
 `scripts/leaks.sh` builds the program as one translation unit with

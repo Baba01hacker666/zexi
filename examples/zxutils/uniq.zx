@@ -1,0 +1,33 @@
+// uniq: collapse adjacent duplicate lines, like `uniq` without options.
+
+use common;
+use text;
+
+pub fn run(path: str, use_stdin: bool) -> i32 {
+    let data = match common::read_input(path, use_stdin) {
+        Ok(data) => data,
+        Err(e) => {
+            common::report_io("uniq", e);
+            return 1;
+        }
+    };
+    let lines = text::lines(data.as_str());
+    let mut end = lines.len();
+    if end > 0 && lines[end - 1].len() == 0 {
+        end -= 1;
+    }
+
+    let mut last: usize = 0;
+    let mut have_last = false;
+    let mut i: usize = 0;
+    while i < end {
+        let same = have_last && text::compare(lines[last].as_str(), lines[i].as_str()) == 0;
+        if !same {
+            println(lines[i].as_str());
+            last = i;
+            have_last = true;
+        }
+        i += 1;
+    }
+    return 0;
+}

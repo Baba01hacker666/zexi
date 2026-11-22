@@ -1,0 +1,6 @@
+// Shifts are an integer operation; a float operand is a type error rather than
+// an emitted C shift on a floating-point value.
+fn main() {
+    let f: f64 = 1.0;
+    println(f << 2); // error: E0308 shift operators require integers, found `f64`
+}

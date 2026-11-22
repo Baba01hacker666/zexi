@@ -1,0 +1,9 @@
+// A sibling module: `mod report;` in main.zx loads this file, and only the
+// `pub` function is visible as `report::line`.
+pub fn line(label: str, total: i64) -> String {
+    f"{label}: {total}"
+}
+
+fn indent_for_debug(n: i64) -> i64 {
+    n * 2
+}

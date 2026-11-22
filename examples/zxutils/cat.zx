@@ -1,0 +1,51 @@
+// cat: stream a file to standard output in 8 KiB chunks. Streaming avoids the
+// stdlib's single-read MAX_BYTES cap and preserves arbitrary bytes, including
+// NUL.
+
+use common;
+use io;
+use sys;
+
+pub fn run(path: str) -> i32 {
+    let fd = match sys::open_read(path) {
+        Ok(fd) => fd,
+        Err(e) => {
+            common::report_io("cat", e);
+            return 1;
+        }
+    };
+    let mut buf: [u8; 8192] = [0; 8192];
+    loop {
+        match sys::read_fd(fd, &mut buf) {
+            Ok(n) => {
+                if n == 0 {
+                    match sys::close_fd(fd) {
+                        Ok(_) => return 0,
+                        Err(e) => {
+                            common::report_io("cat", e);
+                            return 1;
+                        }
+                    }
+                }
+                match io::write(buf[0..n]) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let closed = sys::close_fd(fd);
+                        common::report_io("cat", e);
+                        return 1;
+                    }
+                }
+            }
+            Err(e) => {
+                match e {
+                    IoError::Interrupted => { /* retry */ }
+                    _ => {
+                        let closed = sys::close_fd(fd);
+                        common::report_io("cat", e);
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+}

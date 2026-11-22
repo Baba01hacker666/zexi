@@ -1,0 +1,18 @@
+// A by-value binding still cannot move an owning payload out of a borrowed
+// scrutinee; `ref s` is the way to borrow it in place.
+enum M {
+    T(String),
+    P,
+}
+
+fn f(m: &M) {
+    match m {
+        M::T(s) => println(s), // error: E0507 cannot move the owned value `s` out of a borrowed scrutinee
+        M::P => {},
+    }
+}
+
+fn main() {
+    let t = M::T(String::from("y"));
+    f(&t);
+}

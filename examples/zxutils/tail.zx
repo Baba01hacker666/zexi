@@ -1,0 +1,29 @@
+// tail: print the last N lines (default 10) from a file or standard input.
+
+use common;
+use text;
+
+pub fn run(count: i64, path: str, use_stdin: bool) -> i32 {
+    let data = match common::read_input(path, use_stdin) {
+        Ok(data) => data,
+        Err(e) => {
+            common::report_io("tail", e);
+            return 1;
+        }
+    };
+    let lines = text::lines(data.as_str());
+    let mut end = lines.len();
+    if end > 0 && lines[end - 1].len() == 0 {
+        end -= 1;
+    }
+    let mut start: usize = 0;
+    if count < end as i64 {
+        start = end - count as usize;
+    }
+    let mut i = start;
+    while i < end {
+        println(lines[i].as_str());
+        i += 1;
+    }
+    return 0;
+}

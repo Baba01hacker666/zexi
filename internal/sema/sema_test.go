@@ -2,6 +2,7 @@ package sema_test
 
 import (
 	"slices"
+	"strings"
 	"testing"
 
 	"zexi/internal/diag"
@@ -1240,6 +1241,58 @@ func TestDidYouMeanStillErrors(t *testing.T) {
 	ok, codes = check(t, `fn main() -> i32 { let total = 1; println(totla); 0 }`)
 	if ok || !has(codes, "E0425") {
 		t.Fatalf("expected E0425, got ok=%v codes=%v", ok, codes)
+	}
+}
+
+// TestSuggestionsCoverFieldsVariantsMethodsAndTypes checks that a spelling
+// mistake gets a suggestion at every name-shaped diagnostic, not just for bare
+// function names.
+func TestSuggestionsCoverFieldsVariantsMethodsAndTypes(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{
+			name: "field",
+			src: `struct Point { x: i64, y: i64 }
+fn main() -> i32 { let p = Point { x: 1, y: 2 }; println(p.xx); 0 }`,
+			want: "did you mean `x`",
+		},
+		{
+			name: "method",
+			src: `struct Point { x: i64 }
+impl Point { fn norm(&self) -> i64 { self.x } }
+fn main() -> i32 { let p = Point { x: 1 }; println(p.nrom()); 0 }`,
+			want: "did you mean `norm`",
+		},
+		{
+			name: "variant",
+			src: `enum Color { Red, Green }
+fn main() -> i32 { let c = Color::Red; match c { Color::Reed => {}, _ => {} } 0 }`,
+			want: "did you mean `Red`",
+		},
+		{
+			name: "type",
+			src: `struct Point { x: i64 }
+fn main() -> i32 { let p: Pont = Point { x: 1 }; 0 }`,
+			want: "did you mean `Point`",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			file, pd := parser.Parse(0, 0, []byte(tc.src))
+			if len(pd) > 0 {
+				t.Fatalf("unexpected parse diagnostics: %v", codesOf(pd))
+			}
+			_, ds := sema.Check(file)
+			for _, d := range ds {
+				if strings.Contains(d.Message, tc.want) {
+					return
+				}
+			}
+			t.Fatalf("no diagnostic contained %q; got %v", tc.want, ds)
+		})
 	}
 }
 

@@ -1,0 +1,5 @@
+// Bitwise compound assignment is integer-only, like `&`, `|`, and `^`.
+fn main() {
+    let mut f: f64 = 1.0;
+    f &= 2.0; // error: E0308 bitwise operators require integers, found `f64`
+}

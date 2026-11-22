@@ -4,7 +4,9 @@ Zexi's extension story (chapter [17](17-extending.md)) is that a capability is a
 **library file**, not a compiler change. This chapter is the packaging side of
 that promise: `zexic add` installs a ready-made binding for a well-known C
 library into your project, and the catalog — with the source of every package —
-ships inside the compiler binary.
+ships inside the compiler binary. For the language-side layout (`mod`, `use`,
+`import`, visibility, and folder packages) see chapter
+[20](20-projects-and-modules.md).
 
 ```sh
 zexic add               # list the catalog, with live dependency status

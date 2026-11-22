@@ -1,0 +1,26 @@
+// head: print the first N lines (default 10) from a file or standard input.
+
+use common;
+use text;
+
+pub fn run(count: i64, path: str, use_stdin: bool) -> i32 {
+    let data = match common::read_input(path, use_stdin) {
+        Ok(data) => data,
+        Err(e) => {
+            common::report_io("head", e);
+            return 1;
+        }
+    };
+    let lines = text::lines(data.as_str());
+    let mut i: usize = 0;
+    while i < lines.len() && (i as i64) < count {
+        // A file ending in '\n' has one final empty piece; it is not a line.
+        let trailing = i + 1 == lines.len() && lines[i].len() == 0;
+        if trailing {
+            break;
+        }
+        println(lines[i].as_str());
+        i += 1;
+    }
+    return 0;
+}

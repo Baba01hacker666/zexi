@@ -1,0 +1,17 @@
+// A multi-file Zexi project.
+//
+//     zexic run examples/project
+//
+// `report.zx` is a plain module next to this file; `util/` is a folder package
+// with a small facade over two implementation files.
+
+mod report;
+use util;
+
+fn main() -> i32 {
+    let items: [i64; 5] = [3, 8, 5, 13, 21];
+    let total = util::sum(&items);
+    let label = util::label(total);
+    println(report::line(label, total));
+    0
+}

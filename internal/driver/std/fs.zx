@@ -29,6 +29,16 @@ pub fn exists(path: str) -> bool {
     return sys::path_kind(path) != 0;
 }
 
+// is_file reports whether path names a regular file.
+pub fn is_file(path: str) -> bool {
+    return sys::path_kind(path) == 1;
+}
+
+// is_dir reports whether path names a directory.
+pub fn is_dir(path: str) -> bool {
+    return sys::path_kind(path) == 2;
+}
+
 // file_len returns a regular file's byte length.
 pub fn file_len(path: str) -> Result<u64, IoError> {
     return sys::file_size(path);
@@ -150,6 +160,14 @@ pub fn copy(from: str, to: str) -> Result<u64, IoError> {
 // remove removes a regular file or an empty directory. It never recurses.
 pub fn remove(path: str) -> Result<(), IoError> {
     return sys::remove_path_status(path);
+}
+
+// rename renames or moves a file or directory within the local filesystem.
+pub fn rename(from: str, to: str) -> Result<(), IoError> {
+    if sys::rename_path(from, to) == 0 {
+        return Ok(());
+    }
+    return Err(sys::error_of(sys::errno()));
 }
 
 // list_dir returns the names of the entries in `path` (excluding "." and "..").

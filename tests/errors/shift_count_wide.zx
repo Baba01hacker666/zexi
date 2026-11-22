@@ -1,0 +1,6 @@
+// A constant shift count at or above the type's width is undefined in C, so
+// the checker rejects it before it can reach the back end.
+fn main() -> i64 {
+    let n: i64 = 1 << 64; // error: E0073 shift count `64` is out of range for `i64`
+    n
+}

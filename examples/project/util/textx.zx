@@ -1,0 +1,3 @@
+pub fn label(n: i64) -> str {
+    if n > 20 { "big" } else { "small" }
+}

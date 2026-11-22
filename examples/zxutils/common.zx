@@ -1,0 +1,79 @@
+// Shared diagnostics and argument/input helpers for the zxutils tools.
+
+use fs;
+use io;
+use sys;
+use text;
+
+// report prints `tool: message` on standard error.
+pub fn report(tool: str, message: str) {
+    io::eprint(tool);
+    io::eprint(": ");
+    io::eprintln(message);
+}
+
+// report_io renders the stdlib's IoError for a CLI user.
+pub fn report_io(tool: str, e: IoError) {
+    io::eprint(tool);
+    io::eprint(": ");
+    io::eprintln(sys::message(e).as_str());
+}
+
+// join_path adds one separator, so `join_path(".", "x")` is `./x` and
+// `join_path("src/", "x")` is `src/x`, never `src//x`.
+pub fn join_path(dir: str, name: str) -> String {
+    let mut out = String::from(dir);
+    if !out.ends_with("/") {
+        out.push('/');
+    }
+    out.push_str(name);
+    return out;
+}
+
+// sort_names sorts a small list of names in place. Directory listings are
+// usually short, so insertion sort is enough here; the `sort` tool uses an
+// index quicksort for arbitrary input.
+pub fn sort_names(items: &mut Vec<String>) {
+    let mut i: usize = 1;
+    while i < items.len() {
+        let item = items.remove(i);
+        let mut j = i;
+        while j > 0 && text::compare(items[j - 1].as_str(), item.as_str()) > 0 {
+            j -= 1;
+        }
+        items.insert(j, item);
+        i += 1;
+    }
+}
+
+// read_input reads a file, or all of standard input when `use_stdin` is set.
+pub fn read_input(path: str, use_stdin: bool) -> Result<String, IoError> {
+    if use_stdin {
+        return io::read_all();
+    }
+    return fs::read(path);
+}
+
+// parse_count parses a non-negative decimal line count. It returns -1 for an
+// empty, signed, non-numeric, or absurdly large value; `parse_i64` is not used
+// because it maps invalid input to 0, which is also a valid count.
+pub fn parse_count(text: str) -> i64 {
+    if text.len() == 0 {
+        return -1;
+    }
+    let bytes = text.as_bytes();
+    let mut n: i64 = 0;
+    let mut i: usize = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c < 48 || c > 57 {
+            return -1;
+        }
+        if n > 1000000000 {
+            return -1;
+        }
+        n = n * 10 + (c - 48) as i64;
+        i += 1;
+    }
+    return n;
+}

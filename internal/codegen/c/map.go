@@ -442,7 +442,7 @@ func optionExpr(opt, elem *types.Type, cond, val string) string {
 // original keeps ownership), while a non-place owning temporary is bound to a
 // local and dropped after the helper returns.
 func (g *gen) mapKeyArg(e ast.Expr, key *types.Type) (prelude, expr, postlude string) {
-	if key != nil && key.NeedsDrop() && !isPlaceExpr(e) {
+	if key != nil && key.NeedsDrop() && !ast.IsPlace(e) {
 		tm := g.tmpName()
 		return ctype(key) + " " + tm + " = " + g.value(e) + "; ",
 			tm,
@@ -461,7 +461,7 @@ func (g *gen) mapMethodCall(x *ast.MethodCallExpr) string {
 	recv := g.vecReceiverValue(x.Recv)
 	borrowed := vecBorrowedReceiver(g.info.TypeOf(x.Recv))
 	var prologue, epilogue string
-	if !isPlaceExpr(x.Recv) && !borrowed {
+	if !ast.IsPlace(x.Recv) && !borrowed {
 		tm := g.tmpName()
 		prologue = ctype(t) + " " + tm + " = " + recv + "; "
 		recv = tm

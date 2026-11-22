@@ -24,6 +24,7 @@ import (
 	"zexi/internal/ast"
 	"zexi/internal/diag"
 	"zexi/internal/parser"
+	"zexi/internal/suggest"
 	"zexi/internal/token"
 )
 
@@ -440,7 +441,11 @@ func (l *loader) bindMod(root, owner *module, d *ast.ModDecl, prefix []string) {
 		bind(l.loadPackage(pkgDir))
 		return
 	}
-	l.em.Report(diag.New("E9023", "cannot find module `%s` (looked for %s.zx and %s/mod.zx)", d.Name, d.Name, d.Name).WithSpan(d.Sp))
+	dirs := l.searchDirs(owner.dir)
+	l.em.Report(diag.New("E9023", "cannot find module `%s` (looked for %s.zx and %s/mod.zx)%s",
+		d.Name, d.Name, d.Name, suggest.Name(d.Name, localModuleNames(dirs))).
+		WithSpan(d.Sp).
+		WithHelp("create `%s.zx` beside the importing file, or `%s/mod.zx` for a directory module", d.Name, d.Name))
 }
 
 // bindUse resolves and loads one `use` / `import` declaration and records the
@@ -498,7 +503,9 @@ func (l *loader) resolveUse(m *module, d *ast.UseDecl) (*module, []string, bool)
 	parts := d.Path
 	if parts[0] == "std" {
 		if len(parts) < 2 {
-			l.em.Report(diag.New("E9022", "`use std;` needs a module name, such as `use std::math;`").WithSpan(d.Sp))
+			l.em.Report(diag.New("E9022", "`use std;` needs a module name, such as `use std::math;`").
+				WithSpan(d.Sp).
+				WithHelp("one of: %s", strings.Join(stdModuleNames(), ", ")))
 			return nil, nil, false
 		}
 		parts = parts[1:]
@@ -508,7 +515,9 @@ func (l *loader) resolveUse(m *module, d *ast.UseDecl) (*module, []string, bool)
 			}
 			return nil, nil, false
 		}
-		l.em.Report(diag.New("E9022", "there is no standard library module named `%s`", strings.Join(parts, "::")).WithSpan(d.Sp))
+		joined := strings.Join(parts, "::")
+		l.em.Report(diag.New("E9022", "there is no standard library module named `%s`%s",
+			joined, suggest.Name(strings.ReplaceAll(joined, "::", "."), stdModuleNames())).WithSpan(d.Sp))
 		return nil, nil, false
 	}
 
@@ -552,7 +561,12 @@ func (l *loader) resolveUse(m *module, d *ast.UseDecl) (*module, []string, bool)
 		}
 		return nil, nil, false
 	}
-	l.em.Report(diag.New("E9022", "cannot find a library named `%s` (looked for %s next to the importing file, in its lib/ folder, at the project root, and in the standard library)", strings.Join(parts, "::"), name).WithSpan(d.Sp))
+	joined := strings.Join(parts, "::")
+	cands := append(localModuleNames(dirs), stdModuleNames()...)
+	l.em.Report(diag.New("E9022", "cannot find a library named `%s` (looked for %s next to the importing file, in its lib/ folder, at the project root, and in the standard library)%s",
+		joined, name, suggest.Name(strings.ReplaceAll(joined, "::", "."), cands)).
+		WithSpan(d.Sp).
+		WithHelp("import a file with `use \"path.zx\";`, or drop `%s` into the project's lib/ folder", name))
 	return nil, nil, false
 }
 
@@ -578,6 +592,51 @@ func (l *loader) searchDirs(importerDir string) []string {
 		add(filepath.Join(l.root, "lib"))
 	}
 	return dirs
+}
+
+// localModuleNames lists the `.zx` files and package directories sitting in
+// the loader's search path, for a "did you mean" hint on a misspelled import.
+// It runs only on the error path, so reading a few directories costs nothing on
+// a successful build.
+func localModuleNames(dirs []string) []string {
+	var out []string
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if e.IsDir() {
+				out = append(out, name)
+				continue
+			}
+			if strings.HasSuffix(name, ".zx") && !strings.HasPrefix(name, "_") {
+				out = append(out, strings.TrimSuffix(name, ".zx"))
+			}
+		}
+	}
+	return out
+}
+
+// stdModuleNames lists every embedded module name and alias as it would be
+// written in a `use`/`import` path (`math`, `http.server`, `sys::time`).
+func stdModuleNames() []string {
+	var out []string
+	for alias := range stdModuleAliases {
+		out = append(out, strings.ReplaceAll(alias, "::", "."))
+	}
+	entries, err := fs.ReadDir(stdFS, "std")
+	if err != nil {
+		return out
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasSuffix(name, ".zx") {
+			out = append(out, strings.TrimSuffix(name, ".zx"))
+		}
+	}
+	return out
 }
 
 // loadPackage loads every `.zx` file in a directory as one aggregate module:

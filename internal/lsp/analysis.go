@@ -863,7 +863,7 @@ func variantDetail(v *types.Variant) string {
 var zexiKeywords = []string{
 	"as", "async", "break", "const", "continue", "defer", "else", "enum",
 	"extern", "fn", "for", "if", "impl", "import", "in", "let", "loop",
-	"match", "mod", "mut", "pub", "return", "struct", "type", "unsafe",
+	"match", "mod", "mut", "pub", "ref", "return", "struct", "type", "unsafe",
 	"use", "while",
 }
 

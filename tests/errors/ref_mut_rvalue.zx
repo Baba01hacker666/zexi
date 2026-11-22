@@ -1,0 +1,18 @@
+// An rvalue reference scrutinee (`match get()`) reborrows whatever the
+// function returned: a shared `&M` cannot be reborrowed mutably.
+enum M {
+    T(String),
+    P,
+}
+
+fn get(m: &M) -> &M {
+    m
+}
+
+fn main() {
+    let m = M::T(String::from("y"));
+    match get(&m) {
+        M::T(ref mut s) => { *s = String::from("x"); }, // error: E0596 cannot mutably borrow `s` through a shared reference
+        M::P => {},
+    }
+}

@@ -162,6 +162,18 @@ Parallelism: modules type-check and lower concurrently (worker pool); MIR
 optimization is per-function parallel. The incremental cache keys on a
 content hash of (source, flags) per module.
 
+**Shared language facts have one owner.** A fact that both the checker and a
+backend must agree on lives in the lowest package that can express it, not in
+per-backend copies: `types.Kind.Bits` is the only table of primitive widths,
+`types.Kind.FloatCastBounds` is the only definition of the range in which a
+float-to-integer cast is defined, and `ast.IsPlace` is the only predicate for
+what is addressable. The checker, MIR interpreter, C backend, and LLVM backend
+all call these helpers, so a change to a width or a cast rule cannot land in one
+half of the compiler and not the other. `internal/suggest` is the same idea for
+spelling: the checker, module loader, and package registry use its one
+case-insensitive matcher, so `pnritln`, `Pont`, `doulbe`, and `mat` all get a
+consistent "did you mean" hint.
+
 ## 4.5 Type checking strategy
 
 - **Bidirectional inference** (`check` vs `infer` modes) rather than full

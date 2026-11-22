@@ -16,9 +16,10 @@ use json;
 Most JSON libraries model a document as a recursive enum
 (`Null | Bool | Num | Str | Array | Object`). Zexi can *declare* that today —
 recursive types work when the recursion goes through `Vec` or `HashMap` — but a
-pattern match cannot yet move an owned payload out of a **borrowed** enum, and
-every accessor on `&Value` would need to. So `json::Value` is a struct with a
-`kind` tag and one field per payload:
+pattern match cannot move an owned payload out of a **borrowed** enum (it can
+borrow one in place with `ref`, which would work for reads, but not transfer
+it), and every accessor on `&Value` would need to. So `json::Value` is a
+struct with a `kind` tag and one field per payload:
 
 | Field | Meaning |
 | --- | --- |

@@ -234,6 +234,70 @@ func (k Kind) IsUnsigned() bool {
 	return false
 }
 
+// Bits returns the bit width of a numeric or char kind, or 0 for every other
+// kind. It is the one place that knows the width of a primitive, so the checker
+// (shift-count bounds) and the backends (integer and float conversions) cannot
+// disagree.
+func (k Kind) Bits() int {
+	switch k {
+	case I8, U8:
+		return 8
+	case I16, U16:
+		return 16
+	case I32, U32, F32, Char:
+		return 32
+	case I64, U64, F64, Isize, Usize:
+		return 64
+	}
+	return 0
+}
+
+// FloatCastBounds returns decimal literals for the exclusive range of floating
+// values whose truncation toward zero fits in k: lo is the largest value that
+// still does *not* fit below the range, hi the smallest that does not fit above
+// it. A backend guards a float-to-integer cast with `v > lo && v < hi`, which is
+// exactly the region C and LLVM define; NaN and the infinities fail both
+// comparisons and are rejected too. ok is false when k is not an integer kind.
+func (k Kind) FloatCastBounds() (lo, hi string, ok bool) {
+	if !k.IsInt() && k != Char {
+		return "", "", false
+	}
+	w := k.Bits()
+	if k.IsUnsigned() || k == Char {
+		return "-1.0", pow2Float(w), true
+	}
+	if w == 64 {
+		// min-1 is not representable as a double, so the range starts at
+		// min itself (any double below it is far enough out to be caught).
+		return "-9223372036854775808.0", pow2Float(63), true
+	}
+	return fmt.Sprintf("-%d.0", (int64(1)<<uint(w-1))+1), pow2Float(w - 1), true
+}
+
+// pow2Float returns an exact decimal floating literal for 2^n, for the widths a
+// primitive integer can have.
+func pow2Float(n int) string {
+	switch n {
+	case 7:
+		return "128.0"
+	case 8:
+		return "256.0"
+	case 15:
+		return "32768.0"
+	case 16:
+		return "65536.0"
+	case 31:
+		return "2147483648.0"
+	case 32:
+		return "4294967296.0"
+	case 63:
+		return "9223372036854775808.0"
+	case 64:
+		return "18446744073709551616.0"
+	}
+	return "0.0"
+}
+
 // Equal reports structural equality of two types. A nil type equals only nil.
 func Equal(a, b *Type) bool {
 	if a == nil || b == nil {

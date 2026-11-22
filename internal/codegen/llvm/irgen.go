@@ -692,15 +692,73 @@ func (e *fnEmitter) conv(val string, from, to *types.Type, what string) (string,
 			e.line("%s = sitofp %s %s to %s", v, fx, val, tx)
 		}
 		return v, nil
-	case from.Kind.IsFloat() && to.Kind.IsInt():
+	case from.Kind.IsFloat() && (to.Kind.IsInt() || to.Kind == types.Char):
+		// fptoui/fptosi are poison when the value does not fit (NaN and the
+		// infinities included), so guard the conversion exactly as the C
+		// backend does before emitting it.
+		lo, hi, ok := to.Kind.FloatCastBounds()
+		if !ok {
+			return "", unsupportedf("%s: no float bounds for %s", what, to)
+		}
+		// Compare in double: an f32 value widens without loss, and LLVM's
+		// decimal float constants are exact only for the type's own
+		// precision. The bounds are powers of two (or their neighbours), so
+		// they are exact doubles.
+		cmpTy, cmpVal := fx, val
+		if from.Kind == types.F32 {
+			cmpVal = e.temp()
+			e.line("%s = fpext float %s to double", cmpVal, val)
+			cmpTy = "double"
+		}
+		above := e.temp()
+		e.line("%s = fcmp ogt %s %s, %s", above, cmpTy, cmpVal, lo)
+		below := e.temp()
+		e.line("%s = fcmp olt %s %s, %s", below, cmpTy, cmpVal, hi)
+		fits := e.temp()
+		e.line("%s = and i1 %s, %s", fits, above, below)
+		panicLbl, err := e.panicMsgPanic("attempt to cast a float out of range")
+		if err != nil {
+			return "", err
+		}
+		okLbl := e.label("castok")
+		e.line("br i1 %s, label %%%s, label %%%s", fits, okLbl, panicLbl)
+		e.startLabel(okLbl)
 		v := e.temp()
-		if to.Kind.IsUnsigned() {
-			e.line("%s = fptoui %s %s to %s", v, fx, val, tx)
+		if to.Kind.IsUnsigned() || to.Kind == types.Char {
+			e.line("%s = fptoui %s %s to %s", v, cmpTy, cmpVal, tx)
 		} else {
-			e.line("%s = fptosi %s %s to %s", v, fx, val, tx)
+			e.line("%s = fptosi %s %s to %s", v, cmpTy, cmpVal, tx)
 		}
 		return v, nil
 	case from.Kind.IsFloat() && to.Kind.IsFloat():
+		if intWidth(from) > intWidth(to) {
+			// fptrunc is poison for a finite value outside the smaller
+			// type's range. Infinities are representable and NaN is NaN;
+			// only a finite overflow is rejected, matching the C backend.
+			gt := e.temp()
+			e.line("%s = fcmp ogt double %s, 0x47EFFFFFE0000000", gt, val)
+			lt := e.temp()
+			e.line("%s = fcmp olt double %s, 0xC7EFFFFFE0000000", lt, val)
+			oor := e.temp()
+			e.line("%s = or i1 %s, %s", oor, gt, lt)
+			pinf := e.temp()
+			e.line("%s = fcmp oeq double %s, 0x7FF0000000000000", pinf, val)
+			ninf := e.temp()
+			e.line("%s = fcmp oeq double %s, 0xFFF0000000000000", ninf, val)
+			inf := e.temp()
+			e.line("%s = or i1 %s, %s", inf, pinf, ninf)
+			finite := e.temp()
+			e.line("%s = xor i1 %s, true", finite, inf)
+			bad := e.temp()
+			e.line("%s = and i1 %s, %s", bad, oor, finite)
+			panicLbl, err := e.panicMsgPanic("attempt to cast a float out of range")
+			if err != nil {
+				return "", err
+			}
+			okLbl := e.label("fcastok")
+			e.line("br i1 %s, label %%%s, label %%%s", bad, panicLbl, okLbl)
+			e.startLabel(okLbl)
+		}
 		v := e.temp()
 		if intWidth(from) < intWidth(to) {
 			e.line("%s = fpext %s %s to %s", v, fx, val, tx)
@@ -727,17 +785,11 @@ func (e *fnEmitter) conv(val string, from, to *types.Type, what string) (string,
 
 // intWidth returns a checked integer type's bit width.
 func intWidth(ty *types.Type) int {
-	switch ty.Kind {
-	case types.I8, types.U8:
-		return 8
-	case types.I16, types.U16:
-		return 16
-	case types.I32, types.U32, types.Char:
-		return 32
-	default:
-		// i64, u64, isize, usize (callers checked the family first).
-		return 64
+	if w := ty.Kind.Bits(); w != 0 {
+		return w
 	}
+	// i64, u64, isize, usize (callers checked the family first).
+	return 64
 }
 
 // zeroSized reports whether a local or member occupies no storage.
@@ -897,22 +949,13 @@ func (e *fnEmitter) binop(b *mir.BinOp) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		// Shift counts live in their own type; the checker guarantees the
-		// count fits the value's width, so widen rather than truncate.
+		// Shift counts live in their own type; widen rather than truncate so
+		// the count is compared against the value's real width.
 		cnt, err := e.conv(rv, rty, b.Ty, "shift count")
 		if err != nil {
 			return "", err
 		}
-		res := e.temp()
-		switch {
-		case b.Op == token.KindShl:
-			e.line("%s = shl %s %s, %s", res, lLL, lv, cnt)
-		case b.Ty.Kind.IsSigned():
-			e.line("%s = ashr %s %s, %s", res, lLL, lv, cnt)
-		default:
-			e.line("%s = lshr %s %s, %s", res, lLL, lv, cnt)
-		}
-		return res, nil
+		return e.intShift(b, lLL, lv, cnt)
 	}
 	return "", unsupportedf("operator %s", b.Op)
 }
@@ -978,6 +1021,37 @@ func overflowWord(arith string) string {
 // minSigned is INT_MIN for width w.
 func minSigned(w int) int64 {
 	return int64(uint64(1) << uint(w-1))
+}
+
+// intShift emits a shift whose count is checked at run time. LLVM's shl and
+// shr are poison when the count is not less than the width, and a negative
+// count is just a huge unsigned one, so one unsigned compare covers both.
+// `shl` already wraps on overflow and `ashr` is a defined arithmetic shift, so
+// only the count needs guarding.
+func (e *fnEmitter) intShift(b *mir.BinOp, tyLL, lv, cnt string) (string, error) {
+	dir := "left"
+	if b.Op == token.KindShr {
+		dir = "right"
+	}
+	bad := e.temp()
+	e.line("%s = icmp uge %s %s, %d", bad, tyLL, cnt, intWidth(b.Ty))
+	panicLbl, err := e.panicMsgPanic("attempt to shift " + dir + " with overflow")
+	if err != nil {
+		return "", err
+	}
+	ok := e.label("shiftok")
+	e.line("br i1 %s, label %%%s, label %%%s", bad, panicLbl, ok)
+	e.startLabel(ok)
+	res := e.temp()
+	switch {
+	case b.Op == token.KindShl:
+		e.line("%s = shl %s %s, %s", res, tyLL, lv, cnt)
+	case b.Ty.Kind.IsSigned():
+		e.line("%s = ashr %s %s, %s", res, tyLL, lv, cnt)
+	default:
+		e.line("%s = lshr %s %s, %s", res, tyLL, lv, cnt)
+	}
+	return res, nil
 }
 
 // intDivMod emits integer division and remainder with the C runtime's exact

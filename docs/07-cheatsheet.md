@@ -149,6 +149,16 @@ or index (`a.x = 1`, `xs[0] = 1`), not by taking `&mut`, and not by calling a
 Precedence (tightest first): unary `- ! & *` → `as` → `* / %` → `+ -` →
 `<< >>` → `&` → `^` → `|` → `.. ..=` → comparisons → `&&` → `||` → `=`.
 
+Shifts are integers-only and the count must be in `0..width`; an out-of-range
+count is an error at compile time or a panic at run time, and the same holds
+for `<<=`/`>>=` — see [`02-language-spec.md`](02-language-spec.md) §2.2 and the
+memory model §3.6.
+
+`/` and `%` by zero panic (in every build), and a float-to-integer cast panics
+when the value does not fit the destination integer. Safe code therefore does
+not rely on C undefined behaviour; see spec §2.4.
+
+
 ## 7.7 Control flow
 
 <!-- fragment -->
@@ -278,6 +288,25 @@ match c {
 
 A binding may be declared mutable inside a pattern: `Shape::Circle(mut r)`.
 Pattern bindings in a `let` use `let mut` as usual.
+
+A binding may borrow the payload instead of moving it: prefix it with `ref`
+(`Shape::Circle(ref r)`), or `ref mut` for an exclusive borrow. `ref` works on
+any match, owned or borrowed, so an owning payload can be read out of a match
+on a `&Enum` borrow without moving it — which a plain binding cannot (`E0507`).
+`ref mut` needs an exclusive path: a `&mut` reference into the scrutinee (a raw
+pointer works too), or the match's own ownership; a shared `&T` anywhere on the
+path is `E0596`. A `ref` binding takes no ownership, so it is never dropped.
+
+<!-- fragment -->
+```zx
+match self.kind {
+    Dir::Inner(ref s) => println(s),   // s: &String — borrowed, not moved
+    Dir::Leaf => {},
+}
+```
+
+Only `match` arms take `ref` for now; a `let` or a `for` pattern still binds
+by value.
 
 Strings match too (compared by value, needs a `_` arm) — handy for
 command dispatch; match a `String` via `.as_str()`:
@@ -501,7 +530,8 @@ fn main() -> i32 {
 A by-value `match` over an enum that owns memory consumes the scrutinee; bound
 payloads move into the arm and are dropped once. A guarded arm copies for the
 guard and takes ownership only after it passes. Binding an owned payload out of
-a borrow is `E0507`.
+a borrow is `E0507`; bind it with `ref s` (or `ref mut s` through a `&mut`)
+instead to borrow it in place.
 
 ### Builtin methods on `Option` and `Result`
 
@@ -817,10 +847,12 @@ code left to drop them. Borrow instead (`&String`, `&mut [u8]`).
 Traits (and trait bounds), `dyn Trait`, associated types, const generics,
 `Box`, user-defined `Drop`, closure environments are not freed yet, tuple values (tuple *structs* exist; `(a, b)` values
 and destructuring do not yet), borrow-lifetime (NLL) analysis, bindings inside
-or-patterns, and nested patterns. Pattern bindings in a `match` on a *borrowed*
-enum still cannot move an owned payload out (E0507), which is why `json::Value`
-is a tagged struct rather than an enum; `ref` bindings / match ergonomics are
-the missing piece. Scoped modules have landed for
+or-patterns, and nested patterns. A by-value binding may still not move an
+owned payload out of a borrowed scrutinee (`E0507`); bind it with `ref` to
+borrow the payload in place instead. `ref` bindings in a *borrowed* enum match
+landed, which is part of the answer for `json::Value` — though the tagged
+struct there predates the `ref` pattern and is still the natural shape for
+hand-written exhaustive dispatch. Scoped modules have landed for
 *qualified* access (imports, `as` aliases, `mod::item`, `pub` checks), but the
 merged program is still one flat namespace: unqualified cross-module names
 remain visible and ignore `pub`, so full isolation and package metadata are

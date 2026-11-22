@@ -17,7 +17,8 @@
 > one `use pkg;`. Modules are isolated: private items stay private, only
 > public items are imported unqualified, and same-named declarations in two
 > modules are lowered under distinct internal names. Files named together on
-> the command line remain one flat program.
+> the command line remain one flat program. The practical guide to project
+> layout and visibility is [`20-projects-and-modules.md`](20-projects-and-modules.md).
 > Implemented language surface: functions and recursion; `let`/`const`;
 > integer/float/bool/char/`str`; arithmetic, bitwise, comparison, and logical
 > operators; `as` casts; `if`/`else`; `while`/`loop`/`for i in a..b` and
@@ -56,8 +57,8 @@
 > Not yet implemented: traits and trait bounds (generic parameters are
 > unconstrained), `dyn Trait`, associated types, const generics, `Box`,
 > user-defined `Drop`, borrow-lifetime analysis (so bound
-> `&`/`*` aliases are not tracked), match ergonomics (`ref` bindings, so an
-> owned payload cannot be read out of a borrowed enum), nested patterns, and
+> `&`/`*` aliases are not tracked), `ref` bindings in `let`/`for` patterns
+> (they work in `match` arms), nested patterns, and
 > tuple values.
 > See `docs/06-backend-strategy.md` for the backend status.
 

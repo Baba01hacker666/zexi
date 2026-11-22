@@ -17,11 +17,18 @@ trap 'rm -rf "$work"' EXIT
 # One translation unit, exactly as `zexic emit` prints it.
 if [ -n "${ZEXIC:-}" ]; then
     zexic=$ZEXIC
-elif command -v zexic > /dev/null 2>&1; then
-    zexic=$(command -v zexic)
 else
-    zexic=$(dirname "$0")/../build/zexic
-    [ -x "$zexic" ] || { echo "build the compiler first (go build -o build/zexic ./cmd/zexic), or set ZEXIC=" >&2; exit 2; }
+    # Prefer the local build: a `zexic` installed earlier can lag behind the
+    # tree and then this script reports on the wrong compiler.
+    local_zexic=$(dirname "$0")/../build/zexic
+    if [ -x "$local_zexic" ]; then
+        zexic=$local_zexic
+    elif command -v zexic > /dev/null 2>&1; then
+        zexic=$(command -v zexic)
+    else
+        echo "build the compiler first (go build -o build/zexic ./cmd/zexic), or set ZEXIC=" >&2
+        exit 2
+    fi
 fi
 "$zexic" emit "$prog" > "$work/out.c"
 "$cc_bin" -std=gnu11 -O1 -g -fsanitize=address -o "$work/prog" "$work/out.c"

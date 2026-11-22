@@ -1,0 +1,20 @@
+// Shifts are checked at run time: a count outside the type's width panics
+// instead of producing C undefined behaviour, a signed left shift wraps in the
+// unsigned domain, and a signed right shift is an arithmetic shift.
+fn main() {
+    let one: i64 = 1;
+    println(one << 4);        // 16
+    let neg: i64 = -8;
+    println(neg >> 2);        // -2
+    let u: u64 = 1;
+    println(u << 63);         // 9223372036854775808
+    let b: u8 = 128;
+    println(b >> 3);          // 16
+    println(b << 1);          // 0: wraps at the u8 width
+
+    let mut x: i64 = 3;
+    x <<= 2;
+    println(x);               // 12
+    x >>= 1;
+    println(x);               // 6
+}

@@ -276,10 +276,12 @@ go run ./cmd/zexic run tests/easy.zx      # the easy way: no semicolons, f-strin
 go run ./cmd/zexic run examples/easy.zx   # same ideas, as a small standalone demo
 go run ./cmd/zexic run tests/sugar.zx     # break-with-value, Type::new(..), print/format sugar
 go run ./cmd/zexic run tests/pi.zx        # 30 digits of π: big-int + Machin's formula
+go run ./cmd/zexic run examples/project                      # a multi-file project: mod + folder package + facade
 go run ./cmd/zexic run examples/site                        # a pooled site: templates, folders, JSON API
 go run ./cmd/zexic run examples/http_app.zx                  # Go-style default mux: handle_get + listen
 go run ./cmd/zexic run examples/static_server.zx -- .         # one-call static server
 go run ./cmd/zexic run examples/local_tools.zx -- release-42  # local os + regex helpers
+go run ./cmd/zexic run examples/zxutils -- ls examples       # BusyBox-style ls, cat, grep, wc, head, tail, find, sort, uniq
 go run ./cmd/zexic run examples/math_tools.zx                 # roots, logs, angles, and geometry
 go run ./cmd/zexic run examples/regex.zx                      # POSIX-ERE matching
 # The low-level, explicit FFI example remains available too:
@@ -329,6 +331,7 @@ for why, its real costs, and the plan to replace it with a native backend.
 - [`docs/17-extending.md`](docs/17-extending.md) — adding a capability as a library, not a compiler change.
 - [`docs/18-one-translation-unit.md`](docs/18-one-translation-unit.md) — measured: one C file or many, and why.
 - [`docs/19-modules.md`](docs/19-modules.md) — `zexic add`: the C-library catalog, and how to write a package.
+- [`docs/20-projects-and-modules.md`](docs/20-projects-and-modules.md) — project layout, `mod`/`use`/`import`, visibility, folder packages, and spelling suggestions.
 - [`examples/`](examples/) — ready-to-run Zexi programs plus focused feature examples.
 - [`tests/tour.zx`](tests/tour.zx) — the end-to-end program the test suite compiles and runs.
 - [`tests/syntax.zx`](tests/syntax.zx) — a runnable syntax tour; [`tests/pi.zx`](tests/pi.zx) — 30 digits of π.

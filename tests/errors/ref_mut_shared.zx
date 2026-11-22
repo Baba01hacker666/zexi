@@ -1,0 +1,17 @@
+// A `ref mut` binding cannot borrow exclusively through a shared reference.
+enum M {
+    T(String),
+    P,
+}
+
+fn f(m: &M) {
+    match m {
+        M::T(ref mut s) => { *s = String::from("x"); }, // error: E0596 cannot mutably borrow `s` through a shared reference
+        M::P => {},
+    }
+}
+
+fn main() {
+    let t = M::T(String::from("y"));
+    f(&t);
+}
