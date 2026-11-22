@@ -248,8 +248,8 @@ yields each element by value.
 
 Owning values compose: a `struct`, `enum` variant, or array containing a
 `String` is itself an owning type and gets a generated destructor, so dropping
-it drops each field/element/variant payload. `Vec<T>` and `Box<T>` are not
-implemented yet.
+it drops each field/element/variant payload. `Vec<T>` follows the same rule;
+`Box<T>` is not implemented yet.
 
 `+` concatenates any mix of `str` and `String`, allocating a fresh `String`. A
 number, `bool`, or `char` operand is rendered as text first, so labels are easy
@@ -414,7 +414,15 @@ fn abs(n: i64) -> i64 {
 
 Loops: `loop { }` (infinite), `while cond { }`, `until cond { }` (loops while
 the condition is false), and `for pat in iter { }` over an integer range
-(`1..4`) or an array. `break`/`continue` behave as expected. A `loop` may yield
+(`1..4`), an array, a slice, a `Vec`, or a shared borrow of an array or `Vec`.
+Iterating a value yields each element by value (so the element must be `Copy`);
+`for s in &v` and `for s in &arr` bind `&T` to the live element instead, which
+is how an owning element type is visited without moving it. A plain slice value
+is already a shared borrow, so `for b in slice` keeps yielding `T`.
+`break`/`continue` behave as expected. As with every bound borrow today, the
+checker does not track the borrow across the loop body: pushing to, clearing, or
+reassigning the collection while iterating it can invalidate the element
+reference, so index the collection instead when the body must mutate it. A `loop` may yield
 a value with `break <expr>`, and the loop expression then has the type of that
 value (`while`/`until`/`for` always evaluate to `()`).
 
@@ -522,10 +530,11 @@ Rules:
 | --- | --- | --- |
 | Moves | yes; use-after-move = `E0382` | + conditional/partial moves tracked precisely |
 | Drop | yes for `String`, and for `struct`/array values that contain one | user-defined `Drop`, drop flags, drop elision |
-| Heap types | `String` | `Box<T>`, `Vec<T>`, collections |
-| Enum payloads | `Copy` only (owning payloads rejected: `E0900`) | owning payloads once `match` borrows instead of aliasing |
+| Heap types | `String`, `Vec<T>`, `HashMap<K, V>` | `Box<T>`, user-defined collections |
+| Enum payloads | owning payloads work: a match through a borrow binds in place (`ref`), and by-value matching moves the payload with generated drop glue | user-defined `Drop`, drop flags |
 | Borrows | `&`/`&mut self` param passing; no lifetime tracking | full NLL borrow checker, lifetimes |
 | Slices | `[T]` / `&[T]` / `&mut [T]` as a `(ptr, len)` value; `a[lo..hi]`, `len`, indexing, and `for x in slice`; `&[T; N]` unsizes to `&[T]` | explicit lifetimes; unsizing from `Vec<T>`/`String` without a method call |
+| Borrowed iteration | `for s in &v` / `for s in &arr` binds `&T` to each live element, so an owning element type is visited without a copy or move; mutable (`&mut`) iteration is rejected with `E0900` | a borrow-checked iterator protocol; `for s in &mut v` |
 
 ## 2.7 Error handling
 

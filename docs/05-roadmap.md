@@ -22,7 +22,9 @@
 > Implemented language surface: functions and recursion; `let`/`const`;
 > integer/float/bool/char/`str`; arithmetic, bitwise, comparison, and logical
 > operators; `as` casts; `if`/`else`; `while`/`loop`/`for i in a..b` and
-> `for x in arr` (value iteration over `Copy` elements); `print`/`println` with
+> `for x in arr` (value iteration over `Copy` elements), plus `for s in &v` /
+> `for s in &arr` (shared-borrow iteration binding `&T`, so owning elements are
+> visited without a copy); `print`/`println` with
 > any number of values; `len(x)` / `x.len()`; structs (named and tuple) with
 > `impl` methods (`self`, `&self`, `&mut self`) and associated functions
 > (`Point::new(..)`); value-yielding `loop` (`break <expr>`); enums
@@ -149,8 +151,9 @@ seam.
   `Iterator`, `Clone`/`Copy`/`Drop`, `From`/`Into`, `dyn Trait` (M1 late).
 - **Real ownership checker:** NLL, lifetime elision + explicit lifetimes,
   conditional moves, drop flags.
-- **Strings & collections:** `String` and `Vec<T>` are live; `HashMap` (in
-  `alloc`) is the remaining piece, and needs a `Hash` trait to key on.
+- **Strings & collections:** `String`, `Vec<T>`, and the builtin `HashMap<K, V>`
+  are live (integer, `bool`, `char`, and `String` keys); a user-defined key
+  would need a `Hash` trait, which is not planned until traits land.
 - **Formatting:** `println`/`print` accept any number of values (space separated)
   today; a full `println(fmt, args)` with a monomorphized formatting trait (no
   reflection) arrives with generics.
@@ -205,7 +208,7 @@ when its check runs in CI, not when the feature lands.
 | 2 | Long-running processes do not grow | ASan corpus sweep reports 0 leaked bytes; closure environments and statement-scoped temporary drops are released |
 | 3 | Safe code cannot reach undefined behavior | 24 h differential fuzz between the C backend and the MIR interpreter with no mismatch or sanitizer report; every fixed soundness bug has a regression test |
 | 4 | Concurrency degrades fairly | A stalled head costs a poll, not a worker for its deadline; `-race` clean on server and pool tests; `Send` boundary decided |
-| 5 | The language surface is closed enough to document | `docs/02-language-spec.md` is normative and matches the compiler; `for s in &v` and owning `Vec::fold` either land or are documented as out of 1.0 |
+| 5 | The language surface is closed enough to document | `docs/02-language-spec.md` is normative and matches the compiler; owning `Vec::fold` either lands or is documented as out of 1.0; `for s in &v` is live |
 | 6 | Performance is tracked, not remembered | Checked-in `bench/results.json` baseline with a tolerance; every row within 1.25× of its C twin at `-O2`, or a written cause |
 | 7 | A stranger can install and debug it | `zexi fmt`, complete LSP, source-mapped debug info, tagged binaries with an install path; Windows supported or plainly declared unsupported |
 | 8 | 1.0 means something | CLI and language frozen; stability and security policies published; `v1.0.0` tagged only when gates 1–7 are closed |

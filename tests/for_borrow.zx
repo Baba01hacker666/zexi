@@ -1,0 +1,29 @@
+// tests/for_borrow.zx
+// Iterating a shared borrow binds a reference to each element instead of
+// copying it, so a `Vec<String>` can be visited without moving anything out.
+// A fixed array supports the same form; a slice value is already a borrow and
+// keeps yielding its elements by value.
+//
+//     zexic run tests/for_borrow.zx
+
+fn main() {
+    let mut words: Vec<String> = Vec::new();
+    words.push(String::from("alpha"));
+    words.push(String::from("b"));
+    for w in &words {
+        println(w);
+    }
+    // The vector is unchanged: the loop only borrowed it.
+    println(words.len());
+    println(words[0].as_str());
+
+    let mut a: [i64; 3] = [1, 2, 3];
+    for n in &a {
+        println(n);
+    }
+    // A bare slice still yields elements by value.
+    let s: &[i64] = &a[..];
+    for n in s {
+        println(n);
+    }
+}

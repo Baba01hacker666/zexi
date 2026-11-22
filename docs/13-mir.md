@@ -222,7 +222,7 @@ causes include:
 | --- | --- |
 | Indirect calls through function values | needs a callee *operand* in `Call`, not just a `FuncRef` |
 | `defer` | needs scope-exit action lists ordered before drops |
-| `for x in collection` | needs an iterator protocol (or an index loop over `len`) |
+| `for x in collection` | the C backend lowers arrays, slices, `Vec`, and `&Vec`/`&[T; N]`; MIR still needs an iterator protocol (or an index loop over `len`) |
 | Indexing `Vec`/`HashMap` | currently array-only; would become a runtime intrinsic |
 | Tuple values | tuples are not implemented in the language yet |
 | Partial moves | see §13.4 |

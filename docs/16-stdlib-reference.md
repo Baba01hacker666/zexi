@@ -162,7 +162,7 @@ Template rules: `{{name}}` is escaped, `{{name|raw}}` is inserted verbatim,
 | `serve_file(path)`, `serve_static(root, url_path)`, `serve_page(root, url_path)` | file responses |
 | `serve_dir(root, port)`, `serve_dir_n`, `serve_dir_local` | serve a folder with no code |
 | `project_path(path)` | resolve a relative folder against the entry directory |
-| `parse_request(raw) -> Request`, `read_request(&conn)`, `send_response(&conn, &resp)` | low level |
+| `parse_request(raw) -> Request`, `read_request(&conn)`, `send_response(&conn, &resp)`, `send_response_head(&conn, &resp)` | low level (`send_response_head` writes headers only, for HEAD) |
 | `requests_served()`, `connections_served()`, `stop_serving()`, `serving_stopped()`, `reset_stats()` | pool control |
 
 `Request` exposes `method`, `path`, `body`, `headers`, `query`, and methods

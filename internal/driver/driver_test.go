@@ -78,6 +78,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/c_body.zx",
 		"../../tests/pointer_cast.zx",
 		"../../tests/vec_visit.zx",
+		"../../tests/for_borrow.zx",
 		"../../tests/ref_pattern.zx",
 		"../../tests/shift.zx",
 	}
@@ -583,6 +584,17 @@ func TestRunPrograms(t *testing.T) {
 				"7", "8", "1",
 				"z",
 				"1",
+				"",
+			}, "\n"),
+		},
+		{
+			// `for x in &v`: shared-borrow iteration over owning elements.
+			file: "../../tests/for_borrow.zx",
+			want: strings.Join([]string{
+				"alpha", "b",
+				"2", "alpha",
+				"1", "2", "3",
+				"1", "2", "3",
 				"",
 			}, "\n"),
 		},

@@ -4590,6 +4590,30 @@ func recvBase(t *types.Type) *types.Type {
 	return t
 }
 
+// borrowIterElem reports the element type when `for x in e` iterates a shared
+// borrow: `&Vec<T>` or `&[T; N]` binds `&T` instead of copying T, so the
+// elements need not be `Copy` (a `Vec<String>` can be visited without moving
+// or copying any element). A plain slice value is already a shared borrow, so
+// `for x in slice` keeps yielding elements by value.
+func borrowIterElem(t *types.Type) *types.Type {
+	if t == nil || t.Kind != types.Ref || t.Elem == nil {
+		return nil
+	}
+	switch t.Elem.Kind {
+	case types.Array, types.VecKind:
+		return t.Elem.Elem
+	}
+	return nil
+}
+
+// explicitMutBorrow reports whether e is written `&mut ...`. Iterating a
+// variable whose type is `&mut Vec<T>` still reads elements by shared borrow;
+// only taking a new mutable borrow in the loop header is rejected.
+func explicitMutBorrow(e ast.Expr) bool {
+	u, ok := e.(*ast.UnExpr)
+	return ok && u.Op == token.KindAmp && u.Mut
+}
+
 // sliceElem returns the element type when t is a slice or a reference to one,
 // and nil otherwise.
 func sliceElem(t *types.Type) *types.Type {
@@ -5161,6 +5185,25 @@ func (c *checker) inferFor(x *ast.LoopExpr) *types.Type {
 		// otherwise the loop binding would alias (and possibly double-free) an
 		// owned element.
 		it := c.checkExpr(x.Iter, nil)
+		elem := borrowIterElem(it)
+		if elem != nil && it.Mut && explicitMutBorrow(x.Iter) {
+			// A mutable borrow would let the body reallocate the collection or
+			// move an element while the loop holds a pointer into it; that needs
+			// the borrow checker this language does not have yet.
+			c.errAt(x.Iter, "E0900", "`for` iterates a shared borrow (`&v`); mutable iteration is not supported yet")
+		}
+		if elem != nil {
+			// `for s in &v` yields a shared reference to each element, so an
+			// owning element type is fine: nothing is copied or moved out. A
+			// `&mut Vec` variable is read through the same shared borrow.
+			c.pushScope()
+			c.bindPattern(x.Pat, types.RefTo(elem, false))
+			c.loopDepth++
+			c.checkBlock(x.Body)
+			c.loopDepth--
+			c.popScope()
+			return types.UnitT
+		}
 		if it != nil && it.Kind == types.Array {
 			if !it.Elem.IsCopy() {
 				c.errAt(x.Iter, "E0507", "cannot iterate an array of non-`Copy` element type `%s` by value", it.Elem)
@@ -5200,7 +5243,7 @@ func (c *checker) inferFor(x *ast.LoopExpr) *types.Type {
 			c.popScope()
 			return types.UnitT
 		}
-		c.errAt(x.Iter, "E0900", "`for` iterates an integer range (`a..b`), an array, or a `Vec`")
+		c.errAt(x.Iter, "E0900", "`for` iterates an integer range (`a..b`), an array, a slice, a `Vec`, or a shared borrow (`&v`) of one")
 		c.loopDepth++
 		c.checkBlock(x.Body)
 		c.loopDepth--

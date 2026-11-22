@@ -254,6 +254,7 @@ and `send_response` remain public.
 | `Request.query/param/route_param/cookie/path_only/raw_query/wants_keep_alive` | request access (`param` reads query, route, then form) |
 | `Response::text/html/json/empty/redirect`, `Response.set_header/set_cookie` | response builders |
 | `send_response(&Conn, &Response) -> i64` | serialize and write a response |
+| `send_response_head(&Conn, &Response) -> i64` | write only the status line and headers (a HEAD response) |
 | `Response.keep_alive` | advertise a persistent connection — the pool still honours it, but idle keep-alive exits after `KEEPALIVE_IDLE_MS` unless the client sends another request |
 | `handle*` / `use_before` / `use_after` / `listen` / `listen_n` | top-level default-mux registration and serving |
 | `new_app()`, `Router.get/.post/.put/.delete/.add`, `.use_before/.use_after`, `.set_fallback`, `.listen/.listen_n`, `.dispatch/.serve` | explicit router with the same features |
@@ -289,6 +290,16 @@ fn main() -> i32 {
 prefix route (`/api/*` matches `/api/echo`), `*` matches everything, and a `*`
 segment after named segments matches the remaining path. `Router.serve` answers
 oversized bodies with `413` before calling a handler.
+
+Method handling follows HTTP/1.1. `HEAD` uses an explicit `HEAD` route when one
+is registered and otherwise the `GET` handler; only the status line and headers
+are written, with the `Content-Length` the corresponding `GET` would return. A
+path that exists under a different method, or as a static mount, answers `405`
+with an `Allow` header listing the methods that would work (a `GET` route also
+allows `HEAD`). An unknown path still reaches the router's fallback, which is a
+plain `404` by default. Static mounts are read-only and serve `GET`/`HEAD` only;
+the standalone `serve_dir` helper answers other methods with `405 Allow: GET,
+HEAD` as well.
 
 The default mux is one per process (it is not a user-visible global; the storage
 lives behind the `http` shim). Programs that need isolated registries should use

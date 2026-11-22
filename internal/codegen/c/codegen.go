@@ -1241,6 +1241,21 @@ func sliceTypeName(t *types.Type) string {
 	return "zx_slice_" + typeMangle(t.Elem)
 }
 
+// borrowIterElem reports the element type when a `for` loop iterates a shared
+// borrow (`&Vec<T>` or `&[T; N]`). The binding is then `&T`, and the element
+// is read in place instead of copied. A slice is already a shared borrow, so
+// `for x in slice` keeps yielding elements by value.
+func borrowIterElem(t *types.Type) *types.Type {
+	if t == nil || t.Kind != types.Ref || t.Elem == nil {
+		return nil
+	}
+	switch t.Elem.Kind {
+	case types.Array, types.VecKind:
+		return t.Elem.Elem
+	}
+	return nil
+}
+
 // isSliceLike reports whether t is a slice or a reference to one. Both are
 // represented by the same two-word value, so borrowing a slice is a no-op.
 func isSliceLike(t *types.Type) bool {
@@ -1699,9 +1714,13 @@ func (g *gen) forStmt(x *ast.LoopExpr) string {
 }
 
 // forArray lowers `for x in arr`: the array is evaluated once into a temporary,
-// then each element (a `Copy` value, enforced by sema) is bound in turn.
+// then each element (a `Copy` value, enforced by sema) is bound in turn. A
+// shared borrow (`for x in &arr`) instead binds `&T` to the live element.
 func (g *gen) forArray(x *ast.LoopExpr) string {
 	it := g.info.TypeOf(x.Iter)
+	if elem := borrowIterElem(it); elem != nil && it.Elem.Kind == types.Array {
+		return g.forBorrowedArray(x, it, elem)
+	}
 	if base := recvBase(it); base != nil && base.Kind == types.VecKind {
 		return g.vecForLoop(x)
 	}
@@ -1745,6 +1764,29 @@ func (g *gen) forSlice(x *ast.LoopExpr, it *types.Type) string {
 	g.w.line("for (size_t %s = 0; %s < %s.len; %s++) {", ctr, ctr, s, ctr)
 	g.w.indent++
 	g.w.line("%s %s = %s.ptr[%s];", ctype(sliceElem(it)), name, s, ctr)
+	res := g.loopResult(x)
+	brk, cont := g.openLoop(res)
+	g.blockStmts(x.Body, nil)
+	g.closeLoop()
+	g.endLoopBody(cont)
+	g.w.indent--
+	g.w.line("}")
+	g.w.line("%s: ;", brk)
+	g.popScope()
+	return res
+}
+
+// forBorrowedArray lowers `for x in &arr`: the borrow is bound once and each
+// iteration binds a pointer to the live element, so no element is copied.
+func (g *gen) forBorrowedArray(x *ast.LoopExpr, it, elem *types.Type) string {
+	arr := g.tmpName()
+	g.w.line("%s %s = %s;", ctype(it), arr, g.value(x.Iter))
+	g.pushScope()
+	name := g.bindLoopVar(x.Pat)
+	ctr := g.tmpName()
+	g.w.line("for (size_t %s = 0; %s < %d; %s++) {", ctr, ctr, it.Elem.Len, ctr)
+	g.w.indent++
+	g.w.line("%s %s = &(%s)->e[%s];", ctype(types.RefTo(elem, false)), name, arr, ctr)
 	res := g.loopResult(x)
 	brk, cont := g.openLoop(res)
 	g.blockStmts(x.Body, nil)

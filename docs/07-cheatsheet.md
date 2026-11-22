@@ -425,8 +425,23 @@ A borrow reads like the value it points at: a method call goes through it
 prints it. It is still a borrow — assigning to it is an error, and a `fold`
 accumulates by value, so its elements must be `Copy`.
 
-`for x in v` still copies each element, so iterating a `Vec<String>` is E0507;
-use `each` with a `&T` closure, or index with `v[i]`.
+`for x in v` copies each element, so iterating a `Vec<String>` that way is
+`E0507`. Prefix the vector with `&` to borrow each element instead (a fixed
+array works the same way):
+
+<!-- fragment -->
+```zx
+for w in &words {
+    println(w);        // w: &String; nothing is moved or copied
+}
+for n in &nums {
+    println(n);        // n: &i64
+}
+```
+
+`each` with a `&T` closure remains the way to visit elements with a callback,
+and `&mut` iteration is not supported yet (`E0900`): index with `v[i]` when the
+loop must mutate the elements.
 
 Nested (`Vec<Vec<i64>>`) and struct-holding (`Vec<Item>`) vectors work, and a
 struct may hold a `Vec` field. See `tests/vec.zx` for a full tour.

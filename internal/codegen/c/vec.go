@@ -495,12 +495,19 @@ func (g *gen) vecForLoop(x *ast.LoopExpr) string {
 		g.registerDrop(tm, it)
 		recv = tm
 	}
+	// `for s in &v` binds `&T` to the live element, so an owning element type
+	// can be visited without copying or moving it.
+	borrowed := borrowIterElem(g.info.TypeOf(x.Iter)) != nil
 	g.pushScope()
 	name := g.bindLoopVar(x.Pat)
 	ctr := g.tmpName()
 	g.w.line("for (size_t %s = 0; %s < (size_t)(%s).len; %s++) {", ctr, ctr, recv, ctr)
 	g.w.indent++
-	g.w.line("%s %s = (%s).ptr[%s];", ctype(it.Elem), name, recv, ctr)
+	if borrowed {
+		g.w.line("%s %s = &(%s).ptr[%s];", ctype(types.RefTo(it.Elem, false)), name, recv, ctr)
+	} else {
+		g.w.line("%s %s = (%s).ptr[%s];", ctype(it.Elem), name, recv, ctr)
+	}
 	res := g.loopResult(x)
 	brk, cont := g.openLoop(res)
 	g.blockStmts(x.Body, nil)

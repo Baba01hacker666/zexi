@@ -1,0 +1,7 @@
+fn main() {
+    let mut names: Vec<String> = Vec::new();
+    names.push(String::from("a"));
+    for name in &mut names { // error: E0900 mutable iteration
+        println(name);
+    }
+}

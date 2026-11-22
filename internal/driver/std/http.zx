@@ -780,12 +780,23 @@ pub fn render_response(r: &Response) -> String {
 
 // send_response writes a complete response. Returns bytes sent, or -1.
 pub fn send_response(c: &Conn, r: &Response) -> i64 {
+    return send_response_mode(c, r, false);
+}
+
+// send_response_head writes only the status line and headers, with the same
+// Content-Length the body would have had. It is the response a HEAD request
+// gets: the client learns the size and metadata without a body on the wire.
+pub fn send_response_head(c: &Conn, r: &Response) -> i64 {
+    return send_response_mode(c, r, true);
+}
+
+fn send_response_mode(c: &Conn, r: &Response, head_only: bool) -> i64 {
     let head = response_head(r);
     let sent = c.write(head);
     if sent < 0 {
         return -1;
     }
-    if r.body.len() == 0 {
+    if head_only || r.body.len() == 0 {
         return sent;
     }
     let body_sent = c.write_raw(r.body.as_str(), r.body.len());
@@ -1478,6 +1489,77 @@ impl Router {
         return serve_workers_n(self, workers, max_requests, a.port, a.host.as_str());
     }
 
+    // try_route matches one method against the route table and runs its
+    // handler. It returns None when no route for that method matches.
+    fn try_route(&self, method: str, path: &String, req: &mut Request) -> Option<Response> {
+        let mut i: usize = 0;
+        while i < (self.count as usize) {
+            if self.methods[i] == method {
+                let mut captured = String::new();
+                if route_match(self.paths[i], path, &mut captured) {
+                    req.params = captured;
+                    let handler = self.handlers[i];
+                    return Some(handler(req));
+                }
+            }
+            i += 1;
+        }
+        return None;
+    }
+
+    // allowed_methods is the Allow header for a path that matched no route:
+    // every method registered for that path, with HEAD implied by GET. A
+    // static mount is read-only, so it contributes GET and HEAD. An empty
+    // result means the path is genuinely unknown.
+    fn allowed_methods(&self, path: &String) -> String {
+        let mut get = false;
+        let mut head = false;
+        let mut extras = String::new();
+        let mut seen = String::new();
+        let mut i: usize = 0;
+        while i < (self.count as usize) {
+            let mut captured = String::new();
+            if route_match(self.paths[i], path, &mut captured) {
+                let m = self.methods[i];
+                if m == "GET" {
+                    get = true;
+                } else if m == "HEAD" {
+                    head = true;
+                } else if !allow_seen(&seen, m) {
+                    allow_mark(&mut seen, m);
+                    push_allow(&mut extras, m);
+                }
+            }
+            i += 1;
+        }
+        let mut mounted = false;
+        let mut k: usize = 0;
+        while k < (self.mount_count as usize) {
+            if path.starts_with(self.mounts[k]) {
+                mounted = true;
+            }
+            k += 1;
+        }
+        if mounted {
+            get = true;
+        }
+
+        let mut out = String::new();
+        if get {
+            push_allow(&mut out, "GET");
+        }
+        if get || head {
+            push_allow(&mut out, "HEAD");
+        }
+        if extras.len() > 0 {
+            if out.len() > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(extras.as_str());
+        }
+        return out;
+    }
+
     pub fn add(&mut self, method: str, path: str, handler: fn(&Request) -> Response) {
         if self.count >= MAX_ROUTES {
             return;
@@ -1535,26 +1617,31 @@ impl Router {
             }
             b += 1;
         }
-
         let mut res = Response::empty(404);
         let mut matched = false;
-        let mut i: usize = 0;
-        while i < (self.count as usize) {
-            if self.methods[i] == req.method.as_str() {
-                let mut captured = String::new();
-                if route_match(self.paths[i], &path, &mut captured) {
-                    req.params = captured;
-                    let handler = self.handlers[i];
-                    res = handler(req);
-                    matched = true;
-                    break;
-                }
+        let method = req.method.clone();
+        match self.try_route(method.as_str(), &path, req) {
+            Some(r) => {
+                res = r;
+                matched = true;
             }
-            i += 1;
+            None => {}
         }
-        if !matched {
+        // HEAD is a GET without the response body. An explicit HEAD route wins;
+        // otherwise the GET handler supplies the headers and Content-Length.
+        if !matched && method.as_str() == "HEAD" {
+            match self.try_route("GET", &path, req) {
+                Some(r) => {
+                    res = r;
+                    matched = true;
+                }
+                None => {}
+            }
+        }
+        if !matched && (method.as_str() == "GET" || method.as_str() == "HEAD") {
             // The longest matching prefix wins, so `/static` beats a `/` mount
-            // no matter which was registered first.
+            // no matter which was registered first. A mount is a read-only
+            // resource, so other methods fall through to 405 below.
             let mut best: i64 = -1;
             let mut best_len: usize = 0;
             let mut m: usize = 0;
@@ -1569,6 +1656,17 @@ impl Router {
             if best >= 0 {
                 let rest = path.substr(best_len, SUBSTR_ALL);
                 res = serve_page(self.roots[best as usize], rest.as_str());
+                matched = true;
+            }
+        }
+        if !matched {
+            // The path exists under another method (or as a static mount), so
+            // this is 405 with the methods that would work, not a plain 404.
+            let allow = self.allowed_methods(&path);
+            if allow.len() > 0 {
+                let mut r = Response::empty(405);
+                r.set_header("Allow", allow.as_str());
+                res = r;
                 matched = true;
             }
         }
@@ -1660,7 +1758,11 @@ impl Router {
         let keep = request_keep_alive(&req) && !req.chunked();
         let mut res = self.dispatch(&mut req);
         res.keep_alive = keep;
-        send_response(c, &res);
+        if req.method.as_str() == "HEAD" {
+            send_response_head(c, &res);
+        } else {
+            send_response(c, &res);
+        }
         if req.chunked() {
             // A malformed chunked body can leave bytes in the socket; draining
             // makes close() send FIN, so the status line survives.
@@ -2194,6 +2296,29 @@ pub fn collect_query_into(raw: &String, out: &mut HashMap<String, String>) {
     }
 }
 
+// allow_seen reports whether method was already collected. The seen string is
+// `,METHOD,METHOD,`, so a method name cannot match part of another one.
+fn allow_seen(seen: &String, method: str) -> bool {
+    let mut needle = String::from(",");
+    needle.push_str(method);
+    needle.push_byte(44); // ','
+    return seen.contains(needle.as_str());
+}
+
+fn allow_mark(seen: &mut String, method: str) {
+    seen.push_byte(44); // ','
+    seen.push_str(method);
+    seen.push_byte(44); // ','
+}
+
+// push_allow appends a method to an Allow header, comma-separated.
+fn push_allow(out: &mut String, method: str) {
+    if out.len() > 0 {
+        out.push_str(", ");
+    }
+    out.push_str(method);
+}
+
 // last_slash is the index of the final "/" in s, or -1.
 fn last_slash(s: &String) -> i64 {
     let mut i: usize = 0;
@@ -2621,8 +2746,21 @@ fn serve_dir_connection(c: &Conn, root: str) -> bool {
         return true;
     }
     let request_path = req.path_only();
+    if req.method.as_str() != "GET" && req.method.as_str() != "HEAD" {
+        let mut r = Response::empty(405);
+        r.set_header("Allow", "GET, HEAD");
+        send_response(c, &r);
+        if req.chunked() {
+            c.drain(DRAIN_MS);
+        }
+        return true;
+    }
     let res = serve_static(root, request_path.as_str());
-    send_response(c, &res);
+    if req.method.as_str() == "HEAD" {
+        send_response_head(c, &res);
+    } else {
+        send_response(c, &res);
+    }
     if req.chunked() {
         c.drain(DRAIN_MS);
     }

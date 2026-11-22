@@ -210,10 +210,11 @@ documented "integers and closures only" boundary that the checker enforces.
   text: today that means no traits, no `dyn`, no user `Drop`, no lifetimes, and
   a documented borrow model. Anything listed as "not yet implemented" in
   `docs/05-roadmap.md` is explicitly out of 1.0 unless it is promoted here.
-- Close the two gaps that users hit in ordinary library code: `for s in &v`
-  (the borrow-checked iterator protocol in §8) and an owning-accumulator
-  `Vec::fold`. Both need the same missing concept, so do them together or
-  document why they wait.
+- `for s in &v` / `for s in &arr` now binds `&T` to the live element, so a
+  `Vec<String>` can be visited without a copy. `&mut` iteration is rejected with
+  `E0900` until the borrow-checked protocol in §8 exists. The remaining gap is
+  an owning-accumulator `Vec::fold`; either land it or document it as out of
+  1.0.
 - Turn every example in `docs/` and `examples/` into a conformance case whose
   output is checked, not just compiled.
 - Exit: the spec and the compiler agree on every normative sentence, and no
@@ -401,7 +402,7 @@ still open.
 | Matching an enum through a borrow reported `E0507` | **stale claim** for `Copy` payloads — `match s { Shape::Circle(r) => … }` on `s: &Shape` binds by value and works. The real restriction is binding an *owning* payload, listed below |
 | `HashMap::get` allocated a key per lookup | **fixed earlier** — `get_str`/`contains_str` hash the borrowed bytes |
 | `Vec::fold` over owning elements | **open** — its accumulator is an element value and the generated loop cannot drop the values it replaces, so it stays `Copy`-only; fold into an owned accumulator with an index instead |
-| `for x in v` copies each element | **open** — iterating a `Vec<String>` is `E0507`; `v.each(|s: &String| …)` is the way today. A `for s in &v` form is the fix, and it needs the borrow-checked iterator idea below |
+| `for x in v` copies each element | **fixed for the common case** — `for s in &v` (and `for s in &arr`) binds `&T`, so a `Vec<String>` is visited without a copy; `&mut` iteration is still `E0900`, and a bare `for s in v` remains `E0507` for owning elements |
 | No `ref`-style pattern | **fixed** — `ref s` binds a shared reference and `ref mut s` an exclusive one, borrowing the payload in place; `ref mut` needs a `&mut` (or raw pointer, or the match's own ownership) along the path, `E0596` otherwise. A borrowed match now binds a pointer to the referent instead of copying the enum, and `ref` works in `if let` / `while let` too. `let ref` and `for ref` are still rejected (`E0900`) |
 | Variadic string building | **fixed** — `push_str` takes one or more arguments (`s.push_str("a", "b", "c")`); each is appended in order and a `String` argument is borrowed, not moved |
 | `io::read_line` does one `read` syscall per byte | **open** — a line needs a buffered-reader type (buffer + consumed mark); the type is the work, not the syscalls |
@@ -427,10 +428,10 @@ still open.
   the language today would mean implementing a protocol, not using one.
 - Windows. The C blocks are POSIX; a Windows port means per-platform blocks,
   which the inline-C mechanism now makes possible without touching the driver.
-- A borrow-checked iterator protocol (`for s in &v`). Every other item in §6 is
-  a widening of an existing builtin; this one needs a trait, or an equivalent
-  hand-rolled protocol the compiler knows about, and it is the only item here
-  that would grow the type system.
+- A borrow-checked iterator protocol (`for s in &mut v`, custom iterators).
+  Shared-borrow iteration over `&Vec` and `&[T; N]` is now a compiler-known
+  form; widening it to mutable iteration or a user type needs a trait, or an
+  equivalent hand-rolled protocol the compiler knows about.
 
 ## How to verify a change here
 
