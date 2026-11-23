@@ -1,8 +1,11 @@
 package driver_test
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
+	"io"
+	stdhttp "net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -322,4 +325,68 @@ func TestHTTPFullServerBudget(t *testing.T) {
 	if !strings.Contains(srv.stdout.String(), "server stopped after 3 request(s)") {
 		t.Errorf("stdout = %q, want the budget shutdown message", srv.stdout.String())
 	}
+}
+
+// TestKeepAliveCapSignalsClose checks the per-connection request cap. The
+// server must say `Connection: close` on the response that uses up a
+// connection's last slot, so a client never sends another request down a
+// socket the server is about to close. The client here is a raw connection
+// with no retry logic, so a server that keeps advertising keep-alive fails.
+func TestKeepAliveCapSignalsClose(t *testing.T) {
+	bin := buildFullExample(t)
+	srv := startFullServer(t, bin, filepath.Join(t.TempDir(), "notes.json"), "2")
+	conn := dialExample(t, srv.addr)
+	defer func() { conn.Close() }()
+	br := bufio.NewReader(conn)
+	req, err := stdhttp.NewRequest("GET", "http://"+srv.addr+"/health", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const total = 205
+	closes := 0
+	for i := 1; i <= total; i++ {
+		fmt.Fprintf(conn, "GET /health HTTP/1.1\r\nHost: %s\r\n\r\n", srv.addr)
+		resp, err := stdhttp.ReadResponse(br, req)
+		if err != nil {
+			t.Fatalf("request %d on one connection failed: %v", i, err)
+		}
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			t.Fatalf("request %d: reading body: %v", i, err)
+		}
+		resp.Body.Close()
+		if resp.Close {
+			closes++
+			if i%100 != 0 {
+				t.Errorf("server closed after request %d, want only after multiples of 100", i)
+			}
+			conn.Close()
+			conn = dialExample(t, srv.addr)
+			br = bufio.NewReader(conn)
+		}
+	}
+	if closes != total/100 {
+		t.Errorf("connection closed %d times in %d requests, want %d", closes, total, total/100)
+	}
+}
+
+// TestSlowFirstByteIsAnswered checks that a client which connects and takes
+// half a second to send its request still gets an answer. Only a socket that
+// stays silent for the whole header budget may be dropped without a reply.
+func TestSlowFirstByteIsAnswered(t *testing.T) {
+	bin := buildFullExample(t)
+	srv := startFullServer(t, bin, filepath.Join(t.TempDir(), "notes.json"), "2")
+	conn := dialExample(t, srv.addr)
+	defer conn.Close()
+	time.Sleep(500 * time.Millisecond)
+	fmt.Fprintf(conn, "GET /health HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", srv.addr)
+	req, err := stdhttp.NewRequest("GET", "http://"+srv.addr+"/health", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(conn), req)
+	if err != nil {
+		t.Fatalf("slow client got no answer: %v", err)
+	}
+	resp.Body.Close()
+	wantStatus(t, resp, 200)
 }

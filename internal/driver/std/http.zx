@@ -1690,9 +1690,13 @@ impl Router {
     // what happened: 1 = a request was served and the connection stays open
     // (keep-alive), 0 = a request was served and the connection must close,
     // -1 = nothing arrived (a probe or a clean EOF) and nothing was sent.
-    fn serve_one(&self, c: &Conn, first: bool) -> i32 {
+    fn serve_one(&self, c: &Conn, first: bool, served: i64, started: i64) -> i32 {
         if first {
-            if !c.wait_readable(FIRST_BYTE_MS) {
+            // A real client may take longer than FIRST_BYTE_MS to send its
+            // request (slow links, a busy peer), so the first byte gets the same
+            // budget as the whole head. A silent socket is still dropped without
+            // an answer once that budget runs out.
+            if !c.wait_readable(self.header_timeout_ms) {
                 return -1;
             }
         } else {
@@ -1755,7 +1759,13 @@ impl Router {
         }
         // A chunked request body is not consumed byte-exact, so the connection
         // cannot be reused safely: answer, drain, and close.
-        let keep = request_keep_alive(&req) && !req.chunked();
+        // The decision is made before the response is written, so the response
+        // that uses up the connection's last slot says `Connection: close`. A
+        // client that is told keep-alive must be able to send another request.
+        let within_limits = served + 1 < MAX_REQUESTS_PER_CONN
+            && zxh_now_ms() - started < (CONNECTION_LIFETIME_MS as i64)
+            && zxh_stopping() == 0;
+        let keep = request_keep_alive(&req) && !req.chunked() && within_limits;
         let mut res = self.dispatch(&mut req);
         res.keep_alive = keep;
         if req.method.as_str() == "HEAD" {
@@ -1799,7 +1809,7 @@ impl Router {
             if zxh_now_ms() - start > (CONNECTION_LIFETIME_MS as i64) {
                 break;
             }
-            let r = self.serve_one(c, first);
+            let r = self.serve_one(c, first, served, start);
             if r < 0 {
                 break;
             }
