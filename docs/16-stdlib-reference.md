@@ -246,7 +246,7 @@ Guards carry the protected `T` in their type and must be released explicitly
 with `unlock()` (user-defined `Drop` is not implemented yet). Full semantics in
 [`21-typed-sync.md`](21-typed-sync.md).
 
-## 16.6c `bufio`, `process`, `path`, `time`, `sort`, `log`, `flag`, `strings`, `csv`, `strconv`
+## 16.6c Go-style C-backed packages
 
 Go-shaped, C-backed packages. See [`24-c-backed-stdlib.md`](24-c-backed-stdlib.md).
 
@@ -262,6 +262,9 @@ Go-shaped, C-backed packages. See [`24-c-backed-stdlib.md`](24-c-backed-stdlib.m
 | `strings` | `contains`, `has_prefix`, `has_suffix`, `index`, `to_upper`, `to_lower`, `trim`, `replace`, `split`, `join` |
 | `csv` | `parse_line`, `write` |
 | `strconv` | `parse_i64`, `parse_f64`, `format_i64`, `format_u64`, `format_f64`, `itoa` |
+| `glob` | `match_`, `files` |
+| `url` | `parse`, `query_get`, `encode`, `decode`, `Url` fields |
+| `container` | `List`: `push_front/back`, `pop_front/back`, `front`, `back`, `len`, `contains`, `remove`, `free` |
 
 ## 16.7 `sys`, `io`, `fs`
 

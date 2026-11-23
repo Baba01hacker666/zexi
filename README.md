@@ -146,8 +146,9 @@ This repository contains the **initial design and specification** of Zexi: the v
 > packages fill gaps a bigger language would put in its core — `bufio`
 > (buffered lines, Go `bufio.Reader`), `process` (Go `os/exec`), `path` (Go
 > `path/filepath`), `time` (strftime formatting), `sort` (with Zexi comparator
-> closures), `log`, `flag`, `strings`, `csv`, `strconv` and a recursive
-> `path::walk`; see [`docs/24-c-backed-stdlib.md`](docs/24-c-backed-stdlib.md).
+> closures), `log`, `flag`, `strings`, `csv`, `strconv`, `glob`, `url`,
+> `container::List` and a recursive `path::walk`; see
+> [`docs/24-c-backed-stdlib.md`](docs/24-c-backed-stdlib.md).
 >
 > Not yet implemented: `dyn Trait`, associated types, const generics, full module
 > **isolation** (qualified access, `as` aliases, and `pub` checks work, but the

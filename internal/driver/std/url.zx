@@ -1,0 +1,218 @@
+// url — URL parsing and percent encoding, modeled on Go's net/url.
+// https://pkg.go.dev/net/url
+//
+// C does the parsing and unescaping; Zexi owns the resulting strings.
+//
+//     use url;
+//
+//     fn main() -> i32 {
+//         let u = url::parse("https://example.com:8080/a/b?x=1&y=2#top");
+//         println(u.scheme, u.host, u.port, u.path, u.query, u.fragment);
+//         println(url::query_get(u.query.as_str(), "x"));
+//         println(url::encode("a b&c"), url::decode("a%20b%26c"));
+//         0
+//     }
+//
+// Output components are capped (scheme/host/fragment 512 bytes, path/query
+// 2048). `query_get` returns the first value for a key, already decoded.
+
+extern "C" fn zxu_parse(s: str, scheme: &mut [u8; 512], host: &mut [u8; 512],
+                        path: &mut [u8; 2048], query: &mut [u8; 2048],
+                        fragment: &mut [u8; 512]) -> i64;
+extern "C" fn zxu_query_get(query: str, key: str, out: &mut [u8; 2048]) -> i64;
+extern "C" fn zxu_encode(s: str, out: &mut [u8; 2048]) -> i64;
+extern "C" fn zxu_decode(s: str, out: &mut [u8; 2048]) -> i64;
+
+pub struct Url {
+    scheme: String,
+    host: String,
+    port: i64,
+    path: String,
+    query: String,
+    fragment: String,
+}
+
+fn from(buf: &[u8], n: i64) -> String {
+    let mut s = String::new();
+    if n > 0 { s.push_bytes(buf[0..n as usize]); }
+    return s;
+}
+
+pub fn parse(s: str) -> Url {
+    let mut scheme: [u8; 512] = [0; 512];
+    let mut host: [u8; 512] = [0; 512];
+    let mut path: [u8; 2048] = [0; 2048];
+    let mut query: [u8; 2048] = [0; 2048];
+    let mut fragment: [u8; 512] = [0; 512];
+    let port = zxu_parse(s, &mut scheme, &mut host, &mut path, &mut query, &mut fragment);
+    return Url {
+        scheme: from(&scheme, len(&scheme)),
+        host: from(&host, len(&host)),
+        port: port,
+        path: from(&path, len(&path)),
+        query: from(&query, len(&query)),
+        fragment: from(&fragment, len(&fragment)),
+    };
+}
+
+fn len(buf: &[u8]) -> i64 {
+    let mut n: i64 = 0;
+    while (n as usize) < buf.len() && buf[n as usize] != 0 { n += 1; }
+    return n;
+}
+
+pub fn query_get(query: str, key: str) -> String {
+    let mut out: [u8; 2048] = [0; 2048];
+    let n = zxu_query_get(query, key, &mut out);
+    return from(&out, n);
+}
+
+pub fn encode(s: str) -> String {
+    let mut out: [u8; 2048] = [0; 2048];
+    let n = zxu_encode(s, &mut out);
+    return from(&out, n);
+}
+
+pub fn decode(s: str) -> String {
+    let mut out: [u8; 2048] = [0; 2048];
+    let n = zxu_decode(s, &mut out);
+    return from(&out, n);
+}
+
+c """
+#define _POSIX_C_SOURCE 200809L
+#include <stdint.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdlib.h>
+
+#define ZXU_S(a) ((char *)((a)->e))
+#define ZXU_M(a) ((char *)((a)->e))
+#define ZXU_L(a) ((char *)((a)->e))
+
+static void zxu_put(char *dst, size_t cap, const char *s, size_t n) {
+    if (n >= cap) n = cap - 1;
+    memcpy(dst, s, n);
+    dst[n] = 0;
+}
+
+int64_t zxu_parse(const char *s, zx_arr512_u8 *scheme, zx_arr512_u8 *host,
+                  zx_arr2048_u8 *path, zx_arr2048_u8 *query,
+                  zx_arr512_u8 *fragment) {
+    if (!s) return -1;
+    ZXU_S(scheme)[0] = ZXU_M(host)[0] = ZXU_L(fragment)[0] = 0;
+    ZXU_L(path)[0] = ZXU_L(query)[0] = 0;
+    const char *cur = s;
+    const char *colon = strstr(cur, "://");
+    if (colon) {
+        zxu_put(ZXU_S(scheme), 512, cur, (size_t)(colon - cur));
+        cur = colon + 3;
+    }
+    const char *end = cur + strlen(cur);
+    const char *frag = strchr(cur, '#');
+    if (frag) {
+        zxu_put(ZXU_L(fragment), 512, frag + 1, strlen(frag + 1));
+        end = frag;
+    }
+    const char *q = strchr(cur, '?');
+    const char *authority_end = q ? q : end;
+    if (q) {
+        const char *qend = (frag && frag > q) ? frag : end;
+        zxu_put(ZXU_L(query), 2048, q + 1, (size_t)(qend - (q + 1)));
+    }
+    const char *slash = strchr(cur, '/');
+    int64_t port = -1;
+    if (slash && slash < authority_end) {
+        zxu_put(ZXU_M(host), 512, cur, (size_t)(slash - cur));
+        zxu_put(ZXU_L(path), 2048, slash, (size_t)(authority_end - slash));
+    } else {
+        zxu_put(ZXU_M(host), 512, cur, (size_t)(authority_end - cur));
+    }
+    /* Split host:port at the last colon (IPv6 hosts are not handled). */
+    char *h = ZXU_M(host);
+    char *pc = strrchr(h, ':');
+    if (pc && pc[1]) {
+        char *tail = pc + 1;
+        char *check = NULL;
+        long v = strtol(tail, &check, 10);
+        if (check && *check == 0 && v >= 0 && v <= 65535) {
+            port = v;
+            *pc = 0;
+        }
+    }
+    return port;
+}
+
+static int zxu_hex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+int64_t zxu_decode(const char *s, zx_arr2048_u8 *out) {
+    if (!s || !out) return 0;
+    char *dst = ZXU_L(out);
+    size_t n = 0;
+    for (const char *p = s; *p && n < 2047; p++) {
+        if (*p == '%' && p[1] && p[2]) {
+            int a = zxu_hex(p[1]), b = zxu_hex(p[2]);
+            if (a >= 0 && b >= 0) {
+                dst[n++] = (char)(a * 16 + b);
+                p += 2;
+                continue;
+            }
+        }
+        if (*p == '+') dst[n++] = ' ';
+        else dst[n++] = *p;
+    }
+    dst[n] = 0;
+    return (int64_t)n;
+}
+
+int64_t zxu_encode(const char *s, zx_arr2048_u8 *out) {
+    if (!s || !out) return 0;
+    static const char *hex = "0123456789ABCDEF";
+    char *dst = ZXU_L(out);
+    size_t n = 0;
+    for (const char *p = s; *p && n < 2045; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            dst[n++] = (char)c;
+        } else {
+            dst[n++] = '%';
+            dst[n++] = hex[c >> 4];
+            dst[n++] = hex[c & 15];
+        }
+    }
+    dst[n] = 0;
+    return (int64_t)n;
+}
+
+int64_t zxu_query_get(const char *query, const char *key, zx_arr2048_u8 *out) {
+    if (!query || !key || !out) return 0;
+    const char *cur = query;
+    while (*cur) {
+        const char *amp = strchr(cur, '&');
+        size_t len = amp ? (size_t)(amp - cur) : strlen(cur);
+        for (size_t i = 0; i < len; i++) {
+            if (cur[i] == '=') {
+                size_t klen = i;
+                if (klen == strlen(key) && strncmp(cur, key, klen) == 0) {
+                    char tmp[2048];
+                    size_t vlen = len - i - 1;
+                    if (vlen >= sizeof(tmp)) vlen = sizeof(tmp) - 1;
+                    memcpy(tmp, cur + i + 1, vlen);
+                    tmp[vlen] = 0;
+                    return zxu_decode(tmp, out);
+                }
+                break;
+            }
+        }
+        if (!amp) break;
+        cur = amp + 1;
+    }
+    ZXU_L(out)[0] = 0;
+    return 0;
+}
+"""

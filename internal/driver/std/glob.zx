@@ -1,0 +1,133 @@
+// glob — shell-style filename matching, modeled on Go's path/filepath.Glob
+// and path.Match. https://pkg.go.dev/path/filepath#Glob
+//
+// C uses fnmatch(3) for matching and readdir(3) for enumeration; Zexi turns the
+// returned names into owned Strings. Patterns support `*`, `?` and `[...]`
+// within a single directory (no `**` recursion).
+//
+//     use glob;
+//
+//     fn main() -> i32 {
+//         println(glob::match_("*.txt", "notes.txt"));
+//         let files = glob::files("/tmp/*.txt");
+//         let mut i: usize = 0;
+//         while i < files.len() { println(files[i]); i += 1; }
+//         0
+//     }
+//
+// At most 64 matches and 8192 bytes of names are returned. Results are in
+// readdir order, so callers should sort when they need a stable order.
+
+extern "C" fn zxg_match(pattern: str, name: str) -> i32;
+extern "C" fn zxg_files(dir: str, pattern: str, buf: &mut [u8; 8192], lens: &mut [i32; 64], prefix: str) -> i32;
+extern "C" fn zxg_split(pattern: str, dir: &mut [u8; 1024], pat: &mut [u8; 1024], prefix: &mut [u8; 1024]);
+
+// match_ tests a single name against a pattern (named with a trailing
+// underscore because `match` is a keyword).
+pub fn match_(pattern: str, name: str) -> bool {
+    return zxg_match(pattern, name) == 1;
+}
+
+// files returns the names in `pattern` that exist. When the pattern has a
+// directory part, the returned strings include it.
+fn from1024(buf: &[u8; 1024]) -> String {
+    let mut s = String::new();
+    let mut n: usize = 0;
+    while n < buf.len() && buf[n] != 0 { n += 1; }
+    if n > 0 { s.push_bytes(buf[0..n]); }
+    return s;
+}
+
+pub fn files(pattern: str) -> Vec<String> {
+    let mut dbuf: [u8; 1024] = [0; 1024];
+    let mut pbuf: [u8; 1024] = [0; 1024];
+    let mut xbuf: [u8; 1024] = [0; 1024];
+    zxg_split(pattern, &mut dbuf, &mut pbuf, &mut xbuf);
+    let dir = from1024(&dbuf);
+    let pat = from1024(&pbuf);
+    let prefix = from1024(&xbuf);
+
+    let mut buf: [u8; 8192] = [0; 8192];
+    let mut lens: [i32; 64] = [0; 64];
+    let n = zxg_files(dir.as_str(), pat.as_str(), &mut buf, &mut lens, prefix.as_str());
+    let mut out = Vec::<String>::new();
+    let mut at: usize = 0;
+    let mut i: i32 = 0;
+    while i < n {
+        let len = lens[i as usize] as usize;
+        let mut s = String::new();
+        if len > 0 { s.push_bytes(buf[at..at + len]); }
+        out.push(s);
+        at += len + 1; // C writes a NUL after each name
+        i += 1;
+    }
+    return out;
+}
+
+c """
+#define _POSIX_C_SOURCE 200809L
+#include <stdint.h>
+#include <string.h>
+#include <dirent.h>
+#include <fnmatch.h>
+
+#define ZXG_BYTES(a) ((char *)((a)->e))
+#define ZXG_B1024(a) ((char *)((a)->e))
+#define ZXG_LENS(a) ((int32_t *)((a)->e))
+
+int32_t zxg_match(const char *pattern, const char *name) {
+    if (!pattern || !name) return 0;
+    return fnmatch(pattern, name, 0) == 0 ? 1 : 0;
+}
+
+static void zxg_copy(zx_arr1024_u8 *out, const char *s, size_t n) {
+    if (n >= 1024) n = 1023;
+    memcpy(ZXG_B1024(out), s, n);
+    ZXG_B1024(out)[n] = 0;
+}
+
+/* Split a pattern at its last slash into directory, base pattern and the
+ * directory prefix kept in results. */
+void zxg_split(const char *pattern, zx_arr1024_u8 *dir,
+               zx_arr1024_u8 *pat, zx_arr1024_u8 *prefix) {
+    if (!pattern) return;
+    const char *slash = strrchr(pattern, '/');
+    if (!slash) {
+        zxg_copy(dir, ".", 1);
+        zxg_copy(pat, pattern, strlen(pattern));
+        zxg_copy(prefix, "", 0);
+        return;
+    }
+    size_t dlen = (size_t)(slash - pattern);
+    zxg_copy(dir, pattern, dlen);
+    zxg_copy(pat, slash + 1, strlen(slash + 1));
+    zxg_copy(prefix, pattern, dlen + 1);
+}
+
+int32_t zxg_files(const char *dir, const char *pat, zx_arr8192_u8 *buf,
+                  zx_arr64_i32 *lens, const char *prefix) {
+    if (!dir || !pat || !buf || !lens) return 0;
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    size_t used = 0;
+    int32_t count = 0;
+    const char *pre = prefix ? prefix : "";
+    size_t prelen = strlen(pre);
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && count < 64) {
+        if (fnmatch(pat, e->d_name, 0) != 0) continue;
+        size_t nlen = strlen(e->d_name);
+        if (used + prelen + nlen + 1 > 8192) break;
+        memcpy(ZXG_BYTES(buf) + used, pre, prelen);
+        used += prelen;
+        memcpy(ZXG_BYTES(buf) + used, e->d_name, nlen);
+        used += nlen;
+        ZXG_BYTES(buf)[used] = 0;
+        ZXG_LENS(lens)[count] = (int32_t)(prelen + nlen);
+        used++;
+        count++;
+    }
+    closedir(d);
+    return count;
+}
+"""

@@ -1,0 +1,149 @@
+// container — linked lists, modeled on Go's container/list.
+// https://pkg.go.dev/container/list
+//
+// Nodes and bookkeeping live in C; Zexi sees an owning handle. Values are i64,
+// matching the rest of the handle-based concurrency API. A List is not Copy,
+// so share it through its handle if workers need it (guard with sync::Mutex).
+//
+//     use container;
+//
+//     fn main() -> i32 {
+//         let l = List::new();
+//         l.push_back(2);
+//         l.push_front(1);
+//         println(l.len(), l.front(), l.back());
+//         println(l.pop_front());
+//         l.free();
+//         0
+//     }
+
+extern "C" fn zxcl_new() -> i64;
+extern "C" fn zxcl_push_back(h: i64, v: i64);
+extern "C" fn zxcl_push_front(h: i64, v: i64);
+extern "C" fn zxcl_pop_front(h: i64) -> i64;
+extern "C" fn zxcl_pop_back(h: i64) -> i64;
+extern "C" fn zxcl_front(h: i64) -> i64;
+extern "C" fn zxcl_back(h: i64) -> i64;
+extern "C" fn zxcl_len(h: i64) -> i64;
+extern "C" fn zxcl_remove(h: i64, v: i64) -> i32;
+extern "C" fn zxcl_contains(h: i64, v: i64) -> i32;
+extern "C" fn zxcl_free(h: i64);
+
+pub struct List { h: i64 }
+
+impl List {
+    pub fn new() -> List {
+        return List { h: zxcl_new() };
+    }
+
+    pub fn push_back(&self, value: i64) { zxcl_push_back(self.h, value); }
+    pub fn push_front(&self, value: i64) { zxcl_push_front(self.h, value); }
+    pub fn pop_front(&self) -> i64 { return zxcl_pop_front(self.h); }
+    pub fn pop_back(&self) -> i64 { return zxcl_pop_back(self.h); }
+    pub fn front(&self) -> i64 { return zxcl_front(self.h); }
+    pub fn back(&self) -> i64 { return zxcl_back(self.h); }
+    pub fn len(&self) -> i64 { return zxcl_len(self.h); }
+
+    // remove deletes the first node holding value; returns whether it found one.
+    pub fn remove(&self, value: i64) -> bool { return zxcl_remove(self.h, value) == 1; }
+    pub fn contains(&self, value: i64) -> bool { return zxcl_contains(self.h, value) == 1; }
+
+    pub fn ok(&self) -> bool { return self.h != 0; }
+
+    // free releases every node. Call once the list is no longer used.
+    pub fn free(&self) { zxcl_free(self.h); }
+}
+
+c """
+#include <stdint.h>
+#include <stdlib.h>
+
+typedef struct zxcl_node {
+    int64_t value;
+    struct zxcl_node *prev, *next;
+} zxcl_node;
+
+typedef struct {
+    zxcl_node *head, *tail;
+    int64_t count;
+} zxcl_list;
+
+int64_t zxcl_new(void) {
+    zxcl_list *l = (zxcl_list *)calloc(1, sizeof(zxcl_list));
+    return l ? (int64_t)(uintptr_t)l : 0;
+}
+
+static void zxcl_push(zxcl_list *l, int64_t v, int front) {
+    if (!l) return;
+    zxcl_node *n = (zxcl_node *)malloc(sizeof(zxcl_node));
+    if (!n) return;
+    n->value = v;
+    n->prev = n->next = NULL;
+    if (!l->head) {
+        l->head = l->tail = n;
+    } else if (front) {
+        n->next = l->head;
+        l->head->prev = n;
+        l->head = n;
+    } else {
+        n->prev = l->tail;
+        l->tail->next = n;
+        l->tail = n;
+    }
+    l->count++;
+}
+void zxcl_push_back(int64_t h, int64_t v) { zxcl_push((zxcl_list *)(uintptr_t)h, v, 0); }
+void zxcl_push_front(int64_t h, int64_t v) { zxcl_push((zxcl_list *)(uintptr_t)h, v, 1); }
+
+static int64_t zxcl_pop(zxcl_list *l, int front) {
+    if (!l || !l->head) return 0;
+    zxcl_node *n = front ? l->head : l->tail;
+    int64_t v = n->value;
+    if (n->prev) n->prev->next = n->next; else l->head = n->next;
+    if (n->next) n->next->prev = n->prev; else l->tail = n->prev;
+    free(n);
+    l->count--;
+    return v;
+}
+int64_t zxcl_pop_front(int64_t h) { return zxcl_pop((zxcl_list *)(uintptr_t)h, 1); }
+int64_t zxcl_pop_back(int64_t h) { return zxcl_pop((zxcl_list *)(uintptr_t)h, 0); }
+
+int64_t zxcl_front(int64_t h) {
+    zxcl_list *l = (zxcl_list *)(uintptr_t)h;
+    return (l && l->head) ? l->head->value : 0;
+}
+int64_t zxcl_back(int64_t h) {
+    zxcl_list *l = (zxcl_list *)(uintptr_t)h;
+    return (l && l->tail) ? l->tail->value : 0;
+}
+int64_t zxcl_len(int64_t h) {
+    zxcl_list *l = (zxcl_list *)(uintptr_t)h;
+    return l ? l->count : 0;
+}
+int32_t zxcl_remove(int64_t h, int64_t v) {
+    zxcl_list *l = (zxcl_list *)(uintptr_t)h;
+    if (!l) return 0;
+    for (zxcl_node *n = l->head; n; n = n->next) {
+        if (n->value != v) continue;
+        if (n->prev) n->prev->next = n->next; else l->head = n->next;
+        if (n->next) n->next->prev = n->prev; else l->tail = n->prev;
+        free(n);
+        l->count--;
+        return 1;
+    }
+    return 0;
+}
+int32_t zxcl_contains(int64_t h, int64_t v) {
+    zxcl_list *l = (zxcl_list *)(uintptr_t)h;
+    if (!l) return 0;
+    for (zxcl_node *n = l->head; n; n = n->next) if (n->value == v) return 1;
+    return 0;
+}
+void zxcl_free(int64_t h) {
+    zxcl_list *l = (zxcl_list *)(uintptr_t)h;
+    if (!l) return;
+    zxcl_node *n = l->head;
+    while (n) { zxcl_node *next = n->next; free(n); n = next; }
+    free(l);
+}
+"""

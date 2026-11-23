@@ -20,6 +20,9 @@ library, which has the same "small core, useful packages" shape.
 | `path::walk` (in [`path`](../internal/driver/std/path.zx)) | `filepath.Walk` | no recursive directory traversal |
 | [`csv`](../internal/driver/std/csv.zx) | `encoding/csv` | no CSV parsing or quoting |
 | [`strconv`](../internal/driver/std/strconv.zx) | `strconv` | no checked number parsing / formatting |
+| [`glob`](../internal/driver/std/glob.zx) | `filepath.Glob` / `path.Match` | no filename matching |
+| [`url`](../internal/driver/std/url.zx) | `net/url` | no URL parsing or percent decoding |
+| [`container`](../internal/driver/std/container.zx) | `container/list` | no linked list |
 
 ## 24.1 `bufio`
 
@@ -202,7 +205,44 @@ fn main() -> i32 {
 input); `format_i64`, `format_u64`, `format_f64(v, precision)` and `itoa`
 return owned `String`s built by C's `snprintf`.
 
-## 24.8 Why C, and what the limits are
+## 24.8 `glob`, `url`, `container`
+
+`glob::match_(pattern, name)` uses C `fnmatch` (`*`, `?`, `[...]`);
+`glob::files(pattern)` enumerates one directory with `readdir` and returns the
+matching names, including the directory prefix. At most 64 names and 8192 bytes
+are returned, and the order is readdir order. The function is spelled `match_`
+because `match` is a Zexi keyword.
+
+```zx
+use glob;
+
+fn main() -> i32 {
+    println(glob::match_("*.txt", "notes.txt"));  // true
+    0
+}
+```
+
+`url::parse` returns a `Url` with `scheme`, `host`, `port`, `path`, `query` and
+`fragment` fields. `query_get`, `encode` and `decode` handle percent escapes
+(plus decodes to a space, like HTML form values). IPv6 literals are not split
+out of the host.
+
+```zx
+use url;
+
+fn main() -> i32 {
+    let u = url::parse("https://example.com:8080/a/b?x=1#top");
+    println(u.host, u.port, u.path, url::query_get(u.query.as_str(), "x"));
+    0
+}
+```
+
+`container::List` is a C doubly linked list of i64 values with `push_front`,
+`push_back`, `pop_front`, `pop_back`, `front`, `back`, `len`, `contains`,
+`remove` and `free`. Like the other handle types, it is not `Copy` and is not
+itself thread-safe — guard a shared handle with `sync::Mutex`.
+
+## 24.9 Why C, and what the limits are
 
 - Every module carries its own C; none adds a driver-side C blob or a linker
   flag. This keeps the self-extension promise in docs/17 intact.

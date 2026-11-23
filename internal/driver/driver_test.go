@@ -3452,6 +3452,138 @@ fn main() -> i32 {
 	}
 }
 
+// TestStdGlob checks fnmatch-style matching and single-directory enumeration.
+func TestStdGlob(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	for _, name := range []string{"a.txt", "b.txt", "c.md"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(dir, "main.zx")
+	src := `use glob;
+
+fn main() -> i32 {
+    println(glob::match_("*.txt", "notes.txt"), glob::match_("*.txt", "notes.md"));
+    let f = glob::files(f"{arg_at(1)}/*.txt");
+    let mut names = String::new();
+    let mut i: usize = 0;
+    while i < f.len() { names.push_str(f[i].as_str()); names.push_str(" "); i += 1; }
+    println(f.len(), names.trim());
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build glob program")
+	}
+	raw, err := exec.Command(out, dir).Output()
+	if err != nil {
+		t.Fatalf("running glob program: %v", err)
+	}
+	got := strings.TrimSpace(string(raw))
+	if !strings.HasPrefix(got, "true false\n2 ") {
+		t.Fatalf("unexpected output %q", got)
+	}
+	if !strings.Contains(got, "a.txt") || !strings.Contains(got, "b.txt") || strings.Contains(got, "c.md") {
+		t.Fatalf("unexpected matches in %q", got)
+	}
+}
+
+// TestStdURL checks Go-style URL parsing and percent encoding.
+func TestStdURL(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.zx")
+	src := `use url;
+
+fn main() -> i32 {
+    let u = url::parse("https://example.com:8080/a/b?x=1&y=2#top");
+    println(u.scheme, u.host, u.port, u.path, u.query, u.fragment);
+    println(url::query_get(u.query.as_str(), "x"));
+    println(url::encode("a b&c"), url::decode("a%20b%26c"));
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build url program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running url program: %v", err)
+	}
+	want := "https example.com 8080 /a/b x=1&y=2 top\n1\na%20b%26c a b&c\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestStdContainerList checks the C-backed doubly linked list.
+func TestStdContainerList(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.zx")
+	src := `use container;
+
+fn main() -> i32 {
+    let l = List::new();
+    l.push_back(2);
+    l.push_front(1);
+    l.push_back(3);
+    println(l.len(), l.front(), l.back());
+    println(l.contains(2), l.contains(9));
+    println(l.pop_front(), l.pop_back());
+    println(l.remove(2), l.len());
+    l.free();
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build list program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running list program: %v", err)
+	}
+	want := "3 1 3\ntrue false\n1 3\ntrue 0\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
 // TestStdMathConvenience exercises the high-level dependency-free numerical
 // surface: conventional aliases, transcendental helpers, geometry, domain
 // fallbacks, and floating-point classification.
