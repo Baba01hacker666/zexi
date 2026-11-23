@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net"
 	stdhttp "net/http"
 	"os"
 	"path/filepath"
@@ -389,4 +390,185 @@ func TestSlowFirstByteIsAnswered(t *testing.T) {
 	}
 	resp.Body.Close()
 	wantStatus(t, resp, 200)
+}
+
+// keepAliveLoop sends n requests on one keep-alive connection and reconnects
+// only after the server says `Connection: close`. A connection the server drops
+// early, or a status other than 200, is an error. The close may come only on
+// the request that uses up the connection's last slot (every 100th request).
+func keepAliveLoop(addr string, n int) error {
+	dial := func() (net.Conn, *bufio.Reader, error) {
+		c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			return nil, nil, err
+		}
+		_ = c.SetDeadline(time.Now().Add(60 * time.Second))
+		return c, bufio.NewReader(c), nil
+	}
+	conn, br, err := dial()
+	if err != nil {
+		return err
+	}
+	defer func() { conn.Close() }()
+	for i := 1; i <= n; i++ {
+		if _, err := fmt.Fprintf(conn, "GET /health HTTP/1.1\r\nHost: %s\r\n\r\n", addr); err != nil {
+			return fmt.Errorf("request %d: write: %w", i, err)
+		}
+		resp, err := stdhttp.ReadResponse(br, nil)
+		if err != nil {
+			return fmt.Errorf("request %d: %w", i, err)
+		}
+		_, err = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return fmt.Errorf("request %d: body: %w", i, err)
+		}
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("request %d: status %d", i, resp.StatusCode)
+		}
+		if resp.Close {
+			if i%100 != 0 {
+				return fmt.Errorf("server closed after request %d, want only after multiples of 100", i)
+			}
+			conn.Close()
+			if conn, br, err = dial(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// TestHTTPFullStressKeepAlive runs more keep-alive clients than the pool has
+// workers. Every request must get an answer: no connection may be dropped
+// early and no request may time out.
+func TestHTTPFullStressKeepAlive(t *testing.T) {
+	bin := buildFullExample(t)
+	srv := startFullServer(t, bin, filepath.Join(t.TempDir(), "notes.json"), "4")
+	const clients = 40
+	const perClient = 150 // crosses the 100-request connection cap once per client
+	var wg sync.WaitGroup
+	errs := make(chan error, clients)
+	for c := 0; c < clients; c++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			if err := keepAliveLoop(srv.addr, perClient); err != nil {
+				errs <- fmt.Errorf("client %d: %w", id, err)
+			}
+		}(c)
+	}
+	wg.Wait()
+	close(errs)
+	failed := 0
+	for err := range errs {
+		failed++
+		if failed <= 5 {
+			t.Error(err)
+		}
+	}
+	if failed > 0 {
+		t.Errorf("%d of %d clients failed", failed, clients)
+	}
+}
+
+// TestIdleKeepAliveDoesNotStarveNewClients holds more idle keep-alive
+// connections than the pool has workers. An idle connection must not hold a
+// worker, so a new client is still answered at once, and the idle connections
+// still work afterwards.
+func TestIdleKeepAliveDoesNotStarveNewClients(t *testing.T) {
+	bin := buildFullExample(t)
+	srv := startFullServer(t, bin, filepath.Join(t.TempDir(), "notes.json"), "2")
+	req, err := stdhttp.NewRequest("GET", "http://"+srv.addr+"/health", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const idleCount = 6
+	idle := make([]net.Conn, 0, idleCount)
+	readers := make([]*bufio.Reader, 0, idleCount)
+	defer func() {
+		for _, c := range idle {
+			c.Close()
+		}
+	}()
+	for i := 0; i < idleCount; i++ {
+		conn := dialExample(t, srv.addr)
+		fmt.Fprintf(conn, "GET /health HTTP/1.1\r\nHost: %s\r\n\r\n", srv.addr)
+		br := bufio.NewReader(conn)
+		resp, err := stdhttp.ReadResponse(br, req)
+		if err != nil {
+			t.Fatalf("idle client %d: %v", i, err)
+		}
+		resp.Body.Close()
+		wantStatus(t, resp, 200)
+		idle = append(idle, conn)
+		readers = append(readers, br)
+	}
+
+	start := time.Now()
+	probe := dialExample(t, srv.addr)
+	defer probe.Close()
+	fmt.Fprintf(probe, "GET /health HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", srv.addr)
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(probe), req)
+	waited := time.Since(start)
+	if err != nil {
+		t.Fatalf("new client got no answer behind %d idle connections: %v", idleCount, err)
+	}
+	resp.Body.Close()
+	wantStatus(t, resp, 200)
+	if waited > 2*time.Second {
+		t.Errorf("new client waited %v behind idle keep-alive connections", waited)
+	}
+
+	// The idle connections are still usable after the probe.
+	fmt.Fprintf(idle[0], "GET /health HTTP/1.1\r\nHost: %s\r\n\r\n", srv.addr)
+	resp, err = stdhttp.ReadResponse(readers[0], req)
+	if err != nil {
+		t.Fatalf("idle connection dead after the probe: %v", err)
+	}
+	resp.Body.Close()
+	wantStatus(t, resp, 200)
+}
+
+// TestHTTPFullTraversalIsBlocked sends raw request lines that try to leave the
+// static folder, in plain, percent-encoded, double-encoded, backslash, NUL,
+// and Unicode-dot forms. The client does not normalize them (Go's and curl's
+// clients would), so the server sees exactly these bytes. Each must get 403 or
+// 404, and no response may contain a file from outside the folder.
+func TestHTTPFullTraversalIsBlocked(t *testing.T) {
+	bin := buildFullExample(t)
+	srv := startFullServer(t, bin, filepath.Join(t.TempDir(), "notes.json"), "2")
+	cases := []string{
+		"/static/../../etc/passwd",
+		"/static/..%2f..%2fetc%2fpasswd",
+		"/static/%2e%2e/%2e%2e/etc/passwd",
+		"/static/%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+		"/static/..%5c..%5cetc%5cpasswd",
+		"/static/..\\..\\etc\\passwd",
+		"/static/%252e%252e/%252e%252e/etc/passwd",
+		"/static/%00/../../etc/passwd",
+		"/static/x%00.txt",
+		"/static/....//....//etc/passwd",
+		"/static//etc/passwd",
+		"/static/%2fetc%2fpasswd",
+		"/static/./../go.mod",
+		"/static/style.css/..",
+		"/static/%ef%bc%8e%ef%bc%8e/etc/passwd",
+		"/static/style.css%00",
+	}
+	for _, path := range cases {
+		t.Run(path, func(t *testing.T) {
+			conn := dialExample(t, srv.addr)
+			defer conn.Close()
+			fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", path)
+			data, _ := io.ReadAll(conn)
+			status, _, _ := strings.Cut(string(data), "\r\n")
+			if !strings.HasPrefix(status, "HTTP/1.1 403 ") && !strings.HasPrefix(status, "HTTP/1.1 404 ") {
+				t.Errorf("status %q, want 403 or 404", status)
+			}
+			if bytes.Contains(data, []byte("root:")) || bytes.Contains(data, []byte("module ")) {
+				t.Errorf("response leaks a file outside the static folder: %q", data)
+			}
+		})
+	}
 }

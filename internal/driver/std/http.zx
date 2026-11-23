@@ -1690,35 +1690,10 @@ impl Router {
     // what happened: 1 = a request was served and the connection stays open
     // (keep-alive), 0 = a request was served and the connection must close,
     // -1 = nothing arrived (a probe or a clean EOF) and nothing was sent.
-    fn serve_one(&self, c: &Conn, first: bool, served: i64, started: i64) -> i32 {
-        if first {
-            // A real client may take longer than FIRST_BYTE_MS to send its
-            // request (slow links, a busy peer), so the first byte gets the same
-            // budget as the whole head. A silent socket is still dropped without
-            // an answer once that budget runs out.
-            if !c.wait_readable(self.header_timeout_ms) {
-                return -1;
-            }
-        } else {
-            let mut waited: i32 = 0;
-            while waited < KEEPALIVE_IDLE_MS {
-                if zxh_stopping() == 1 {
-                    return -1;
-                }
-                let slice = if KEEPALIVE_IDLE_MS - waited < WORKER_POLL_MS {
-                    KEEPALIVE_IDLE_MS - waited
-                } else {
-                    WORKER_POLL_MS
-                };
-                if c.wait_readable(slice) {
-                    break;
-                }
-                waited += slice;
-            }
-            if waited >= KEEPALIVE_IDLE_MS {
-                return -1;
-            }
-        }
+    //
+    // serve_one does not wait for the first byte: the caller has already seen
+    // the socket readable (the pool poller, or await_request on the serial path).
+    fn serve_one(&self, c: &Conn, served: i64, started: i64) -> i32 {
         c.set_timeout(self.header_timeout_ms);
         let mut req = read_request(c);
         if req.head_overflow {
@@ -1785,6 +1760,36 @@ impl Router {
         return 0;
     }
 
+    // await_request blocks until the connection has a request to read, or gives
+    // up: the first byte gets the header budget, a keep-alive connection gets
+    // KEEPALIVE_IDLE_MS. It returns false when nothing arrived in time. Only the
+    // serial path waits this way; pool workers are handed ready connections.
+    fn await_request(&self, c: &Conn, first: bool) -> bool {
+        if first {
+            // A real client may take longer than FIRST_BYTE_MS to send its
+            // request (slow links, a busy peer), so the first byte gets the same
+            // budget as the whole head. A silent socket is still dropped without
+            // an answer once that budget runs out.
+            return c.wait_readable(self.header_timeout_ms);
+        }
+        let mut waited: i32 = 0;
+        while waited < KEEPALIVE_IDLE_MS {
+            if zxh_stopping() == 1 {
+                return false;
+            }
+            let slice = if KEEPALIVE_IDLE_MS - waited < WORKER_POLL_MS {
+                KEEPALIVE_IDLE_MS - waited
+            } else {
+                WORKER_POLL_MS
+            };
+            if c.wait_readable(slice) {
+                return true;
+            }
+            waited += slice;
+        }
+        return false;
+    }
+
     // serve handles one connection, following keep-alive: it serves requests
     // until the client asks to close, goes idle past KEEPALIVE_IDLE_MS, or
     // disconnects, and reports whether it served at least one request.
@@ -1809,7 +1814,10 @@ impl Router {
             if zxh_now_ms() - start > (CONNECTION_LIFETIME_MS as i64) {
                 break;
             }
-            let r = self.serve_one(c, first, served, start);
+            if !self.await_request(c, first) {
+                break;
+            }
+            let r = self.serve_one(c, served, start);
             if r < 0 {
                 break;
             }
@@ -2030,6 +2038,14 @@ extern "C" fn zxh_stop();
 extern "C" fn zxh_clear_stop();
 extern "C" fn zxh_stopping() -> i32;
 extern "C" fn zxh_now_ms() -> i64;
+extern "C" fn zxh_pool_begin();
+extern "C" fn zxh_poll_run(listen_fd: i32, header_ms: i32, idle_ms: i32, life_ms: i32) -> i64;
+extern "C" fn zxh_pool_next() -> i64;
+extern "C" fn zxh_conn_fd(h: i64) -> i32;
+extern "C" fn zxh_conn_served(h: i64) -> i64;
+extern "C" fn zxh_conn_started(h: i64) -> i64;
+extern "C" fn zxh_conn_done(h: i64, code: i32);
+extern "C" fn zxh_pool_end();
 
 // WORKER_POLL_MS bounds how long a worker waits on an idle listener before it
 // re-checks the stop flag, so a pool shuts down promptly instead of hanging on
@@ -2085,41 +2101,51 @@ fn pin_router(src: &Router, dst: *Router) {
     (*dst).header_timeout_ms = src.header_timeout_ms;
 }
 
-// drain is the worker loop: accept bounded so the stop flag is noticed, serve
-// one request per connection, count it, and repeat. It returns how many
-// requests this worker served.
-fn drain(mux: *Router, listener_fd: i64) -> i64 {
-    let mut server = Server::from_fd(listener_fd as i32);
+// pool_worker answers requests for the router in `slot` (slot 0 is the default
+// mux). It takes a connection from the poller only when a request is waiting,
+// answers one request, and hands the connection back for keep-alive or closes
+// it. It never sleeps on an idle client, so a keep-alive connection does not
+// hold a worker. It returns how many requests this worker answered.
+fn pool_worker(_listener_fd: i64, slot: i64) -> i64 {
+    let mux = zxh_mux_slot(slot as i32);
     let mut served: i64 = 0;
     loop {
-        if zxh_stopping() == 1 {
+        let h = zxh_pool_next();
+        if h == 0 {
             break;
         }
-        let mut conn = server.accept_timeout(WORKER_POLL_MS);
-        if !conn.is_open() {
-            continue;
+        let conn = Conn::from_fd(zxh_conn_fd(h));
+        let before = zxh_conn_served(h);
+        let started = zxh_conn_started(h);
+        let r = mux.serve_one(&conn, before, started);
+        if r >= 0 {
+            zxh_count_requests(1);
+            served += 1;
+            let budget = zxh_budget();
+            if budget > 0 && zxh_requests_served() >= budget {
+                // Pool-wide budget reached: this request is answered, so stop
+                // the pool instead of letting more connections in.
+                zxh_stop();
+            }
         }
-        zxh_count_conn();
-        served += mux.serve_count(&conn);
-        conn.close();
+        // 1 = keep the connection (back to the poller), 0 = close after the
+        // answer, -1 = nothing was sent (probe or EOF): close.
+        zxh_conn_done(h, r);
     }
     return served;
 }
 
-// worker_slot serves a router that was pinned into a slot.
-fn worker_slot(listener_fd: i64, slot: i64) -> i64 {
-    return drain(zxh_mux_slot(slot as i32), listener_fd);
+// pool_poller owns accept() and idle keep-alive sockets for the pool (see
+// zxh_poll_run). It returns when the pool stops.
+fn pool_poller(listener_fd: i64, slot: i64) -> i64 {
+    let mux = zxh_mux_slot(slot as i32);
+    zxh_poll_run(listener_fd as i32, (*mux).header_timeout_ms, KEEPALIVE_IDLE_MS, CONNECTION_LIFETIME_MS);
+    return 0;
 }
 
-// worker_default serves the process-wide default mux, which lives in a fixed
-// slot already, so nothing needs pinning.
-fn worker_default(listener_fd: i64, slot: i64) -> i64 {
-    return drain(default_router(), listener_fd);
-}
-
-// run_pool starts `workers` threads on one listener and joins them. A
-// max_requests of 0 means "serve until stopped".
-fn run_pool(fd: i64, workers: i32, max_requests: i64, entry: fn(i64, i64) -> i64, slot: i32) -> i32 {
+// run_pool starts `workers` pool workers and one poller on one listener, then
+// waits for them. A max_requests of 0 means "serve until stopped".
+fn run_pool(fd: i64, workers: i32, max_requests: i64, slot: i32) -> i32 {
     let mut n = workers;
     if n <= 0 {
         // Two threads per core covers the common case where a handler waits on
@@ -2133,11 +2159,12 @@ fn run_pool(fd: i64, workers: i32, max_requests: i64, entry: fn(i64, i64) -> i64
         n = MAX_WORKERS;
     }
     zxh_set_budget(max_requests);
+    zxh_pool_begin();
     let mut handles: [i64; 64] = [0; 64];
     let mut started: i32 = 0;
     let mut i: i32 = 0;
     while i < n {
-        let h = thread::spawn2(entry, fd, slot as i64);
+        let h = thread::spawn2(pool_worker, fd, slot as i64);
         if h == 0 {
             break;
         }
@@ -2148,8 +2175,24 @@ fn run_pool(fd: i64, workers: i32, max_requests: i64, entry: fn(i64, i64) -> i64
     if started == 0 {
         // The thread table is full or pthread_create failed: serve inline so
         // the program still makes progress.
-        let mux = zxh_mux_slot(slot);
-        drain_until_budget(mux, fd, max_requests);
+        drain_until_budget(zxh_mux_slot(slot), fd, max_requests);
+        zxh_set_budget(0);
+        zxh_clear_stop();
+        return 0;
+    }
+    let poller = thread::spawn2(pool_poller, fd, slot as i64);
+    if poller == 0 {
+        // No poller means no connection is ever handed over. Stop the workers
+        // that did start, then serve inline.
+        zxh_stop();
+        let mut j: i32 = 0;
+        while j < started {
+            thread::join(handles[j as usize]);
+            j += 1;
+        }
+        zxh_pool_end();
+        zxh_clear_stop();
+        drain_until_budget(zxh_mux_slot(slot), fd, max_requests);
         zxh_set_budget(0);
         zxh_clear_stop();
         return 0;
@@ -2159,6 +2202,8 @@ fn run_pool(fd: i64, workers: i32, max_requests: i64, entry: fn(i64, i64) -> i64
         thread::join(handles[j as usize]);
         j += 1;
     }
+    thread::join(poller);
+    zxh_pool_end();
     zxh_set_budget(0);
     zxh_clear_stop();
     return 0;
@@ -2215,7 +2260,7 @@ pub fn serve_workers_n(router: &Router, workers: i32, max_requests: i32, port: i
     }
     pin_router(router, zxh_mux_slot(slot));
     zxh_stats_reset();
-    let rc = run_pool(listener.fd() as i64, workers, max_requests as i64, worker_slot, slot);
+    let rc = run_pool(listener.fd() as i64, workers, max_requests as i64, slot);
     listener.close();
     zxh_mux_release(slot);
     return rc;
@@ -2363,7 +2408,7 @@ pub fn listen_workers(addr: str = "0.0.0.0:8000", workers: i32 = 0) -> i32 {
     // blocking.
     listener.set_nonblocking(true);
     zxh_stats_reset();
-    let rc = run_pool(listener.fd() as i64, workers, 0, worker_default, 0);
+    let rc = run_pool(listener.fd() as i64, workers, 0, 0);
     listener.close();
     return rc;
 }
@@ -2383,7 +2428,7 @@ pub fn listen_workers_n(addr: str, workers: i32, max_requests: i32) -> i32 {
     // the budget shutdown never completes.
     listener.set_nonblocking(true);
     zxh_stats_reset();
-    let rc = run_pool(listener.fd() as i64, workers, max_requests as i64, worker_default, 0);
+    let rc = run_pool(listener.fd() as i64, workers, max_requests as i64, 0);
     listener.close();
     return rc;
 }
@@ -3094,7 +3139,17 @@ fn push_int(s: &mut String, n: i64) {
 c """
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 
 #define ZXH_MUX_SLOTS 4
 
@@ -3172,7 +3227,240 @@ void zxh_set_budget(int64_t n) { atomic_store(&zxh_budget_requests, n); }
 
 int64_t zxh_budget(void) { return atomic_load(&zxh_budget_requests); }
 
+/* Monotonic wall time in milliseconds. (clock() measures CPU time, which
+ * stops while every connection is idle, so it cannot time a keep-alive.) */
 int64_t zxh_now_ms(void) {
-    return (int64_t)(clock() * 1000 / CLOCKS_PER_SEC);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* ---- readiness pool ------------------------------------------------------
+ * One poller thread owns accept() and every idle keep-alive socket. It moves a
+ * socket to the ready queue only when a request is waiting on it, so a worker
+ * never sleeps on an idle client. Idle sockets cost a poll slot, not a thread.
+ * The tables grow on demand: there is no connection cap. */
+typedef struct zxh_conn {
+    int fd;
+    int64_t served;      /* requests answered on this connection */
+    int64_t started;     /* monotonic ms when accepted */
+    int64_t idle_since;  /* monotonic ms when it last went idle */
+} zxh_conn;
+
+static pthread_mutex_t zxh_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t zxh_pool_cv = PTHREAD_COND_INITIALIZER;
+static zxh_conn **zxh_idle = NULL;
+static size_t zxh_idle_n = 0, zxh_idle_cap = 0;
+static zxh_conn **zxh_ready = NULL;
+static size_t zxh_ready_n = 0, zxh_ready_cap = 0;
+static int zxh_wake[2] = {-1, -1};
+
+static int zxh_grow(zxh_conn ***arr, size_t *n, size_t *cap) {
+    if (*n < *cap) return 1;
+    size_t nc = *cap ? *cap * 2 : 64;
+    zxh_conn **p = realloc(*arr, nc * sizeof *p);
+    if (!p) return 0;
+    *arr = p;
+    *cap = nc;
+    return 1;
+}
+
+static void zxh_wake_poller(void) {
+    char b = 1;
+    if (zxh_wake[1] >= 0) {
+        ssize_t r = write(zxh_wake[1], &b, 1);
+        (void)r;
+    }
+}
+
+static void zxh_idle_remove(zxh_conn *c) {
+    for (size_t i = 0; i < zxh_idle_n; i++) {
+        if (zxh_idle[i] == c) {
+            zxh_idle[i] = zxh_idle[--zxh_idle_n];
+            return;
+        }
+    }
+}
+
+static void zxh_conn_free(zxh_conn *c) {
+    if (c->fd >= 0) close(c->fd);
+    free(c);
+}
+
+static void zxh_socket_setup(int c) {
+    int one = 1;
+    setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    int fl = fcntl(c, F_GETFL, 0);
+    if (fl >= 0) fcntl(c, F_SETFL, fl & ~O_NONBLOCK);
+}
+
+/* zxh_pool_begin prepares the wake-up pipe. It is called once per pool. */
+void zxh_pool_begin(void) {
+    pthread_mutex_lock(&zxh_pool_mu);
+    if (zxh_wake[0] < 0 && pipe(zxh_wake) == 0) {
+        for (int i = 0; i < 2; i++) {
+            int fl = fcntl(zxh_wake[i], F_GETFL, 0);
+            fcntl(zxh_wake[i], F_SETFL, fl | O_NONBLOCK);
+        }
+    }
+    pthread_mutex_unlock(&zxh_pool_mu);
+}
+
+/* zxh_poll_run is the poller thread. It returns once the stop flag is set. */
+int64_t zxh_poll_run(int32_t listen_fd, int32_t header_ms, int32_t idle_ms, int32_t life_ms) {
+    for (;;) {
+        pthread_mutex_lock(&zxh_pool_mu);
+        if (atomic_load(&zxh_stop_flag)) {
+            for (size_t i = 0; i < zxh_idle_n; i++) zxh_conn_free(zxh_idle[i]);
+            zxh_idle_n = 0;
+            pthread_cond_broadcast(&zxh_pool_cv);
+            pthread_mutex_unlock(&zxh_pool_mu);
+            return 0;
+        }
+        size_t n = zxh_idle_n;
+        struct pollfd *pfds = malloc((n + 2) * sizeof *pfds);
+        zxh_conn **snap = malloc((n ? n : 1) * sizeof *snap);
+        if (!pfds || !snap) {
+            free(pfds);
+            free(snap);
+            pthread_mutex_unlock(&zxh_pool_mu);
+            usleep(10000);
+            continue;
+        }
+        pfds[0].fd = listen_fd;
+        pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
+        pfds[1].fd = zxh_wake[0];
+        pfds[1].events = POLLIN;
+        pfds[1].revents = 0;
+        for (size_t i = 0; i < n; i++) {
+            snap[i] = zxh_idle[i];
+            pfds[i + 2].fd = snap[i]->fd;
+            pfds[i + 2].events = POLLIN;
+            pfds[i + 2].revents = 0;
+        }
+        pthread_mutex_unlock(&zxh_pool_mu);
+
+        poll(pfds, n + 2, 50);
+
+        pthread_mutex_lock(&zxh_pool_mu);
+        if (pfds[1].revents & POLLIN) {
+            char buf[64];
+            while (read(zxh_wake[0], buf, sizeof buf) > 0) {
+            }
+        }
+        if (pfds[0].revents & (POLLIN | POLLERR)) {
+            for (;;) {
+                int c = accept(listen_fd, NULL, NULL);
+                if (c < 0) {
+                    /* EAGAIN ends the burst. Out of descriptors: back off so the
+                     * listener does not spin the poller until one is freed. */
+                    if (errno == EMFILE || errno == ENFILE) usleep(10000);
+                    break;
+                }
+                zxh_socket_setup(c);
+                zxh_conn *rec = calloc(1, sizeof *rec);
+                if (!rec) {
+                    close(c);
+                    break;
+                }
+                rec->fd = c;
+                rec->started = zxh_now_ms();
+                rec->idle_since = rec->started;
+                zxh_count_conn();
+                if (!zxh_grow(&zxh_idle, &zxh_idle_n, &zxh_idle_cap)) {
+                    zxh_conn_free(rec);
+                    break;
+                }
+                zxh_idle[zxh_idle_n++] = rec;
+            }
+        }
+        for (size_t i = 0; i < n; i++) {
+            if (!(pfds[i + 2].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            zxh_conn *c = snap[i];
+            zxh_idle_remove(c);
+            if (!zxh_grow(&zxh_ready, &zxh_ready_n, &zxh_ready_cap)) {
+                zxh_conn_free(c);
+                continue;
+            }
+            zxh_ready[zxh_ready_n++] = c;
+            pthread_cond_signal(&zxh_pool_cv);
+        }
+        /* A connection that waits too long is closed without an answer: a
+         * new one within the header budget, a keep-alive one within idle_ms. */
+        int64_t now = zxh_now_ms();
+        for (size_t i = 0; i < zxh_idle_n;) {
+            zxh_conn *c = zxh_idle[i];
+            int64_t limit = c->served == 0 ? (int64_t)header_ms : (int64_t)idle_ms;
+            if (now - c->idle_since >= limit || now - c->started >= (int64_t)life_ms) {
+                zxh_idle[i] = zxh_idle[--zxh_idle_n];
+                zxh_conn_free(c);
+            } else {
+                i++;
+            }
+        }
+        free(pfds);
+        free(snap);
+        pthread_mutex_unlock(&zxh_pool_mu);
+    }
+}
+
+/* zxh_pool_next blocks a worker until a connection has a request waiting. It
+ * returns a handle, or 0 once the pool is stopping. */
+int64_t zxh_pool_next(void) {
+    pthread_mutex_lock(&zxh_pool_mu);
+    for (;;) {
+        if (atomic_load(&zxh_stop_flag)) {
+            pthread_mutex_unlock(&zxh_pool_mu);
+            return 0;
+        }
+        if (zxh_ready_n > 0) {
+            zxh_conn *c = zxh_ready[0];
+            memmove(zxh_ready, zxh_ready + 1, (zxh_ready_n - 1) * sizeof *zxh_ready);
+            zxh_ready_n--;
+            pthread_mutex_unlock(&zxh_pool_mu);
+            return (int64_t)(intptr_t)c;
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 100000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&zxh_pool_cv, &zxh_pool_mu, &ts);
+    }
+}
+
+int32_t zxh_conn_fd(int64_t h) { return ((zxh_conn *)(intptr_t)h)->fd; }
+int64_t zxh_conn_served(int64_t h) { return ((zxh_conn *)(intptr_t)h)->served; }
+int64_t zxh_conn_started(int64_t h) { return ((zxh_conn *)(intptr_t)h)->started; }
+
+/* zxh_conn_done ends one request. code 1 keeps the connection (it goes back to
+ * the poller), 0 closes it after an answer, -1 closes it with nothing sent. */
+void zxh_conn_done(int64_t h, int32_t code) {
+    zxh_conn *c = (zxh_conn *)(intptr_t)h;
+    pthread_mutex_lock(&zxh_pool_mu);
+    if (code >= 0) c->served++;
+    if (code == 1 && !atomic_load(&zxh_stop_flag) &&
+        zxh_grow(&zxh_idle, &zxh_idle_n, &zxh_idle_cap)) {
+        c->idle_since = zxh_now_ms();
+        zxh_idle[zxh_idle_n++] = c;
+        zxh_wake_poller();
+        pthread_mutex_unlock(&zxh_pool_mu);
+        return;
+    }
+    pthread_mutex_unlock(&zxh_pool_mu);
+    zxh_conn_free(c);
+}
+
+/* zxh_pool_end closes whatever is still queued or idle. */
+void zxh_pool_end(void) {
+    pthread_mutex_lock(&zxh_pool_mu);
+    for (size_t i = 0; i < zxh_idle_n; i++) zxh_conn_free(zxh_idle[i]);
+    zxh_idle_n = 0;
+    for (size_t i = 0; i < zxh_ready_n; i++) zxh_conn_free(zxh_ready[i]);
+    zxh_ready_n = 0;
+    pthread_mutex_unlock(&zxh_pool_mu);
 }
 """
