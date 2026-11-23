@@ -1,0 +1,114 @@
+// csv — comma-separated values, modeled on Go's encoding/csv.
+// https://pkg.go.dev/encoding/csv
+//
+// C scans one field at a time (handling quotes and doubled quotes) and Zexi
+// builds the owned fields. Only one record at a time is held, so a large file
+// can be streamed through bufio::Reader line by line.
+//
+//     use csv;
+//
+//     fn main() -> i32 {
+//         let fields = csv::parse_line("a,\"b,c\",d");
+//         println(fields.len(), fields[0], fields[1], fields[2]);
+//         println(csv::write(&fields));
+//         0
+//     }
+//
+// A field longer than 8192 bytes is truncated. `write` quotes a field when it
+// contains a comma, a quote, a newline or leading/trailing space.
+
+extern "C" fn zxc_field(line: str, from: i64, out: &mut [u8; 8192]) -> i64;
+extern "C" fn zxc_needs_quote(field: str) -> i32;
+
+// parse_line splits one CSV record. It returns an empty Vec for an empty line.
+pub fn parse_line(line: str) -> Vec<String> {
+    let mut out = Vec::<String>::new();
+    let mut from: i64 = 0;
+    loop {
+        let mut buf: [u8; 8192] = [0; 8192];
+        let end = zxc_field(line, from, &mut buf);
+        if end < 0 { break; }
+        let mut s = String::new();
+        let mut n: usize = 0;
+        while n < buf.len() && buf[n] != 0 { n += 1; }
+        if n > 0 { s.push_bytes(buf[0..n]); }
+        out.push(s);
+        from = end;
+    }
+    return out;
+}
+
+// write renders fields as one CSV record, quoting where needed.
+pub fn write(fields: &Vec<String>) -> String {
+    let mut out = String::new();
+    let mut i: usize = 0;
+    while i < fields.len() {
+        if i > 0 { out.push_str(","); }
+        let f = fields[i].as_str();
+        if zxc_needs_quote(f) == 1 {
+            out.push_str("\"");
+            let bytes = f.as_bytes();
+            let mut j: usize = 0;
+            while j < bytes.len() {
+                if bytes[j] == 34 { out.push_str("\"\""); }
+                else { out.push_bytes(bytes[j..j + 1]); }
+                j += 1;
+            }
+            out.push_str("\"");
+        } else {
+            out.push_str(f);
+        }
+        i += 1;
+    }
+    return out;
+}
+
+c """
+#define _POSIX_C_SOURCE 200809L
+#include <stdint.h>
+#include <string.h>
+#include <ctype.h>
+
+#define ZXC_BYTES(a) ((char *)((a)->e))
+#define ZXC_CAP 8192
+
+/* Parse one field starting at `from` and write its unescaped bytes to out.
+ * Returns the offset just past the trailing comma, or -1 when done. */
+int64_t zxc_field(const char *line, int64_t from, zx_arr8192_u8 *out) {
+    if (!line || !out) return -1;
+    size_t n = strlen(line);
+    if ((size_t)from >= n) return -1;
+    const char *cur = line + from;
+    size_t used = 0;
+    if (*cur == '"') {
+        cur++;
+        while (*cur && used < ZXC_CAP - 1) {
+            if (*cur == '"' && cur[1] == '"') {
+                ZXC_BYTES(out)[used++] = '"';
+                cur += 2;
+            } else if (*cur == '"') {
+                cur++;
+                break;
+            } else {
+                ZXC_BYTES(out)[used++] = *cur++;
+            }
+        }
+        if (*cur == ',') cur++;
+    } else {
+        while (*cur && *cur != ',' && used < ZXC_CAP - 1) {
+            ZXC_BYTES(out)[used++] = *cur++;
+        }
+        if (*cur == ',') cur++;
+    }
+    ZXC_BYTES(out)[used] = 0;
+    return (int64_t)(cur - line);
+}
+
+int32_t zxc_needs_quote(const char *field) {
+    if (!field) return 0;
+    if (strpbrk(field, ",\"\r\n") != NULL) return 1;
+    if (*field && (isspace((unsigned char)*field) ||
+                   isspace((unsigned char)field[strlen(field) - 1]))) return 1;
+    return 0;
+}
+"""

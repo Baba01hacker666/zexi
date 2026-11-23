@@ -18,6 +18,8 @@ library, which has the same "small core, useful packages" shape.
 | [`flag`](../internal/driver/std/flag.zx) | `flag` | only raw `arg_at` / `arg_count` |
 | [`strings`](../internal/driver/std/strings.zx) | `strings` | no split / trim / case conversion helpers |
 | `path::walk` (in [`path`](../internal/driver/std/path.zx)) | `filepath.Walk` | no recursive directory traversal |
+| [`csv`](../internal/driver/std/csv.zx) | `encoding/csv` | no CSV parsing or quoting |
+| [`strconv`](../internal/driver/std/strconv.zx) | `strconv` | no checked number parsing / formatting |
 
 ## 24.1 `bufio`
 
@@ -178,7 +180,29 @@ fn main() -> i32 {
 }
 ```
 
-## 24.7 Why C, and what the limits are
+## 24.7 `csv` and `strconv`
+
+`csv::parse_line` returns a `Vec<String>` of unescaped fields (doubled quotes
+collapse), and `csv::write(&fields)` quotes fields containing a comma, quote,
+newline or surrounding space. Both stream one record at a time, so a CSV file
+can be read through `bufio::Reader` line by line.
+
+```zx
+use csv;
+
+fn main() -> i32 {
+    let f = csv::parse_line("a,\"b,c\",d");
+    println(f.len(), f[1]);   // 3 b,c
+    println(csv::write(&f));  // a,"b,c",d
+    0
+}
+```
+
+`strconv::parse_i64` / `parse_f64` return `Option` (no silent zero on bad
+input); `format_i64`, `format_u64`, `format_f64(v, precision)` and `itoa`
+return owned `String`s built by C's `snprintf`.
+
+## 24.8 Why C, and what the limits are
 
 - Every module carries its own C; none adds a driver-side C blob or a linker
   flag. This keeps the self-extension promise in docs/17 intact.

@@ -3366,6 +3366,87 @@ fn main() -> i32 {
 	}
 }
 
+// TestStdCSV checks the C-backed CSV parser and writer, including doubled
+// quotes and automatic quoting of fields that contain a comma or space.
+func TestStdCSV(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.zx")
+	src := `use csv;
+
+fn main() -> i32 {
+    let f = csv::parse_line("a,\"b,c\",d");
+    println(f.len(), f[0], f[1], f[2]);
+    println(csv::write(&f));
+    let q = csv::parse_line("\"x\"\"y\", z");
+    println(q.len(), q[0], q[1]);
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build csv program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running csv program: %v", err)
+	}
+	want := "3 a b,c d\na,\"b,c\",d\n2 x\"y  z\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestStdStrconv checks Option-returning parsers and C-formatted numbers.
+func TestStdStrconv(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.zx")
+	src := `use strconv;
+
+fn main() -> i32 {
+    match strconv::parse_i64("42") { Some(n) => println(n), None => println("bad") }
+    match strconv::parse_i64("abc") { Some(n) => println(n), None => println("bad") }
+    match strconv::parse_f64("3.5") { Some(x) => println(x), None => println("bad") }
+    println(strconv::format_i64(-12), strconv::format_u64(9));
+    println(strconv::format_f64(3.14159, 2));
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build strconv program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running strconv program: %v", err)
+	}
+	want := "42\nbad\n3.5\n-12 9\n3.14\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
 // TestStdMathConvenience exercises the high-level dependency-free numerical
 // surface: conventional aliases, transcendental helpers, geometry, domain
 // fallbacks, and floating-point classification.

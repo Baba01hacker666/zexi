@@ -1,0 +1,112 @@
+// strconv — string/number conversion, modeled on Go's strconv package.
+// https://pkg.go.dev/strconv
+//
+// C's strtoll/strtod/snprintf do the work. Parsing returns Option so a bad
+// string cannot silently become zero; formatting returns an owned String.
+//
+//     use strconv;
+//
+//     fn main() -> i32 {
+//         match strconv::parse_i64("42") {
+//             Some(n) => println(n),
+//             None => println("not a number"),
+//         }
+//         println(strconv::format_f64(3.14159, 2));  // 3.14
+//         0
+//     }
+
+extern "C" fn zxsc_parse_i64(s: str, out: &mut i64) -> i32;
+extern "C" fn zxsc_parse_f64(s: str, out: &mut f64) -> i32;
+extern "C" fn zxsc_format_i64(v: i64, out: &mut [u8; 256]) -> i64;
+extern "C" fn zxsc_format_u64(v: u64, out: &mut [u8; 256]) -> i64;
+extern "C" fn zxsc_format_f64(v: f64, precision: i32, out: &mut [u8; 256]) -> i64;
+
+pub fn parse_i64(s: str) -> Option<i64> {
+    let mut v: i64 = 0;
+    if zxsc_parse_i64(s, &mut v) == 1 { return Some(v); }
+    return None;
+}
+
+pub fn parse_f64(s: str) -> Option<f64> {
+    let mut v: f64 = 0.0;
+    if zxsc_parse_f64(s, &mut v) == 1 { return Some(v); }
+    return None;
+}
+
+fn from_buf(buf: &[u8; 256], n: i64) -> String {
+    let mut s = String::new();
+    if n > 0 { s.push_bytes(buf[0..n as usize]); }
+    return s;
+}
+
+pub fn format_i64(v: i64) -> String {
+    let mut buf: [u8; 256] = [0; 256];
+    return from_buf(&buf, zxsc_format_i64(v, &mut buf));
+}
+
+pub fn format_u64(v: u64) -> String {
+    let mut buf: [u8; 256] = [0; 256];
+    return from_buf(&buf, zxsc_format_u64(v, &mut buf));
+}
+
+pub fn format_f64(v: f64, precision: i32) -> String {
+    let mut buf: [u8; 256] = [0; 256];
+    return from_buf(&buf, zxsc_format_f64(v, precision, &mut buf));
+}
+
+pub fn itoa(v: i64) -> String { return format_i64(v); }
+
+c """
+#define _POSIX_C_SOURCE 200809L
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+
+#define ZXSC_BYTES(a) ((char *)((a)->e))
+
+int32_t zxsc_parse_i64(const char *s, int64_t *out) {
+    if (!s || !*s || !out) return 0;
+    errno = 0;
+    char *end = NULL;
+    long long v = strtoll(s, &end, 10);
+    if (errno != 0 || !end || *end != 0) return 0;
+    *out = (int64_t)v;
+    return 1;
+}
+int32_t zxsc_parse_f64(const char *s, double *out) {
+    if (!s || !*s || !out) return 0;
+    errno = 0;
+    char *end = NULL;
+    double v = strtod(s, &end);
+    if (errno != 0 || !end || *end != 0) return 0;
+    *out = v;
+    return 1;
+}
+static int64_t zxsc_put(zx_arr256_u8 *out, const char *s) {
+    size_t n = strlen(s);
+    if (n >= 256) n = 255;
+    memcpy(ZXSC_BYTES(out), s, n);
+    ZXSC_BYTES(out)[n] = 0;
+    return (int64_t)n;
+}
+int64_t zxsc_format_i64(int64_t v, zx_arr256_u8 *out) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%lld", (long long)v);
+    return zxsc_put(out, buf);
+}
+int64_t zxsc_format_u64(uint64_t v, zx_arr256_u8 *out) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%llu", (unsigned long long)v);
+    return zxsc_put(out, buf);
+}
+int64_t zxsc_format_f64(double v, int32_t precision, zx_arr256_u8 *out) {
+    if (precision < 0) precision = 6;
+    if (precision > 40) precision = 40;
+    char pattern[16], buf[128];
+    snprintf(pattern, sizeof(pattern), "%%.%df", precision);
+    snprintf(buf, sizeof(buf), pattern, v);
+    return zxsc_put(out, buf);
+}
+"""
