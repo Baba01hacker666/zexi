@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -3360,9 +3362,12 @@ fn main() -> i32 {
 	if err != nil {
 		t.Fatalf("running walk program: %v", err)
 	}
-	want := "tree 1\na.txt 0\nsub 1\nb.txt 0\n0\n"
-	if got := string(raw); got != want {
-		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	// readdir order is filesystem-dependent, so compare as a set of lines.
+	gotLines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	sort.Strings(gotLines)
+	wantLines := []string{"0", "a.txt 0", "b.txt 0", "sub 1", "tree 1"}
+	if !reflect.DeepEqual(gotLines, wantLines) {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", gotLines, wantLines)
 	}
 }
 
