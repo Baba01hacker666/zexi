@@ -141,11 +141,45 @@ owning values work because the Zexi assignment `*out = v` is a move, so there
 is no double free. This is how richer values now reach a worker: through a
 typed channel handle rather than a general `Arc<T>`.
 
-## 21.5 What is still missing
+## 21.5 Shared values across threads
 
-- **Traits and trait bounds.** Generic parameters remain unconstrained, so a
-  generic body cannot call methods on `T` or use `io.Reader`-style interfaces.
-- **A general `Arc<T>`.** Typed channels cover the common "send an owned value
-  to a worker" case, but there is no reference-counted shared `T` yet.
+`shared_new::<T>(v)` puts an owning `T` in C-allocated memory behind an atomic
+refcount and returns an i64 handle. `shared_clone` hands the same value to
+another worker, `shared_get` borrows it, and `shared_drop` releases one
+reference; the last drop returns `Some(value)` so the Zexi destructor runs
+exactly once. The counter is a `zxt_atomic` slot, released with the memory on
+the final drop.
+
+```zx
+use thread;
+
+fn worker(h: i64) -> i64 {
+    println(shared_get::<String>(h));
+    shared_drop::<String>(h);
+    0
+}
+
+fn main() -> i32 {
+    let h = shared_new::<String>(String::from("payload"));
+    let h2 = shared_clone::<String>(h);
+    let t = Thread::spawn(worker, h2);
+    t.join();
+    shared_drop::<String>(h);
+    0
+}
+```
+
+`shared_get` returns a plain `&T` with no tracked lifetime — only i64 crosses a
+thread boundary, so the borrow checker cannot see the handle. Keep at least one
+reference alive for as long as any borrow (or any other thread) can use the
+value; dropping the last reference while another thread is inside
+`shared_get` is a use-after-free. For mutable shared state, pair a `Shared<T>`
+with a `sync::Mutex<T>`.
+
+## 21.6 What is still missing
+
+- **`dyn Trait` and `Reader`/`Writer` stream traits.** Traits with bounds and
+  static dispatch now exist ([`22-traits.md`](22-traits.md)), but there is no
+  trait object and no generic body/stream abstraction to hang I/O off.
 - **Non-blocking I/O / async.** A blocked read still holds a thread. This is
   the largest of the §5 gaps and is not addressed here.

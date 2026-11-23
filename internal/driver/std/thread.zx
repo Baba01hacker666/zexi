@@ -151,6 +151,7 @@ extern "C" fn zxt_tc_broadcast(handle: i64);
 extern "C" fn zxt_tc_free(handle: i64);
 extern "C" fn zxt_typed_alloc(size: i64) -> i64;
 extern "C" fn zxt_typed_free(addr: i64);
+extern "C" fn zxt_atomic_free(handle: i64);
 
 // chan_new creates a bounded channel; cap is clamped to 1..65536.
 pub fn chan_new(cap: i32) -> i64 {
@@ -366,6 +367,65 @@ pub fn tchan_free<T>(handle: i64) {
     (*p).buf.clear();
     zxt_tc_free((*p).raw);
     zxt_typed_free(handle);
+}
+
+// --- shared, reference-counted values (T) ----------------------------------
+
+// Shared<T> is a refcounted T in C-allocated memory. The i64 handle is what
+// crosses a thread boundary; `shared_clone` hands the same value to another
+// worker and `shared_drop` releases one reference. When the last reference
+// goes, the value is moved out so its Zexi destructor runs, then the memory
+// and the atomic counter are released.
+pub struct Shared<T> {
+    refs: i64,
+    value: T,
+}
+
+// shared_new moves v into a fresh Shared<T> and returns its handle, or 0 if a
+// slot could not be allocated.
+pub fn shared_new<T>(v: T) -> i64 {
+    let refs = zxt_atomic_new(1);
+    if refs == 0 {
+        return 0;
+    }
+    let addr = zxt_typed_alloc(sizeof::<Shared<T>>() as i64);
+    if addr == 0 {
+        zxt_atomic_free(refs);
+        return 0;
+    }
+    let p = addr as *Shared<T>;
+    let s: Shared<T> = Shared { refs: refs, value: v };
+    *p = s;
+    return addr;
+}
+
+// shared_clone adds one reference and returns the same handle.
+pub fn shared_clone<T>(handle: i64) -> i64 {
+    let p = handle as *Shared<T>;
+    zxt_atomic_add((*p).refs, 1);
+    return handle;
+}
+
+// shared_get borrows the value through the handle. The caller must keep at
+// least one reference alive for as long as the borrow is used; this module
+// cannot track the lifetime because only i64 crosses a thread boundary.
+pub fn shared_get<T>(handle: i64) -> &T {
+    let p = handle as *Shared<T>;
+    return &(*p).value;
+}
+
+// shared_drop releases one reference. The last drop returns `Some(value)` so
+// the caller can keep it (or let it fall out of scope and drop); other drops
+// return None. The handle must not be used after the last drop.
+pub fn shared_drop<T>(handle: i64) -> Option<T> {
+    let p = handle as *Shared<T>;
+    if zxt_atomic_add((*p).refs, -1) == 0 {
+        let v = (*p).value; // move out: the destructor runs when v is dropped
+        zxt_atomic_free((*p).refs);
+        zxt_typed_free(handle);
+        return Some(v);
+    }
+    return None;
 }
 
 // --- atomics (i64) ---------------------------------------------------------
@@ -1136,6 +1196,16 @@ void zxt_atomic_set(int64_t h, int64_t v) {
         return;
     }
     atomic_store(&a->v, v);
+}
+
+void zxt_atomic_free(int64_t h) {
+    zxt_atom_t *a = zxt_atom_resolve(h);
+    if (!a) {
+        return;
+    }
+    pthread_mutex_lock(&g_atoms_mu);
+    a->used = 0;
+    pthread_mutex_unlock(&g_atoms_mu);
 }
 
 /* ---- task pools -----------------------------------------------------------

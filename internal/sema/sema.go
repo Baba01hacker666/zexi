@@ -36,7 +36,10 @@ type Fn struct {
 	// just as an ordinary function may name a declared type. Nil on templates
 	// and non-generic functions.
 	Bindings map[string]*types.Type
-	Params   []*types.Type
+	// Bounds maps a generic parameter name to the traits it must implement.
+	// Checked when the function is instantiated with concrete types.
+	Bounds map[string][]string
+	Params []*types.Type
 	// ParamNames and Defaults are aligned with Params (the receiver, when
 	// present, occupies slot 0 with an empty name and no default).
 	// Defaults[i] is the materialized literal for parameter i's default
@@ -94,6 +97,7 @@ type Info struct {
 	StructOrd  []*types.Struct
 	Enums      map[string]*types.Enum
 	EnumOrd    []*types.Enum
+	Traits     map[string]*Trait
 	Methods    map[string]map[string]*Fn  // struct name -> method name -> fn
 	Resolved   map[ast.Expr]*Fn           // resolved call / method target
 	FnValues   map[ast.Expr]*Fn           // resolved function value (instantiated generic)
@@ -125,6 +129,15 @@ type Info struct {
 	Types      map[ast.Expr]*types.Type
 	DeclTypes  map[ast.Stmt]*types.Type
 	Main       *Fn
+}
+
+// Trait is a named set of method signatures. Dispatch is static: a generic
+// call is resolved against the concrete type when the function is instantiated,
+// so no runtime dispatch table is needed.
+type Trait struct {
+	Name    string
+	Methods map[string]*ast.FnDecl
+	Sp      token.Span
 }
 
 // Closure is the resolved shape of a lambda: its parameter and return types
@@ -190,6 +203,7 @@ func Check(file *ast.File) (*Info, []diag.Diagnostic) {
 			Consts:         map[string]*Const{},
 			Structs:        map[string]*types.Struct{},
 			Enums:          map[string]*types.Enum{},
+			Traits:         map[string]*Trait{},
 			Methods:        map[string]map[string]*Fn{},
 			Resolved:       map[ast.Expr]*Fn{},
 			FnValues:       map[ast.Expr]*Fn{},
@@ -325,7 +339,9 @@ func (c *checker) errAt(e ast.Expr, code, format string, args ...any) {
 }
 
 // checkGenerics validates a type-parameter list and returns its names.
-// Duplicate names are rejected; written bounds are not supported yet.
+// Duplicate names are rejected. Trait bounds are validated by traitBounds when
+// a function is made; they are recorded on the instantiated Fn and checked
+// against the concrete type arguments.
 func (c *checker) checkGenerics(gps []ast.GenericParam) []string {
 	if len(gps) == 0 {
 		return nil
@@ -333,9 +349,6 @@ func (c *checker) checkGenerics(gps []ast.GenericParam) []string {
 	var names []string
 	seen := map[string]bool{}
 	for _, g := range gps {
-		if len(g.Bounds) > 0 {
-			c.errf(g.Sp, "E0900", "trait bounds are not supported yet (roadmap M1)")
-		}
 		if seen[g.Name] {
 			c.errf(g.Sp, "E0428", "the type parameter `%s` is declared more than once", g.Name)
 			continue
@@ -344,6 +357,26 @@ func (c *checker) checkGenerics(gps []ast.GenericParam) []string {
 		names = append(names, g.Name)
 	}
 	return names
+}
+
+// traitBounds validates the written bounds and returns them keyed by type
+// parameter name. Unknown trait names are diagnosed once, here.
+func (c *checker) traitBounds(gps []ast.GenericParam) map[string][]string {
+	if len(gps) == 0 {
+		return nil
+	}
+	out := map[string][]string{}
+	for _, g := range gps {
+		for _, b := range g.Bounds {
+			name := typePathName(b)
+			if _, ok := c.info.Traits[name]; !ok {
+				c.errf(b.Span(), "E0405", "trait `%s` is not defined", name)
+				continue
+			}
+			out[g.Name] = append(out[g.Name], name)
+		}
+	}
+	return out
 }
 
 // withTypeParams runs fn with the named type parameters in scope, each bound to
@@ -411,6 +444,13 @@ func (c *checker) collect() {
 			c.collectStructFields(d)
 		case *ast.EnumDecl:
 			c.collectEnumVariants(d)
+		}
+	}
+	// Traits before impls: an `impl Trait for T` names a trait, and bounds on
+	// generic parameters are checked when those functions are instantiated.
+	for _, it := range c.info.File.Items {
+		if d, ok := it.(*ast.TraitDecl); ok {
+			c.collectTrait(d)
 		}
 	}
 	// Functions, then impl blocks (methods need their struct).
@@ -728,10 +768,71 @@ func (c *checker) collectStructFieldsInner(d *ast.StructDecl, st *types.Struct) 
 	}
 }
 
+func hasSelfParam(f *ast.FnDecl) bool {
+	for _, p := range f.Params {
+		if p.Self {
+			return true
+		}
+	}
+	return false
+}
+
+// collectTrait registers a trait's method signatures. Only the shape is kept;
+// the bodies live in `impl Trait for T` blocks and are checked as ordinary
+// methods on the concrete type.
+func (c *checker) collectTrait(d *ast.TraitDecl) {
+	if _, dup := c.info.Traits[d.Name]; dup {
+		c.errf(d.Sp, "E0428", "the trait `%s` is defined more than once", d.Name)
+		return
+	}
+	tr := &Trait{Name: d.Name, Methods: map[string]*ast.FnDecl{}, Sp: d.Sp}
+	for _, m := range d.Methods {
+		if _, dup := tr.Methods[m.Name]; dup {
+			c.errf(m.Sp, "E0592", "duplicate method `%s` in trait `%s`", m.Name, d.Name)
+			continue
+		}
+		if !hasSelfParam(m) {
+			c.errf(m.Sp, "E0900", "trait method `%s` needs a receiver (`&self` or `self`)", m.Name)
+		}
+		tr.Methods[m.Name] = m
+	}
+	c.info.Traits[d.Name] = tr
+}
+
 func (c *checker) collectImpl(d *ast.ImplBlock) {
 	if d.Trait != nil {
-		c.errf(d.Sp, "E0900", "trait impls are not supported by the compiler yet (roadmap M1)")
-		return
+		traitName := typePathName(d.Trait)
+		tr, ok := c.info.Traits[traitName]
+		if !ok {
+			c.errf(d.Trait.Span(), "E0405", "trait `%s` is not defined", traitName)
+			return
+		}
+		// Check the impl supplies exactly the trait's methods with compatible
+		// receivers and arity. The method bodies then register as ordinary
+		// methods on the concrete type, so `.method()` resolves at each
+		// monomorphization with no runtime dispatch.
+		seen := map[string]bool{}
+		for _, m := range d.Fns {
+			want, has := tr.Methods[m.Name]
+			if !has {
+				c.errf(m.Sp, "E0406", "method `%s` is not a member of trait `%s`", m.Name, traitName)
+				continue
+			}
+			seen[m.Name] = true
+			if hasSelfParam(m) != hasSelfParam(want) {
+				c.errf(m.Sp, "E0053", "method `%s` has a different receiver than the trait declares", m.Name)
+			}
+			if len(m.Params) != len(want.Params) {
+				c.errf(m.Sp, "E0053", "method `%s` takes %d argument(s), but trait `%s` declares %d", m.Name, len(m.Params), traitName, len(want.Params))
+			}
+		}
+		for method := range tr.Methods {
+			if !seen[method] {
+				c.errf(d.Sp, "E0046", "missing method `%s` in impl of `%s`", method, traitName)
+			}
+		}
+		// Reuse the ordinary impl path below for registration.
+		d = &ast.ImplBlock{Generics: d.Generics, SelfTy: d.SelfTy, Fns: d.Fns, Sp: d.Sp}
 	}
 	name := typePathName(d.SelfTy)
 	baseSt, hasStruct := c.info.Structs[name]
@@ -978,6 +1079,7 @@ func (c *checker) makeFn(d *ast.FnDecl, recv *types.Type) *Fn {
 	})
 	fn.Generics = names
 	fn.Generic = len(names) > 0
+	fn.Bounds = c.traitBounds(d.Generics)
 	return fn
 }
 
@@ -2935,11 +3037,35 @@ func (c *checker) instantiateFn(tmpl *Fn, args []*types.Type) *Fn {
 	fn.Generics = nil
 	fn.Generic = false
 	fn.Bindings = bind
+	c.checkBoundImpls(fn.Decl.Sp, tmpl.Bounds, bind)
 	fn.Extern = tmpl.Extern
 	fn.ABI = tmpl.ABI
 	c.info.Fns[key] = fn
 	c.info.FnOrder = append(c.info.FnOrder, fn)
 	return fn
+}
+
+// checkBoundImpls verifies, at instantiation time, that every concrete type
+// argument has the methods required by the trait bounds on its parameter.
+// Static dispatch means no dictionary is passed: the call in the body was
+// resolved against these same methods.
+func (c *checker) checkBoundImpls(sp token.Span, bounds map[string][]string, bind map[string]*types.Type) {
+	for param, traits := range bounds {
+		arg := bind[param]
+		base := nominalBaseName(arg)
+		for _, name := range traits {
+			tr := c.info.Traits[name]
+			if tr == nil || base == "" {
+				continue
+			}
+			for method := range tr.Methods {
+				if _, ok := c.info.Methods[base][method]; !ok {
+					c.errf(sp, "E0277", "the trait bound `%s: %s` is not satisfied: `%s` has no method `%s`", arg, name, base, method)
+					break
+				}
+			}
+		}
+	}
 }
 
 // instKey is the canonical, injective name of a generic instantiation:

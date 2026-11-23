@@ -1348,11 +1348,19 @@ fn main() -> i32 {
 	}
 }
 
-func TestGenericBoundsRejected(t *testing.T) {
+func TestGenericBoundsValidateTrait(t *testing.T) {
+	// A bound naming an undefined trait is rejected; a defined one is accepted
+	// and checked when the generic is instantiated with a concrete type.
 	_, codes := check(t, `fn max<T: Ord>(a: T, b: T) -> T { a }
 fn main() -> i32 { 0 }`)
-	if !has(codes, "E0900") {
-		t.Fatalf("expected E0900 for a bound, got %v", codes)
+	if !has(codes, "E0405") {
+		t.Fatalf("expected E0405 for an unknown trait bound, got %v", codes)
+	}
+	_, codes = check(t, `trait Ord { fn cmp(&self) -> i64; }
+fn max<T: Ord>(a: T, b: T) -> T { a }
+fn main() -> i32 { 0 }`)
+	if len(codes) != 0 {
+		t.Fatalf("a defined trait bound should type-check, got %v", codes)
 	}
 }
 

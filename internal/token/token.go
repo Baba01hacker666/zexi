@@ -50,6 +50,7 @@ const (
 	KindRef
 	KindReturn
 	KindStruct
+	KindTrait
 	KindTrue
 	KindType
 	KindUnsafe
@@ -140,6 +141,7 @@ var keywords = map[string]Kind{
 	"ref":      KindRef,
 	"return":   KindReturn,
 	"struct":   KindStruct,
+	"trait":    KindTrait,
 	"true":     KindTrue,
 	"type":     KindType,
 	"unsafe":   KindUnsafe,
@@ -213,6 +215,7 @@ var kindNames = map[Kind]string{
 	KindRef:        "ref",
 	KindReturn:     "return",
 	KindStruct:     "struct",
+	KindTrait:      "trait",
 	KindTrue:       "true",
 	KindType:       "type",
 	KindUnsafe:     "unsafe",

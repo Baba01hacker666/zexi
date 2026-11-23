@@ -211,6 +211,21 @@ type ImplBlock struct {
 func (*ImplBlock) itemNode()          {}
 func (d *ImplBlock) Span() token.Span { return d.Sp }
 
+// TraitDecl is a named set of method signatures. Implementations supply the
+// bodies with `impl Trait for Type`. Dispatch is static: a call is resolved to
+// the concrete type's method when a generic is monomorphized.
+type TraitDecl struct {
+	Vis      Visibility
+	Name     string
+	Generics []GenericParam
+	// Methods are signature-only declarations (Body == nil).
+	Methods []*FnDecl
+	Sp      token.Span
+}
+
+func (*TraitDecl) itemNode()          {}
+func (d *TraitDecl) Span() token.Span { return d.Sp }
+
 // --- types ----------------------------------------------------------------
 
 // Type is a syntactic type. Distinct from the semantic type in package types.

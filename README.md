@@ -104,6 +104,11 @@ This repository contains the **initial design and specification** of Zexi: the v
 > from the function that made it, and is what `Vec::each/count/any/all/fold`
 > take. See [`docs/15-closures.md`](docs/15-closures.md).
 >
+> **Traits:** `trait Describe { fn describe(&self) -> str; }` plus
+> `impl Describe for Dog { ... }` gives static-dispatch method sets; a bound
+> `fn f<T: Describe>(x: T)` is checked when the generic is monomorphized. No
+> `dyn Trait` or associated types. See [`docs/22-traits.md`](docs/22-traits.md).
+>
 > **Self-extension:** adding a capability is a library change, not a compiler
 > change. `extern "C" fn sqrt(x: f64) -> f64;` with `#[link("m")]` calls a system
 > library, `c """ ... """` compiles C with the program (in the same translation
@@ -128,8 +133,9 @@ This repository contains the **initial design and specification** of Zexi: the v
 > `Chan::new`, `Atomic::new`, `Pool::new().map(f, lo, hi)`; see
 > [`docs/11-concurrency.md`](docs/11-concurrency.md)). Channels also have
 > `recv_timeout`/`send_timeout`, a two-channel `chan_select2`, and a typed
-> `tchan_*` family that moves owning values through an i64 handle. The `sync`
-> module adds typed `Mutex<T>` / `RwLock<T>` with guards that carry the
+> `tchan_*` family that moves owning values through an i64 handle, plus
+> refcounted `shared_*` handles for sharing an owned value with a worker. The
+> `sync` module adds typed `Mutex<T>` / `RwLock<T>` with guards that carry the
 > protected value (`use sync;`, see
 > [`docs/21-typed-sync.md`](docs/21-typed-sync.md)). Generic code can ask the
 > compiler for `sizeof::<T>()` / `align_of::<T>()`, and a generic body may name
@@ -141,8 +147,9 @@ This repository contains the **initial design and specification** of Zexi: the v
 > merged program is still one flat namespace, so unqualified cross-module names
 > remain visible and ignore `pub`), `Box`,
 > `Send`/`Sync` value passing across threads (only `i64` handles, arguments, and
-> return values cross a thread boundary directly; a typed channel moves owned
-> values through such a handle), traits and trait bounds, match ergonomics (`ref` bindings,
+> return values cross a thread boundary directly; typed channels and refcounted
+> `shared_*` values move/borrow owned values through such a handle, with manual
+> lifetime discipline), match ergonomics (`ref` bindings,
 > so a payload cannot be read out of a borrowed enum), user-defined `Drop`,
 > borrow-lifetime analysis (bound `&`/`*` aliases are not yet tracked), nested
 > patterns, and tuple values. See `docs/05-roadmap.md`.
@@ -353,7 +360,8 @@ for why, its real costs, and the plan to replace it with a native backend.
 - [`docs/18-one-translation-unit.md`](docs/18-one-translation-unit.md) — measured: one C file or many, and why.
 - [`docs/19-modules.md`](docs/19-modules.md) — `zexic add`: the C-library catalog, and how to write a package.
 - [`docs/20-projects-and-modules.md`](docs/20-projects-and-modules.md) — project layout, `mod`/`use`/`import`, visibility, folder packages, and spelling suggestions.
-- [`docs/21-typed-sync.md`](docs/21-typed-sync.md) — typed `Mutex<T>` / `RwLock<T>`, channel timeouts and `select`, and the remaining §5 gaps.
+- [`docs/21-typed-sync.md`](docs/21-typed-sync.md) — typed `Mutex<T>` / `RwLock<T>`, channel timeouts and `select`, typed/shared channels, and the remaining §5 gaps.
+- [`docs/22-traits.md`](docs/22-traits.md) — trait declarations, impls, bounds, and static dispatch.
 - [`examples/`](examples/) — ready-to-run Zexi programs plus focused feature examples.
 - [`tests/tour.zx`](tests/tour.zx) — the end-to-end program the test suite compiles and runs.
 - [`tests/syntax.zx`](tests/syntax.zx) — a runnable syntax tour; [`tests/pi.zx`](tests/pi.zx) — 30 digits of π.

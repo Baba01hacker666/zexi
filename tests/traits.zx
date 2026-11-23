@@ -1,0 +1,41 @@
+// tests/traits.zx
+//
+// Traits are sets of method signatures with static dispatch. `impl Trait for
+// Type` registers the bodies as ordinary methods; a bound `T: Trait` is checked
+// when the generic is instantiated, and the call inside the body resolves to
+// the concrete type's method.
+
+trait Describe {
+    fn describe(&self) -> str;
+    fn size(&self) -> i64;
+}
+
+struct Dog { name: str }
+struct Cat { name: str }
+
+impl Describe for Dog {
+    fn describe(&self) -> str { return "dog"; }
+    fn size(&self) -> i64 { return 1; }
+}
+
+impl Describe for Cat {
+    fn describe(&self) -> str { return "cat"; }
+    fn size(&self) -> i64 { return 2; }
+}
+
+fn announce<T: Describe>(x: T) -> str {
+    return x.describe();
+}
+
+fn both<T: Describe>(x: T) {
+    let y: T = x; // a generic body may name its parameter
+    println(y.describe(), y.size());
+}
+
+fn main() -> i32 {
+    println(announce(Dog { name: "rex" }));
+    println(announce(Cat { name: "tom" }));
+    both(Dog { name: "rex" });
+    both(Cat { name: "tom" });
+    0
+}

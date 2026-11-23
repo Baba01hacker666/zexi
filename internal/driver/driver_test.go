@@ -58,6 +58,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/formatting.zx",
 		"../../tests/encoding.zx",
 		"../../tests/generics.zx",
+		"../../tests/traits.zx",
 		"../../tests/option_result.zx",
 		"../../tests/vec.zx",
 		"../../tests/hashmap.zx",
@@ -702,6 +703,12 @@ func TestRunPrograms(t *testing.T) {
 				"500",
 				"404 ",
 				"",
+			}, "\n"),
+		},
+		{
+			file: "../../tests/traits.zx",
+			want: strings.Join([]string{
+				"dog", "cat", "dog 1", "cat 2", "",
 			}, "\n"),
 		},
 		{
@@ -2770,6 +2777,53 @@ fn main() -> i32 {
 		t.Fatalf("running typed-channel program: %v", err)
 	}
 	if got, want := string(raw), "item\nitem\nitem\n"; got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestThreadSharedValue checks that a refcounted owning value can be shared
+// with a worker through an i64 handle: clone keeps it alive, get borrows it,
+// and the last drop destroys the String once.
+func TestThreadSharedValue(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shared.zx")
+	src := `use thread;
+
+fn worker(h: i64) -> i64 {
+    println(shared_get::<String>(h));
+    shared_drop::<String>(h);
+    0
+}
+
+fn main() -> i32 {
+    let h = shared_new::<String>(String::from("payload"));
+    let h2 = shared_clone::<String>(h);
+    let t = Thread::spawn(worker, h2);
+    t.join();
+    shared_drop::<String>(h);
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "shared")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build shared-value program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running shared-value program: %v", err)
+	}
+	if got, want := string(raw), "payload\n"; got != want {
 		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
 	}
 }

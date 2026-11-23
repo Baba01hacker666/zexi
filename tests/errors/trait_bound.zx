@@ -1,0 +1,11 @@
+// error: E0277
+// error: E0599
+trait Describe { fn describe(&self) -> str; }
+struct Num { v: i64 }
+
+fn announce<T: Describe>(x: T) -> str { return x.describe(); }
+
+fn main() -> i32 {
+    println(announce(Num { v: 3 }));
+    0
+}

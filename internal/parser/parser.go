@@ -154,6 +154,8 @@ func (p *parser) parseItem() ast.Item {
 		return p.parseTypeAlias(vis, start)
 	case token.KindImpl:
 		return p.parseImpl(start)
+	case token.KindTrait:
+		return p.parseTrait(vis, start)
 	case token.KindImport:
 		return p.parseImport(start, vis)
 	case token.KindMod:
@@ -176,6 +178,40 @@ func (p *parser) parseItem() ast.Item {
 // together with the generated code. The body is taken verbatim, so it can hold
 // preprocessor directives, string literals, and braces without escaping; a
 // plain string is rejected because every backslash in it would need doubling.
+// parseTrait parses `trait Name { fn method(&self, ..) -> T; .. }`. Method
+// bodies are not allowed: a trait is a set of signatures and the implementation
+// lives in `impl Trait for Type` blocks.
+func (p *parser) parseTrait(vis ast.Visibility, start token.Pos) ast.Item {
+	p.bump() // trait
+	name, ok := p.expectIdent("trait name")
+	if !ok {
+		return nil
+	}
+	d := &ast.TraitDecl{Vis: vis, Name: name, Sp: p.spanFrom(start)}
+	d.Generics = p.parseGenerics()
+	if !p.expect(token.KindLBrace, " to begin trait body") {
+		return d
+	}
+	for !p.at(token.KindRBrace) && !p.at(token.KindEOF) {
+		before := p.pos
+		f, isFn := p.parseFn(ast.Visibility(false), nil, p.cur().Pos.Offset, false).(*ast.FnDecl)
+		if !isFn {
+			if p.pos == before {
+				p.bump()
+			}
+			continue
+		}
+		if f.Body != nil {
+			p.errf(p.cur(), "E0207", "trait method `%s` must not have a body", f.Name)
+			f.Body = nil
+		}
+		d.Methods = append(d.Methods, f)
+	}
+	p.expect(token.KindRBrace, " to close trait body")
+	d.Sp = p.spanFrom(start)
+	return d
+}
+
 func (p *parser) parseCBlock(attrs []string, start token.Pos) ast.Item {
 	word := p.bump().Lit // `c` or `c_source`
 	if !p.at(token.KindRawString) {
