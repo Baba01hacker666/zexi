@@ -2670,6 +2670,59 @@ fn main() -> i32 {
 	}
 }
 
+// TestAsyncTasksAwaitReadiness checks the non-blocking I/O path: two tasks
+// suspend in `await` on different sockets and are resumed by the scheduler's
+// poll() when the connections arrive. A blocked read would hold two threads;
+// these tasks share one.
+func TestAsyncTasksAwaitReadiness(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	p1, _ := freePort(t)
+	p2, _ := freePort(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "async_tasks.zx")
+	src := `use async;
+use net;
+
+fn task_a(fd: i64) -> i64 { await(fd); println("A"); 0 }
+fn task_b(fd: i64) -> i64 { await(fd); println("B"); 0 }
+
+fn main() -> i32 {
+    let p1 = String::from(arg_at(1)).parse_i64() as i32;
+    let p2 = String::from(arg_at(2)).parse_i64() as i32;
+    let s1 = listen_tcp("127.0.0.1", p1);
+    let s2 = listen_tcp("127.0.0.1", p2);
+    async_spawn(task_a, s1.fd as i64);
+    async_spawn(task_b, s2.fd as i64);
+    let c1 = connect("127.0.0.1", p1, 1000);
+    let c2 = connect("127.0.0.1", p2, 1000);
+    async_run();
+    println("done");
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "async_tasks")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build async program")
+	}
+	raw, err := exec.Command(out, strconv.Itoa(p1), strconv.Itoa(p2)).Output()
+	if err != nil {
+		t.Fatalf("running async program: %v", err)
+	}
+	if got, want := string(raw), "A\nB\ndone\n"; got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
 // TestThreadChannelTimeoutAndSelect pins the deadline and select APIs added
 // for next_http.md §5: a timed receive that expires, one that succeeds, a
 // two-channel select, and close waking both a select and a timed receiver.

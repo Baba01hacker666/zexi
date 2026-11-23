@@ -1,0 +1,184 @@
+// async — stackful tasks and readiness-based non-blocking I/O for Zexi.
+//
+// A task is a Zexi function running on its own small stack, so it can suspend
+// in the middle of a call without blocking an OS thread. `await(fd)` hands the
+// current task to the scheduler until fd becomes readable; while every task is
+// waiting, the scheduler blocks in poll() on all of them at once. A blocked
+// read therefore costs a poll entry, not a thread — the gap described in
+// next_http.md §5.
+//
+//     use async;
+//
+// fn worker(fd: i64) -> i64 {
+//     await(fd);                 // suspend until the socket is readable
+//     // ... read without blocking ...
+//     return 0;
+// }
+//
+// fn main() -> i32 {
+//     let t = async_spawn(worker, fd);
+//     async_run();               // drive every task to completion
+//     0
+// }
+//
+// All tasks share one OS thread. `await` and `yield_now` are only meaningful
+// inside a spawned task; called from main they are no-ops. The scheduler stops
+// when no live task remains. A task that awaits an fd nobody will ever make
+// readable stalls the scheduler, just as a blocking read would stall a thread.
+
+extern "C" fn zxa_spawn(entry: fn(i64) -> i64, arg: i64) -> i64;
+extern "C" fn zxa_run();
+extern "C" fn zxa_await(fd: i64);
+extern "C" fn zxa_yield();
+
+// async_spawn schedules f(arg) on a fresh fiber and returns a task handle (0
+// on failure). The task starts running when async_run drives the scheduler.
+pub fn async_spawn(f: fn(i64) -> i64, arg: i64) -> i64 {
+    return zxa_spawn(f, arg);
+}
+
+// async_run runs the scheduler until every task has finished. Tasks that call
+// await are resumed when their descriptor becomes readable.
+pub fn async_run() {
+    zxa_run();
+}
+
+// yield_now gives other tasks a turn without waiting for I/O.
+pub fn yield_now() {
+    zxa_yield();
+}
+
+// The fiber scheduler lives in this file's own C block, so `use async;` links
+// it with no driver-side C. Only ucontext and poll are needed.
+c """
+#include <ucontext.h>
+#include <poll.h>
+#include <sched.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#define ZXA_MAX 256
+#define ZXA_STACK 65536
+
+typedef enum {
+    ZXA_FREE = 0,
+    ZXA_READY,
+    ZXA_RUNNING,
+    ZXA_WAIT,
+    ZXA_DONE
+} zxa_state;
+
+typedef struct {
+    ucontext_t ctx;
+    char *stack;
+    zxa_state state;
+    int fd;
+    void *entry;
+    int64_t arg;
+} zxa_task;
+
+static zxa_task g_tasks[ZXA_MAX];
+static ucontext_t g_sched;
+static int g_current = -1;
+
+/* A Zexi function value is a closure record: rc, then the code pointer, which
+ * receives the record itself as its first argument (see codegen closures). */
+typedef struct { long rc; void *fn; } zxa_closure;
+typedef int64_t (*zxa_fn1)(void *, int64_t);
+#define ZXA_CALL1(p, a) (((zxa_fn1)((zxa_closure *)(p))->fn)((void *)(p), (a)))
+
+static void zxa_fiber_entry(int slot, int unused) {
+    zxa_task *t = &g_tasks[slot];
+    ZXA_CALL1(t->entry, t->arg);
+    t->state = ZXA_DONE;
+    setcontext(&g_sched);
+}
+
+int64_t zxa_spawn(void *entry, int64_t arg) {
+    int slot = -1;
+    for (int i = 0; i < ZXA_MAX; i++) {
+        if (g_tasks[i].state == ZXA_FREE) { slot = i; break; }
+    }
+    if (slot < 0) return 0;
+    zxa_task *t = &g_tasks[slot];
+    t->stack = (char *)malloc(ZXA_STACK);
+    if (!t->stack) return 0;
+    getcontext(&t->ctx);
+    t->ctx.uc_stack.ss_sp = t->stack;
+    t->ctx.uc_stack.ss_size = ZXA_STACK;
+    t->ctx.uc_link = &g_sched;
+    t->entry = entry;
+    t->arg = arg;
+    t->fd = -1;
+    t->state = ZXA_READY;
+    makecontext(&t->ctx, (void (*)(void))zxa_fiber_entry, 2, slot, 0);
+    return (int64_t)slot + 1;
+}
+
+/* Suspend the current task until fd is readable. Called outside a task it is
+ * a no-op, which lets the same code run under async_run or directly. */
+void zxa_await(int64_t fd) {
+    if (g_current < 0) return;
+    zxa_task *t = &g_tasks[g_current];
+    t->fd = (int)fd;
+    t->state = ZXA_WAIT;
+    swapcontext(&t->ctx, &g_sched);
+}
+
+void zxa_yield(void) {
+    if (g_current < 0) return;
+    zxa_task *t = &g_tasks[g_current];
+    t->state = ZXA_READY;
+    swapcontext(&t->ctx, &g_sched);
+}
+
+void zxa_run(void) {
+    for (;;) {
+        int ran = 0;
+        /* Run one ready task per pass, then re-scan: a task may have become
+         * ready or finished while it was running. */
+        for (int i = 0; i < ZXA_MAX; i++) {
+            if (g_tasks[i].state == ZXA_READY) {
+                ran = 1;
+                g_current = i;
+                g_tasks[i].state = ZXA_RUNNING;
+                swapcontext(&g_sched, &g_tasks[i].ctx);
+                g_current = -1;
+                break;
+            }
+        }
+        int live = 0, n = 0;
+        struct pollfd pfds[ZXA_MAX];
+        int map[ZXA_MAX];
+        for (int i = 0; i < ZXA_MAX; i++) {
+            zxa_state s = g_tasks[i].state;
+            if (s != ZXA_FREE && s != ZXA_DONE) live++;
+            if (s == ZXA_WAIT) {
+                pfds[n].fd = g_tasks[i].fd;
+                pfds[n].events = POLLIN | POLLHUP | POLLERR;
+                pfds[n].revents = 0;
+                map[n] = i;
+                n++;
+            }
+        }
+        if (live == 0) {
+            for (int i = 0; i < ZXA_MAX; i++) {
+                if (g_tasks[i].state != ZXA_FREE) {
+                    free(g_tasks[i].stack);
+                    g_tasks[i].stack = NULL;
+                    g_tasks[i].state = ZXA_FREE;
+                }
+            }
+            return;
+        }
+        if (n > 0) {
+            poll(pfds, (nfds_t)n, -1);
+        } else if (!ran) {
+            sched_yield();
+        }
+        for (int j = 0; j < n; j++) {
+            if (pfds[j].revents) g_tasks[map[j]].state = ZXA_READY;
+        }
+    }
+}
+"""

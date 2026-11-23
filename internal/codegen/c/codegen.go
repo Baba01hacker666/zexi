@@ -2949,6 +2949,12 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 	if name == "len" {
 		return g.lenValue(x)
 	}
+	if name == "await" {
+		if len(x.Args) != 1 {
+			return "0"
+		}
+		return "zxa_await((int64_t)(" + g.value(x.Args[0]) + "))"
+	}
 	if name == "sizeof" || name == "size_of" || name == "alignof" || name == "align_of" {
 		t := g.info.Types[x.Callee]
 		if t == nil {

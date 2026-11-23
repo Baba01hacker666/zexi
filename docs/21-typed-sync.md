@@ -181,5 +181,6 @@ with a `sync::Mutex<T>`.
 - **`dyn Trait` and `Reader`/`Writer` stream traits.** Traits with bounds and
   static dispatch now exist ([`22-traits.md`](22-traits.md)), but there is no
   trait object and no generic body/stream abstraction to hang I/O off.
-- **Non-blocking I/O / async.** A blocked read still holds a thread. This is
-  the largest of the §5 gaps and is not addressed here.
+- **General futures / `async fn`.** The `async` module ([`23-async.md`](23-async.md))
+  has fiber tasks and `await(fd)` on descriptors, so a waiting read no longer
+  holds a thread. It has no `Future<T>`, `async fn`, or trait-object dispatch.

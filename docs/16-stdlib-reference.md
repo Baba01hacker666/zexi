@@ -2,7 +2,7 @@
 
 Every module below is built into the compiler: `use <module>;` needs no project
 setup, no package download, and no extra C file. A module whose work is done in
-C (`sys`, `regex`, `json`, `net`, `http`, `thread`, `sync`) carries that C inside its own
+C (`sys`, `regex`, `json`, `net`, `http`, `thread`, `sync`, `async`) carries that C inside its own
 `.zx` file as a `c """..."""` block, so importing the module is all it takes to
 link it. Any library can do the same — see [`17-extending.md`](17-extending.md).
 
@@ -222,7 +222,18 @@ and object key order is preserved.
 
 Closures work as task bodies: `pool.map(|x| x * x, 0, 100)`.
 
-### 16.6a `sync`
+### 16.6a `async`
+
+| function | description |
+| --- | --- |
+| `async_spawn(f, arg)` | run `f(arg)` on a fiber; returns a task handle |
+| `await(fd)` | compiler builtin: suspend until descriptor `fd` is readable |
+| `yield_now()` | give other tasks a turn |
+| `async_run()` | drive the scheduler until all tasks finish |
+
+See [`23-async.md`](23-async.md) for the fiber model and its limits.
+
+### 16.6b `sync`
 
 | type / function | description |
 | --- | --- |

@@ -2495,6 +2495,9 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 	if name == "len" {
 		return c.inferLen(x)
 	}
+	if name == "await" {
+		return c.inferAwait(x)
+	}
 	if name == "sizeof" || name == "size_of" {
 		return c.inferSizeOf(x, false)
 	}
@@ -2622,7 +2625,7 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		if t := c.inferBareVariantCtor(x, name, expected); t != nil {
 			return t
 		}
-		cands := []string{"print", "println", "eprint", "eprintln", "panic", "len", "sizeof", "alignof", "cstr", "from_cstr", "arg_count", "arg_at", "project_dir"}
+		cands := []string{"print", "println", "eprint", "eprintln", "panic", "len", "await", "sizeof", "alignof", "cstr", "from_cstr", "arg_count", "arg_at", "project_dir"}
 		for n := range c.info.Fns {
 			cands = append(cands, n)
 		}
@@ -3546,6 +3549,24 @@ func (c *checker) inferArgAt(x *ast.CallExpr) *types.Type {
 		c.errAt(x.Args[0], "E0308", "`arg_at` expects an integer index, found `%s`", at)
 	}
 	return types.StringT
+}
+
+// inferAwait checks the async builtin `await(fd)`: it suspends the current
+// task until the descriptor is readable and returns the descriptor. It only
+// has an effect inside a task spawned by `use async;`; elsewhere it is a no-op.
+func (c *checker) inferAwait(x *ast.CallExpr) *types.Type {
+	if len(x.Args) != 1 {
+		c.errAt(x, "E0061", "`await` takes exactly one descriptor but %d were supplied", len(x.Args))
+		for _, a := range x.Args {
+			c.checkExpr(a, nil)
+		}
+		return types.I64T
+	}
+	fd := c.checkExpr(x.Args[0], nil)
+	if fd != nil && fd.Kind != types.Invalid && !fd.Kind.IsInt() {
+		c.errAt(x.Args[0], "E0308", "`await` expects an integer descriptor, found `%s`", fd)
+	}
+	return types.I64T
 }
 
 // inferSizeOf checks `sizeof::<T>()` and `alignof::<T>()`. The type argument is

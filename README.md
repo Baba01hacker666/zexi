@@ -139,10 +139,12 @@ This repository contains the **initial design and specification** of Zexi: the v
 > protected value (`use sync;`, see
 > [`docs/21-typed-sync.md`](docs/21-typed-sync.md)). Generic code can ask the
 > compiler for `sizeof::<T>()` / `align_of::<T>()`, and a generic body may name
-> its own type parameter (docs/12-generics.md §12.15).
+> its own type parameter (docs/12-generics.md §12.15). For non-blocking I/O,
+> the `async` module runs tasks on fibers: `await(fd)` suspends a task until a
+> descriptor is readable, so a waiting request costs a poll entry instead of a
+> thread (see [`docs/23-async.md`](docs/23-async.md)).
 >
-> Not yet implemented: traits (and trait bounds, so generic parameters are
-> unconstrained), `dyn Trait`, associated types, const generics, full module
+> Not yet implemented: `dyn Trait`, associated types, const generics, full module
 > **isolation** (qualified access, `as` aliases, and `pub` checks work, but the
 > merged program is still one flat namespace, so unqualified cross-module names
 > remain visible and ignore `pub`), `Box`,
@@ -362,6 +364,7 @@ for why, its real costs, and the plan to replace it with a native backend.
 - [`docs/20-projects-and-modules.md`](docs/20-projects-and-modules.md) — project layout, `mod`/`use`/`import`, visibility, folder packages, and spelling suggestions.
 - [`docs/21-typed-sync.md`](docs/21-typed-sync.md) — typed `Mutex<T>` / `RwLock<T>`, channel timeouts and `select`, typed/shared channels, and the remaining §5 gaps.
 - [`docs/22-traits.md`](docs/22-traits.md) — trait declarations, impls, bounds, and static dispatch.
+- [`docs/23-async.md`](docs/23-async.md) — stackful tasks, `await`, and the readiness scheduler.
 - [`examples/`](examples/) — ready-to-run Zexi programs plus focused feature examples.
 - [`tests/tour.zx`](tests/tour.zx) — the end-to-end program the test suite compiles and runs.
 - [`tests/syntax.zx`](tests/syntax.zx) — a runnable syntax tour; [`tests/pi.zx`](tests/pi.zx) — 30 digits of π.

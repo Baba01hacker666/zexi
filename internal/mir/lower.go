@@ -1540,7 +1540,7 @@ func (l *lowerer) callInto(x *ast.CallExpr, dest Place) error {
 			return l.lenInto(x, dest)
 		case "sizeof", "size_of", "alignof", "align_of":
 			return l.sizeOfInto(x, dest, name == "alignof" || name == "align_of")
-		case "cstr", "from_cstr", "arg_count", "arg_at":
+		case "cstr", "from_cstr", "arg_count", "arg_at", "await":
 			return unsupportedf(x.Sp, "builtin `%s`", name)
 		}
 	}
