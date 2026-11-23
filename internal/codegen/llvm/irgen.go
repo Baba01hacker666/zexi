@@ -548,7 +548,12 @@ func (e *fnEmitter) gepBytes(addr string, off int64) string {
 // boundsPanic adds (once) a tail block panicking with the runtime's exact
 // bounds message and returns its label.
 func (e *fnEmitter) boundsPanic(idxV string, n int64) (string, error) {
-	const key = "bounds"
+	// One block per (index value, length). Sharing a single block across
+	// different checks made it reference an SSA value that does not dominate
+	// all its predecessors — clang rejects that IR with "instruction does not
+	// dominate all uses". The same value and length may still share a block:
+	// a single SSA definition dominates every use of that value.
+	key := fmt.Sprintf("bounds:%s:%d", idxV, n)
 	if lbl, ok := e.panicLabels[key]; ok {
 		return lbl, nil
 	}

@@ -10,8 +10,10 @@ import (
 	"strings"
 	"testing"
 
+	"zexi/internal/codegen/llvm"
 	"zexi/internal/diag"
 	"zexi/internal/driver"
+	"zexi/internal/mir"
 )
 
 // The LLVM backend is checked the same way the MIR interpreter is: the same
@@ -312,6 +314,61 @@ fn main() -> i32 {
 				t.Errorf("exit code differs: c %d, llvm %d", want.exit, got.exit)
 			}
 		})
+	}
+}
+
+// TestBoundsPanicBlockPerCheck keeps the IR verifier-clean: a panic block must
+// not be shared by several bounds checks, because the index value it uses is
+// defined in only one of them. Sharing produced "instruction does not dominate
+// all uses" on stricter clangs even though older ones accepted the IR.
+func TestBoundsPanicBlockPerCheck(t *testing.T) {
+	src := `
+fn checked(a: &mut [i64; 4], i: usize) -> i64 {
+    let mut total: i64 = 0;
+    total += (*a)[i];
+    total += (*a)[i as usize];
+    total += (*a)[0];
+    total += (*a)[2];
+    return total;
+}
+fn main() -> i32 {
+    let mut a: [i64; 4] = [1, 2, 3, 4];
+    println(checked(&mut a, 1));
+    0
+}
+`
+	path := filepath.Join(t.TempDir(), "bounds.zx")
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	em := diag.NewEmitter()
+	art, ok := driver.FrontEnd(path, driver.Options{CheckOnly: true}, em)
+	if !ok {
+		t.Fatal("front end failed")
+	}
+	res := mir.Lower(art.Info)
+	if len(res.Unsupported) > 0 {
+		t.Fatalf("MIR could not lower the program: %v", res.Unsupported)
+	}
+	ir, err := llvm.Generate(res.Prog, llvm.Options{})
+	if err != nil {
+		t.Fatalf("llvm.Generate: %v", err)
+	}
+	defs, branches := 0, 0
+	for _, line := range strings.Split(ir, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "br ") && strings.Contains(trimmed, "label %bb.panic") {
+			branches++
+		}
+		if strings.HasSuffix(trimmed, ":") && strings.Contains(trimmed, "bb.panic") {
+			defs++
+		}
+	}
+	if defs == 0 {
+		t.Fatal("no bounds panic blocks emitted")
+	}
+	if branches != defs {
+		t.Fatalf("panic blocks are shared: %d branches but %d blocks; every check must get its own block", branches, defs)
 	}
 }
 
