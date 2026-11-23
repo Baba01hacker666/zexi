@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"zexi/internal/ast"
+	"zexi/internal/layout"
 	"zexi/internal/sema"
 	"zexi/internal/token"
 	"zexi/internal/types"
@@ -1537,6 +1538,8 @@ func (l *lowerer) callInto(x *ast.CallExpr, dest Place) error {
 			return l.panicInto(x)
 		case "len":
 			return l.lenInto(x, dest)
+		case "sizeof", "size_of", "alignof", "align_of":
+			return l.sizeOfInto(x, dest, name == "alignof" || name == "align_of")
 		case "cstr", "from_cstr", "arg_count", "arg_at":
 			return unsupportedf(x.Sp, "builtin `%s`", name)
 		}
@@ -1867,6 +1870,30 @@ func (l *lowerer) lenInto(x *ast.CallExpr, dest Place) error {
 		return err
 	}
 	l.emit(&Assign{Place: dest, RV: &Len{Place: p, Ty: l.ty(x)}, Sp: x.Sp})
+	return nil
+}
+
+// sizeOfInto folds `sizeof::<T>()` / `alignof::<T>()` into a constant using the
+// same layout rules the LLVM backend uses. Semantics are fixed at compile
+// time, so there is no runtime intrinsic to call.
+func (l *lowerer) sizeOfInto(x *ast.CallExpr, dest Place, align bool) error {
+	t := l.info.Types[x.Callee]
+	if t == nil {
+		return unsupportedf(x.Sp, "sizeof/alignof with no resolved type")
+	}
+	sized, err := layout.Default().Of(t)
+	if err != nil {
+		return unsupportedf(x.Sp, "sizeof/alignof of %s: %v", t, err)
+	}
+	n := sized.Size
+	if align {
+		n = sized.Align
+	}
+	l.emit(&Assign{Place: dest, RV: Use{Op: Operand{
+		Kind:  OpConst,
+		Const: IntConst(n),
+		Ty:    types.UsizeT,
+	}}, Sp: x.Sp})
 	return nil
 }
 

@@ -1,0 +1,23 @@
+// tests/sizeof.zx
+//
+// sizeof::<T>() and align_of::<T>() are compiler builtins: sema resolves the
+// type argument and records it, the C backend emits C's sizeof/_Alignof, and
+// MIR folds the same answer using internal/layout. This program also checks
+// that a generic body may name its own type parameter in an annotation, which
+// is what makes sizeof::<T>() usable inside a generic function.
+
+struct Pair { a: i64, b: i32 }
+
+fn sum_size<T>(v: T) -> i64 {
+    let x: T = v;              // T is in scope in an instantiated body
+    return sizeof::<T>() as i64 + align_of::<T>() as i64;
+}
+
+fn main() -> i32 {
+    println(sizeof::<i64>(), align_of::<i64>());
+    println(sizeof::<u8>(), align_of::<u8>());
+    println(sizeof::<Pair>(), align_of::<Pair>());
+    println(size_of::<String>(), alignof::<String>());
+    println(sum_size::<i64>(7));
+    0
+}

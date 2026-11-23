@@ -2949,6 +2949,17 @@ func (g *gen) callValue(x *ast.CallExpr) string {
 	if name == "len" {
 		return g.lenValue(x)
 	}
+	if name == "sizeof" || name == "size_of" || name == "alignof" || name == "align_of" {
+		t := g.info.Types[x.Callee]
+		if t == nil {
+			return "0"
+		}
+		ct := ctype(t)
+		if name == "alignof" || name == "align_of" {
+			return "(size_t)_Alignof(" + ct + ")"
+		}
+		return "(size_t)sizeof(" + ct + ")"
+	}
 	if name == "cstr" {
 		return g.cstrValue(x)
 	}

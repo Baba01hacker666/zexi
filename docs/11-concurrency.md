@@ -116,6 +116,12 @@ can capture — and uses the free functions. Both forms exist:
 `send` returns `false` if the channel is closed. `recv` blocks; it returns
 `false` only when the channel is closed *and* drained.
 
+For a bounded wait, `recv_timeout(&mut v, ms)` and `send_timeout(v, ms)` return
+`1` on success, `0` when closed, and `2` on timeout. `chan_select2(a, b, ms,
+&mut which, &mut out)` waits for the first value on either of two handles
+(`which` is `0` for `a`, `1` for `b`). See
+[`docs/21-typed-sync.md`](21-typed-sync.md) §21.3 for the full semantics.
+
 Because a full channel blocks senders, a producer and consumer must run
 **concurrently**: draining in the same thread *after* joining the producers
 deadlocks as soon as the buffer fills. Size the channel to the whole workload,

@@ -110,10 +110,10 @@ Developer note: `zexic` embeds the standard library at build time. After changin
 
 These are what the server design wants, and what Zexi lacks. From `docs/02-language-spec.md` and `docs/03-memory-model.md`:
 
-- **Closures as handlers.** Handlers are plain function pointers, so they cannot capture configuration or shared state. Go: `HandlerFunc` closures. hyper: `Service` values.
-- **Traits or generics** for a `Reader`/`Writer` abstraction. Go: `io.Reader`, `io.Writer`. hyper: `Body`. Without it, every body type is a separate function.
-- **Typed `Mutex<T>` and `RwLock<T>`.** Only a C pthread mutex inside `c """` blocks exists. Go: `sync.Mutex`, `sync.RWMutex`.
-- **Typed channels and `select` with a timeout.** Channels carry `i64` only, and there is no `select`. Go: `chan T`, `select` with `time.After`.
+- **Closures as handlers. — closed** Handlers can now be closures that capture configuration or shared state by value (`docs/15-closures.md`); Result-returning handlers are supported too. Go: `HandlerFunc` closures. hyper: `Service` values.
+- **Traits or generics** for a `Reader`/`Writer` abstraction. Monomorphized generics exist (`docs/12-generics.md`), but they are unconstrained: there are no trait bounds, so a body type still needs its own function. Go: `io.Reader`, `io.Writer`. hyper: `Body`.
+- **Typed `Mutex<T>` and `RwLock<T>`. — closed in the library** The new `sync` module (`internal/driver/std/sync.zx`, `docs/21-typed-sync.md`) wraps a pthread lock and the value it protects; guards carry `T` and expose `get`/`get_mut`. Go: `sync.Mutex`, `sync.RWMutex`.
+- **Typed channels and `select` with a timeout. — closed** `recv_timeout`/`send_timeout` (real `pthread_cond_timedwait`) and `chan_select2` cover the `i64` channel (`docs/21-typed-sync.md` §21.3). A typed `tchan_*` family now moves arbitrary `T` — including owning values like `String` — through an i64 handle; it needed two compiler changes: `sizeof::<T>()`/`align_of::<T>()` builtins and binding-aware generic bodies (docs/12-generics.md §12.15). Go: `chan T`, `select` with `time.After`.
 - **Non-blocking I/O as a language construct**, or async functions. Today a blocked read holds a thread. Go: goroutines over a netpoller. hyper: futures on tokio. nginx: an event loop per worker.
 - **A way to pass richer values to workers.** The pool passes a small integer and pins the router into a fixed slot, because only `i64` crosses threads safely. Go shares pointers under its race-free rules; a typed `Arc<T>` would replace the slot table.
 
@@ -128,7 +128,7 @@ Not gaps, because the docs list them: `Vec<T>`, `HashMap<K, V>`, `String`, slice
 5. Connection cap and configurable limits (P1.6, P2.11). Small to medium.
 6. `epoll` (P1.5). Medium. Only needed past a few thousand connections.
 7. Chunked responses and chunked request bodies (P2.9, P2.10). Medium.
-8. Language: closures, typed `Mutex`, typed channels with `select`, traits (§5). Large. These unlock a server design closer to Go's.
+8. Language: closures, typed locks, typed channels with `select`, traits (§5). Closures, typed locks, channel timeouts/`select`, and typed channels are in (`docs/21-typed-sync.md`); typed channels required the `sizeof::<T>()` builtin and binding-aware generic bodies (docs/12-generics.md §12.15). Traits, a general `Arc<T>`, and async still need compiler work.
 
 ## 7. Not yet verified
 

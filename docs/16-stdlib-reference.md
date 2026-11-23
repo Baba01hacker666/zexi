@@ -2,7 +2,7 @@
 
 Every module below is built into the compiler: `use <module>;` needs no project
 setup, no package download, and no extra C file. A module whose work is done in
-C (`sys`, `regex`, `json`, `net`, `http`, `thread`) carries that C inside its own
+C (`sys`, `regex`, `json`, `net`, `http`, `thread`, `sync`) carries that C inside its own
 `.zx` file as a `c """..."""` block, so importing the module is all it takes to
 link it. Any library can do the same — see [`17-extending.md`](17-extending.md).
 
@@ -215,11 +215,25 @@ and object key order is preserved.
 | `Thread::new/spawn/join` | the handle form |
 | `chan_new(cap)` → `Chan` | bounded channel |
 | `Chan::send/recv/try_recv/close/len/closed` | channel operations |
+| `Chan::recv_timeout/send_timeout`, `chan_send_timeout`, `chan_select2` | bounded waits and two-channel select (see [`21-typed-sync.md`](21-typed-sync.md)) |
 | `atomic_new`, `Atomic::add/get/set` | atomics |
 | `Pool::new(workers)`, `.submit(f, arg)`, `.wait()`, `.result(seq)`, `.map(f, lo, hi)`, `.free()` | fixed-size worker pool |
 | `cpu_count()` | available cores |
 
 Closures work as task bodies: `pool.map(|x| x * x, 0, 100)`.
+
+### 16.6a `sync`
+
+| type / function | description |
+| --- | --- |
+| `Mutex::<T>::new(v)`, `.lock()`, `.try_lock()`, `.ok()`, `.free()` | typed mutual exclusion |
+| `MutexGuard::<T>::get()/get_mut()/unlock()` | the borrow handed out by `lock` |
+| `RwLock::<T>::new(v)`, `.read()/write()/try_read()/try_write()`, `.ok()/free()` | typed reader/writer lock |
+| `RwLockReadGuard` / `RwLockWriteGuard`: `get()`, `get_mut()`, `unlock()` | the two read/write guards |
+
+Guards carry the protected `T` in their type and must be released explicitly
+with `unlock()` (user-defined `Drop` is not implemented yet). Full semantics in
+[`21-typed-sync.md`](21-typed-sync.md).
 
 ## 16.7 `sys`, `io`, `fs`
 

@@ -497,3 +497,34 @@ Known limits (deliberate for M1):
   (no libasan/clang). Drop behavior is covered by the runtime tests in
   `tests/generics.zx`, `tests/enums.zx`, `tests/option_result.zx`, and
   `tests/drop.zx`.
+
+## 12.15 Type-level size and alignment
+
+A monomorphized body needs the machine size of its own type parameter to talk
+to C — a typed channel, for instance, has to allocate exactly one element.
+`sizeof::<T>()` and `align_of::<T>()` are compiler builtins for this. They take
+exactly one type argument, no value arguments, and return `usize`. The aliases
+`size_of`/`alignof` are accepted too:
+
+```zx
+fn slot<T>() -> i64 {
+    return sizeof::<T>() as i64 + align_of::<T>() as i64;
+}
+```
+
+Sema resolves the type argument and records it on the callee. The C backend
+then emits `(size_t)sizeof(<concrete C type>)` (or `_Alignof`), and MIR folds a
+constant with `internal/layout` — the same layout rules the LLVM backend uses,
+so both backends agree. `tests/sizeof.zx` is the acceptance test.
+
+To make this usable in a generic function, instantiation bindings are now
+carried into body checking (`sema.Fn.Bindings`, layered in by `checkBodies`).
+That removes an older restriction: a generic body may name its own type
+parameter in an annotation, so `let x: T = v;` and `sizeof::<T>()` both work
+inside `fn f<T>(v: T)`. Generic *templates* are still checked once with opaque
+parameters and are never emitted; every call site gets its own monomorphized
+body with concrete bindings.
+
+What is still missing is trait bounds (`T: Ord`, `T: Trait`): a type parameter
+remains unconstrained, so a generic body cannot call methods on `T` without a
+concrete type. See `next_http.md` §5.

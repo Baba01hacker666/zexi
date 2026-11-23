@@ -1,9 +1,10 @@
 // tests/http_server.zx
 //
 // Used by the end-to-end test in internal/driver. Serves exactly two real
-// requests on 127.0.0.1:18081 and logs each request line to stdout. Bare TCP
-// probes (empty request head) are ignored and do not count against the budget,
-// which keeps the test's readiness check from consuming a request.
+// requests on the loopback port passed as argv[1] and logs each request line to
+// stdout. Bare TCP probes (empty request head) are ignored and do not count
+// against the budget, which keeps the test's readiness check from consuming a
+// request.
 
 struct Reply { status: i32, body: String }
 
@@ -18,7 +19,8 @@ fn route(req: &Request) -> Reply {
 }
 
 fn main() -> i32 {
-    let srv = http_listen("127.0.0.1", 18081);
+    let port = String::from(arg_at(1)).parse_i64() as i32;
+    let srv = http_listen("127.0.0.1", port);
     if srv.fd < 0 {
         println("bind failed");
         return 1;

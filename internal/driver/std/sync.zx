@@ -1,0 +1,249 @@
+// sync — typed mutexes and reader/writer locks for Zexi.
+//
+// next_http.md §5 asks for typed `Mutex<T>` and `RwLock<T>`: today the only
+// lock in the language is a raw pthread mutex hidden inside a `c """..."""`
+// block, so the value a lock protects is not carried by its type. This module
+// closes that gap in the library, the way the rest of the standard library
+// extends Zexi — no compiler change is needed. A generic `T` is opaque here,
+// which is all the language promises (docs/12-generics.md §12.2): it can be
+// stored, borrowed, moved and dropped, but not compared or called.
+//
+//     use sync;
+//
+//     fn main() -> i32 {
+//         let counter = Mutex::<i64>::new(0);
+//         {
+//             let mut guard = counter.lock();
+//             *guard.get_mut() += 1;      // C mutex is held for this scope
+//             guard.unlock();             // explicit: no user-defined Drop yet
+//         }
+//         println(counter.lock().get());   // 1
+//         0
+//     }
+//
+// `MutexGuard<T>` and the two `RwLock` guards borrow the lock they came from,
+// so the protected value cannot outlive its lock. Guards are not `Copy`: each
+// `unlock(self)` releases exactly one acquisition. Because user-defined `Drop`
+// is not implemented yet, release with `guard.unlock()` or `defer g.unlock()`
+// rather than relying on scope exit.
+//
+// The pthread primitives live in this file's own C block; `use sync;` links
+// `-pthread` automatically. Each lock is heap allocated in C and addressed by
+// an i64 handle; the Zexi wrapper owns the value alongside that handle.
+
+// --- mutex ------------------------------------------------------------------
+
+extern "C" fn zxs_mutex_new() -> i64;
+extern "C" fn zxs_mutex_lock(handle: i64);
+extern "C" fn zxs_mutex_trylock(handle: i64) -> i32;
+extern "C" fn zxs_mutex_unlock(handle: i64);
+extern "C" fn zxs_mutex_free(handle: i64);
+
+// Mutex<T> owns one value and a pthread mutex that guards access to it.
+pub struct Mutex<T> {
+    raw: i64,
+    value: T,
+}
+
+// MutexGuard<T> is the exclusive borrow returned by Mutex::lock.
+pub struct MutexGuard<T> {
+    mu: &Mutex<T>,
+}
+
+impl<T> Mutex<T> {
+    pub fn new(value: T) -> Mutex<T> {
+        return Mutex { raw: zxs_mutex_new(), value: value };
+    }
+
+    // lock blocks until the mutex is free. Only one guard can exist at a time;
+    // waiting on a mutex you already hold deadlocks, as in any pthread mutex.
+    pub fn lock(&self) -> MutexGuard<T> {
+        zxs_mutex_lock(self.raw);
+        return MutexGuard { mu: self };
+    }
+
+    // try_lock returns None when another thread holds the mutex.
+    pub fn try_lock(&self) -> Option<MutexGuard<T>> {
+        if zxs_mutex_trylock(self.raw) == 0 {
+            return None;
+        }
+        return Some(MutexGuard { mu: self });
+    }
+
+    // ok reports whether the underlying pthread mutex was created.
+    pub fn ok(&self) -> bool {
+        return self.raw != 0;
+    }
+
+    // free destroys the pthread mutex. Call it only when no guard is alive and
+    // no other thread can reach this Mutex.
+    pub fn free(&self) {
+        zxs_mutex_free(self.raw);
+    }
+}
+
+impl<T> MutexGuard<T> {
+    pub fn get(&self) -> &T {
+        return &self.mu.value;
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        return &mut self.mu.value;
+    }
+
+    // unlock releases the mutex. It consumes the guard, so it cannot be called
+    // twice on the same acquisition.
+    pub fn unlock(self) {
+        zxs_mutex_unlock(self.mu.raw);
+    }
+}
+
+// --- reader/writer lock -----------------------------------------------------
+
+extern "C" fn zxs_rwlock_new() -> i64;
+extern "C" fn zxs_rwlock_rdlock(handle: i64);
+extern "C" fn zxs_rwlock_wrlock(handle: i64);
+extern "C" fn zxs_rwlock_tryrdlock(handle: i64) -> i32;
+extern "C" fn zxs_rwlock_trywrlock(handle: i64) -> i32;
+extern "C" fn zxs_rwlock_rdunlock(handle: i64);
+extern "C" fn zxs_rwlock_wrunlock(handle: i64);
+extern "C" fn zxs_rwlock_free(handle: i64);
+
+// RwLock<T> allows many concurrent readers or one exclusive writer.
+pub struct RwLock<T> {
+    raw: i64,
+    value: T,
+}
+
+// RwLockReadGuard<T> is a shared borrow of the protected value.
+pub struct RwLockReadGuard<T> {
+    lock: &RwLock<T>,
+}
+
+// RwLockWriteGuard<T> is an exclusive borrow of the protected value.
+pub struct RwLockWriteGuard<T> {
+    lock: &RwLock<T>,
+}
+
+impl<T> RwLock<T> {
+    pub fn new(value: T) -> RwLock<T> {
+        return RwLock { raw: zxs_rwlock_new(), value: value };
+    }
+
+    pub fn read(&self) -> RwLockReadGuard<T> {
+        zxs_rwlock_rdlock(self.raw);
+        return RwLockReadGuard { lock: self };
+    }
+
+    pub fn write(&self) -> RwLockWriteGuard<T> {
+        zxs_rwlock_wrlock(self.raw);
+        return RwLockWriteGuard { lock: self };
+    }
+
+    pub fn try_read(&self) -> Option<RwLockReadGuard<T>> {
+        if zxs_rwlock_tryrdlock(self.raw) == 0 {
+            return None;
+        }
+        return Some(RwLockReadGuard { lock: self });
+    }
+
+    pub fn try_write(&self) -> Option<RwLockWriteGuard<T>> {
+        if zxs_rwlock_trywrlock(self.raw) == 0 {
+            return None;
+        }
+        return Some(RwLockWriteGuard { lock: self });
+    }
+
+    pub fn ok(&self) -> bool {
+        return self.raw != 0;
+    }
+
+    pub fn free(&self) {
+        zxs_rwlock_free(self.raw);
+    }
+}
+
+impl<T> RwLockReadGuard<T> {
+    pub fn get(&self) -> &T {
+        return &self.lock.value;
+    }
+
+    pub fn unlock(self) {
+        zxs_rwlock_rdunlock(self.lock.raw);
+    }
+}
+
+impl<T> RwLockWriteGuard<T> {
+    pub fn get(&self) -> &T {
+        return &self.lock.value;
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        return &mut self.lock.value;
+    }
+
+    pub fn unlock(self) {
+        zxs_rwlock_wrunlock(self.lock.raw);
+    }
+}
+
+// The C travels with the module, so `use sync;` links it and -pthread without
+// any driver-side list. Handles are malloc'd pthread objects; 0 means failure.
+#[link("pthread")]
+c """
+#define _POSIX_C_SOURCE 200809L
+#include <pthread.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+int64_t zxs_mutex_new(void) {
+    pthread_mutex_t *m = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
+    if (!m) return 0;
+    if (pthread_mutex_init(m, NULL) != 0) { free(m); return 0; }
+    return (int64_t)(uintptr_t)m;
+}
+void zxs_mutex_lock(int64_t h) {
+    pthread_mutex_lock((pthread_mutex_t *)(uintptr_t)h);
+}
+int32_t zxs_mutex_trylock(int64_t h) {
+    return pthread_mutex_trylock((pthread_mutex_t *)(uintptr_t)h) == 0 ? 1 : 0;
+}
+void zxs_mutex_unlock(int64_t h) {
+    pthread_mutex_unlock((pthread_mutex_t *)(uintptr_t)h);
+}
+void zxs_mutex_free(int64_t h) {
+    pthread_mutex_t *m = (pthread_mutex_t *)(uintptr_t)h;
+    pthread_mutex_destroy(m);
+    free(m);
+}
+
+int64_t zxs_rwlock_new(void) {
+    pthread_rwlock_t *l = (pthread_rwlock_t *)malloc(sizeof(pthread_rwlock_t));
+    if (!l) return 0;
+    if (pthread_rwlock_init(l, NULL) != 0) { free(l); return 0; }
+    return (int64_t)(uintptr_t)l;
+}
+void zxs_rwlock_rdlock(int64_t h) {
+    pthread_rwlock_rdlock((pthread_rwlock_t *)(uintptr_t)h);
+}
+void zxs_rwlock_wrlock(int64_t h) {
+    pthread_rwlock_wrlock((pthread_rwlock_t *)(uintptr_t)h);
+}
+int32_t zxs_rwlock_tryrdlock(int64_t h) {
+    return pthread_rwlock_tryrdlock((pthread_rwlock_t *)(uintptr_t)h) == 0 ? 1 : 0;
+}
+int32_t zxs_rwlock_trywrlock(int64_t h) {
+    return pthread_rwlock_trywrlock((pthread_rwlock_t *)(uintptr_t)h) == 0 ? 1 : 0;
+}
+void zxs_rwlock_rdunlock(int64_t h) {
+    pthread_rwlock_unlock((pthread_rwlock_t *)(uintptr_t)h);
+}
+void zxs_rwlock_wrunlock(int64_t h) {
+    pthread_rwlock_unlock((pthread_rwlock_t *)(uintptr_t)h);
+}
+void zxs_rwlock_free(int64_t h) {
+    pthread_rwlock_t *l = (pthread_rwlock_t *)(uintptr_t)h;
+    pthread_rwlock_destroy(l);
+    free(l);
+}
+"""

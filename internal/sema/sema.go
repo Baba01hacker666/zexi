@@ -30,6 +30,12 @@ type Fn struct {
 	QualName string   // "Point::len_sq" for methods, else Name
 	Generics []string // declared type-parameter names
 	Generic  bool     // true for the un-instantiated template
+	// Bindings maps a template type parameter to its concrete type in an
+	// instantiation. checkBodies layers it into the type environment so a
+	// generic body may name its own parameters (`let x: T`, `sizeof::<T>()`)
+	// just as an ordinary function may name a declared type. Nil on templates
+	// and non-generic functions.
+	Bindings map[string]*types.Type
 	Params   []*types.Type
 	// ParamNames and Defaults are aligned with Params (the receiver, when
 	// present, occupies slot 0 with an empty name and no default).
@@ -1240,19 +1246,21 @@ func (c *checker) checkBodies() {
 			want = fn.Ret
 		}
 		c.cbodyOK = cbodyOf(fn.Decl.Body)
-		bt := c.checkBlockWith(fn.Decl.Body, want)
-		if cb := cbodyOf(fn.Decl.Body); cb != nil && c.info.Types[cb] != nil && c.info.Types[cb].Kind != types.Invalid {
-			c.checkCBody(fn, cb)
-		}
-		c.cbodyOK = nil
-		if fn.Ret.Kind != types.Unit {
-			// An invalid body type has already been diagnosed; don't pile on.
-			if !c.exprAlwaysReturns(fn.Decl.Body) && bt.Kind != types.Never && bt.Kind != types.Invalid {
-				if !c.assignable(fn.Ret, bt) {
-					c.errf(fn.Decl.Body.Sp, "E0308", "function `%s` returns `%s` but its body has type `%s`", fn.Name, fn.Ret, bt)
+		c.withBindings(fn.Bindings, func() {
+			bt := c.checkBlockWith(fn.Decl.Body, want)
+			if cb := cbodyOf(fn.Decl.Body); cb != nil && c.info.Types[cb] != nil && c.info.Types[cb].Kind != types.Invalid {
+				c.checkCBody(fn, cb)
+			}
+			c.cbodyOK = nil
+			if fn.Ret.Kind != types.Unit {
+				// An invalid body type has already been diagnosed; don't pile on.
+				if !c.exprAlwaysReturns(fn.Decl.Body) && bt.Kind != types.Never && bt.Kind != types.Invalid {
+					if !c.assignable(fn.Ret, bt) {
+						c.errf(fn.Decl.Body.Sp, "E0308", "function `%s` returns `%s` but its body has type `%s`", fn.Name, fn.Ret, bt)
+					}
 				}
 			}
-		}
+		})
 		c.popScope()
 	}
 }
@@ -2385,6 +2393,12 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 	if name == "len" {
 		return c.inferLen(x)
 	}
+	if name == "sizeof" || name == "size_of" {
+		return c.inferSizeOf(x, false)
+	}
+	if name == "alignof" || name == "align_of" {
+		return c.inferSizeOf(x, true)
+	}
 	if name == "cstr" {
 		return c.inferCStr(x)
 	}
@@ -2506,7 +2520,7 @@ func (c *checker) inferCall(x *ast.CallExpr, expected *types.Type) *types.Type {
 		if t := c.inferBareVariantCtor(x, name, expected); t != nil {
 			return t
 		}
-		cands := []string{"print", "println", "eprint", "eprintln", "panic", "len", "cstr", "from_cstr", "arg_count", "arg_at", "project_dir"}
+		cands := []string{"print", "println", "eprint", "eprintln", "panic", "len", "sizeof", "alignof", "cstr", "from_cstr", "arg_count", "arg_at", "project_dir"}
 		for n := range c.info.Fns {
 			cands = append(cands, n)
 		}
@@ -2920,6 +2934,7 @@ func (c *checker) instantiateFn(tmpl *Fn, args []*types.Type) *Fn {
 	fn.QualName = key
 	fn.Generics = nil
 	fn.Generic = false
+	fn.Bindings = bind
 	fn.Extern = tmpl.Extern
 	fn.ABI = tmpl.ABI
 	c.info.Fns[key] = fn
@@ -3405,6 +3420,30 @@ func (c *checker) inferArgAt(x *ast.CallExpr) *types.Type {
 		c.errAt(x.Args[0], "E0308", "`arg_at` expects an integer index, found `%s`", at)
 	}
 	return types.StringT
+}
+
+// inferSizeOf checks `sizeof::<T>()` and `alignof::<T>()`. The type argument is
+// resolved now and recorded on the callee, so both the C backend (which emits
+// C's `sizeof`/`_Alignof`) and MIR (which folds a constant using internal/layout)
+// see the concrete type after monomorphization. A value argument is rejected:
+// these builtins take a type, not a sample value.
+func (c *checker) inferSizeOf(x *ast.CallExpr, align bool) *types.Type {
+	spelling := "sizeof"
+	if align {
+		spelling = "alignof"
+	}
+	if len(x.Args) != 0 {
+		c.errAt(x, "E0061", "`%s` takes no value arguments; write `%s::<T>()`", spelling, spelling)
+	}
+	args := calleeTypeArgs(x.Callee)
+	if len(args) != 1 {
+		c.errAt(x.Callee, "E0107", "`%s` needs exactly one type argument: `%s::<T>()`", spelling, spelling)
+		return types.UsizeT
+	}
+	if t := c.resolveType(args[0]); t != nil {
+		c.info.Types[x.Callee] = t
+	}
+	return types.UsizeT
 }
 
 // inferLen checks the builtin `len(x)` for arrays and strings.

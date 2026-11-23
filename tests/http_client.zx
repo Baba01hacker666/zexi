@@ -4,13 +4,14 @@
 // test server and print the parsed status and body.
 
 fn main() -> i32 {
-    let a = http_get("127.0.0.1", 18081, "/");
+    let port = String::from(arg_at(1)).parse_i64() as i32;
+    let a = http_get("127.0.0.1", port, "/");
     let ra = parse_response(&a);
     print(ra.status);
     print(" ");
     println(ra.body.trim());
 
-    let b = http_get("127.0.0.1", 18081, "/pi");
+    let b = http_get("127.0.0.1", port, "/pi");
     let rb = parse_response(&b);
     print(rb.status);
     print(" ");

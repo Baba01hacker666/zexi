@@ -133,6 +133,24 @@ extern "C" fn zxt_chan_try_recv(handle: i64, out: &mut i64) -> i32;
 extern "C" fn zxt_chan_close(handle: i64) -> i32;
 extern "C" fn zxt_chan_len(handle: i64) -> i64;
 extern "C" fn zxt_chan_closed(handle: i64) -> i32;
+extern "C" fn zxt_chan_recv_timeout(handle: i64, out: &mut i64, ms: i64) -> i32;
+extern "C" fn zxt_chan_send_timeout(handle: i64, value: i64, ms: i64) -> i32;
+extern "C" fn zxt_chan_select2(a: i64, b: i64, ms: i64, which: &mut i64, out: &mut i64) -> i32;
+
+// Typed channel control: pthread mutex + condition variable in a slot, plus
+// C-allocated storage for the Zexi `TypedChan<T>` itself. `sizeof::<T>()` is a
+// compiler builtin, so the allocation is exactly the size of the monomorphized
+// struct; the value lives in C memory and threads reach it through a raw
+// pointer cast from the i64 handle.
+extern "C" fn zxt_tc_new() -> i64;
+extern "C" fn zxt_tc_lock(handle: i64);
+extern "C" fn zxt_tc_unlock(handle: i64);
+extern "C" fn zxt_tc_wait(handle: i64);
+extern "C" fn zxt_tc_signal(handle: i64);
+extern "C" fn zxt_tc_broadcast(handle: i64);
+extern "C" fn zxt_tc_free(handle: i64);
+extern "C" fn zxt_typed_alloc(size: i64) -> i64;
+extern "C" fn zxt_typed_free(addr: i64);
 
 // chan_new creates a bounded channel; cap is clamped to 1..65536.
 pub fn chan_new(cap: i32) -> i64 {
@@ -153,6 +171,27 @@ pub fn chan_recv(handle: i64, out: &mut i64) -> bool {
 // chan_try_recv is the non-blocking form of chan_recv.
 pub fn chan_try_recv(handle: i64, out: &mut i64) -> bool {
     return zxt_chan_try_recv(handle, out) == 1;
+}
+
+// chan_recv_timeout is chan_recv with a deadline in milliseconds. It returns
+// 1 when a value was written to out, 0 when the channel is closed and drained,
+// and 2 when the deadline passed. A negative or zero timeout is immediate.
+pub fn chan_recv_timeout(handle: i64, out: &mut i64, ms: i64) -> i32 {
+    return zxt_chan_recv_timeout(handle, out, ms);
+}
+
+// chan_send_timeout is chan_send with a deadline in milliseconds. It returns 1
+// on success, 0 when the channel closed, and 2 on timeout.
+pub fn chan_send_timeout(handle: i64, value: i64, ms: i64) -> i32 {
+    return zxt_chan_send_timeout(handle, value, ms);
+}
+
+// chan_select2 waits for the first value on either of two channels. It returns
+// 1 with `which` set to 0 (a) or 1 (b) and the value in `out`, 0 when both are
+// closed and drained, or 2 on timeout. An invalid handle counts as closed.
+// The two channels are checked in turn, so if both are ready, `a` wins.
+pub fn chan_select2(a: i64, b: i64, ms: i64, which: &mut i64, out: &mut i64) -> i32 {
+    return zxt_chan_select2(a, b, ms, which, out);
 }
 
 // chan_close marks the channel closed and wakes every blocked sender/receiver.
@@ -195,6 +234,16 @@ impl Chan {
         return zxt_chan_try_recv(self.id, out) == 1;
     }
 
+    // recv_timeout returns 1 with a value, 0 when closed and drained, 2 on
+    // timeout.
+    pub fn recv_timeout(&self, out: &mut i64, ms: i64) -> i32 {
+        return zxt_chan_recv_timeout(self.id, out, ms);
+    }
+
+    pub fn send_timeout(&self, value: i64, ms: i64) -> i32 {
+        return zxt_chan_send_timeout(self.id, value, ms);
+    }
+
     pub fn close(&self) {
         zxt_chan_close(self.id);
     }
@@ -206,6 +255,117 @@ impl Chan {
     pub fn closed(&self) -> bool {
         return zxt_chan_closed(self.id) == 1;
     }
+}
+
+// --- typed channels (T) ----------------------------------------------------
+
+// TypedChan<T> owns a bounded queue of T and a pthread control block. It lives
+// in C-allocated memory; threads share it via the i64 handle returned by
+// tchan_new. Only i64 crosses a thread boundary, so the handle is the safe
+// currency here, just as it is for Chan (i64) and the worker pool.
+pub struct TypedChan<T> {
+    raw: i64,
+    cap: i64,
+    closed: bool,
+    buf: Vec<T>,
+}
+
+// tchan_new creates a typed channel with the given capacity (at least 1). It
+// returns an i64 handle; pass that handle to worker threads and to the other
+// tchan_* functions. The channel must be released with tchan_free.
+pub fn tchan_new<T>(cap: i64) -> i64 {
+    if cap < 1 {
+        cap = 1;
+    }
+    let raw = zxt_tc_new();
+    if raw == 0 {
+        return 0;
+    }
+    let addr = zxt_typed_alloc(sizeof::<TypedChan<T>>() as i64);
+    if addr == 0 {
+        zxt_tc_free(raw);
+        return 0;
+    }
+    let p = addr as *TypedChan<T>;
+    let buf: Vec<T> = Vec::<T>::new();
+    let ch: TypedChan<T> = TypedChan { raw: raw, cap: cap, closed: false, buf: buf };
+    *p = ch;
+    return addr;
+}
+
+// tchan_send moves v into the channel, blocking while it is full. It returns
+// false if the channel was closed.
+pub fn tchan_send<T>(handle: i64, v: T) -> bool {
+    let p = handle as *TypedChan<T>;
+    let raw = (*p).raw;
+    zxt_tc_lock(raw);
+    while ((*p).buf.len() as i64) >= (*p).cap && !(*p).closed {
+        zxt_tc_wait(raw);
+    }
+    if (*p).closed {
+        zxt_tc_unlock(raw);
+        return false;
+    }
+    (*p).buf.push(v);
+    zxt_tc_signal(raw);
+    zxt_tc_unlock(raw);
+    return true;
+}
+
+// tchan_recv moves the oldest value into out, blocking while the channel is
+// empty. It returns false when the channel is closed and drained.
+pub fn tchan_recv<T>(handle: i64, out: &mut T) -> bool {
+    let p = handle as *TypedChan<T>;
+    let raw = (*p).raw;
+    zxt_tc_lock(raw);
+    while (*p).buf.len() == 0 && !(*p).closed {
+        zxt_tc_wait(raw);
+    }
+    if (*p).buf.len() == 0 {
+        zxt_tc_unlock(raw);
+        return false;
+    }
+    let v = (*p).buf.remove(0);
+    *out = v;
+    zxt_tc_signal(raw);
+    zxt_tc_unlock(raw);
+    return true;
+}
+
+// tchan_try_recv is the non-blocking form of tchan_recv.
+pub fn tchan_try_recv<T>(handle: i64, out: &mut T) -> bool {
+    let p = handle as *TypedChan<T>;
+    let raw = (*p).raw;
+    zxt_tc_lock(raw);
+    if (*p).buf.len() == 0 {
+        zxt_tc_unlock(raw);
+        return false;
+    }
+    let v = (*p).buf.remove(0);
+    *out = v;
+    zxt_tc_signal(raw);
+    zxt_tc_unlock(raw);
+    return true;
+}
+
+// tchan_close marks the channel closed and wakes every waiter. Buffered values
+// stay readable until drained.
+pub fn tchan_close<T>(handle: i64) {
+    let p = handle as *TypedChan<T>;
+    let raw = (*p).raw;
+    zxt_tc_lock(raw);
+    (*p).closed = true;
+    zxt_tc_broadcast(raw);
+    zxt_tc_unlock(raw);
+}
+
+// tchan_free drops any buffered values and releases the C memory. Call it once
+// no thread can reach the channel any more.
+pub fn tchan_free<T>(handle: i64) {
+    let p = handle as *TypedChan<T>;
+    (*p).buf.clear();
+    zxt_tc_free((*p).raw);
+    zxt_typed_free(handle);
 }
 
 // --- atomics (i64) ---------------------------------------------------------
@@ -430,6 +590,8 @@ c """
 #include <string.h>
 #include <sched.h>
 #include <unistd.h>
+#include <errno.h>
+#include <time.h>
 
 #define ZXT_SLOTS 256
 #define ZXT_HANDLE(slot, gen) (((int64_t)((uint64_t)(gen) << 8)) | (int64_t)(slot))
@@ -738,6 +900,172 @@ int zxt_chan_closed(int64_t h) {
     int v = c->closed;
     pthread_mutex_unlock(&c->mu);
     return v;
+}
+
+/* Deadlines for the timed channel calls. recv/send use a CLOCK_REALTIME
+ * absolute time for pthread_cond_timedwait; select polls CLOCK_MONOTONIC so a
+ * wall-clock jump cannot extend or shorten its wait. */
+static int64_t zxt_mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static struct timespec zxt_realtime_deadline(int64_t ms) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    if (ms < 0) ms = 0;
+    ts.tv_sec += ms / 1000;
+    ts.tv_nsec += (ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+    return ts;
+}
+
+/* Returns 1 with a value in *out, 0 if closed and drained, 2 on timeout. */
+int zxt_chan_recv_timeout(int64_t h, int64_t *out, int64_t ms) {
+    zxt_chan_t *c = zxt_chan_resolve(h);
+    if (!c) {
+        return 0;
+    }
+    struct timespec deadline = zxt_realtime_deadline(ms);
+    pthread_mutex_lock(&c->mu);
+    while (c->count == 0 && !c->closed) {
+        if (pthread_cond_timedwait(&c->not_empty, &c->mu, &deadline) == ETIMEDOUT) {
+            pthread_mutex_unlock(&c->mu);
+            return 2;
+        }
+    }
+    if (c->count == 0) {
+        pthread_mutex_unlock(&c->mu);
+        return 0;
+    }
+    int64_t v = c->buf[c->head];
+    c->head = (c->head + 1) % c->cap;
+    c->count--;
+    pthread_cond_signal(&c->not_full);
+    pthread_mutex_unlock(&c->mu);
+    *out = v;
+    return 1;
+}
+
+/* Returns 1 on success, 0 if closed, 2 on timeout. */
+int zxt_chan_send_timeout(int64_t h, int64_t v, int64_t ms) {
+    zxt_chan_t *c = zxt_chan_resolve(h);
+    if (!c) {
+        return 0;
+    }
+    struct timespec deadline = zxt_realtime_deadline(ms);
+    pthread_mutex_lock(&c->mu);
+    while (c->count == c->cap && !c->closed) {
+        if (pthread_cond_timedwait(&c->not_full, &c->mu, &deadline) == ETIMEDOUT) {
+            pthread_mutex_unlock(&c->mu);
+            return 2;
+        }
+    }
+    if (c->closed) {
+        pthread_mutex_unlock(&c->mu);
+        return 0;
+    }
+    int tail = (c->head + c->count) % c->cap;
+    c->buf[tail] = v;
+    c->count++;
+    pthread_cond_signal(&c->not_empty);
+    pthread_mutex_unlock(&c->mu);
+    return 1;
+}
+
+/* select over two channels. Polling try_recv on a 1 ms tick keeps the two
+ * channels' mutexes independent — no lock-ordering hazard — at the cost of at
+ * most 1 ms of extra latency. Returns 1 with *which (0 = a, 1 = b) and *out
+ * set, 0 when both channels are closed and drained, 2 on timeout. */
+int zxt_chan_select2(int64_t a, int64_t b, int64_t ms, int64_t *which, int64_t *out) {
+    int64_t deadline = zxt_mono_ms() + (ms < 0 ? 0 : ms);
+    for (;;) {
+        if (zxt_chan_try_recv(a, out)) { *which = 0; return 1; }
+        if (zxt_chan_try_recv(b, out)) { *which = 1; return 1; }
+        if (zxt_chan_closed(a) && zxt_chan_len(a) == 0 &&
+            zxt_chan_closed(b) && zxt_chan_len(b) == 0) return 0;
+        if (zxt_mono_ms() >= deadline) return 2;
+        struct timespec nap = {0, 1000000L};
+        nanosleep(&nap, NULL);
+    }
+}
+
+/* ---- typed channel control ------------------------------------------------
+ * The queue itself is a Zexi Vec<T> living in C-allocated memory; these calls
+ * only provide the mutex and condition variable that make access to it safe.
+ * The Zexi side casts the malloc'd address to *TypedChan<T> and holds this
+ * mutex around every read or write of the queue. */
+typedef struct {
+    int used;
+    uint32_t gen;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+} zxt_tc_t;
+
+static zxt_tc_t g_tcs[ZXT_SLOTS];
+static pthread_mutex_t g_tcs_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static zxt_tc_t *zxt_tc_resolve(int64_t h) {
+    uint64_t slot = (uint64_t)h & 0xff;
+    uint32_t gen = (uint32_t)((uint64_t)h >> 8);
+    if (slot >= ZXT_SLOTS) return NULL;
+    zxt_tc_t *tc = &g_tcs[slot];
+    if (!tc->used || tc->gen != gen) return NULL;
+    return tc;
+}
+
+int64_t zxt_tc_new(void) {
+    pthread_mutex_lock(&g_tcs_mu);
+    int slot = -1;
+    for (int i = 0; i < ZXT_SLOTS; i++) {
+        if (!g_tcs[i].used) { slot = i; break; }
+    }
+    if (slot < 0) { pthread_mutex_unlock(&g_tcs_mu); return 0; }
+    zxt_tc_t *tc = &g_tcs[slot];
+    tc->gen++;
+    tc->used = 1;
+    pthread_mutex_init(&tc->mu, NULL);
+    pthread_cond_init(&tc->cv, NULL);
+    int64_t h = ZXT_HANDLE(slot, tc->gen);
+    pthread_mutex_unlock(&g_tcs_mu);
+    return h;
+}
+void zxt_tc_lock(int64_t h) {
+    zxt_tc_t *tc = zxt_tc_resolve(h);
+    if (tc) pthread_mutex_lock(&tc->mu);
+}
+void zxt_tc_unlock(int64_t h) {
+    zxt_tc_t *tc = zxt_tc_resolve(h);
+    if (tc) pthread_mutex_unlock(&tc->mu);
+}
+void zxt_tc_wait(int64_t h) {
+    zxt_tc_t *tc = zxt_tc_resolve(h);
+    if (tc) pthread_cond_wait(&tc->cv, &tc->mu);
+}
+void zxt_tc_signal(int64_t h) {
+    zxt_tc_t *tc = zxt_tc_resolve(h);
+    if (tc) pthread_cond_signal(&tc->cv);
+}
+void zxt_tc_broadcast(int64_t h) {
+    zxt_tc_t *tc = zxt_tc_resolve(h);
+    if (tc) pthread_cond_broadcast(&tc->cv);
+}
+void zxt_tc_free(int64_t h) {
+    zxt_tc_t *tc = zxt_tc_resolve(h);
+    if (!tc) return;
+    pthread_mutex_destroy(&tc->mu);
+    pthread_cond_destroy(&tc->cv);
+    tc->used = 0;
+}
+int64_t zxt_typed_alloc(int64_t n) {
+    return (int64_t)(uintptr_t)calloc(1, (size_t)n);
+}
+void zxt_typed_free(int64_t addr) {
+    free((void *)(uintptr_t)addr);
 }
 
 /* ---- atomics (i64) -------------------------------------------------------- */

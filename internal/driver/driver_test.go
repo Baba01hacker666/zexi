@@ -81,6 +81,7 @@ func TestTypeCheckExamples(t *testing.T) {
 		"../../tests/for_borrow.zx",
 		"../../tests/ref_pattern.zx",
 		"../../tests/shift.zx",
+		"../../tests/sizeof.zx",
 	}
 	for _, f := range files {
 		em := diag.NewEmitter()
@@ -704,6 +705,12 @@ func TestRunPrograms(t *testing.T) {
 			}, "\n"),
 		},
 		{
+			file: "../../tests/sizeof.zx",
+			want: strings.Join([]string{
+				"8 8", "1 1", "16 8", "24 8", "16", "",
+			}, "\n"),
+		},
+		{
 			file: "../../examples/result.zx",
 			want: "42\n",
 		},
@@ -743,6 +750,7 @@ func TestHTTPServerAndClient(t *testing.T) {
 		t.Skip("no C compiler available")
 	}
 
+	port, addr := freePort(t)
 	dir := t.TempDir()
 	lib := "../../lib/http.zx"
 	srvBin := filepath.Join(dir, "http_server")
@@ -760,7 +768,7 @@ func TestHTTPServerAndClient(t *testing.T) {
 	}
 
 	var srvOut bytes.Buffer
-	server := exec.Command(srvBin)
+	server := exec.Command(srvBin, strconv.Itoa(port))
 	server.Stdout = &srvOut
 	server.Stderr = &srvOut
 	if err := server.Start(); err != nil {
@@ -768,11 +776,11 @@ func TestHTTPServerAndClient(t *testing.T) {
 	}
 	defer func() { _ = server.Process.Kill() }()
 
-	if !waitPort("127.0.0.1:18081") {
+	if !waitPort(addr) {
 		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
 	}
 
-	out, err := exec.Command(cliBin).Output()
+	out, err := exec.Command(cliBin, strconv.Itoa(port)).Output()
 	if err != nil {
 		t.Fatalf("running client: %v", err)
 	}
@@ -810,13 +818,13 @@ func TestWorkerPoolServerServesConcurrently(t *testing.T) {
 	}
 
 	cases := []struct {
-		name string
-		port string
-		src  string
+		name    string
+		wasPort int
+		src     string
 	}{
 		{
-			name: "router",
-			port: "18083",
+			name:    "router",
+			wasPort: 18083,
 			src: `use http;
 
 fn hello(req: &Request) -> Response {
@@ -833,8 +841,8 @@ fn main() -> i32 {
 `,
 		},
 		{
-			name: "default_mux",
-			port: "18084",
+			name:    "default_mux",
+			wasPort: 18084,
 			src: `use http;
 
 fn hello(req: &Request) -> Response {
@@ -853,14 +861,16 @@ fn main() -> i32 {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			port, addr := freePort(t)
+			src := setPort(tc.src, tc.wasPort, port)
 			dir := t.TempDir()
-			src := filepath.Join(dir, "server.zx")
-			if err := os.WriteFile(src, []byte(tc.src), 0o644); err != nil {
+			srcPath := filepath.Join(dir, "server.zx")
+			if err := os.WriteFile(srcPath, []byte(src), 0o644); err != nil {
 				t.Fatal(err)
 			}
 			bin := filepath.Join(dir, "server")
 			em := diag.NewEmitter()
-			if _, ok := driver.Build(src, bin, driver.Options{}, em); !ok {
+			if _, ok := driver.Build(srcPath, bin, driver.Options{}, em); !ok {
 				em.Render(os.Stderr, em.FirstFileID())
 				t.Fatal("failed to build the worker-pool server")
 			}
@@ -874,7 +884,6 @@ fn main() -> i32 {
 			}
 			defer func() { _ = server.Process.Kill() }()
 
-			addr := "127.0.0.1:" + tc.port
 			if !waitPort(addr) {
 				t.Fatalf("server never started listening; output:\n%s", out.String())
 			}
@@ -942,6 +951,7 @@ func TestWebAppProject(t *testing.T) {
 		t.Skip("no C compiler available")
 	}
 
+	port, addr := freePort(t)
 	dir := t.TempDir()
 	files := map[string]string{
 		"main.zx": `use web;
@@ -976,6 +986,7 @@ fn main() -> i32 {
 		"public/about.html":    "<p>about</p>\n",
 		"public/style.css":     "body { color: red; }\n",
 	}
+	files["main.zx"] = setPort(files["main.zx"], 18087, port)
 	for name, body := range files {
 		path := filepath.Join(dir, name)
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -1003,7 +1014,6 @@ fn main() -> i32 {
 	}
 	defer func() { _ = server.Process.Kill() }()
 
-	const addr = "127.0.0.1:18087"
 	if !waitPort(addr) {
 		t.Fatalf("server never started listening; output:\n%s", out.String())
 	}
@@ -1079,6 +1089,7 @@ func TestStdNetHTTPRoundTrip(t *testing.T) {
 		t.Skip("no C compiler available")
 	}
 
+	port, addr := freePort(t)
 	dir := t.TempDir()
 	serverSrc := `use http;
 
@@ -1139,6 +1150,8 @@ fn main() -> i32 {
     0
 }
 `
+	serverSrc = setPort(serverSrc, 18082, port)
+	clientSrc = setPort(clientSrc, 18082, port)
 	serverPath := filepath.Join(dir, "server.zx")
 	clientPath := filepath.Join(dir, "client.zx")
 	if err := os.WriteFile(serverPath, []byte(serverSrc), 0o644); err != nil {
@@ -1169,7 +1182,7 @@ fn main() -> i32 {
 	}
 	defer func() { _ = server.Process.Kill() }()
 
-	if !waitPort("127.0.0.1:18082") {
+	if !waitPort(addr) {
 		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
 	}
 
@@ -1305,6 +1318,7 @@ func TestStdHTTPHighLevelAPI(t *testing.T) {
 		t.Skip("no C compiler available")
 	}
 
+	port, addr := freePort(t)
 	dir := t.TempDir()
 	serverSrc := `use http;
 
@@ -1418,6 +1432,8 @@ fn main() -> i32 {
     0
 }
 `
+	serverSrc = setPort(serverSrc, 18088, port)
+	clientSrc = setPort(clientSrc, 18088, port)
 	serverPath := filepath.Join(dir, "server.zx")
 	clientPath := filepath.Join(dir, "client.zx")
 	if err := os.WriteFile(serverPath, []byte(serverSrc), 0o644); err != nil {
@@ -1448,7 +1464,7 @@ fn main() -> i32 {
 	}
 	defer func() { _ = server.Process.Kill() }()
 
-	if !waitPort("127.0.0.1:18088") {
+	if !waitPort(addr) {
 		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
 	}
 
@@ -1491,6 +1507,7 @@ func TestStdHTTPStaticFiles(t *testing.T) {
 		t.Skip("no C compiler available")
 	}
 
+	port, addr := freePort(t)
 	dir := t.TempDir()
 	web := filepath.Join(dir, "web")
 	if err := os.MkdirAll(web, 0o755); err != nil {
@@ -1545,6 +1562,7 @@ fn main() -> i32 {
     0
 }
 `
+	serverSrc = setPort(serverSrc, 18089, port)
 	serverPath := filepath.Join(dir, "server.zx")
 	if err := os.WriteFile(serverPath, []byte(serverSrc), 0o644); err != nil {
 		t.Fatal(err)
@@ -1565,11 +1583,11 @@ fn main() -> i32 {
 	}
 	defer func() { _ = server.Process.Kill() }()
 
-	if !waitPort("127.0.0.1:18089") {
+	if !waitPort(addr) {
 		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
 	}
 
-	base := "http://127.0.0.1:18089"
+	base := "http://" + addr
 	get := func(path string) (int, string, []byte) {
 		resp, err := stdhttp.Get(base + path)
 		if err != nil {
@@ -1652,8 +1670,29 @@ func tcpPort(t *testing.T, ln net.Listener) int {
 	return addr.Port
 }
 
-// waitPort reports whether addr accepts a TCP connection within the startup
-// timeout used by the integration tests.
+// freePort reserves a loopback port for an integration test. Tests must not
+// hard-code ports: a stray daemon (or a second `go test` process) can already
+// own one, and the test then talks to that process instead of its own server —
+// a confusing failure that also makes the suite non-reentrant. The listener is
+// closed immediately so the Zexi server can bind the port; the window is small
+// and the OS does not hand the same ephemeral port to two callers back to back.
+func freePort(t *testing.T) (int, string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port, "127.0.0.1:" + strconv.Itoa(port)
+}
+
+// setPort rewrites a test's Zexi source, replacing the fixed port literal it
+// was written with by the ephemeral port the test actually reserved.
+func setPort(src string, was, port int) string {
+	return strings.ReplaceAll(src, strconv.Itoa(was), strconv.Itoa(port))
+}
+
 // TestKeepAliveAndPartialHead drives the embedded http server with raw TCP:
 // two requests on one keep-alive connection must both be answered with
 // `Connection: keep-alive`, a `Connection: close` request must close the
@@ -1669,6 +1708,7 @@ func TestKeepAliveAndPartialHead(t *testing.T) {
 		t.Skip("no C compiler available")
 	}
 
+	port, addr := freePort(t)
 	dir := t.TempDir()
 	src := `use http;
 
@@ -1684,6 +1724,7 @@ fn main() -> i32 {
     0
 }
 `
+	src = setPort(src, 18096, port)
 	mainPath := filepath.Join(dir, "main.zx")
 	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
 		t.Fatal(err)
@@ -1703,7 +1744,7 @@ fn main() -> i32 {
 		t.Fatalf("starting server: %v", err)
 	}
 	defer func() { _ = server.Process.Kill() }()
-	if !waitPort("127.0.0.1:18096") {
+	if !waitPort(addr) {
 		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
 	}
 
@@ -1750,7 +1791,7 @@ fn main() -> i32 {
 	}
 
 	// One connection, two requests: both must be keep-alive.
-	c, err := net.DialTimeout("tcp", "127.0.0.1:18096", 2*time.Second)
+	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1772,7 +1813,7 @@ fn main() -> i32 {
 
 	// A stalled half-head must get a prompt 400 and a close (not a keep-alive
 	// idle hold): it counts as the third budgeted request, so the server exits.
-	c2, err := net.DialTimeout("tcp", "127.0.0.1:18096", 2*time.Second)
+	c2, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1818,6 +1859,7 @@ func TestPoolBudgetShutdownKeepAlive(t *testing.T) {
 		t.Skip("no C compiler available")
 	}
 
+	port, addr := freePort(t)
 	dir := t.TempDir()
 	src := `use http;
 
@@ -1830,6 +1872,7 @@ fn main() -> i32 {
     0
 }
 `
+	src = setPort(src, 18097, port)
 	mainPath := filepath.Join(dir, "main.zx")
 	if err := os.WriteFile(mainPath, []byte(src), 0o644); err != nil {
 		t.Fatal(err)
@@ -1849,12 +1892,12 @@ fn main() -> i32 {
 		t.Fatalf("starting server: %v", err)
 	}
 	defer func() { _ = server.Process.Kill() }()
-	if !waitPort("127.0.0.1:18097") {
+	if !waitPort(addr) {
 		t.Fatalf("server never started listening; output:\n%s", srvOut.String())
 	}
 
 	// All 3 budgeted requests over ONE keep-alive connection.
-	c, err := net.DialTimeout("tcp", "127.0.0.1:18097", 2*time.Second)
+	c, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1892,6 +1935,8 @@ fn main() -> i32 {
 	}
 }
 
+// waitPort reports whether addr accepts a TCP connection within the startup
+// timeout used by the integration tests.
 func waitPort(addr string) bool {
 	const timeout = 5 * time.Second
 	deadline := time.Now().Add(timeout)
@@ -2613,6 +2658,186 @@ fn main() -> i32 {
 		t.Fatalf("running edge-case program: %v", err)
 	}
 	want := "false 7\ntrue 99\n0\n-1\n0 0\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestThreadChannelTimeoutAndSelect pins the deadline and select APIs added
+// for next_http.md §5: a timed receive that expires, one that succeeds, a
+// two-channel select, and close waking both a select and a timed receiver.
+func TestThreadChannelTimeoutAndSelect(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "select.zx")
+	src := `use thread;
+
+fn main() -> i32 {
+    let a = Chan::new(1);
+    let b = Chan::new(1);
+    let mut which: i64 = -1;
+    let mut v: i64 = 0;
+
+    println(chan_select2(a.id(), b.id(), 20, &mut which, &mut v));  // 2 timeout
+    b.send(7);
+    println(chan_select2(a.id(), b.id(), 100, &mut which, &mut v)); // 1
+    println(which, v);                                              // 1 7
+
+    println(a.recv_timeout(&mut v, 20));                            // 2
+    println(a.send_timeout(9, 20));                                 // 1
+    println(a.recv_timeout(&mut v, 20), v);                         // 1 9
+
+    a.close();
+    println(a.recv_timeout(&mut v, 20));                            // 0
+    b.close();
+    println(chan_select2(a.id(), b.id(), 100, &mut which, &mut v)); // 0
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "select")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build channel timeout/select program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running channel timeout/select program: %v", err)
+	}
+	want := "2\n1\n1 7\n2\n1\n1 9\n0\n0\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestThreadTypedChan checks the compiler-backed typed channel: sizeof::<T>()
+// sizes a C-allocated queue, a worker sends owning Strings through an i64
+// handle, and close wakes the receiver after the buffer drains.
+func TestThreadTypedChan(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "typed_chan.zx")
+	src := `use thread;
+
+fn producer(h: i64) -> i64 {
+    let mut i: i64 = 0;
+    while i < 3 {
+        let s = String::from("item");
+        tchan_send::<String>(h, s);
+        i += 1;
+    }
+    tchan_close::<String>(h);
+    0
+}
+
+fn main() -> i32 {
+    let ch = tchan_new::<i64>(2);
+    tchan_free::<i64>(ch);
+
+    let strch = tchan_new::<String>(2);
+    let t = Thread::spawn(producer, strch);
+    let mut v = String::from("");
+    while tchan_recv::<String>(strch, &mut v) { println(v); }
+    t.join();
+    tchan_free::<String>(strch);
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "typed_chan")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build typed-channel program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running typed-channel program: %v", err)
+	}
+	if got, want := string(raw), "item\nitem\nitem\n"; got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestStdSyncTypedLocks checks the typed Mutex<T>/RwLock<T> wrappers from the
+// embedded sync module: guards carry the protected T, get_mut reaches it, and
+// try_lock reports contention instead of blocking.
+func TestStdSyncTypedLocks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "locks.zx")
+	src := `use sync;
+
+fn main() -> i32 {
+    let counter = Mutex::<i64>::new(0);
+    println(counter.ok());
+
+    let mut g = counter.lock();
+    *g.get_mut() += 1;
+    println(g.get());
+    // A second lock would deadlock; try_lock must report it instead.
+    match counter.try_lock() {
+        Some(_h) => println("unexpected"),
+        None => println("busy"),
+    }
+    g.unlock();
+
+    let g2 = counter.lock();
+    println(g2.get());
+    g2.unlock();
+
+    let cfg = RwLock::<String>::new(String::from("ready"));
+    let r = cfg.read();
+    println(r.get());
+    r.unlock();
+
+    let mut w = cfg.write();
+    w.get_mut().push_str("!");
+    println(w.get());
+    w.unlock();
+
+    let ro = cfg.try_read();
+    match ro {
+        Some(h) => { println(h.get()); h.unlock(); },
+        None => println("busy"),
+    }
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "locks")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build typed-lock program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running typed-lock program: %v", err)
+	}
+	want := "true\n1\nbusy\n1\nready\nready!\nready!\n"
 	if got := string(raw); got != want {
 		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
 	}
@@ -3674,7 +3899,7 @@ func TestStandardLibraryNeedsNoCompilerC(t *testing.T) {
 		t.Error("driver.go embeds a library C file again; the module should carry its own C")
 	}
 
-	shippingC := []string{"http.zx", "json.zx", "net.zx", "regex.zx", "sys.zx", "thread.zx"}
+	shippingC := []string{"http.zx", "json.zx", "net.zx", "regex.zx", "sync.zx", "sys.zx", "thread.zx"}
 	for _, name := range shippingC {
 		src, err := os.ReadFile(filepath.Join("std", name))
 		if err != nil {
@@ -3705,6 +3930,7 @@ func TestServerRejectsBadRequests(t *testing.T) {
 	if _, err := exec.LookPath("cc"); err != nil {
 		t.Skip("no C compiler available")
 	}
+	port, addr := freePort(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "server.zx")
 	program := `use web;
@@ -3722,6 +3948,7 @@ fn main() -> i32 {
     return app.serve_local(18090);
 }
 `
+	program = setPort(program, 18090, port)
 	if err := os.WriteFile(src, []byte(program), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -3743,7 +3970,7 @@ fn main() -> i32 {
 	// exchange sends payload and returns whatever the server wrote before it
 	// closed the connection, waiting at most `wait`.
 	exchange := func(payload []byte, wait time.Duration) string {
-		conn, err := net.DialTimeout("tcp", "127.0.0.1:18090", 2*time.Second)
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 		if err != nil {
 			return ""
 		}
