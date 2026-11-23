@@ -136,8 +136,9 @@ high-level API.
 ## 8.5 Honest limitations (M0)
 
 - **IPv4 only** (`AF_INET`), no IPv6.
-- **No TLS** — plaintext HTTP; HTTPS needs a TLS stack or a syscall-level
-  binding we don't have yet.
+- **No TLS in this module** — `http` is plaintext. For HTTPS, let a library do
+  it: `zexic add curl` installs the libcurl binding, then `curl::get("https://…")`
+  handles TLS, redirects and proxies. Zexi grows no TLS code of its own.
 - **No `Content-Length` handling / chunked decoding** — the client reads until
   the server closes (`Connection: close`), which is why `http_get` requests it.
 - **Single `send`** per write, and request heads are parsed with a budget

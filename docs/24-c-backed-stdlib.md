@@ -239,8 +239,10 @@ fn main() -> i32 {
 
 `container::List` is a C doubly linked list of i64 values with `push_front`,
 `push_back`, `pop_front`, `pop_back`, `front`, `back`, `len`, `contains`,
-`remove` and `free`. Like the other handle types, it is not `Copy` and is not
-itself thread-safe — guard a shared handle with `sync::Mutex`.
+`remove` and `free`. `container::Heap` is a C min-heap with `push`, `peek`,
+`pop`, `len` and `free` (Go's `container/heap` shape). Like the other handle
+types, neither is `Copy` or thread-safe on its own — guard a shared handle with
+`sync::Mutex`.
 
 ## 24.9 Why C, and what the limits are
 

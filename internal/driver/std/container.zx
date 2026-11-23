@@ -4,6 +4,7 @@
 // Nodes and bookkeeping live in C; Zexi sees an owning handle. Values are i64,
 // matching the rest of the handle-based concurrency API. A List is not Copy,
 // so share it through its handle if workers need it (guard with sync::Mutex).
+// `Heap` is a min-heap in the same file, modeled on Go's container/heap.
 //
 //     use container;
 //
@@ -29,6 +30,13 @@ extern "C" fn zxcl_remove(h: i64, v: i64) -> i32;
 extern "C" fn zxcl_contains(h: i64, v: i64) -> i32;
 extern "C" fn zxcl_free(h: i64);
 
+extern "C" fn zxh_new() -> i64;
+extern "C" fn zxh_push(h: i64, v: i64);
+extern "C" fn zxh_pop(h: i64) -> i64;
+extern "C" fn zxh_peek(h: i64) -> i64;
+extern "C" fn zxh_len(h: i64) -> i64;
+extern "C" fn zxh_free(h: i64);
+
 pub struct List { h: i64 }
 
 impl List {
@@ -52,6 +60,22 @@ impl List {
 
     // free releases every node. Call once the list is no longer used.
     pub fn free(&self) { zxcl_free(self.h); }
+}
+
+// Heap is a C min-heap of i64 values: peek/pop return the smallest value.
+pub struct Heap { h: i64 }
+
+impl Heap {
+    pub fn new() -> Heap {
+        return Heap { h: zxh_new() };
+    }
+
+    pub fn push(&self, value: i64) { zxh_push(self.h, value); }
+    pub fn pop(&self) -> i64 { return zxh_pop(self.h); }
+    pub fn peek(&self) -> i64 { return zxh_peek(self.h); }
+    pub fn len(&self) -> i64 { return zxh_len(self.h); }
+    pub fn ok(&self) -> bool { return self.h != 0; }
+    pub fn free(&self) { zxh_free(self.h); }
 }
 
 c """
@@ -145,5 +169,75 @@ void zxcl_free(int64_t h) {
     zxcl_node *n = l->head;
     while (n) { zxcl_node *next = n->next; free(n); n = next; }
     free(l);
+}
+
+/* ---- min-heap ------------------------------------------------------------ */
+
+typedef struct {
+    int64_t *a;
+    int64_t n, cap;
+} zxh_heap;
+
+int64_t zxh_new(void) {
+    zxh_heap *h = (zxh_heap *)calloc(1, sizeof(zxh_heap));
+    return h ? (int64_t)(uintptr_t)h : 0;
+}
+
+static void zxh_grow(zxh_heap *h) {
+    if (h->n < h->cap) return;
+    int64_t want = h->cap ? h->cap * 2 : 16;
+    int64_t *na = (int64_t *)realloc(h->a, (size_t)want * sizeof(int64_t));
+    if (!na) return;
+    h->a = na;
+    h->cap = want;
+}
+
+void zxh_push(int64_t handle, int64_t v) {
+    zxh_heap *h = (zxh_heap *)(uintptr_t)handle;
+    if (!h) return;
+    zxh_grow(h);
+    if (h->n >= h->cap) return;
+    int64_t i = h->n++;
+    h->a[i] = v;
+    while (i > 0) {
+        int64_t p = (i - 1) / 2;
+        if (h->a[p] <= h->a[i]) break;
+        int64_t t = h->a[p]; h->a[p] = h->a[i]; h->a[i] = t;
+        i = p;
+    }
+}
+
+static void zxh_down(zxh_heap *h, int64_t i) {
+    for (;;) {
+        int64_t l = i * 2 + 1, r = l + 1, smallest = i;
+        if (l < h->n && h->a[l] < h->a[smallest]) smallest = l;
+        if (r < h->n && h->a[r] < h->a[smallest]) smallest = r;
+        if (smallest == i) return;
+        int64_t t = h->a[i]; h->a[i] = h->a[smallest]; h->a[smallest] = t;
+        i = smallest;
+    }
+}
+
+int64_t zxh_pop(int64_t handle) {
+    zxh_heap *h = (zxh_heap *)(uintptr_t)handle;
+    if (!h || h->n == 0) return 0;
+    int64_t top = h->a[0];
+    h->a[0] = h->a[--h->n];
+    zxh_down(h, 0);
+    return top;
+}
+int64_t zxh_peek(int64_t handle) {
+    zxh_heap *h = (zxh_heap *)(uintptr_t)handle;
+    return (h && h->n) ? h->a[0] : 0;
+}
+int64_t zxh_len(int64_t handle) {
+    zxh_heap *h = (zxh_heap *)(uintptr_t)handle;
+    return h ? h->n : 0;
+}
+void zxh_free(int64_t handle) {
+    zxh_heap *h = (zxh_heap *)(uintptr_t)handle;
+    if (!h) return;
+    free(h->a);
+    free(h);
 }
 """

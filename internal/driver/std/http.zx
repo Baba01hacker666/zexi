@@ -169,7 +169,7 @@ pub fn parse_url(raw: str) -> Url {
     let scheme = http_lower(&scheme_raw);
     if scheme.as_str() != "http" {
         if scheme.as_str() == "https" {
-            return empty_url("https is not supported (this client is plaintext HTTP only)");
+            return empty_url("https needs libcurl: run `zexic add curl`, then use curl::get (TLS handled by the library)");
         }
         return empty_url("unsupported URL scheme");
     }

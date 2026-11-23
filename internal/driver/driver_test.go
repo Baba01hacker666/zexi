@@ -1484,7 +1484,7 @@ fn main() -> i32 {
 	want := "200 text/html; charset=utf-8 hello sid=abc <h1>hello</h1>\n" +
 		"200 <h1>hello</h1>\n" +
 		"200 hi there:body text\n" +
-		"0 https is not supported (this client is plaintext HTTP only)\n" +
+		"0 https needs libcurl: run `zexic add curl`, then use curl::get (TLS handled by the library)\n" +
 		"200 abc\n" +
 		"200 zexi lang\n" +
 		"200\n" +
@@ -3580,6 +3580,46 @@ fn main() -> i32 {
 	}
 	want := "3 1 3\ntrue false\n1 3\ntrue 0\n"
 	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestStdContainerHeap checks the C min-heap: peek returns the smallest value
+// and pops come out in sorted order.
+func TestStdContainerHeap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.zx")
+	src := `use container;
+
+fn main() -> i32 {
+    let h = Heap::new();
+    h.push(5); h.push(1); h.push(9); h.push(3);
+    println(h.len(), h.peek());
+    println(h.pop(), h.pop(), h.pop(), h.pop(), h.len());
+    h.free();
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build heap program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running heap program: %v", err)
+	}
+	if got, want := string(raw), "4 1\n1 3 5 9 0\n"; got != want {
 		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
 	}
 }
