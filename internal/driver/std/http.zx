@@ -855,8 +855,20 @@ fn request_keep_alive(req: &Request) -> bool {
     return req.version.as_str() == "HTTP/1.1";
 }
 
+//
+// Both reads run under absolute deadlines (monotonic ms). The head gets head_ms
+// from the call; the body gets DEFAULT_TIMEOUT_MS from the end of the head. A
+// per-recv timeout restarts on every byte, so a client sending one byte at a
+// time would hold its worker forever; a deadline does not.
 pub fn read_request(c: &Conn) -> Request {
-    let head = c.read_head();
+    return read_request_within(c, HEAD_TIMEOUT_MS);
+}
+
+// read_request_within is read_request with the head budget chosen by the caller
+// (a server passes its header_timeout).
+pub fn read_request_within(c: &Conn, head_ms: i32) -> Request {
+    let head_deadline = zxh_now_ms() + (head_ms as i64);
+    let head = c.read_head_until(head_deadline);
     let mut req = parse_request(&head);
     req.head_bytes = head.len();
     // read_head stops one byte short of its buffer, so the last possible
@@ -871,7 +883,8 @@ pub fn read_request(c: &Conn) -> Request {
         let have = req.body.len() as i64;
         if have < want {
             let take = want - have;
-            let more = c.read_exact(take as usize);
+            let body_deadline = zxh_now_ms() + (DEFAULT_TIMEOUT_MS as i64);
+            let more = c.read_exact_until(take as usize, body_deadline);
             req.body.push_str(more);
         }
     }
@@ -1695,7 +1708,7 @@ impl Router {
     // the socket readable (the pool poller, or await_request on the serial path).
     fn serve_one(&self, c: &Conn, served: i64, started: i64) -> i32 {
         c.set_timeout(self.header_timeout_ms);
-        let mut req = read_request(c);
+        let mut req = read_request_within(c, self.header_timeout_ms);
         if req.head_overflow {
             let too_big = Response::empty(431);
             send_response(c, &too_big);

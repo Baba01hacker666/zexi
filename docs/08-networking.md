@@ -427,15 +427,20 @@ response the client has not read yet. The server drains before it closes.
 Idle keep-alive connections no longer hold a worker. Two idle clients on a
 2-worker pool leave a new client answered in about 1 ms (it took 5 s before).
 
-One limit remains honest: a client that sends *part* of a head occupies a worker
-until the head deadline expires, then gets a prompt `400` and a close. The
-poller hands a connection over when its first byte arrives, not when its whole
-head does, so a head that trickles in still parks a worker. The bench numbers
-for this (`bench/http-results.md`, 8 stalled heads against 8 workers delayed one
-normal request by ~1.1 s; against 2 workers, ~4.4 s) were measured before the
-poller and are not re-run. Raise `workers`, lower `header_timeout`, or put a real
-edge in front when that matters. Polling the partial head in the poller is the
-next step.
+Both the head and the body are read under an **absolute** deadline. The head
+gets `header_timeout` from the call; the body gets 30 s from the end of the
+head. The earlier code reset a per-`recv` timer on every byte, so one byte every
+half second held a worker forever (measured: a probe waited 10.5 s behind two
+trickling clients, for the length of the attack). Now each trickling client holds
+a worker for at most its deadline, then gets `400` (head) or is closed (body).
+
+One limit remains honest: a client that sends *part* of a head still occupies a
+worker for up to `header_timeout`. The poller hands a connection over when its
+first byte arrives, not when its whole head does. With 2 workers and 2 trickling
+clients, a normal request waits about one deadline. Raise `workers`, lower
+`header_timeout`, or put a real edge in front when that matters. Holding partial
+heads in the poller (no worker until the head is complete) is the next step; it
+is listed in `next_http.md`.
 
 ### Measured scale (2-core x86_64, 2026-10-31)
 

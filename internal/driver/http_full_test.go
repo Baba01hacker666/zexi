@@ -572,3 +572,128 @@ func TestHTTPFullTraversalIsBlocked(t *testing.T) {
 		})
 	}
 }
+
+// TestPipelinedRequestsAreAnswered checks that requests pipelined on one
+// connection each get an answer, including when the blank line that ends a
+// head is split across two writes. The second request must not be read as
+// part of the first request's head (that merged its headers into the first).
+func TestPipelinedRequestsAreAnswered(t *testing.T) {
+	bin := buildFullExample(t)
+	srv := startFullServer(t, bin, filepath.Join(t.TempDir(), "notes.json"), "2")
+	last := "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+	cases := []struct {
+		name   string
+		chunks []string
+	}{
+		{"both in one write", []string{"GET /health HTTP/1.1\r\nHost: x\r\n\r\n" + last}},
+		{"blank line split across writes", []string{"GET /health HTTP/1.1\r\nHost: x\r\n\r", "\n" + last}},
+		{"blank line split one byte at a time", []string{"GET /health HTTP/1.1\r\nHost: x\r\n", "\r", "\n", last}},
+		{"POST body then pipelined GET", []string{"POST /api/notes HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 7\r\n\r\n{\"a\":1}" + last}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := dialExample(t, srv.addr)
+			defer conn.Close()
+			for i, c := range tc.chunks {
+				if i > 0 {
+					time.Sleep(100 * time.Millisecond)
+				}
+				if _, err := io.WriteString(conn, c); err != nil {
+					t.Fatal(err)
+				}
+			}
+			br := bufio.NewReader(conn)
+			req, err := stdhttp.NewRequest("GET", "http://"+srv.addr+"/health", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The first response, then the second, which closes the connection.
+			r1, err := stdhttp.ReadResponse(br, req)
+			if err != nil {
+				t.Fatalf("first response: %v", err)
+			}
+			io.Copy(io.Discard, r1.Body)
+			r1.Body.Close()
+			if tc.name == "POST body then pipelined GET" {
+				// The POST is answered (401: no key), the GET after it is 200.
+				if r1.StatusCode != 401 {
+					t.Fatalf("POST answered %d, want 401", r1.StatusCode)
+				}
+				r2, err := stdhttp.ReadResponse(br, req)
+				if err != nil {
+					t.Fatalf("pipelined GET after the POST got no answer: %v", err)
+				}
+				io.Copy(io.Discard, r2.Body)
+				r2.Body.Close()
+				wantStatus(t, r2, 200)
+				return
+			}
+			wantStatus(t, r1, 200)
+			r2, err := stdhttp.ReadResponse(br, req)
+			if err != nil {
+				t.Fatalf("pipelined request got no answer: %v", err)
+			}
+			io.Copy(io.Discard, r2.Body)
+			r2.Body.Close()
+			wantStatus(t, r2, 200)
+		})
+	}
+}
+
+// TestTricklingHeadCannotHoldWorkers opens more trickling connections than the
+// pool has workers. Each sends a header line every 300 ms and never ends its
+// head. The head deadline is absolute, so each such connection is cut off
+// after about a second, and a normal client still gets an answer while the
+// trickling lasts. Before the deadline was absolute, the trickle restarted the
+// per-recv timer and the probe waited for the whole attack.
+func TestTricklingHeadCannotHoldWorkers(t *testing.T) {
+	bin := buildFullExample(t)
+	srv := startFullServer(t, bin, filepath.Join(t.TempDir(), "notes.json"), "2")
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := net.DialTimeout("tcp", srv.addr, 5*time.Second)
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			fmt.Fprintf(c, "GET /health HTTP/1.1\r\nHost: x\r\n")
+			tick := time.NewTicker(300 * time.Millisecond)
+			defer tick.Stop()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-tick.C:
+					if _, err := fmt.Fprintf(c, "X-Slow: a\r\n"); err != nil {
+						return
+					}
+				}
+			}
+		}()
+	}
+	time.Sleep(1500 * time.Millisecond)
+	start := time.Now()
+	probe := dialExample(t, srv.addr)
+	defer probe.Close()
+	fmt.Fprintf(probe, "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+	req, err := stdhttp.NewRequest("GET", "http://"+srv.addr+"/health", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := stdhttp.ReadResponse(bufio.NewReader(probe), req)
+	waited := time.Since(start)
+	if err != nil {
+		t.Fatalf("probe got no answer behind trickling heads: %v", err)
+	}
+	resp.Body.Close()
+	wantStatus(t, resp, 200)
+	if waited > 3*time.Second {
+		t.Errorf("probe waited %v behind trickling heads; the head deadline should cut them off in about 1 s", waited)
+	}
+	close(stop)
+	wg.Wait()
+}
