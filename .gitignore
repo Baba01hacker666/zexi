@@ -32,3 +32,6 @@ coverage.out
 
 # Python tooling cache
 __pycache__/
+
+# Notes written by examples/http_full.zx
+/examples/http_full_data/

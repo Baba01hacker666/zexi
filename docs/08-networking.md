@@ -347,9 +347,10 @@ dispatches, writes, closes, and only then looks at the next connection. That is
 fine for a laptop demo and wrong for anything with two visitors — a single slow
 request, or a client that connects and sends nothing, stalls everyone behind it.
 
-A **worker pool** fixes that by letting several OS threads accept on the *same*
-listening socket. The kernel hands each new connection to whichever thread is
-idle, so a slow request only occupies its own worker:
+A **worker pool** fixes that. One poller thread owns `accept()` and every idle
+keep-alive socket; it waits on them with `poll()`. A connection goes to a worker
+only when a request is waiting on it, so an idle client costs a poll slot, not a
+thread. A slow request occupies only its own worker:
 
 <!-- check-only -->
 ```zx
@@ -382,11 +383,10 @@ slot number. The default mux already lives in slot 0, so it needs no copy. Three
 slots are available for explicit routers; if all are busy, `serve_workers*`
 falls back to serving on the calling thread instead of failing.
 
-Shutdown is cooperative. Workers accept with `accept_timeout` (see §8.8) so each
-one notices the stop flag within `WORKER_POLL_MS` (100 ms) instead of blocking
-forever. Every pool entry point puts the listener in non-blocking mode first: two
-workers can wake for the same connection, and without `O_NONBLOCK` the loser
-blocks in `accept()` forever, which used to hang budget shutdown entirely. A
+Shutdown is cooperative. The poller wakes at least every 50 ms and workers wait on
+a condition variable with a 100 ms timeout (`WORKER_POLL_MS`), so each notices the
+stop flag promptly instead of blocking forever. The listener is non-blocking, so
+`accept()` in the poller never blocks. A
 request budget (`*_n` calls) is how tests and one-shot tools exit
 deterministically: the budget counts **requests**, not connections, so a
 keep-alive connection that carries the whole budget still triggers it — the
@@ -406,7 +406,9 @@ so every accepted connection carries deadlines:
 
 | Deadline | Default | What it stops |
 | --- | --- | --- |
-| first byte | 250 ms (`FIRST_BYTE_MS`) | a socket that connects and sends nothing |
+| first byte | 1 s (`header_timeout`) | a socket that connects and sends nothing; the poller drops it without an answer |
+| keep-alive idle | 5 s (`KEEPALIVE_IDLE_MS`) | an idle keep-alive connection; the poller closes it without an answer |
+| connection lifetime | 30 s (`CONNECTION_LIFETIME_MS`) | a keep-alive connection that stays open too long; closed by the poller |
 | request head | 1 s (`HEAD_TIMEOUT_MS`), `app.header_timeout(ms)` | a head sent a byte at a time |
 | body and I/O | 30 s (`DEFAULT_TIMEOUT_MS`) | a client that stalls mid-body or stops reading |
 
@@ -422,14 +424,23 @@ The last column matters for the same reason the timeouts do: closing a socket
 that still has unread bytes makes the kernel send RST, which can destroy the
 response the client has not read yet. The server drains before it closes.
 
-One limit remains honest: a client that sends *part* of a head occupies a worker
-until the head deadline expires, then gets a prompt `400` and a close. Measured
-(`bench/http-results.md`): 8 stalled heads against 8 workers delayed one normal
-request by ~1.1 s; against 2 workers, ~4.4 s — roughly `stalled / workers × 1 s`.
-Raise `workers`, lower `header_timeout`, or put a real edge in front when that
-matters. A per-worker list of pending half-read heads (poll instead of park) is
-the next step, and the pieces it needs (`poll_read`, `wait_readable`,
-per-connection buffers) are already in `net`.
+Idle keep-alive connections no longer hold a worker. Two idle clients on a
+2-worker pool leave a new client answered in about 1 ms (it took 5 s before).
+
+Both the head and the body are read under an **absolute** deadline. The head
+gets `header_timeout` from the call; the body gets 30 s from the end of the
+head. The earlier code reset a per-`recv` timer on every byte, so one byte every
+half second held a worker forever (measured: a probe waited 10.5 s behind two
+trickling clients, for the length of the attack). Now each trickling client holds
+a worker for at most its deadline, then gets `400` (head) or is closed (body).
+
+One limit remains honest: a client that sends *part* of a head still occupies a
+worker for up to `header_timeout`. The poller hands a connection over when its
+first byte arrives, not when its whole head does. With 2 workers and 2 trickling
+clients, a normal request waits about one deadline. Raise `workers`, lower
+`header_timeout`, or put a real edge in front when that matters. Holding partial
+heads in the poller (no worker until the head is complete) is the next step; it
+is listed in `next_http.md`.
 
 ### Measured scale (2-core x86_64, 2026-10-31)
 

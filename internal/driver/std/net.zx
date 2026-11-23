@@ -47,6 +47,9 @@ extern "C" fn zxn_set_nodelay(fd: i32) -> i32;
 extern "C" fn zxn_send_all(fd: i32, buf: str, n: i32) -> i32;
 extern "C" fn zxn_recv(fd: i32, buf: &mut [u8; 8192], cap: usize) -> i32;
 extern "C" fn zxn_read_head(fd: i32, buf: &mut [u8; 8192], cap: i32) -> i32;
+extern "C" fn zxn_read_head_until(fd: i32, buf: &mut [u8; 8192], cap: i32, deadline: i64) -> i32;
+extern "C" fn zxn_read_until(fd: i32, buf: &mut [u8; 8192], want: i32, deadline: i64) -> i32;
+extern "C" fn zxn_mono_ms() -> i64;
 extern "C" fn zxn_close(fd: i32) -> i32;
 
 // File helpers share the opt-in POSIX C shim with sockets. Keeping the ABI
@@ -353,6 +356,39 @@ impl Conn {
         return out;
     }
 
+    // read_head_until is read_head under one absolute deadline (monotonic ms,
+    // see zxn_mono_ms). read_head's socket timeout restarts with every recv, so
+    // a client that sends one byte at a time never times out; this one does.
+    // Whatever arrived before the deadline is returned.
+    pub fn read_head_until(&self, deadline: i64) -> String {
+        let mut out = String::new();
+        let mut buf: [u8; 8192] = [0; 8192];
+        let n = zxn_read_head_until(self.fd, &mut buf, RECV_BUF as i32, deadline);
+        if n > 0 {
+            out.push_bytes(buf[0..n as usize]);
+        }
+        return out;
+    }
+
+    // read_exact_until reads up to n bytes under one absolute deadline. The
+    // same trickling client that defeats read_exact's per-recv timeout cannot
+    // hold the connection past `deadline`.
+    pub fn read_exact_until(&self, n: usize, deadline: i64) -> String {
+        let mut out = String::with_capacity(if n < RECV_BUF { n } else { RECV_BUF });
+        let mut buf: [u8; 8192] = [0; 8192];
+        let mut left = n;
+        while left > 0 {
+            let want = if left < RECV_BUF { left } else { RECV_BUF };
+            let got = zxn_read_until(self.fd, &mut buf, want as i32, deadline);
+            if got <= 0 {
+                break;
+            }
+            out.push_bytes(buf[0..got as usize]);
+            left = left - (got as usize);
+        }
+        return out;
+    }
+
     // read_exact reads up to n bytes (fewer only at EOF or on error).
     pub fn read_exact(&self, n: usize) -> String {
         let mut out = String::with_capacity(if n < RECV_BUF { n } else { RECV_BUF });
@@ -563,6 +599,8 @@ extern char *realpath(const char *, char *);
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/select.h>
+#include <poll.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -753,20 +791,19 @@ int zxn_close(int fd) { return close(fd); }
  * Returns 1 when readable, 0 on timeout, -1 on error/closed descriptor. */
 int zxn_poll_read(int fd, int ms) {
     if (fd < 0) return -1;
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(fd, &rfds);
-    struct timeval tv;
+    /* poll, not select: select() cannot watch a descriptor at or above
+     * FD_SETSIZE (1024), and a busy server reaches that long before its
+     * connection count is high. */
+    struct pollfd p;
+    p.fd = fd;
+    p.events = POLLIN;
+    p.revents = 0;
     if (ms < 0) ms = 0;
-    tv.tv_sec = ms / 1000;
-    tv.tv_usec = (ms % 1000) * 1000;
     for (;;) {
-        int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
-        if (rc >= 0) return rc > 0 ? 1 : 0;
+        int rc = poll(&p, 1, ms);
+        if (rc > 0) return p.revents != 0 ? 1 : 0;   /* EOF and errors read as ready */
+        if (rc == 0) return 0;
         if (errno != EINTR) return -1;
-        /* Rebuild the set: select may clear it on interruption. */
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
     }
 }
 
@@ -999,16 +1036,92 @@ int32_t zxn_read_head(int32_t fd, zx_arr8192_u8 *bp, int32_t cap) {
             break;                       /* timeout or error: keep what we have */
         }
         if (avail == 0) break;            /* peer closed */
-        int want = (int)avail;
-        int end = 0;
-        for (int i = 0; i + 3 < want; i++) {
-            if (buf[total + i] == '\r' && buf[total + i + 1] == '\n' &&
-                buf[total + i + 2] == '\r' && buf[total + i + 3] == '\n') {
+        /* The peeked bytes sit at buf[total ..]. A blank line can straddle the
+         * previous read (its \r\n\r went out, its \n arrives now), so the scan
+         * starts 3 bytes back and works in absolute offsets. Starting at the
+         * new bytes alone let the head run past its blank line into the next
+         * pipelined request, which then arrived as this request's headers. */
+        int from = total >= 3 ? total - 3 : 0;
+        int limit = total + (int)avail;
+        int end = 0;                      /* absolute length of the head, or 0 */
+        for (int i = from; i + 3 < limit; i++) {
+            if (buf[i] == '\r' && buf[i + 1] == '\n' &&
+                buf[i + 2] == '\r' && buf[i + 3] == '\n') {
                 end = i + 4;
                 break;
             }
         }
-        if (end > 0) want = end;
+        int want = end > 0 ? end - total : (int)avail;
+        ssize_t got = recv(fd, buf + total, (size_t)want, 0);
+        if (got <= 0) {
+            if (got < 0 && errno == EINTR) continue;
+            break;
+        }
+        total += (int)got;
+        if (end > 0 && got == want) break;
+    }
+    buf[total] = '\0';
+    return total;
+}
+
+/* zxn_mono_ms is the monotonic clock in milliseconds: the base for deadlines
+ * (the same clock as zxh_now_ms in the http module). */
+int64_t zxn_mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* zxn_wait_deadline waits until fd is readable (1), the monotonic deadline
+ * passes (0), or poll fails (-1). */
+static int zxn_wait_deadline(int fd, int64_t deadline) {
+    for (;;) {
+        int64_t left = deadline - zxn_mono_ms();
+        if (left <= 0) return 0;
+        int ms = left > (1 << 30) ? (1 << 30) : (int)left;
+        int r = zxn_poll_read(fd, ms);
+        if (r > 0) return 1;
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+    }
+}
+
+/* zxn_read_until reads up to want bytes, waiting no later than the monotonic
+ * deadline. Returns the count (0 on deadline, EOF, or error). */
+int32_t zxn_read_until(int32_t fd, zx_arr8192_u8 *bp, int32_t want, int64_t deadline) {
+    if (zxn_wait_deadline(fd, deadline) != 1) return 0;
+    return zxn_recv(fd, bp, (size_t)want);
+}
+
+/* zxn_read_head_until is zxn_read_head with a deadline on the whole head. It
+ * waits for data with poll before each peek, so the wait is bounded by the
+ * deadline and not by the per-recv socket timeout. */
+int32_t zxn_read_head_until(int32_t fd, zx_arr8192_u8 *bp, int32_t cap, int64_t deadline) {
+    char *buf = ZXN_BYTES(bp);
+    int total = 0;
+    if (cap < 5) return 0;
+    while (total < cap - 1) {
+        if (zxn_wait_deadline(fd, deadline) != 1) break;
+        int room = cap - 1 - total;
+        ssize_t avail = recv(fd, buf + total, (size_t)room, MSG_PEEK);
+        if (avail < 0) {
+            if (errno == EINTR || errno == EAGAIN) continue;
+            break;
+        }
+        if (avail == 0) break;
+        int from = total >= 3 ? total - 3 : 0;
+        int limit = total + (int)avail;
+        int end = 0;
+        for (int i = from; i + 3 < limit; i++) {
+            if (buf[i] == '\r' && buf[i + 1] == '\n' &&
+                buf[i + 2] == '\r' && buf[i + 3] == '\n') {
+                end = i + 4;
+                break;
+            }
+        }
+        int want = end > 0 ? end - total : (int)avail;
         ssize_t got = recv(fd, buf + total, (size_t)want, 0);
         if (got <= 0) {
             if (got < 0 && errno == EINTR) continue;

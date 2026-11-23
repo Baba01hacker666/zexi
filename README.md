@@ -278,7 +278,8 @@ go run ./cmd/zexic run tests/sugar.zx     # break-with-value, Type::new(..), pri
 go run ./cmd/zexic run tests/pi.zx        # 30 digits of π: big-int + Machin's formula
 go run ./cmd/zexic run examples/project                      # a multi-file project: mod + folder package + facade
 go run ./cmd/zexic run examples/site                        # a pooled site: templates, folders, JSON API
-go run ./cmd/zexic run examples/http_app.zx                  # Go-style default mux: handle_get + listen
+go run ./cmd/zexic run examples/http_app.zx                  # LEAN HTTP server: handle_get + listen (port 8000)
+go run ./cmd/zexic run examples/http_full.zx -- 8080 4       # FULL HTTP server: notes app, JSON API, forms, workers
 go run ./cmd/zexic run examples/static_server.zx -- .         # one-call static server
 go run ./cmd/zexic run examples/local_tools.zx -- release-42  # local os + regex helpers
 go run ./cmd/zexic run examples/zxutils -- ls examples       # BusyBox-style ls, cat, grep, wc, head, tail, find, sort, uniq
@@ -291,6 +292,18 @@ go run ./cmd/zexic run examples/hello.zx
 go run ./cmd/zexic emit --emit=c tests/tour.zx   # inspect the generated C
 go run ./cmd/zexic emit --emit=mir tests/tour.zx # inspect the control-flow IR
 ```
+
+Two high-level HTTP servers are offered as ready-to-run options. Both use the
+embedded `import http.server;` module, so they need no C file:
+
+| Option | File | What it is |
+| --- | --- | --- |
+| Lean | [`examples/http_app.zx`](examples/http_app.zx) | About 80 lines: a few routes, `{name}` parameters, and the default mux. Start here. |
+| Full | [`examples/http_full.zx`](examples/http_full.zx) | The lean server grown into a notes app: an HTML page with forms, a JSON API (list, search, create, read, PUT, PATCH, DELETE), API-key checks on writes, CORS preflight, middleware, static files, JSON file storage, and a worker pool. Its design notes are in the file header, and it serves [`examples/http_full_www`](examples/http_full_www) under `/static/`. |
+
+The full server reads `ZEXI_API_KEY` (default `dev-key`) and stores its data in
+`examples/http_full_data/notes.json`, which is git-ignored. Arguments are
+`[port] [workers] [max-requests]`.
 
 `hello.zx` links to a ~18 KB native ELF. The backend emits C and hands it to the
 system C compiler; see [`docs/06-backend-strategy.md`](docs/06-backend-strategy.md)

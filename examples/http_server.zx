@@ -1,58 +1,630 @@
 // examples/http_server.zx
 //
-// A tiny HTTP server written in Zexi. It serves a few routes and echoes the
-// length of any request body. Run it with:
+// A complete HTTP/1.1 server written in Zexi, built on the socket layer in
+// lib/http.zx. It shows what a hand-rolled server needs: request framing with
+// Content-Length bodies, keep-alive, method and version checks, query and
+// form decoding, cookies, redirects, static files with traversal protection,
+// binary responses, HEAD and OPTIONS, JSON and HTML output, a request log, and
+// a clean shutdown.
+//
+// Run it (the first file is the program, lib/http.zx is compiled into it):
 //
 //     zexic run examples/http_server.zx lib/http.zx
 //
-// then, from another terminal:
+// Optional arguments come after `--`:
 //
-//     curl http://127.0.0.1:9090/
-//     curl http://127.0.0.1:9090/pi
-//     curl -d 'hello' http://127.0.0.1:9090/echo
+//     zexic run examples/http_server.zx lib/http.zx -- 8080       # port
+//     zexic run examples/http_server.zx lib/http.zx -- 8080 50    # exit after 50 requests
+//
+// The server listens on 127.0.0.1 only. Try, from another terminal:
+//
+//     curl -i http://127.0.0.1:9090/
+//     curl -i http://127.0.0.1:9090/health
+//     curl -i 'http://127.0.0.1:9090/query?name=Ada&lang=zexi'
+//     curl -i -d 'name=Ada&msg=hi' http://127.0.0.1:9090/form
+//     curl -i -X POST -d 'hello' http://127.0.0.1:9090/echo
+//     curl -i -H 'Cookie: theme=dark' http://127.0.0.1:9090/cookies
+//     curl -i http://127.0.0.1:9090/static/style.css
+//     curl -i --head http://127.0.0.1:9090/time
+//     curl -i http://127.0.0.1:9090/nothing-here
+//     curl -i -X DELETE http://127.0.0.1:9090/health       # 405 with Allow
+//
+// Every route is listed on the index page at `/`.
 
-struct Reply { status: i32, body: String }
+use fs;
+use sys;
 
-fn route(req: &Request) -> Reply {
-    if req.path == "/" {
-        return Reply { status: 200, body: String::from("Welcome to a server written in Zexi!\n") };
+// ---------------------------------------------------------------------------
+// Routing table
+// ---------------------------------------------------------------------------
+
+const R_NONE: i32 = 0;
+const R_INDEX: i32 = 1;
+const R_HEALTH: i32 = 2;
+const R_PI: i32 = 3;
+const R_ECHO: i32 = 4;
+const R_TIME: i32 = 5;
+const R_HEADERS: i32 = 6;
+const R_QUERY: i32 = 7;
+const R_FORM: i32 = 8;
+const R_GREET: i32 = 9;
+const R_STATUS: i32 = 10;
+const R_REDIRECT: i32 = 11;
+const R_COOKIES: i32 = 12;
+const R_COOKIE_SET: i32 = 13;
+const R_COOKIE_CLEAR: i32 = 14;
+const R_BYTES: i32 = 15;
+const R_STATS: i32 = 16;
+const R_SHUTDOWN: i32 = 17;
+const R_STATIC: i32 = 18;
+
+/// Largest body `/bytes/{n}` will produce.
+const BYTES_MAX: i64 = 1048576;
+
+/// Map a request path to a route id, or `R_NONE` for an unknown path.
+fn match_route(p: &String) -> i32 {
+    if p == "/" { return R_INDEX; }
+    if p == "/health" { return R_HEALTH; }
+    if p == "/pi" { return R_PI; }
+    if p == "/echo" { return R_ECHO; }
+    if p == "/time" { return R_TIME; }
+    if p == "/headers" { return R_HEADERS; }
+    if p == "/query" { return R_QUERY; }
+    if p == "/form" { return R_FORM; }
+    if p == "/redirect" { return R_REDIRECT; }
+    if p == "/cookies" { return R_COOKIES; }
+    if p == "/cookies/set" { return R_COOKIE_SET; }
+    if p == "/cookies/clear" { return R_COOKIE_CLEAR; }
+    if p == "/stats" { return R_STATS; }
+    if p == "/shutdown" { return R_SHUTDOWN; }
+    if p.starts_with("/greet/") { return R_GREET; }
+    if p.starts_with("/status/") { return R_STATUS; }
+    if p.starts_with("/bytes/") { return R_BYTES; }
+    if p == "/static" || p.starts_with("/static/") { return R_STATIC; }
+    return R_NONE;
+}
+
+/// The methods a route accepts, besides OPTIONS (which every route answers).
+fn allows(id: i32, m: str) -> bool {
+    if id == R_ECHO {
+        return m == "GET" || m == "HEAD" || m == "POST" || m == "PUT";
     }
-    if req.path == "/health" {
-        return Reply { status: 200, body: String::from("ok\n") };
+    if id == R_FORM {
+        return m == "GET" || m == "HEAD" || m == "POST";
     }
-    if req.path == "/pi" {
-        return Reply { status: 200, body: String::from("3.141592653589793238462643383279\n") };
+    if id == R_SHUTDOWN {
+        return m == "POST";
     }
-    if req.path == "/echo" {
+    return m == "GET" || m == "HEAD";
+}
+
+/// The value for an `Allow` header on route `id`.
+fn allow_header(id: i32) -> str {
+    if id == R_ECHO {
+        return "GET, HEAD, POST, PUT, OPTIONS";
+    }
+    if id == R_FORM {
+        return "GET, HEAD, POST, OPTIONS";
+    }
+    if id == R_SHUTDOWN {
+        return "POST, OPTIONS";
+    }
+    return "GET, HEAD, OPTIONS";
+}
+
+/// Methods this server knows at all. Anything else is `501 Not Implemented`.
+fn known_method(m: str) -> bool {
+    return m == "GET" || m == "HEAD" || m == "POST" || m == "PUT" || m == "DELETE" || m == "OPTIONS" || m == "PATCH";
+}
+
+// ---------------------------------------------------------------------------
+// Statistics
+// ---------------------------------------------------------------------------
+
+struct Stats {
+    started: i64,
+    total: i64,
+    ok: i64,
+    redirects: i64,
+    client_errors: i64,
+    server_errors: i64,
+    bytes_out: i64,
+}
+
+impl Stats {
+    fn new(now: i64) -> Stats {
+        return Stats {
+            started: now,
+            total: 0,
+            ok: 0,
+            redirects: 0,
+            client_errors: 0,
+            server_errors: 0,
+            bytes_out: 0,
+        };
+    }
+
+    /// Count one finished response.
+    fn record(&mut self, status: i32, bytes: usize) {
+        self.total += 1;
+        self.bytes_out += bytes as i64;
+        if status < 300 {
+            self.ok += 1;
+        } else if status < 400 {
+            self.redirects += 1;
+        } else if status < 500 {
+            self.client_errors += 1;
+        } else {
+            self.server_errors += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSON building
+// ---------------------------------------------------------------------------
+
+/// Append `"key":"value"` to a JSON object under construction. The object's
+/// opening brace is already in `out`, so a comma is added only after it.
+fn json_field(out: &mut String, key: str, value: str) {
+    if out.len() > 1 {
+        out.push_str(",");
+    }
+    let k = json_quote(key);
+    let v = json_quote(value);
+    out.push_str(k.as_str(), ":", v.as_str());
+}
+
+/// Append `"key":<raw>` where `raw` is already JSON (a number, bool, object).
+fn json_raw(out: &mut String, key: str, raw: str) {
+    if out.len() > 1 {
+        out.push_str(",");
+    }
+    let k = json_quote(key);
+    out.push_str(k.as_str(), ":", raw);
+}
+
+/// Turn `a=1&b=two%20words` (or `a=1;b=2` with `sep = ";"`) into a JSON object.
+/// Keys and values are percent-decoded and trimmed. A piece with no `=` gets
+/// an empty value.
+fn pairs_json(src: str, sep: str) -> String {
+    let mut out = String::from("{");
+    let mut rest = String::from(src);
+    while rest.len() > 0 {
+        let cut = rest.find(sep);
+        let piece = if cut < 0 { rest.clone() } else { rest.substr(0, cut as usize) };
+        let next = if cut < 0 { String::new() } else { rest.substr((cut + len(sep) as i64) as usize, 4294967295) };
+        let p = piece.trim();
+        if p.len() > 0 {
+            let eq = p.find("=");
+            let raw_key = if eq < 0 { p.clone() } else { p.substr(0, eq as usize) };
+            let raw_val = if eq < 0 { String::new() } else { p.substr((eq + 1) as usize, 4294967295) };
+            let key = url_decode(raw_key.trim().as_str());
+            let val = url_decode(raw_val.trim().as_str());
+            json_field(&mut out, key.as_str(), val.as_str());
+        }
+        rest = next;
+    }
+    out.push_str("}");
+    return out;
+}
+
+/// Turn a raw header block into a JSON object, keeping the names as sent.
+fn headers_json(headers: &String) -> String {
+    let mut out = String::from("{");
+    let mut rest = headers.clone();
+    while rest.len() > 0 {
+        let e = rest.find("\r\n");
+        let line = if e < 0 { rest.clone() } else { rest.substr(0, e as usize) };
+        let next = if e < 0 { String::new() } else { rest.substr((e + 2) as usize, 4294967295) };
+        let colon = line.find(":");
+        if colon > 0 {
+            let name = line.substr(0, colon as usize);
+            let value = line.substr((colon + 1) as usize, 4294967295);
+            json_field(&mut out, name.trim().as_str(), value.trim().as_str());
+        }
+        rest = next;
+    }
+    out.push_str("}");
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Pages
+// ---------------------------------------------------------------------------
+
+fn index_html() -> str {
+    return "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>Zexi HTTP server</title>\n<link rel=\"stylesheet\" href=\"/static/style.css\"></head>\n<body>\n<h1>Zexi HTTP server</h1>\n<p>This page is served by a web server written in Zexi, on sockets declared in <code>lib/http.zx</code>.</p>\n<h2>Routes</h2>\n<ul>\n<li><a href=\"/health\">/health</a> &mdash; JSON health report</li>\n<li><a href=\"/pi\">/pi</a> &mdash; plain text</li>\n<li><a href=\"/echo\">/echo</a> &mdash; echoes the request body (GET, POST, PUT)</li>\n<li><a href=\"/time\">/time</a> &mdash; the server clock, UTC</li>\n<li><a href=\"/headers\">/headers</a> &mdash; the request headers as JSON</li>\n<li><a href=\"/query?name=Ada&amp;lang=zexi\">/query?name=Ada&amp;lang=zexi</a> &mdash; query parameters as JSON</li>\n<li><a href=\"/form\">/form</a> &mdash; an HTML form (POST)</li>\n<li><a href=\"/greet/Ada\">/greet/{name}</a> &mdash; a path parameter</li>\n<li><a href=\"/status/418\">/status/{code}</a> &mdash; respond with any status code</li>\n<li><a href=\"/redirect?to=/health\">/redirect?to=/path</a> &mdash; 302 to a local path</li>\n<li><a href=\"/cookies\">/cookies</a> &mdash; cookies the browser sent</li>\n<li><a href=\"/cookies/set?name=theme&amp;value=dark\">/cookies/set?name=&amp;value=</a> &mdash; set a cookie</li>\n<li><a href=\"/cookies/clear?name=theme\">/cookies/clear?name=</a> &mdash; expire a cookie</li>\n<li><a href=\"/bytes/256\">/bytes/{n}</a> &mdash; n binary bytes, up to 1 MiB</li>\n<li><a href=\"/stats\">/stats</a> &mdash; request counters</li>\n<li><a href=\"/static/\">/static/</a> &mdash; files from the <code>http_www</code> folder</li>\n<li>POST <code>/shutdown</code> &mdash; stop the server</li>\n</ul>\n</body></html>\n";
+}
+
+fn form_html() -> str {
+    return "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>Form</title></head>\n<body>\n<h1>Leave a message</h1>\n<form method=\"post\" action=\"/form\">\n<label>Name <input name=\"name\"></label>\n<label>Message <input name=\"msg\"></label>\n<button type=\"submit\">Send</button>\n</form>\n</body></html>\n";
+}
+
+// ---------------------------------------------------------------------------
+// Static files
+// ---------------------------------------------------------------------------
+
+/// Serve `req_path` (which starts with `/static`) from the folder `www`.
+/// Refuses `..`, backslashes, and NUL bytes, and maps a directory to its
+/// `index.html`.
+fn serve_static(www: &String, req_path: &String) -> Answer {
+    let raw = req_path.substr(7, 4294967295);
+    let decoded = url_decode(raw.as_str());
+
+    let mut bad = decoded.find("..") >= 0 || decoded.find("\\") >= 0;
+    let mut i: usize = 0;
+    while i < decoded.len() {
+        if decoded.byte_at(i) == 0 {
+            bad = true;
+        }
+        i += 1;
+    }
+    if bad {
+        return Answer::text(403, "403 forbidden\n");
+    }
+
+    let mut rel = decoded.clone();
+    while rel.starts_with("/") {
+        rel = rel.substr(1, 4294967295);
+    }
+    let mut full = www.clone();
+    full.push_str("/");
+    full.push_str(rel.as_str());
+    if rel.len() == 0 || rel.ends_with("/") {
+        full.push_str("index.html");
+    }
+    if fs::is_dir(full.as_str()) {
+        full.push_str("/index.html");
+    }
+    if !fs::is_file(full.as_str()) {
+        return Answer::text(404, "404 not found\n");
+    }
+    match fs::read(full.as_str()) {
+        Ok(data) => {
+            let mut a = Answer::bytes(200, mime_type(full.as_str()), data);
+            a.add_header("Cache-Control", "no-cache");
+            return a;
+        }
+        Err(_) => {
+            return Answer::text(500, "500 could not read the file\n");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cookies
+// ---------------------------------------------------------------------------
+
+/// True when `s` is a non-empty name made only of letters, digits, `-`, `_`.
+fn is_token(s: str) -> bool {
+    let t = String::from(s);
+    if t.len() == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < t.len() {
+        let b = t.byte_at(i);
+        let ok = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45 || b == 95;
+        if !ok {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+fn handle(req: &Request, st: &Stats, www: &String) -> Answer {
+    let id = match_route(&req.path);
+    if id == R_NONE {
+        return Answer::text(404, "404 not found\n");
+    }
+    if req.method == "OPTIONS" {
+        let mut a = Answer::empty(204);
+        a.add_header("Allow", allow_header(id));
+        return a;
+    }
+    if !allows(id, req.method.as_str()) {
+        let mut a = Answer::text(405, "405 method not allowed\n");
+        a.add_header("Allow", allow_header(id));
+        return a;
+    }
+
+    if id == R_INDEX {
+        return Answer::html(200, index_html());
+    }
+
+    if id == R_HEALTH {
+        let mut j = String::from("{");
+        json_field(&mut j, "status", "ok");
+        json_raw(&mut j, "uptime_s", int_to_str(now_seconds() - st.started).as_str());
+        json_raw(&mut j, "requests", int_to_str(st.total).as_str());
+        j.push_str("}");
+        return Answer::json(200, j.as_str());
+    }
+
+    if id == R_PI {
+        return Answer::text(200, "3.141592653589793238462643383279\n");
+    }
+
+    if id == R_ECHO {
         let mut body = String::from("you sent ");
         push_int(&mut body, req.body.len() as i64);
         body.push_str(" byte(s): ");
-        body.push_str(req.body);
+        body.push_str(req.body.as_str());
         body.push_str("\n");
-        return Reply { status: 200, body: body };
+        return Answer::text(200, body.as_str());
     }
-    return Reply { status: 404, body: String::from("not found\n") };
+
+    if id == R_TIME {
+        let now = now_seconds();
+        let mut j = String::from("{");
+        json_raw(&mut j, "unix", int_to_str(now).as_str());
+        json_field(&mut j, "iso", iso_time(now).as_str());
+        json_field(&mut j, "http", http_date(now).as_str());
+        j.push_str("}");
+        return Answer::json(200, j.as_str());
+    }
+
+    if id == R_HEADERS {
+        return Answer::json(200, headers_json(&req.headers).as_str());
+    }
+
+    if id == R_QUERY {
+        return Answer::json(200, pairs_json(req.query.as_str(), "&").as_str());
+    }
+
+    if id == R_FORM {
+        if req.method == "GET" || req.method == "HEAD" {
+            return Answer::html(200, form_html());
+        }
+        let ct = lower_of(req.header("content-type").as_str());
+        if ct.len() > 0 && !ct.starts_with("application/x-www-form-urlencoded") {
+            return Answer::text(415, "send application/x-www-form-urlencoded\n");
+        }
+        return Answer::json(200, pairs_json(req.body.as_str(), "&").as_str());
+    }
+
+    if id == R_GREET {
+        let name = url_decode(req.path.substr(7, 4294967295).as_str());
+        if name.len() == 0 || name.len() > 100 {
+            return Answer::json(400, "{\"error\":\"give a name of 1 to 100 bytes\"}");
+        }
+        let mut greeting = String::from("Hello, ");
+        greeting.push_str(name.as_str(), "!");
+        let mut j = String::from("{");
+        json_field(&mut j, "greeting", greeting.as_str());
+        j.push_str("}");
+        return Answer::json(200, j.as_str());
+    }
+
+    if id == R_STATUS {
+        let code_text = req.path.substr(8, 4294967295);
+        if code_text.len() != 3 || !all_digits(code_text.as_str()) {
+            return Answer::json(400, "{\"error\":\"status must be three digits\"}");
+        }
+        let code = code_text.parse_i64() as i32;
+        if code < 200 || code > 599 {
+            return Answer::json(400, "{\"error\":\"status must be 200 to 599\"}");
+        }
+        let mut body = String::new();
+        push_int(&mut body, code as i64);
+        body.push_str(" ");
+        body.push_str(reason_phrase(code));
+        body.push_str("\n");
+        return Answer::text(code, body.as_str());
+    }
+
+    if id == R_REDIRECT {
+        let to = req.query_param("to");
+        if !to.starts_with("/") || to.starts_with("//") || to.find("\r") >= 0 || to.find("\n") >= 0 {
+            return Answer::json(400, "{\"error\":\"to must be a local path starting with /\"}");
+        }
+        let code_text = req.query_param("code");
+        let mut a = Answer::redirect(to.as_str());
+        if code_text.len() > 0 {
+            let code = code_text.parse_i64() as i32;
+            if code != 301 && code != 302 && code != 303 && code != 307 && code != 308 {
+                return Answer::json(400, "{\"error\":\"code must be 301, 302, 303, 307 or 308\"}");
+            }
+            a.status = code;
+        }
+        return a;
+    }
+
+    if id == R_COOKIES {
+        let jar = pairs_json(req.header("cookie").as_str(), ";");
+        return Answer::json(200, jar.as_str());
+    }
+
+    if id == R_COOKIE_SET {
+        let name = req.query_param("name");
+        let value = req.query_param("value");
+        if !is_token(name.as_str()) || !is_token(value.as_str()) {
+            return Answer::json(400, "{\"error\":\"name and value may use letters, digits, - and _ only\"}");
+        }
+        let mut a = Answer::json(200, "{\"ok\":true}");
+        let mut cookie = String::new();
+        cookie.push_str(name.as_str(), "=", value.as_str(), "; Path=/; Max-Age=3600; HttpOnly; SameSite=Lax");
+        a.add_header("Set-Cookie", cookie.as_str());
+        return a;
+    }
+
+    if id == R_COOKIE_CLEAR {
+        let name = req.query_param("name");
+        if !is_token(name.as_str()) {
+            return Answer::json(400, "{\"error\":\"name may use letters, digits, - and _ only\"}");
+        }
+        let mut a = Answer::json(200, "{\"ok\":true}");
+        let mut cookie = String::new();
+        cookie.push_str(name.as_str(), "=; Path=/; Max-Age=0");
+        a.add_header("Set-Cookie", cookie.as_str());
+        return a;
+    }
+
+    if id == R_BYTES {
+        let n_text = req.path.substr(7, 4294967295);
+        if n_text.len() == 0 || !all_digits(n_text.as_str()) || n_text.len() > 8 {
+            return Answer::json(400, "{\"error\":\"n must be a number of bytes\"}");
+        }
+        let n = n_text.parse_i64();
+        if n > BYTES_MAX {
+            return Answer::json(400, "{\"error\":\"n must be at most 1048576\"}");
+        }
+        // Byte i is i mod 256, so the body holds NULs and high bytes too.
+        let mut data = String::with_capacity(n as usize);
+        let mut i: i64 = 0;
+        while i < n {
+            data.push_byte((i % 256) as u8);
+            i += 1;
+        }
+        return Answer::bytes(200, "application/octet-stream", data);
+    }
+
+    if id == R_STATS {
+        let mut out = String::from("{");
+        json_field(&mut out, "started", iso_time(st.started).as_str());
+        json_raw(&mut out, "uptime_s", int_to_str(now_seconds() - st.started).as_str());
+        json_raw(&mut out, "requests", int_to_str(st.total).as_str());
+        json_raw(&mut out, "2xx", int_to_str(st.ok).as_str());
+        json_raw(&mut out, "3xx", int_to_str(st.redirects).as_str());
+        json_raw(&mut out, "4xx", int_to_str(st.client_errors).as_str());
+        json_raw(&mut out, "5xx", int_to_str(st.server_errors).as_str());
+        json_raw(&mut out, "bytes_out", int_to_str(st.bytes_out).as_str());
+        out.push_str("}");
+        return Answer::json(200, out.as_str());
+    }
+
+    if id == R_SHUTDOWN {
+        return Answer::text(200, "shutting down\n");
+    }
+
+    if id == R_STATIC {
+        return serve_static(www, &req.path);
+    }
+
+    return Answer::text(404, "404 not found\n");
 }
 
+// ---------------------------------------------------------------------------
+// Connection handling
+// ---------------------------------------------------------------------------
+
+/// Log one line per request to stderr (unbuffered, so it appears at once):
+/// method, path, status, body bytes sent, and handling time.
+fn log_request(method: str, path: str, status: i32, bytes: usize, ms: i64) {
+    eprintln(f"{method} {path} -> {status} ({bytes} bytes, {ms} ms)");
+}
+
+/// Answer a protocol error (the request was never handled) and log it. The
+/// connection is closed afterwards, because its framing can no longer be
+/// trusted.
+fn fail(conn: &Conn, st: &mut Stats, status: i32, t0: i64) {
+    let reason = reason_phrase(status);
+    let body = f"{status} {reason}\n";
+    let mut a = Answer::text(status, body.as_str());
+    a.add_header("Connection", "close");
+    let sent = send_answer(conn, &a, false, false);
+    let shown: usize = if sent < 0 { 0 } else { sent as usize };
+    st.record(status, shown);
+    log_request("-", "-", status, shown, sys::mono_ms() - t0);
+}
+
+/// Read and answer one request on `rd`. Returns true when the connection may
+/// stay open for another request.
+fn serve_one(rd: &mut Reader, st: &mut Stats, www: &String, budget: i64, stop: &mut bool) -> bool {
+    let inc = rd.next();
+    let t0 = sys::mono_ms();
+    if inc.raw.len() == 0 {
+        // Either the peer went away quietly (status 0) or the request was
+        // incomplete or too large, and we answer with that status.
+        if inc.status != 0 {
+            fail(&rd.conn, st, inc.status, t0);
+        }
+        return false;
+    }
+
+    let req = parse_request(&inc.raw);
+    if req.method.len() == 0 || !req.path.starts_with("/") {
+        fail(&rd.conn, st, 400, t0);
+        return false;
+    }
+    if req.version != "HTTP/1.1" && req.version != "HTTP/1.0" {
+        fail(&rd.conn, st, 505, t0);
+        return false;
+    }
+    if !known_method(req.method.as_str()) {
+        fail(&rd.conn, st, 501, t0);
+        return false;
+    }
+
+    let ans = handle(&req, st, www);
+    let head_only = req.method == "HEAD";
+    let mut keep = req.wants_keep_alive();
+
+    let is_shutdown = req.path == "/shutdown" && req.method == "POST" && ans.status == 200;
+    if is_shutdown {
+        *stop = true;
+        keep = false;
+    }
+    if budget > 0 && st.total + 1 >= budget {
+        // This answer is the last one the budget allows.
+        *stop = true;
+        keep = false;
+    }
+
+    let sent = send_answer(&rd.conn, &ans, head_only, keep);
+    let shown: usize = if sent < 0 { 0 } else { sent as usize };
+    st.record(ans.status, shown);
+    log_request(req.method.as_str(), req.path.as_str(), ans.status, shown, sys::mono_ms() - t0);
+    return keep && sent >= 0;
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
 fn main() -> i32 {
-    let srv = http_listen("127.0.0.1", 9090);
+    let port: i32 = if arg_count() > 1 { arg_at(1).parse_i64() as i32 } else { 9090 };
+    if port <= 0 || port > 65535 {
+        eprintln("usage: zexic run examples/http_server.zx lib/http.zx -- [port] [max-requests]");
+        return 2;
+    }
+    let budget: i64 = if arg_count() > 2 { arg_at(2).parse_i64() } else { 0 };
+    let www = project_dir() + "/http_www";
+
+    let srv = http_listen("127.0.0.1", port);
     if srv.fd < 0 {
-        println("error: could not bind 127.0.0.1:9090");
+        eprintln(f"error: could not bind 127.0.0.1:{port} (is the port in use?)");
         return 1;
     }
-    println("zexi server listening on http://127.0.0.1:9090/");
+    println(f"zexi server listening on http://127.0.0.1:{port}/");
 
+    let mut st = Stats::new(now_seconds());
+    let mut stop = false;
     loop {
         let c = srv.accept();
         if c.fd < 0 {
             continue;
         }
-        let raw = c.read_head();
-        let req = parse_request(&raw);
-        let reply = route(&req);
-        let resp = response(reply.status, reason_phrase(reply.status), reply.body);
-        c.write(resp);
-        c.close();
+        let mut rd = Reader::new(c);
+        let mut more = true;
+        while more {
+            more = serve_one(&mut rd, &mut st, &www, budget, &mut stop);
+        }
+        rd.conn.close();
+        if budget > 0 && st.total >= budget {
+            stop = true;
+        }
+        if stop {
+            break;
+        }
     }
-    0
+    srv.close();
+    println(f"server stopped after {st.total} request(s)");
+    return 0;
 }

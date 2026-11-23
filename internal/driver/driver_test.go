@@ -1049,6 +1049,10 @@ func TestHTTPExamplesTypeCheck(t *testing.T) {
 	}{
 		{[]string{"../../examples/http_server.zx", "../../lib/http.zx"}, "http_server.zx + lib/http.zx"},
 		{[]string{"../../examples/http_client.zx", "../../lib/http.zx"}, "http_client.zx + lib/http.zx"},
+		// The two high-level servers use the embedded `http.server` module, so
+		// they compile without lib/http.zx.
+		{[]string{"../../examples/http_app.zx"}, "http_app.zx (lean)"},
+		{[]string{"../../examples/http_full.zx"}, "http_full.zx (full)"},
 		// The site project uses the standard library only (no extra C source
 		// and no on-disk library), so it compiles on its own.
 		{[]string{"../../examples/site/main.zx"}, "site/main.zx"},

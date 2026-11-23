@@ -1,0 +1,735 @@
+// Full HTTP server: a notes app built on the same high-level `http.server`
+// module as the lean examples/http_app.zx. It adds an HTML page with forms, a
+// JSON API with validation, API-key protection on writes, middleware, static
+// files, file-backed persistence, and a pool of worker threads.
+//
+// Run:
+//   zexic run examples/http_full.zx                 -> http://127.0.0.1:8080/
+//   zexic run examples/http_full.zx -- 9000 8       -> port 9000, 8 workers
+//   zexic run examples/http_full.zx -- 9000 8 50    -> stop after 50 requests
+// Set ZEXI_API_KEY to change the write key (default "dev-key").
+//
+// Sizing: a keep-alive connection holds its worker for up to 5 s after its last
+// request (the pool's idle timeout). Pick --workers at least as large as the
+// number of clients that keep connections open at the same time.
+//
+// Try:
+//   curl http://127.0.0.1:8080/api/notes
+//   curl 'http://127.0.0.1:8080/api/notes?q=zexi&tag=welcome'
+//   curl -X POST -H 'X-Api-Key: dev-key' -H 'Content-Type: application/json' \
+//        -d '{"title":"Ship it","body":"today","tags":["work"]}' \
+//        http://127.0.0.1:8080/api/notes
+//   curl -X PATCH -H 'X-Api-Key: dev-key' -d '{"body":"edited"}' \
+//        http://127.0.0.1:8080/api/notes/2
+//   curl -X DELETE -H 'X-Api-Key: dev-key' http://127.0.0.1:8080/api/notes/2
+//
+// Storage: one JSON file, examples/http_full_data/notes.json. Every read and
+// write runs under a pthread mutex (the C block below), so worker threads never
+// interleave a read-modify-write. A save writes a temp file and renames it into
+// place, so a crash never leaves a half-written store behind.
+
+import http.server;
+use json;
+use html;
+use fs;
+use sys;
+use text;
+
+const DEFAULT_PORT: i64 = 8080;
+const DEFAULT_WORKERS: i64 = 4;
+const MAX_TITLE: usize = 120;
+const MAX_NOTE_BODY: usize = 10000;
+const MAX_TAGS: usize = 8;
+const MAX_TAG: usize = 32;
+const DEV_KEY = "dev-key";
+
+// --- the store lock ----------------------------------------------------------
+
+#[link("pthread")]
+c """
+#include <pthread.h>
+static pthread_mutex_t zxn_store_mu = PTHREAD_MUTEX_INITIALIZER;
+void zxn_store_lock(void) { pthread_mutex_lock(&zxn_store_mu); }
+void zxn_store_unlock(void) { pthread_mutex_unlock(&zxn_store_mu); }
+"""
+
+extern "C" fn zxn_store_lock();
+extern "C" fn zxn_store_unlock();
+
+// --- model and persistence ---------------------------------------------------
+
+struct Note {
+    id: i64,
+    title: String,
+    body: String,
+    tags: Vec<String>,
+    created: i64,
+    updated: i64,
+}
+
+struct Store {
+    next_id: i64,
+    notes: Vec<Note>,
+}
+
+// store_path is examples/http_full_data/notes.json, or the file named by the
+// ZEXI_NOTES_FILE environment variable (tests use this to keep data out of the
+// tree).
+fn store_path() -> String {
+    if sys::env_has("ZEXI_NOTES_FILE") {
+        return sys::env_get("ZEXI_NOTES_FILE");
+    }
+    return project_path("http_full_data/notes.json");
+}
+
+// seed_store is what a fresh install starts with.
+fn seed_store() -> Store {
+    let now = sys::time_s();
+    let mut tags: Vec<String> = Vec::new();
+    tags.push(String::from("welcome"));
+    tags.push(String::from("zexi"));
+    let mut notes: Vec<Note> = Vec::new();
+    notes.push(Note {
+        id: 1,
+        title: String::from("Welcome to Zexi"),
+        body: String::from("This note came from the seed data. Edit or delete it freely."),
+        tags: tags,
+        created: now,
+        updated: now,
+    });
+    return Store { next_id: 2, notes: notes };
+}
+
+fn note_from_json(v: &json::Value) -> Note {
+    let mut tags: Vec<String> = Vec::new();
+    let list = v.get("tags");
+    let mut i: usize = 0;
+    while i < list.len() {
+        tags.push(list.item(i).text());
+        i += 1;
+    }
+    return Note {
+        id: v.get_int("id", 0),
+        title: v.get_str("title"),
+        body: v.get_str("body"),
+        tags: tags,
+        created: v.get_int("created", 0),
+        updated: v.get_int("updated", 0),
+    };
+}
+
+fn note_json(n: &Note) -> json::Value {
+    let mut o = json::object();
+    o.set_int("id", n.id);
+    o.set_str("title", n.title.as_str());
+    o.set_str("body", n.body.as_str());
+    let mut tags = json::array();
+    for t in &n.tags {
+        tags.push_str(t.as_str());
+    }
+    o.set("tags", tags);
+    o.set_int("created", n.created);
+    o.set_int("updated", n.updated);
+    return o;
+}
+
+// load_store reads the store file. The caller must hold the lock. A missing
+// file is a fresh install; an unreadable one is moved aside, never overwritten.
+fn load_store() -> Store {
+    let path = store_path();
+    if !fs::exists(path.as_str()) {
+        return seed_store();
+    }
+    let raw = read_file(path.as_str());
+    match json::parse(raw.as_str()) {
+        Ok(doc) => {
+            let mut st = Store { next_id: doc.get_int("next_id", 1), notes: Vec::new() };
+            let list = doc.get("notes");
+            let mut i: usize = 0;
+            while i < list.len() {
+                let item = list.item(i);
+                st.notes.push(note_from_json(&item));
+                i += 1;
+            }
+            return st;
+        }
+        Err(e) => {
+            let mut aside = path.clone();
+            aside.push_str(".bad");
+            sys::rename_path(path.as_str(), aside.as_str());
+            eprintln(f"zexi: store was unreadable ({e}); moved to {aside}");
+            return seed_store();
+        }
+    }
+}
+
+// save_store writes the store atomically: temp file first, then rename. The
+// caller must hold the lock.
+fn save_store(st: &Store) -> bool {
+    let mut doc = json::object();
+    doc.set_int("next_id", st.next_id);
+    let mut arr = json::array();
+    for n in &st.notes {
+        arr.push(note_json(n));
+    }
+    doc.set("notes", arr);
+    let encoded = json::pretty(&doc, 2);
+    let path = store_path();
+    let mut tmp = path.clone();
+    tmp.push_str(".tmp");
+    if write_file(tmp.as_str(), encoded.as_str()) < 0 {
+        return false;
+    }
+    return sys::rename_path(tmp.as_str(), path.as_str()) == 0;
+}
+
+// locked_load reads the store under the lock and releases it.
+fn locked_load() -> Store {
+    zxn_store_lock();
+    let st = load_store();
+    zxn_store_unlock();
+    return st;
+}
+
+// find_index returns the position of note `id`, or -1.
+fn find_index(st: &Store, id: i64) -> i64 {
+    let mut i: usize = 0;
+    while i < st.notes.len() {
+        if st.notes[i].id == id {
+            return i as i64;
+        }
+        i += 1;
+    }
+    return -1;
+}
+
+// --- request helpers ---------------------------------------------------------
+
+// digits_value parses a plain decimal number, or returns -1.
+fn digits_value(raw: &String) -> i64 {
+    if raw.len() == 0 || raw.len() > 9 {
+        return -1;
+    }
+    let mut n: i64 = 0;
+    let mut i: usize = 0;
+    while i < raw.len() {
+        let d = raw.byte_at(i) as i64;
+        if d < 48 || d > 57 {
+            return -1;
+        }
+        n = n * 10 + (d - 48);
+        i += 1;
+    }
+    return n;
+}
+
+fn path_id(req: &Request) -> i64 {
+    let raw = req.route_param("id");
+    return digits_value(&raw);
+}
+
+fn api_error(status: i32, message: str) -> Response {
+    let mut o = json::object();
+    o.set_str("error", message);
+    return Response::json(status, json::stringify(&o).as_str());
+}
+
+// expected_key is the write key. An empty ZEXI_API_KEY falls back to the default.
+fn expected_key() -> String {
+    let k = sys::env_or("ZEXI_API_KEY", DEV_KEY);
+    if k.len() == 0 {
+        return String::from(DEV_KEY);
+    }
+    return k;
+}
+
+// api_key_of reads the key from the X-Api-Key header, or from a `key` form
+// field for the HTML forms.
+fn api_key_of(req: &Request) -> String {
+    let h = req.header("X-Api-Key");
+    if h.len() > 0 {
+        return h;
+    }
+    return query_value(&req.body, "key");
+}
+
+// check_fields validates a note document. It returns "" when the document is
+// acceptable, or the first problem it finds.
+fn check_fields(doc: &json::Value, need_title: bool) -> String {
+    if !doc.is_object() {
+        return String::from("body must be a JSON object");
+    }
+    if doc.has("title") {
+        let t = doc.get("title");
+        if !t.is_str() {
+            return String::from("title must be a string");
+        }
+        let n = t.text().len();
+        if n == 0 || n > MAX_TITLE {
+            return f"title must be 1 to {MAX_TITLE} bytes";
+        }
+    } else if need_title {
+        return String::from("title is required");
+    }
+    if doc.has("body") {
+        if !doc.get("body").is_str() {
+            return String::from("body must be a string");
+        }
+        if doc.get_str("body").len() > MAX_NOTE_BODY {
+            return f"body must be at most {MAX_NOTE_BODY} bytes";
+        }
+    }
+    if doc.has("tags") {
+        let list = doc.get("tags");
+        if !list.is_array() {
+            return String::from("tags must be an array of strings");
+        }
+        if list.len() > MAX_TAGS {
+            return f"at most {MAX_TAGS} tags";
+        }
+        let mut i: usize = 0;
+        while i < list.len() {
+            let item = list.item(i);
+            if !item.is_str() {
+                return String::from("tags must be an array of strings");
+            }
+            let n = item.text().len();
+            if n == 0 || n > MAX_TAG {
+                return f"each tag must be 1 to {MAX_TAG} bytes";
+            }
+            i += 1;
+        }
+    }
+    return String::new();
+}
+
+// apply_fields copies the fields present in a validated document onto a note.
+fn apply_fields(doc: &json::Value, n: &mut Note) {
+    if doc.has("title") {
+        n.title = doc.get_str("title");
+    }
+    if doc.has("body") {
+        n.body = doc.get_str("body");
+    }
+    if doc.has("tags") {
+        let list = doc.get("tags");
+        let mut tags: Vec<String> = Vec::new();
+        let mut i: usize = 0;
+        while i < list.len() {
+            tags.push(list.item(i).text());
+            i += 1;
+        }
+        n.tags = tags;
+    }
+}
+
+// note_matches applies the ?q= (substring of title or body) and ?tag= filters.
+fn note_matches(n: &Note, needle: &String, tag: &String) -> bool {
+    if needle.len() > 0 {
+        let hay = text::to_lower(n.title.as_str()) + " " + text::to_lower(n.body.as_str());
+        if !hay.contains(needle.as_str()) {
+            return false;
+        }
+    }
+    if tag.len() > 0 {
+        let mut found = false;
+        for t in &n.tags {
+            if t.as_str() == tag.as_str() {
+                found = true;
+            }
+        }
+        if !found {
+            return false;
+        }
+    }
+    return true;
+}
+
+// --- store operations (each takes the lock itself) ---------------------------
+
+fn create_from_doc(doc: &json::Value) -> Response {
+    let problem = check_fields(doc, true);
+    if problem.len() > 0 {
+        return api_error(422, problem.as_str());
+    }
+    zxn_store_lock();
+    let mut st = load_store();
+    let now = sys::time_s();
+    let mut note = Note {
+        id: st.next_id,
+        title: String::new(),
+        body: String::new(),
+        tags: Vec::new(),
+        created: now,
+        updated: now,
+    };
+    apply_fields(doc, &mut note);
+    st.next_id = st.next_id + 1;
+    let id = note.id;
+    let nj = note_json(&note);
+    let out = json::stringify(&nj);
+    st.notes.push(note);
+    let saved = save_store(&st);
+    zxn_store_unlock();
+    if !saved {
+        return api_error(500, "could not write the store");
+    }
+    let mut r = Response::json(201, out.as_str());
+    r.set_header("Location", f"/api/notes/{id}");
+    return r;
+}
+
+// update_note serves PUT (full = true: every field is replaced, title is
+// required) and PATCH (full = false: only the fields sent change).
+fn update_note(req: &Request, full: bool) -> Response {
+    let id = path_id(req);
+    if id < 0 {
+        return api_error(400, "id must be a positive integer");
+    }
+    let doc = match json::parse(req.body.as_str()) {
+        Ok(v) => v,
+        Err(_) => {
+            return api_error(400, "body must be valid JSON");
+        }
+    };
+    let problem = check_fields(&doc, full);
+    if problem.len() > 0 {
+        return api_error(422, problem.as_str());
+    }
+    zxn_store_lock();
+    let mut st = load_store();
+    let idx = find_index(&st, id);
+    let mut code = 404;
+    let mut out = String::new();
+    if idx >= 0 {
+        let mut note = st.notes.remove(idx as usize);
+        if full {
+            note.title = String::new();
+            note.body = String::new();
+            note.tags = Vec::new();
+        }
+        apply_fields(&doc, &mut note);
+        note.updated = sys::time_s();
+        let nj = note_json(&note);
+        out = json::stringify(&nj);
+        st.notes.insert(idx as usize, note);
+        code = 500;
+        if save_store(&st) {
+            code = 200;
+        }
+    }
+    zxn_store_unlock();
+    if code == 200 {
+        return Response::json(200, out.as_str());
+    }
+    if code == 404 {
+        return api_error(404, "no such note");
+    }
+    return api_error(500, "could not write the store");
+}
+
+// remove_note returns 204 when the note is gone, 404 when it never existed,
+// and 500 when the store could not be written.
+fn remove_note(id: i64) -> i32 {
+    zxn_store_lock();
+    let mut st = load_store();
+    let idx = find_index(&st, id);
+    let mut code = 404;
+    if idx >= 0 {
+        let _gone = st.notes.remove(idx as usize);
+        code = 500;
+        if save_store(&st) {
+            code = 204;
+        }
+    }
+    zxn_store_unlock();
+    return code;
+}
+
+// --- JSON API ----------------------------------------------------------------
+
+fn api_list(req: &Request) -> Response {
+    let needle = text::to_lower(req.query("q").as_str());
+    let tag = req.query("tag");
+    let st = locked_load();
+    let mut arr = json::array();
+    let mut count: i64 = 0;
+    for n in &st.notes {
+        if note_matches(n, &needle, &tag) {
+            arr.push(note_json(n));
+            count += 1;
+        }
+    }
+    let mut out = json::object();
+    out.set_int("count", count);
+    out.set("notes", arr);
+    return Response::json(200, json::stringify(&out).as_str());
+}
+
+fn api_get(req: &Request) -> Response {
+    let id = path_id(req);
+    if id < 0 {
+        return api_error(400, "id must be a positive integer");
+    }
+    let st = locked_load();
+    let idx = find_index(&st, id);
+    if idx < 0 {
+        return api_error(404, "no such note");
+    }
+    let nj = note_json(&st.notes[idx as usize]);
+    return Response::json(200, json::stringify(&nj).as_str());
+}
+
+fn api_create(req: &Request) -> Response {
+    match json::parse(req.body.as_str()) {
+        Ok(doc) => {
+            return create_from_doc(&doc);
+        }
+        Err(_) => {
+            return api_error(400, "body must be valid JSON");
+        }
+    }
+}
+
+fn api_put(req: &Request) -> Response {
+    return update_note(req, true);
+}
+
+fn api_patch(req: &Request) -> Response {
+    return update_note(req, false);
+}
+
+fn api_delete(req: &Request) -> Response {
+    let id = path_id(req);
+    if id < 0 {
+        return api_error(400, "id must be a positive integer");
+    }
+    let code = remove_note(id);
+    if code == 204 {
+        return Response::empty(204);
+    }
+    if code == 404 {
+        return api_error(404, "no such note");
+    }
+    return api_error(500, "could not write the store");
+}
+
+fn api_stats(req: &Request) -> Response {
+    let st = locked_load();
+    let mut o = json::object();
+    o.set_int("notes", st.notes.len() as i64);
+    o.set_int("next_id", st.next_id);
+    o.set_int("requests", requests_served());
+    o.set_int("connections", connections_served());
+    o.set_str("server", "zexi-http/full");
+    return Response::json(200, json::stringify(&o).as_str());
+}
+
+fn health(req: &Request) -> Response {
+    return Response::json(200, "{\"status\":\"ok\"}");
+}
+
+// admin_shutdown stops the worker pool once this request has been answered.
+fn admin_shutdown(req: &Request) -> Response {
+    stop_serving();
+    return Response::json(202, "{\"status\":\"stopping\"}");
+}
+
+// --- HTML pages and forms ----------------------------------------------------
+
+fn index(req: &Request) -> Response {
+    let st = locked_load();
+    let mut content = String::new();
+    content.push_str("<h1>Notes</h1>\n");
+    content.push_str("<form method=\"post\" action=\"/ui/notes\">\n");
+    content.push_str("<input name=\"title\" placeholder=\"Title\" required> ");
+    content.push_str("<input name=\"body\" placeholder=\"Body\"> ");
+    content.push_str("<input name=\"key\" type=\"password\" placeholder=\"API key\"> ");
+    content.push_str("<button>Add note</button>\n</form>\n<ul>\n");
+    for n in &st.notes {
+        let title = html::escape(n.title.as_str());
+        let id = n.id;
+        content.push_str(f"<li><a href=\"/notes/{id}\">{title}</a></li>\n");
+    }
+    content.push_str("</ul>\n<p>JSON: <a href=\"/api/notes\">/api/notes</a> &middot; <a href=\"/api/stats\">/api/stats</a> &middot; <a href=\"/static/style.css\">static file</a></p>\n");
+    let page = html::page("Zexi notes", content.as_str());
+    return Response::html(200, page.as_str());
+}
+
+fn note_page(req: &Request) -> Response {
+    let id = path_id(req);
+    if id < 0 {
+        return Response::html(400, html::page("Bad request", "<p>The note id must be a number.</p>").as_str());
+    }
+    let st = locked_load();
+    let idx = find_index(&st, id);
+    if idx < 0 {
+        return Response::html(404, html::page("Not found", "<p>No such note.</p>").as_str());
+    }
+    let n = &st.notes[idx as usize];
+    let title = html::escape(n.title.as_str());
+    let body_text = html::escape(n.body.as_str());
+    let mut tags = String::new();
+    for t in &n.tags {
+        tags.push_str(html::escape(t.as_str()).as_str());
+        tags.push_str(" ");
+    }
+    let mut content = String::new();
+    content.push_str(f"<h1>{title}</h1>\n<p>{body_text}</p>\n<p>Tags: {tags}</p>\n");
+    content.push_str(f"<form method=\"post\" action=\"/ui/notes/{id}/delete\"><input name=\"key\" type=\"password\" placeholder=\"API key\"> <button>Delete</button></form>\n");
+    content.push_str("<p><a href=\"/\">All notes</a></p>\n");
+    let page = html::page(title.as_str(), content.as_str());
+    return Response::html(200, page.as_str());
+}
+
+fn ui_create(req: &Request) -> Response {
+    let mut doc = json::object();
+    doc.set_str("title", query_value(&req.body, "title").as_str());
+    doc.set_str("body", query_value(&req.body, "body").as_str());
+    let r = create_from_doc(&doc);
+    if r.status == 201 {
+        return Response::redirect("/");
+    }
+    return r;
+}
+
+fn ui_delete(req: &Request) -> Response {
+    let id = path_id(req);
+    if id < 0 {
+        return Response::text(400, "the note id must be a number");
+    }
+    let code = remove_note(id);
+    if code == 204 {
+        return Response::redirect("/");
+    }
+    if code == 404 {
+        return Response::text(404, "no such note");
+    }
+    return Response::text(500, "could not write the store");
+}
+
+fn hello(req: &Request) -> Response {
+    let name = req.route_param("name");
+    return Response::text(200, f"Hello, {name}!");
+}
+
+fn home(req: &Request) -> Response {
+    return Response::redirect("/");
+}
+
+// not_found answers unknown paths: JSON under /api/, HTML everywhere else.
+fn not_found(req: &Request) -> Response {
+    if req.path_only().starts_with("/api/") {
+        return api_error(404, "no such endpoint");
+    }
+    let page = html::page("Not found", "<h1>404</h1><p>No page at this address. <a href=\"/\">Back to the notes</a>.</p>");
+    return Response::html(404, page.as_str());
+}
+
+// --- middleware --------------------------------------------------------------
+
+// cors_preflight answers OPTIONS on /api/ without touching a handler.
+fn cors_preflight(req: &Request) -> Response {
+    if req.method.as_str() != "OPTIONS" || !req.path_only().starts_with("/api/") {
+        return Response::empty(0);
+    }
+    let mut r = Response::empty(204);
+    r.set_header("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS");
+    r.set_header("Access-Control-Allow-Headers", "Content-Type, X-Api-Key");
+    r.set_header("Access-Control-Max-Age", "600");
+    return r;
+}
+
+// write_gate requires the key for every write under /api/, for /api/admin, and
+// for the HTML form posts. Responses that short-circuit here skip the after
+// hooks, so the 401 carries its own headers.
+fn write_gate(req: &Request) -> Response {
+    let p = req.path_only();
+    let m = req.method.as_str();
+    let is_admin = p.starts_with("/api/admin");
+    let is_api_write = p.starts_with("/api/") && m != "GET" && m != "HEAD" && m != "OPTIONS";
+    let is_form_post = p.starts_with("/ui/") && m == "POST";
+    if !is_admin && !is_api_write && !is_form_post {
+        return Response::empty(0);
+    }
+    let got = api_key_of(req);
+    let want = expected_key();
+    if got.len() > 0 && got.as_str() == want.as_str() {
+        return Response::empty(0);
+    }
+    eprintln(f"{m} {p} -> 401 (missing or wrong key)");
+    let mut r = api_error(401, "missing or wrong API key: send X-Api-Key");
+    r.set_header("WWW-Authenticate", "ApiKey");
+    r.set_header("Access-Control-Allow-Origin", "*");
+    return r;
+}
+
+// common_headers runs after every routed response.
+fn common_headers(req: &Request, res: &mut Response) {
+    res.set_header("X-Content-Type-Options", "nosniff");
+    res.set_header("X-Frame-Options", "DENY");
+    if req.path_only().starts_with("/api/") {
+        res.set_header("Access-Control-Allow-Origin", "*");
+    }
+}
+
+// access_log writes one line per request to stderr.
+fn access_log(req: &Request, res: &mut Response) {
+    let path = req.path_only();
+    eprintln(f"{req.method} {path} -> {res.status}");
+}
+
+// --- startup -----------------------------------------------------------------
+
+fn main() -> i32 {
+    let arg1 = arg_at(1);
+    let arg2 = arg_at(2);
+    let arg3 = arg_at(3);
+    let mut port = digits_value(&arg1);
+    if port <= 0 {
+        port = DEFAULT_PORT;
+    }
+    let mut workers = digits_value(&arg2);
+    if workers <= 0 {
+        workers = DEFAULT_WORKERS;
+    }
+    let budget = digits_value(&arg3);
+
+    if !sys::env_has("ZEXI_NOTES_FILE") {
+        sys::mkdir(project_path("http_full_data").as_str());
+    }
+
+    let mut app = new_app();
+    app.get("/", index);
+    app.get("/notes/{id}", note_page);
+    app.post("/ui/notes", ui_create);
+    app.post("/ui/notes/{id}/delete", ui_delete);
+    app.get("/api/notes", api_list);
+    app.post("/api/notes", api_create);
+    app.get("/api/notes/{id}", api_get);
+    app.put("/api/notes/{id}", api_put);
+    app.add("PATCH", "/api/notes/{id}", api_patch);
+    app.delete("/api/notes/{id}", api_delete);
+    app.get("/api/stats", api_stats);
+    app.get("/health", health);
+    app.post("/api/admin/shutdown", admin_shutdown);
+    app.get("/hello/{name}", hello);
+    app.get("/home", home);
+    app.files("/static", "http_full_www");
+    app.set_fallback(not_found);
+    app.use_before(cors_preflight);
+    app.use_before(write_gate);
+    app.use_after(common_headers);
+    app.use_after(access_log);
+
+    let mut addr = String::from("127.0.0.1:");
+    addr += port;
+    println(f"zexi notes server on http://{addr}/ with {workers} worker(s)");
+    let code = if budget > 0 {
+        app.listen_workers_n(addr.as_str(), workers as i32, budget as i32)
+    } else {
+        app.listen_workers(addr.as_str(), workers as i32)
+    };
+    println(f"server stopped after {requests_served()} request(s)");
+    return code;
+}

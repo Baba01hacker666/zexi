@@ -1,0 +1,5 @@
+{
+  "language": "Zexi",
+  "compiles_to": "C",
+  "served_by": "examples/http_server.zx"
+}
