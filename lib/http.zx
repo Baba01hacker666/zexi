@@ -1,12 +1,22 @@
 // lib/http.zx
 //
-// A small HTTP/1.x library for Zexi.
+// An HTTP/1.1 library for Zexi, written down to the C ABI.
 //
-// The lowest layer talks to the C ABI: `struct sockaddr_in` is modelled as a
-// plain Zexi struct with the same memory layout as the C one, and the BSD
-// socket calls are declared with `extern "C"`. Everything above that — request
-// and response formatting, parsing, a connection type and a tiny server — is
-// ordinary Zexi code.
+// The lowest layer talks to the C library. `struct sockaddr_in` is modelled as
+// a plain Zexi struct with the same memory layout as the C one, the BSD socket
+// calls are declared with `extern "C"`, and a few small helpers (send-all with
+// a timeout, timed receive, time) live in a top-level C block that is compiled
+// into the same translation unit. Everything above that (request framing,
+// parsing, percent-decoding, response building, dates, MIME types, and a
+// keep-alive connection reader) is ordinary Zexi code.
+//
+// Server behaviour: a request head and its Content-Length body are read in
+// full, even when they arrive in several packets. Keep-alive and pipelining
+// work through `Reader`. Silent or slow peers are dropped after `IDLE_MS`.
+// Oversized or malformed requests get 400, 408, 413, 431, or 501. HEAD
+// responses carry the GET length. A peer that disconnects mid-response cannot
+// kill the process, because SIGPIPE is ignored. Every response carries `Date`
+// and `Server` headers.
 //
 // Import it from your program with `use "lib/http.zx";` (the path is
 // relative to your file), or compile the files together:
@@ -16,6 +26,92 @@
 // The first file is the program (it owns `main`); the rest are compiled into
 // it. See docs/08-networking.md, and docs/09-c-bridge.md for how the
 // `extern "C"` layer underneath works.
+
+// ---------------------------------------------------------------------------
+// C runtime: helpers that need headers or pointer arithmetic
+// ---------------------------------------------------------------------------
+//
+// These headers are deliberately limited to ones that do not declare the
+// socket calls (`bind`, `recv`, `accept`, ...). The compiler emits its own
+// prototypes for the `extern "C"` declarations below, and a second, conflicting
+// prototype from <sys/socket.h> would not compile. Timeouts therefore use
+// poll(2) rather than SO_RCVTIMEO, and SIGPIPE is ignored rather than passed
+// as MSG_NOSIGNAL.
+
+c """
+#include <stdint.h>
+#include <stddef.h>
+#include <errno.h>
+#include <time.h>
+#include <poll.h>
+#include <signal.h>
+
+/* Wait until `fd` is ready for `events` (POLLIN or POLLOUT), or `ms`
+ * milliseconds pass (ms < 0 waits forever). Returns 1 when ready, 0 on
+ * timeout, -1 on error. */
+static int zxhttp_wait(int32_t fd, short events, int32_t ms) {
+    struct pollfd p;
+    p.fd = fd;
+    p.events = events;
+    p.revents = 0;
+    for (;;) {
+        int r = poll(&p, 1, ms);
+        if (r > 0)
+            return 1;
+        if (r == 0)
+            return 0;
+        if (errno == EINTR)
+            continue;
+        return -1;
+    }
+}
+
+/* Send all `n` bytes, retrying short writes. Each wait for buffer space is
+ * bounded by `ms`, so a peer that stops reading cannot hold the server.
+ * Returns the bytes sent, or -1. A vanished peer must not raise SIGPIPE, which
+ * would terminate the whole server; ignoring it makes send() fail with EPIPE
+ * instead. */
+int64_t zxhttp_send_all(int32_t fd, const char *buf, size_t n, int32_t ms) {
+    size_t sent = 0;
+    signal(SIGPIPE, SIG_IGN);
+    while (sent < n) {
+        if (zxhttp_wait(fd, POLLOUT, ms) != 1)
+            return -1;
+        ssize_t r = send(fd, buf + sent, n - sent, 0);
+        if (r < 0) {
+            if (errno == EINTR || errno == EAGAIN)
+                continue;
+            return -1;
+        }
+        sent += (size_t)r;
+    }
+    return (int64_t)sent;
+}
+
+/* Receive up to `n` bytes, waiting at most `ms` for data. Returns the count,
+ * 0 when the peer closed the connection, -1 on timeout, and -2 on any other
+ * error. */
+int64_t zxhttp_recv(int32_t fd, uint8_t *buf, size_t n, int32_t ms) {
+    for (;;) {
+        int w = zxhttp_wait(fd, POLLIN, ms);
+        if (w == 0)
+            return -1;
+        if (w < 0)
+            return -2;
+        ssize_t r = recv(fd, buf, n, 0);
+        if (r >= 0)
+            return (int64_t)r;
+        if (errno == EINTR || errno == EAGAIN)
+            continue;
+        return -2;
+    }
+}
+
+/* Seconds since the Unix epoch (UTC). */
+int64_t zxhttp_now(void) {
+    return (int64_t)time(NULL);
+}
+"""
 
 // ---------------------------------------------------------------------------
 // TCP over the C ABI
@@ -31,10 +127,14 @@ extern "C" fn bind(fd: i32, addr: &SockAddrIn, len: u32) -> i32;
 extern "C" fn listen(fd: i32, backlog: i32) -> i32;
 extern "C" fn accept(fd: i32, addr: &SockAddrIn, len: &u32) -> i32;
 extern "C" fn send(fd: i32, buf: str, n: usize, flags: i32) -> i64;
-extern "C" fn recv(fd: i32, buf: &mut [u8; 8192], n: usize, flags: i32) -> i64;
+extern "C" fn recv(fd: i32, buf: *mut u8, n: usize, flags: i32) -> i64;
 extern "C" fn close(fd: i32) -> i32;
 extern "C" fn setsockopt(fd: i32, level: i32, opt: i32, val: &i32, len: u32) -> i32;
 extern "C" fn inet_addr(s: str) -> u32;
+
+extern "C" fn zxhttp_send_all(fd: i32, buf: str, n: usize, ms: i32) -> i64;
+extern "C" fn zxhttp_recv(fd: i32, buf: *mut u8, n: usize, ms: i32) -> i64;
+extern "C" fn zxhttp_now() -> i64;
 
 const AF_INET: i32 = 2;
 const SOCK_STREAM: i32 = 1;
@@ -42,6 +142,17 @@ const SOL_SOCKET: i32 = 1;
 const SO_REUSEADDR: i32 = 2;
 const SOCKADDR_LEN: u32 = 16;
 const RECV_BUF: usize = 8192;
+
+/// Largest request head accepted (the request line plus headers). Beyond it
+/// the server answers 431.
+const HEAD_LIMIT: usize = 16384;
+/// Largest request body accepted. Beyond it the server answers 413.
+const BODY_LIMIT: usize = 1048576;
+/// How long a server socket may stay silent before it is dropped, and how
+/// long a write may wait for a peer that is not reading.
+const IDLE_MS: i32 = 5000;
+/// How long the client waits for a server to answer.
+const CLIENT_TIMEOUT_MS: i32 = 10000;
 
 /// Host byte order -> network byte order for a 16-bit value.
 fn htons(p: u16) -> u16 {
@@ -62,19 +173,25 @@ fn sockaddr(host: str, port: i32) -> SockAddrIn {
 struct Conn { fd: i32 }
 
 impl Conn {
-    /// Send a whole buffer. (M0: a single `send`; fine for headers and small
-    /// bodies.)
+    /// Send a whole NUL-terminated string. Returns the bytes sent, or -1.
     fn write(&self, data: str) -> i64 {
-        return send(self.fd, data, len(data), 0);
+        return zxhttp_send_all(self.fd, data, len(data), IDLE_MS);
+    }
+
+    /// Send exactly `n` bytes of `data`. Binary-safe: pass a `String`'s
+    /// `as_str()` with its `len()`, and embedded NUL bytes go out intact.
+    fn write_n(&self, data: str, n: usize) -> i64 {
+        return zxhttp_send_all(self.fd, data, n, IDLE_MS);
     }
 
     /// Read until the peer closes the connection. Used by the client, where we
-    /// requested `Connection: close`.
+    /// requested `Connection: close`. Gives up after `CLIENT_TIMEOUT_MS` of
+    /// silence and returns what arrived so far.
     fn read_all(&self) -> String {
         let mut out = String::with_capacity(RECV_BUF);
         let mut buf: [u8; 8192] = [0; 8192];
         loop {
-            let n = recv(self.fd, &mut buf, RECV_BUF, 0);
+            let n = zxhttp_recv(self.fd, &mut buf as *mut u8, RECV_BUF, CLIENT_TIMEOUT_MS);
             if n <= 0 {
                 break;
             }
@@ -87,14 +204,15 @@ impl Conn {
         return out;
     }
 
-    /// Read until the end of the request head (`\r\n\r\n`). Used by the server,
-    /// which must not wait for EOF because the client keeps the connection
-    /// open for the response.
+    /// Read until the end of the request head (`\r\n\r\n`), or until the peer
+    /// stops sending. Kept for simple one-request-per-connection servers;
+    /// `Reader` is the complete version (it keeps bytes that arrive after the
+    /// head and reads the body).
     fn read_head(&self) -> String {
         let mut out = String::with_capacity(1024);
         let mut buf: [u8; 8192] = [0; 8192];
         loop {
-            let n = recv(self.fd, &mut buf, RECV_BUF, 0);
+            let n = zxhttp_recv(self.fd, &mut buf as *mut u8, RECV_BUF, IDLE_MS);
             if n <= 0 {
                 break;
             }
@@ -121,8 +239,14 @@ impl Conn {
 
 struct Request {
     method: String,
+    /// The path without the query string (`/search` for `/search?q=1`).
     path: String,
+    /// The raw text after `?`, or "" when there is none.
+    query: String,
     version: String,
+    /// The header lines, CRLF-separated, without the request line or the
+    /// blank line that ends the head.
+    headers: String,
     body: String,
 }
 
@@ -131,6 +255,34 @@ struct Response {
     reason: String,
     body: String,
 }
+
+impl Request {
+    /// The value of header `name` (case-insensitive), or "" when absent.
+    fn header(&self, name: str) -> String {
+        return header_value(self.headers.as_str(), name);
+    }
+
+    /// The decoded value of query parameter `key`, or "". Works on the query
+    /// string; for a form body, pass the body text to `query_value` instead.
+    fn query_param(&self, key: str) -> String {
+        return query_value(self.query.as_str(), key);
+    }
+
+    /// Whether the connection may stay open after this request. HTTP/1.1 keeps
+    /// it open unless the client says `Connection: close`. HTTP/1.0 closes it
+    /// unless the client asks for `keep-alive`.
+    fn wants_keep_alive(&self) -> bool {
+        let conn = lower_of(self.header("connection").as_str());
+        if self.version == "HTTP/1.0" {
+            return conn == "keep-alive";
+        }
+        return conn != "close";
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Text helpers
+// ---------------------------------------------------------------------------
 
 /// Append an integer as decimal text, e.g. `push_int(&mut s, 1527)`.
 fn push_int(s: &mut String, n: i64) {
@@ -166,13 +318,371 @@ fn int_to_str(n: i64) -> String {
     return s;
 }
 
-/// The index just past the blank line separating head and body, or -1.
-fn head_end(raw: &String) -> i64 {
-    let at = raw.find("\r\n\r\n");
-    if at < 0 {
-        return -1;
+/// Append `n` as two decimal digits (zero padded), for dates and clocks.
+fn push_pad2(s: &mut String, n: i64) {
+    if n < 10 {
+        s.push_byte(48);
     }
-    return at + 4;
+    push_int(s, n);
+}
+
+/// ASCII lower-case copy of `s`. Bytes outside `A`-`Z` are left alone, so the
+/// length is unchanged and offsets into the copy match the original.
+fn lower_of(s: str) -> String {
+    let t = String::from(s);
+    let mut out = String::with_capacity(t.len());
+    let mut i: usize = 0;
+    while i < t.len() {
+        let b = t.byte_at(i);
+        if b >= 65 && b <= 90 {
+            out.push_byte((b + 32) as u8);
+        } else {
+            out.push_byte(b as u8);
+        }
+        i += 1;
+    }
+    return out;
+}
+
+/// True when `s` is non-empty and every byte is `0`-`9`.
+fn all_digits(s: str) -> bool {
+    let t = String::from(s);
+    if t.len() == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < t.len() {
+        let b = t.byte_at(i);
+        if b < 48 || b > 57 {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+/// Value of one hexadecimal digit, or -1 when `b` is not one.
+fn hex_val(b: i64) -> i64 {
+    if b >= 48 && b <= 57 {
+        return b - 48;
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87;
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55;
+    }
+    return -1;
+}
+
+/// Upper-case hexadecimal digit for `v` in 0..16.
+fn hex_digit(v: i64) -> u8 {
+    if v < 10 {
+        return (48 + v) as u8;
+    }
+    return (55 + v) as u8;
+}
+
+/// Percent-decode `s`: `%41` becomes `A` and `+` becomes a space. A malformed
+/// escape (`%zz`, or a `%` near the end) is copied through unchanged.
+fn url_decode(s: str) -> String {
+    let t = String::from(s);
+    let mut out = String::with_capacity(t.len());
+    let mut i: usize = 0;
+    while i < t.len() {
+        let b = t.byte_at(i);
+        if b == 43 {
+            out.push_byte(32);
+        } else if b == 37 && i + 2 < t.len() {
+            let hi = hex_val(t.byte_at(i + 1));
+            let lo = hex_val(t.byte_at(i + 2));
+            if hi >= 0 && lo >= 0 {
+                out.push_byte((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+            out.push_byte(37);
+        } else {
+            out.push_byte(b as u8);
+        }
+        i += 1;
+    }
+    return out;
+}
+
+/// Percent-encode `s` for a query value or path segment. Unreserved bytes
+/// (letters, digits, `-._~`) pass through, and everything else becomes `%XX`.
+fn url_encode(s: str) -> String {
+    let t = String::from(s);
+    let mut out = String::with_capacity(t.len());
+    let mut i: usize = 0;
+    while i < t.len() {
+        let b = t.byte_at(i);
+        let plain = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45 || b == 46 || b == 95 || b == 126;
+        if plain {
+            out.push_byte(b as u8);
+        } else {
+            out.push_byte(37);
+            out.push_byte(hex_digit(b / 16));
+            out.push_byte(hex_digit(b % 16));
+        }
+        i += 1;
+    }
+    return out;
+}
+
+/// The value of header `name` in a raw header block, or "". The match is
+/// case-insensitive and anchored to the start of a line, so `Host` never
+/// matches inside another value. Only the first occurrence is returned.
+fn header_value(headers: str, name: str) -> String {
+    let mut hay = String::from("\r\n");
+    hay.push_str(headers);
+    hay.push_str("\r\n");
+    let lower = lower_of(hay.as_str());
+    let lname = lower_of(name);
+    let mut needle = String::from("\r\n");
+    needle.push_str(lname.as_str(), ":");
+    let at = lower.find(needle.as_str());
+    if at < 0 {
+        return String::new();
+    }
+    let start = (at as usize) + needle.len();
+    let rest = hay.substr(start, 4294967295);
+    let end = rest.find("\r\n");
+    let value = if end < 0 { rest } else { rest.substr(0, end as usize) };
+    return value.trim();
+}
+
+/// The value of `key` in an `a=1&b=2` list (a query string or a form body),
+/// percent-decoded. A key without `=` yields "". Returns "" when absent.
+fn query_value(query: str, key: str) -> String {
+    let mut rest = String::from(query);
+    while rest.len() > 0 {
+        let amp = rest.find("&");
+        let pair = if amp < 0 { rest.clone() } else { rest.substr(0, amp as usize) };
+        let next = if amp < 0 { String::new() } else { rest.substr((amp + 1) as usize, 4294967295) };
+        let eq = pair.find("=");
+        let raw_key = if eq < 0 { pair.clone() } else { pair.substr(0, eq as usize) };
+        let k = url_decode(raw_key.as_str());
+        if k.as_str() == key {
+            if eq < 0 {
+                return String::new();
+            }
+            let raw_value = pair.substr((eq + 1) as usize, 4294967295);
+            return url_decode(raw_value.as_str());
+        }
+        rest = next;
+    }
+    return String::new();
+}
+
+/// Escape `s` for an HTML body: `& < > " '` become entities.
+fn html_escape(s: str) -> String {
+    let t = String::from(s);
+    let mut out = String::with_capacity(t.len());
+    let mut i: usize = 0;
+    while i < t.len() {
+        let b = t.byte_at(i);
+        if b == 38 {
+            out.push_str("&amp;");
+        } else if b == 60 {
+            out.push_str("&lt;");
+        } else if b == 62 {
+            out.push_str("&gt;");
+        } else if b == 34 {
+            out.push_str("&quot;");
+        } else if b == 39 {
+            out.push_str("&#39;");
+        } else {
+            out.push_byte(b as u8);
+        }
+        i += 1;
+    }
+    return out;
+}
+
+/// `s` as a JSON string literal, with the surrounding quotes. Quotes,
+/// backslashes, and control bytes are escaped. Other UTF-8 passes through.
+fn json_quote(s: str) -> String {
+    let t = String::from(s);
+    let mut out = String::with_capacity(t.len() + 2);
+    out.push_byte(34);
+    let mut i: usize = 0;
+    while i < t.len() {
+        let b = t.byte_at(i);
+        if b == 34 {
+            out.push_str("\\\"");
+        } else if b == 92 {
+            out.push_str("\\\\");
+        } else if b == 10 {
+            out.push_str("\\n");
+        } else if b == 13 {
+            out.push_str("\\r");
+        } else if b == 9 {
+            out.push_str("\\t");
+        } else if b < 32 {
+            out.push_str("\\u00");
+            out.push_byte(hex_digit(b / 16));
+            out.push_byte(hex_digit(b % 16));
+        } else {
+            out.push_byte(b as u8);
+        }
+        i += 1;
+    }
+    out.push_byte(34);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Dates and content types
+// ---------------------------------------------------------------------------
+
+struct Civil {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    /// 0 = Sunday.
+    weekday: i64,
+}
+
+/// Break a Unix time (seconds, UTC) into calendar fields. Times before 1970
+/// are clamped to the epoch. Uses the proleptic Gregorian calendar.
+fn civil_time(t: i64) -> Civil {
+    let secs_total: i64 = if t < 0 { 0 } else { t };
+    let days = secs_total / 86400;
+    let rem = secs_total % 86400;
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    return Civil {
+        year: year,
+        month: month,
+        day: day,
+        hour: rem / 3600,
+        minute: (rem % 3600) / 60,
+        second: rem % 60,
+        weekday: (days + 4) % 7,
+    };
+}
+
+fn weekday_name(i: i64) -> str {
+    if i == 0 { return "Sun"; }
+    if i == 1 { return "Mon"; }
+    if i == 2 { return "Tue"; }
+    if i == 3 { return "Wed"; }
+    if i == 4 { return "Thu"; }
+    if i == 5 { return "Fri"; }
+    return "Sat";
+}
+
+fn month_name(i: i64) -> str {
+    if i == 1 { return "Jan"; }
+    if i == 2 { return "Feb"; }
+    if i == 3 { return "Mar"; }
+    if i == 4 { return "Apr"; }
+    if i == 5 { return "May"; }
+    if i == 6 { return "Jun"; }
+    if i == 7 { return "Jul"; }
+    if i == 8 { return "Aug"; }
+    if i == 9 { return "Sep"; }
+    if i == 10 { return "Oct"; }
+    if i == 11 { return "Nov"; }
+    return "Dec";
+}
+
+/// An HTTP date (RFC 9110), e.g. `Sun, 06 Nov 1994 08:49:37 GMT`.
+fn http_date(t: i64) -> String {
+    let c = civil_time(t);
+    let mut s = String::with_capacity(29);
+    s.push_str(weekday_name(c.weekday), ", ");
+    push_pad2(&mut s, c.day);
+    s.push_str(" ", month_name(c.month), " ");
+    push_int(&mut s, c.year);
+    s.push_str(" ");
+    push_pad2(&mut s, c.hour);
+    s.push_str(":");
+    push_pad2(&mut s, c.minute);
+    s.push_str(":");
+    push_pad2(&mut s, c.second);
+    s.push_str(" GMT");
+    return s;
+}
+
+/// An ISO 8601 UTC timestamp, e.g. `1994-11-06T08:49:37Z`.
+fn iso_time(t: i64) -> String {
+    let c = civil_time(t);
+    let mut s = String::with_capacity(20);
+    push_int(&mut s, c.year);
+    s.push_str("-");
+    push_pad2(&mut s, c.month);
+    s.push_str("-");
+    push_pad2(&mut s, c.day);
+    s.push_str("T");
+    push_pad2(&mut s, c.hour);
+    s.push_str(":");
+    push_pad2(&mut s, c.minute);
+    s.push_str(":");
+    push_pad2(&mut s, c.second);
+    s.push_str("Z");
+    return s;
+}
+
+/// The current time as a Unix timestamp (seconds, UTC).
+fn now_seconds() -> i64 {
+    return zxhttp_now();
+}
+
+/// The lower-case extension of the final path segment of `path` (the text
+/// after its last `.`), or "" when there is none.
+fn extension_of(path: str) -> String {
+    let t = String::from(path);
+    let mut i = t.len();
+    while i > 0 {
+        i -= 1;
+        let b = t.byte_at(i);
+        if b == 46 {
+            let ext = t.substr(i + 1, 4294967295);
+            return lower_of(ext.as_str());
+        }
+        if b == 47 {
+            return String::new();
+        }
+    }
+    return String::new();
+}
+
+/// The MIME type for a file name, chosen by its extension. Unknown and
+/// missing extensions are `application/octet-stream`.
+fn mime_type(path: str) -> str {
+    let ext = extension_of(path);
+    let e = ext.as_str();
+    if e == "html" || e == "htm" { return "text/html; charset=utf-8"; }
+    if e == "css" { return "text/css; charset=utf-8"; }
+    if e == "js" || e == "mjs" { return "text/javascript; charset=utf-8"; }
+    if e == "json" { return "application/json; charset=utf-8"; }
+    if e == "txt" || e == "md" { return "text/plain; charset=utf-8"; }
+    if e == "csv" { return "text/csv; charset=utf-8"; }
+    if e == "xml" { return "application/xml; charset=utf-8"; }
+    if e == "svg" { return "image/svg+xml"; }
+    if e == "png" { return "image/png"; }
+    if e == "jpg" || e == "jpeg" { return "image/jpeg"; }
+    if e == "gif" { return "image/gif"; }
+    if e == "webp" { return "image/webp"; }
+    if e == "ico" { return "image/x-icon"; }
+    if e == "pdf" { return "application/pdf"; }
+    if e == "wasm" { return "application/wasm"; }
+    if e == "zip" { return "application/zip"; }
+    return "application/octet-stream";
 }
 
 // ---------------------------------------------------------------------------
@@ -211,10 +721,19 @@ fn http_get(host: str, port: i32, path: str) -> String {
         return String::new();
     }
     let req = get_request(host, path);
-    c.write(req);
+    c.write(req.as_str());
     let raw = c.read_all();
     c.close();
     return raw;
+}
+
+/// The index just past the blank line separating head and body, or -1.
+fn head_end(raw: &String) -> i64 {
+    let at = raw.find("\r\n\r\n");
+    if at < 0 {
+        return -1;
+    }
+    return at + 4;
 }
 
 /// Split the status line `HTTP/1.1 200 OK` and the body out of a response.
@@ -268,8 +787,8 @@ impl Server {
     /// Accept one pending connection. Returns a `Conn` whose fd is negative on
     /// failure.
     fn accept(&self) -> Conn {
-        let mut peer = SockAddrIn { family: 0, port: 0, addr: 0, pad: 0 };
-        let mut len: u32 = SOCKADDR_LEN;
+        let peer = SockAddrIn { family: 0, port: 0, addr: 0, pad: 0 };
+        let len: u32 = SOCKADDR_LEN;
         let cfd = accept(self.fd, &peer, &len);
         return Conn { fd: cfd };
     }
@@ -279,52 +798,182 @@ impl Server {
     }
 }
 
-/// Parse a request head into method, path, version and body.
+/// One step of `Reader.next`. A complete request has `status == 0` and its raw
+/// text in `raw`. When `raw` is empty and `status` is non-zero, answer with
+/// that status and close. An empty `raw` with `status == 0` means the peer
+/// closed or went quiet between requests: close without answering.
+struct Incoming {
+    raw: String,
+    status: i32,
+}
+
+/// Reads HTTP/1.x requests from one connection. Bytes that arrive after one
+/// request belong to the next, so they are kept here. That is what makes
+/// keep-alive and pipelining work.
+struct Reader {
+    conn: Conn,
+    buf: String,
+}
+
+impl Reader {
+    fn new(conn: Conn) -> Reader {
+        return Reader { conn: conn, buf: String::with_capacity(1024) };
+    }
+
+    /// Read one chunk into the buffer. Returns 1 when bytes arrived, 0 on
+    /// timeout, and -1 when the peer closed or the read failed.
+    fn fill(&mut self) -> i32 {
+        let mut chunk: [u8; 8192] = [0; 8192];
+        let n = zxhttp_recv(self.conn.fd, &mut chunk as *mut u8, 8192, IDLE_MS);
+        if n > 0 {
+            self.buf.push_bytes(&chunk[0..(n as usize)]);
+            return 1;
+        }
+        if n == -1 {
+            return 0;
+        }
+        return -1;
+    }
+
+    /// Read the next complete request: head, then a `Content-Length` body.
+    fn next(&mut self) -> Incoming {
+        let mut he = head_end(&self.buf);
+        while he < 0 {
+            if self.buf.len() > HEAD_LIMIT {
+                return Incoming { raw: String::new(), status: 431 };
+            }
+            let got = self.fill();
+            if got < 0 {
+                if self.buf.len() == 0 {
+                    return Incoming { raw: String::new(), status: 0 };
+                }
+                return Incoming { raw: String::new(), status: 400 };
+            }
+            if got == 0 {
+                if self.buf.len() == 0 {
+                    return Incoming { raw: String::new(), status: 0 };
+                }
+                return Incoming { raw: String::new(), status: 408 };
+            }
+            he = head_end(&self.buf);
+        }
+        let he_u = he as usize;
+        if he_u > HEAD_LIMIT {
+            return Incoming { raw: String::new(), status: 431 };
+        }
+        let head = self.buf.substr(0, he_u);
+
+        if header_value(head.as_str(), "transfer-encoding").len() > 0 {
+            return Incoming { raw: String::new(), status: 501 };
+        }
+        let cl = header_value(head.as_str(), "content-length");
+        let mut want: usize = 0;
+        if cl.len() > 0 {
+            if cl.len() > 12 || !all_digits(cl.as_str()) {
+                return Incoming { raw: String::new(), status: 400 };
+            }
+            let n = cl.parse_i64();
+            if n > BODY_LIMIT as i64 {
+                return Incoming { raw: String::new(), status: 413 };
+            }
+            want = n as usize;
+        }
+
+        if want > 0 && self.buf.len() < he_u + want {
+            let expect = lower_of(header_value(head.as_str(), "expect").as_str());
+            if expect == "100-continue" {
+                self.conn.write("HTTP/1.1 100 Continue\r\n\r\n");
+            }
+        }
+        while self.buf.len() < he_u + want {
+            let got = self.fill();
+            if got == 0 {
+                return Incoming { raw: String::new(), status: 408 };
+            }
+            if got < 0 {
+                return Incoming { raw: String::new(), status: 400 };
+            }
+        }
+
+        let raw = self.buf.substr(0, he_u + want);
+        let rest = self.buf.substr(he_u + want, 4294967295);
+        self.buf = rest;
+        return Incoming { raw: raw, status: 0 };
+    }
+}
+
+/// Parse a request head into method, path, query, version, headers and body.
+/// A head without a request line yields empty fields.
 fn parse_request(raw: &String) -> Request {
     let end = raw.find("\r\n");
     if end < 0 {
         return Request {
-            method: String::new(), path: String::new(),
-            version: String::new(), body: String::new(),
+            method: String::new(), path: String::new(), query: String::new(),
+            version: String::new(), headers: String::new(), body: String::new(),
         };
     }
-    let line = raw.substr(0, end as usize);
+    let he = head_end(raw);
+    let head_part = if he < 0 { raw.clone() } else { raw.substr(0, (he - 4) as usize) };
+    let line_end = head_part.find("\r\n");
+    let line = if line_end < 0 { head_part.clone() } else { head_part.substr(0, line_end as usize) };
+    let headers = if line_end < 0 { String::new() } else { head_part.substr((line_end + 2) as usize, 4294967295) };
+
     let sp1 = line.find(" ");
     let method = if sp1 < 0 { line.clone() } else { line.substr(0, sp1 as usize) };
     let rest = if sp1 < 0 { String::new() } else { line.substr((sp1 + 1) as usize, 4294967295) };
     let sp2 = rest.find(" ");
-    let path = if sp2 < 0 { rest.clone() } else { rest.substr(0, sp2 as usize) };
+    let target = if sp2 < 0 { rest.clone() } else { rest.substr(0, sp2 as usize) };
     let version = if sp2 < 0 { String::new() } else { rest.substr((sp2 + 1) as usize, 4294967295).trim() };
 
-    let he = head_end(raw);
+    let q = target.find("?");
+    let path = if q < 0 { target.clone() } else { target.substr(0, q as usize) };
+    let query = if q < 0 { String::new() } else { target.substr((q + 1) as usize, 4294967295) };
+
     let body = if he < 0 { String::new() } else { raw.substr(he as usize, 4294967295) };
-    return Request { method: method, path: path, version: version, body: body };
+    return Request {
+        method: method,
+        path: path,
+        query: query,
+        version: version,
+        headers: headers,
+        body: body,
+    };
 }
 
 /// The conventional reason phrase for a status code.
 fn reason_phrase(status: i32) -> str {
-    if status == 200 {
-        return "OK";
-    }
-    if status == 201 {
-        return "Created";
-    }
-    if status == 204 {
-        return "No Content";
-    }
-    if status == 301 {
-        return "Moved Permanently";
-    }
-    if status == 400 {
-        return "Bad Request";
-    }
-    if status == 404 {
-        return "Not Found";
-    }
-    if status == 500 {
-        return "Internal Server Error";
-    }
-    return "OK";
+    if status == 100 { return "Continue"; }
+    if status == 200 { return "OK"; }
+    if status == 201 { return "Created"; }
+    if status == 202 { return "Accepted"; }
+    if status == 204 { return "No Content"; }
+    if status == 206 { return "Partial Content"; }
+    if status == 301 { return "Moved Permanently"; }
+    if status == 302 { return "Found"; }
+    if status == 303 { return "See Other"; }
+    if status == 304 { return "Not Modified"; }
+    if status == 307 { return "Temporary Redirect"; }
+    if status == 308 { return "Permanent Redirect"; }
+    if status == 400 { return "Bad Request"; }
+    if status == 401 { return "Unauthorized"; }
+    if status == 403 { return "Forbidden"; }
+    if status == 404 { return "Not Found"; }
+    if status == 405 { return "Method Not Allowed"; }
+    if status == 408 { return "Request Timeout"; }
+    if status == 409 { return "Conflict"; }
+    if status == 411 { return "Length Required"; }
+    if status == 413 { return "Payload Too Large"; }
+    if status == 414 { return "URI Too Long"; }
+    if status == 415 { return "Unsupported Media Type"; }
+    if status == 418 { return "I'm a teapot"; }
+    if status == 422 { return "Unprocessable Content"; }
+    if status == 429 { return "Too Many Requests"; }
+    if status == 431 { return "Request Header Fields Too Large"; }
+    if status == 500 { return "Internal Server Error"; }
+    if status == 501 { return "Not Implemented"; }
+    if status == 503 { return "Service Unavailable"; }
+    if status == 505 { return "HTTP Version Not Supported"; }
+    return "Unknown";
 }
 
 /// Format a response with `Connection: close`.
@@ -332,11 +981,116 @@ fn response(status: i32, reason: str, body: str) -> String {
     let mut r = String::new();
     r.push_str("HTTP/1.1 ");
     push_int(&mut r, status as i64);
-    r.push_str(" ");
-    r.push_str(reason);
-    r.push_str("\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ");
+    r.push_str(" ", reason, "\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ");
     push_int(&mut r, len(body) as i64);
     r.push_str("\r\nConnection: close\r\n\r\n");
     r.push_str(body);
     return r;
+}
+
+/// The status line and headers for a response whose body is `length` bytes.
+/// `extra` is zero or more complete `Name: value\r\n` lines. The result ends
+/// with the blank line. A 204 or 304 carries no `Content-Length`.
+fn response_head(status: i32, ctype: str, length: usize, keep_alive: bool, extra: str) -> String {
+    let mut h = String::with_capacity(256);
+    h.push_str("HTTP/1.1 ");
+    push_int(&mut h, status as i64);
+    h.push_str(" ", reason_phrase(status), "\r\n");
+    let now = http_date(now_seconds());
+    h.push_str("Date: ", now.as_str(), "\r\n");
+    h.push_str("Server: zexi-http/0.1\r\n");
+    h.push_str("Content-Type: ", ctype, "\r\n");
+    if status != 204 && status != 304 && status >= 200 {
+        h.push_str("Content-Length: ");
+        push_int(&mut h, length as i64);
+        h.push_str("\r\n");
+    }
+    if keep_alive {
+        h.push_str("Connection: keep-alive\r\n");
+    } else {
+        h.push_str("Connection: close\r\n");
+    }
+    h.push_str(extra);
+    h.push_str("\r\n");
+    return h;
+}
+
+/// A response to send: status, content type, extra header lines, and body.
+struct Answer {
+    status: i32,
+    ctype: String,
+    extra: String,
+    body: String,
+}
+
+impl Answer {
+    /// A `text/plain` answer.
+    fn text(status: i32, body: str) -> Answer {
+        return Answer {
+            status: status,
+            ctype: String::from("text/plain; charset=utf-8"),
+            extra: String::new(),
+            body: String::from(body),
+        };
+    }
+
+    /// A `text/html` answer.
+    fn html(status: i32, body: str) -> Answer {
+        return Answer {
+            status: status,
+            ctype: String::from("text/html; charset=utf-8"),
+            extra: String::new(),
+            body: String::from(body),
+        };
+    }
+
+    /// An `application/json` answer. `body` must already be valid JSON.
+    fn json(status: i32, body: str) -> Answer {
+        return Answer {
+            status: status,
+            ctype: String::from("application/json; charset=utf-8"),
+            extra: String::new(),
+            body: String::from(body),
+        };
+    }
+
+    /// An answer with an explicit content type and an owned body (for files).
+    fn bytes(status: i32, ctype: str, body: String) -> Answer {
+        return Answer { status: status, ctype: String::from(ctype), extra: String::new(), body: body };
+    }
+
+    /// An answer with no body.
+    fn empty(status: i32) -> Answer {
+        return Answer { status: status, ctype: String::from("text/plain"), extra: String::new(), body: String::new() };
+    }
+
+    /// A `302 Found` pointing at `location`.
+    fn redirect(location: str) -> Answer {
+        let mut a = Answer::text(302, "redirecting\n");
+        a.add_header("Location", location);
+        return a;
+    }
+
+    /// Add a header line, e.g. `a.add_header("Cache-Control", "no-store")`.
+    fn add_header(&mut self, name: str, value: str) {
+        self.extra.push_str(name, ": ", value, "\r\n");
+    }
+}
+
+/// Write a whole response in one piece: the head, then the body unless
+/// `head_only` (a HEAD request) or the status forbids one. Sending one buffer
+/// keeps a small response in a single segment. Returns the number of body
+/// bytes written (0 for HEAD, 204, and 304), or -1 when the peer is gone.
+fn send_answer(c: &Conn, a: &Answer, head_only: bool, keep_alive: bool) -> i64 {
+    let no_body = a.status == 204 || a.status == 304 || a.status < 200;
+    let mut out = response_head(a.status, a.ctype.as_str(), a.body.len(), keep_alive, a.extra.as_str());
+    let head_len = out.len();
+    if !head_only && !no_body {
+        out.push_bytes(a.body.as_bytes());
+    }
+    let sent = c.write_n(out.as_str(), out.len());
+    if sent < 0 {
+        return -1;
+    }
+    return (out.len() - head_len) as i64;
 }
