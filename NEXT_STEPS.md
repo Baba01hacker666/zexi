@@ -405,7 +405,7 @@ still open.
 | `for x in v` copies each element | **fixed for the common case** — `for s in &v` (and `for s in &arr`) binds `&T`, so a `Vec<String>` is visited without a copy; `&mut` iteration is still `E0900`, and a bare `for s in v` remains `E0507` for owning elements |
 | No `ref`-style pattern | **fixed** — `ref s` binds a shared reference and `ref mut s` an exclusive one, borrowing the payload in place; `ref mut` needs a `&mut` (or raw pointer, or the match's own ownership) along the path, `E0596` otherwise. A borrowed match now binds a pointer to the referent instead of copying the enum, and `ref` works in `if let` / `while let` too. `let ref` and `for ref` are still rejected (`E0900`) |
 | Variadic string building | **fixed** — `push_str` takes one or more arguments (`s.push_str("a", "b", "c")`); each is appended in order and a `String` argument is borrowed, not moved |
-| `io::read_line` does one `read` syscall per byte | **open** — a line needs a buffered-reader type (buffer + consumed mark); the type is the work, not the syscalls |
+| `io::read_line` does one `read` syscall per byte | **fixed** — `use bufio;` provides a Go-style `Reader` with an 8 KiB C window; `read_line` refills only when the window runs dry (docs/24-c-backed-stdlib.md) |
 | `str` is C-ABI-shaped at the boundary | **open, deliberate** — NUL-terminated with no independent length. Slices cover buffers and `str::as_bytes()` covers borrowing; length-prefixing `str` is an ABI change with no forcing need yet |
 | Pointer identity comparison | **not a gap by choice** — a comparison through a borrow compares values, never addresses; two `*T` cannot be compared at all. Use integer addresses if that is what you mean |
 

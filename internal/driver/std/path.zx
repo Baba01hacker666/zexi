@@ -1,0 +1,185 @@
+// path — file paths and filesystem queries, modeled on Go's path/filepath.
+// https://pkg.go.dev/path/filepath
+//
+// String manipulation and stat(2) both live in C here, so Zexi gets Go-like
+// path helpers without growing the language. Every function that returns a
+// path writes into a caller-owned 8 KiB buffer and yields its length.
+//
+//     use path;
+//
+//     fn main() -> i32 {
+//         println(path::join("/tmp", "a.txt"));   // /tmp/a.txt
+//         println(path::base("/tmp/a.txt"));      // a.txt
+//         println(path::ext("/tmp/a.txt"));       // .txt
+//         println(path::exists("/tmp"));          // true
+//         0
+//     }
+
+extern "C" fn zxpa_join(a: str, b: str, out: &mut [u8; 8192]) -> i64;
+extern "C" fn zxpa_base(p: str, out: &mut [u8; 8192]) -> i64;
+extern "C" fn zxpa_dir(p: str, out: &mut [u8; 8192]) -> i64;
+extern "C" fn zxpa_ext(p: str, out: &mut [u8; 8192]) -> i64;
+extern "C" fn zxpa_clean(p: str, out: &mut [u8; 8192]) -> i64;
+extern "C" fn zxpa_realpath(p: str, out: &mut [u8; 8192]) -> i64;
+extern "C" fn zxpa_exists(p: str) -> i32;
+extern "C" fn zxpa_is_dir(p: str) -> i32;
+extern "C" fn zxpa_is_file(p: str) -> i32;
+
+// from_buf builds the String C just wrote.
+fn from_buf(buf: &[u8; 8192], n: i64) -> String {
+    let mut s = String::new();
+    if n > 0 {
+        s.push_bytes(buf[0..n as usize]);
+    }
+    return s;
+}
+
+pub fn join(a: str, b: str) -> String {
+    let mut buf: [u8; 8192] = [0; 8192];
+    return from_buf(&buf, zxpa_join(a, b, &mut buf));
+}
+
+pub fn base(p: str) -> String {
+    let mut buf: [u8; 8192] = [0; 8192];
+    return from_buf(&buf, zxpa_base(p, &mut buf));
+}
+
+pub fn dir(p: str) -> String {
+    let mut buf: [u8; 8192] = [0; 8192];
+    return from_buf(&buf, zxpa_dir(p, &mut buf));
+}
+
+pub fn ext(p: str) -> String {
+    let mut buf: [u8; 8192] = [0; 8192];
+    return from_buf(&buf, zxpa_ext(p, &mut buf));
+}
+
+pub fn clean(p: str) -> String {
+    let mut buf: [u8; 8192] = [0; 8192];
+    return from_buf(&buf, zxpa_clean(p, &mut buf));
+}
+
+pub fn realpath(p: str) -> String {
+    let mut buf: [u8; 8192] = [0; 8192];
+    return from_buf(&buf, zxpa_realpath(p, &mut buf));
+}
+
+pub fn exists(p: str) -> bool { return zxpa_exists(p) == 1; }
+pub fn is_dir(p: str) -> bool { return zxpa_is_dir(p) == 1; }
+pub fn is_file(p: str) -> bool { return zxpa_is_file(p) == 1; }
+
+c """
+#define _POSIX_C_SOURCE 200809L
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+#define ZXPA_BYTES(a) ((char *)((a)->e))
+#define ZXPA_CAP 8192
+
+static int64_t zxpa_put(zx_arr8192_u8 *out, const char *s) {
+    if (!s) return 0;
+    size_t n = strlen(s);
+    if (n >= ZXPA_CAP) n = ZXPA_CAP - 1;
+    memcpy(ZXPA_BYTES(out), s, n);
+    ZXPA_BYTES(out)[n] = 0;
+    return (int64_t)n;
+}
+
+int64_t zxpa_join(const char *a, const char *b, zx_arr8192_u8 *out) {
+    if (!a || !b) return 0;
+    if (b[0] == '/') return zxpa_put(out, b);
+    size_t la = strlen(a);
+    const char *sep = (la > 0 && a[la - 1] == '/') ? "" : "/";
+    char tmp[ZXPA_CAP];
+    snprintf(tmp, sizeof(tmp), "%s%s%s", a, sep, b);
+    return zxpa_put(out, tmp);
+}
+
+int64_t zxpa_base(const char *p, zx_arr8192_u8 *out) {
+    if (!p || !*p) return zxpa_put(out, ".");
+    size_t n = strlen(p);
+    while (n > 1 && p[n - 1] == '/') n--;
+    const char *slash = strrchr(p, '/');
+    if (!slash || slash == p + n - 1) {
+        char tmp[ZXPA_CAP];
+        snprintf(tmp, sizeof(tmp), "%.*s", (int)n, p);
+        return zxpa_put(out, tmp);
+    }
+    return zxpa_put(out, slash + 1);
+}
+
+int64_t zxpa_dir(const char *p, zx_arr8192_u8 *out) {
+    if (!p) return zxpa_put(out, ".");
+    const char *slash = strrchr(p, '/');
+    if (!slash) return zxpa_put(out, ".");
+    if (slash == p) return zxpa_put(out, "/");
+    char tmp[ZXPA_CAP];
+    snprintf(tmp, sizeof(tmp), "%.*s", (int)(slash - p), p);
+    return zxpa_put(out, tmp);
+}
+
+int64_t zxpa_ext(const char *p, zx_arr8192_u8 *out) {
+    if (!p) return 0;
+    const char *slash = strrchr(p, '/');
+    const char *start = slash ? slash + 1 : p;
+    const char *dot = strrchr(start, '.');
+    if (!dot || dot == start) return 0;
+    return zxpa_put(out, dot);
+}
+
+/* Lexical Clean: collapse repeated slashes, drop "." and resolve "..". */
+int64_t zxpa_clean(const char *p, zx_arr8192_u8 *out) {
+    if (!p || !*p) return zxpa_put(out, ".");
+    char parts[ZXPA_CAP];
+    size_t used = 0;
+    int absolute = (p[0] == '/');
+    const char *cur = p;
+    while (*cur) {
+        while (*cur == '/') cur++;
+        const char *start = cur;
+        while (*cur && *cur != '/') cur++;
+        size_t len = (size_t)(cur - start);
+        if (len == 0 || (len == 1 && start[0] == '.')) continue;
+        if (len == 2 && start[0] == '.' && start[1] == '.') {
+            size_t j = used;
+            while (j > 0 && parts[j - 1] != '/') j--;
+            if (j > 0) used = j - 1; else used = 0;
+            continue;
+        }
+        if (used > 0 && parts[used - 1] != '/') parts[used++] = '/';
+        if (used + len >= ZXPA_CAP) break;
+        memcpy(parts + used, start, len);
+        used += len;
+    }
+    if (used == 0) return zxpa_put(out, absolute ? "/" : ".");
+    char tmp[ZXPA_CAP];
+    size_t at = 0;
+    if (absolute) tmp[at++] = '/';
+    memcpy(tmp + at, parts, used);
+    tmp[at + used] = 0;
+    return zxpa_put(out, tmp);
+}
+
+int64_t zxpa_realpath(const char *p, zx_arr8192_u8 *out) {
+    if (!p) return 0;
+    char buf[ZXPA_CAP];
+    if (!realpath(p, buf)) return 0;
+    return zxpa_put(out, buf);
+}
+
+static int zxpa_kind(const char *p, int want_dir) {
+    if (!p) return 0;
+    struct stat st;
+    if (stat(p, &st) != 0) return 0;
+    return (want_dir ? S_ISDIR(st.st_mode) : S_ISREG(st.st_mode)) ? 1 : 0;
+}
+int32_t zxpa_exists(const char *p) {
+    if (!p) return 0;
+    struct stat st;
+    return stat(p, &st) == 0 ? 1 : 0;
+}
+int32_t zxpa_is_dir(const char *p) { return zxpa_kind(p, 1); }
+int32_t zxpa_is_file(const char *p) { return zxpa_kind(p, 0); }
+"""

@@ -2950,6 +2950,183 @@ fn main() -> i32 {
 	}
 }
 
+// TestStdBufioReadsLines checks that the C-backed buffered reader returns whole
+// lines with their terminators stripped, including CRLF, and reports EOF once.
+func TestStdBufioReadsLines(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	data := filepath.Join(dir, "lines.txt")
+	if err := os.WriteFile(data, []byte("alpha\nbeta\r\ngamma\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "main.zx")
+	src := `use bufio;
+use sys;
+
+fn main() -> i32 {
+    let f = sys::open_read(arg_at(1).as_str());
+    match f {
+        Ok(fd) => {
+            let r = Reader::from_fd(fd);
+            println(r.ok(), r.buffered());
+            loop {
+                let line = r.read_line();
+                if line.len() == 0 { break; }
+                println(line);
+            }
+            r.close();
+            sys::close_fd(fd);
+        },
+        Err(_) => println("open failed"),
+    }
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build bufio program")
+	}
+	raw, err := exec.Command(out, data).Output()
+	if err != nil {
+		t.Fatalf("running bufio program: %v", err)
+	}
+	if got, want := string(raw), "true 0\nalpha\nbeta\ngamma\n"; got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestStdProcessCapture checks the C fork/exec wrapper: exit status, captured
+// stdout and stderr, and arguments with spaces.
+func TestStdProcessCapture(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.zx")
+	src := `use process;
+
+fn main() -> i32 {
+    let c = Command::new("/bin/echo");
+    c.arg("hello");
+    c.arg("big world");
+    let out = c.output();
+    println(out.status, out.stdout.trim(), out.stderr.len());
+    c.free();
+
+    let d = Command::new("/bin/sh");
+    d.arg("-c");
+    d.arg("echo err >&2; exit 7");
+    let r = d.output();
+    println(r.status, r.stderr.trim());
+    d.free();
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build process program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running process program: %v", err)
+	}
+	if got, want := string(raw), "0 hello big world 0\n7 err\n"; got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestStdPathQueries checks the C-backed filepath helpers and stat queries.
+func TestStdPathQueries(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.zx")
+	src := `use path;
+
+fn main() -> i32 {
+    println(path::join("/tmp", "a.txt"));
+    println(path::base("/tmp/a.txt"), path::dir("/tmp/a.txt"), path::ext("/tmp/a.txt"));
+    println(path::clean("/tmp/./x/../a.txt"));
+    println(path::exists("/tmp"), path::is_dir("/tmp"), path::is_file("/tmp"));
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build path program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running path program: %v", err)
+	}
+	if got, want := string(raw), "/tmp/a.txt\na.txt /tmp .txt\n/tmp/a.txt\ntrue true false\n"; got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestStdTimeFormat checks strftime-based formatting from the time module.
+func TestStdTimeFormat(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.zx")
+	src := `use time;
+
+fn main() -> i32 {
+    println(time::format(0, "%F"));
+    println(time::now_s() > 0, time::now_ms() > 0);
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build time program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running time program: %v", err)
+	}
+	if got, want := string(raw), "1970-01-01\ntrue true\n"; got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
 // TestStdMathConvenience exercises the high-level dependency-free numerical
 // surface: conventional aliases, transcendental helpers, geometry, domain
 // fallbacks, and floating-point classification.

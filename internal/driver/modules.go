@@ -63,7 +63,6 @@ var stdModuleAliases = map[string]string{
 	"thread":       "thread",
 	"thread::sync": "thread",
 	"thread::task": "thread",
-	"time":         "sys",
 }
 
 // stdModule resolves a public module path to an embedded source file. Keeping

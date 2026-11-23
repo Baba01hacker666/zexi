@@ -1,0 +1,58 @@
+// time — wall-clock formatting, modeled on Go's time.Format layout idea.
+// https://pkg.go.dev/time#Time.Format
+//
+// Zexi's `sys` already has `time_ms`, `mono_ms` and `sleep_ms`. This module
+// adds strftime-style formatting (the POSIX spelling, not Go's reference
+// layout) and a few clock readers, all done in C.
+//
+//     use time;
+//
+//     fn main() -> i32 {
+//         let now = time::now_s();
+//         println(time::format(now, "%Y-%m-%d %H:%M:%S"));
+//         0
+//     }
+
+extern "C" fn zxt_now_s() -> i64;
+extern "C" fn zxt_now_ms() -> i64;
+extern "C" fn zxt_format(epoch: i64, fmt: str, out: &mut [u8; 256]) -> i64;
+
+pub fn now_s() -> i64 { return zxt_now_s(); }
+pub fn now_ms() -> i64 { return zxt_now_ms(); }
+
+// format renders epoch seconds with a strftime format string. An empty result
+// means the format was too long for the 256-byte output buffer.
+pub fn format(epoch: i64, fmt: str) -> String {
+    let mut buf: [u8; 256] = [0; 256];
+    let n = zxt_format(epoch, fmt, &mut buf);
+    let mut s = String::new();
+    if n > 0 {
+        s.push_bytes(buf[0..n as usize]);
+    }
+    return s;
+}
+
+c """
+#define _POSIX_C_SOURCE 200809L
+#include <stdint.h>
+#include <string.h>
+#include <time.h>
+
+#define ZXT_BYTES(a) ((char *)((a)->e))
+
+int64_t zxt_now_s(void) { return (int64_t)time(NULL); }
+int64_t zxt_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+int64_t zxt_format(int64_t epoch, const char *fmt, zx_arr256_u8 *out) {
+    if (!fmt || !out) return 0;
+    time_t t = (time_t)epoch;
+    struct tm lt;
+    localtime_r(&t, &lt);
+    size_t n = strftime(ZXT_BYTES(out), 256, fmt, &lt);
+    return (int64_t)n;
+}
+"""

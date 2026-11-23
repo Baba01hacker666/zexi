@@ -1,0 +1,156 @@
+// process — running other programs, modeled on Go's os/exec.
+// https://pkg.go.dev/os/exec#Cmd.Output
+//
+// A Command keeps its program and arguments in a C argv; `output()` forks,
+// captures stdout and stderr, and returns the exit status. All of the fork /
+// pipe / exec / wait work is C, so Zexi needs no process primitives.
+//
+//     use process;
+//
+//     fn main() -> i32 {
+//         let c = Command::new("/bin/echo");
+//         c.arg("hello");
+//         let out = c.output();
+//         println(out.status, out.stdout.trim(), out.stderr);
+//         0
+//     }
+//
+// Captured stdout and stderr are capped at 8192 bytes each (the rest is
+// discarded). At most 63 arguments are kept. `output()` returns status -1 when
+// the program could not be started.
+
+extern "C" fn zxp_cmd_new(prog: str) -> i64;
+extern "C" fn zxp_cmd_arg(handle: i64, arg: str);
+extern "C" fn zxp_cmd_output(handle: i64, stdout: &mut [u8; 8192], stderr: &mut [u8; 8192]) -> i32;
+extern "C" fn zxp_cmd_free(handle: i64);
+
+// Output is the captured result of a command.
+pub struct Output {
+    status: i32,
+    stdout: String,
+    stderr: String,
+}
+
+// Command is a program plus its arguments.
+pub struct Command { h: i64 }
+
+impl Command {
+    pub fn new(prog: str) -> Command {
+        return Command { h: zxp_cmd_new(prog) };
+    }
+
+    pub fn arg(&self, value: str) {
+        zxp_cmd_arg(self.h, value);
+    }
+
+    // output runs the command and captures both streams.
+    pub fn output(&self) -> Output {
+        let mut obuf: [u8; 8192] = [0; 8192];
+        let mut ebuf: [u8; 8192] = [0; 8192];
+        let status = zxp_cmd_output(self.h, &mut obuf, &mut ebuf);
+        let mut out = String::new();
+        let mut err = String::new();
+        out.push_bytes(obuf[0..len_of(&obuf)]);
+        err.push_bytes(ebuf[0..len_of(&ebuf)]);
+        return Output { status: status, stdout: out, stderr: err };
+    }
+
+    pub fn ok(&self) -> bool {
+        return self.h != 0;
+    }
+
+    pub fn free(&self) {
+        zxp_cmd_free(self.h);
+    }
+}
+
+// len_of finds the first NUL, which is where the C side stopped writing.
+fn len_of(buf: &[u8; 8192]) -> usize {
+    let mut n: usize = 0;
+    while n < buf.len() && buf[n] != 0 {
+        n += 1;
+    }
+    return n;
+}
+
+// Fork/exec and pipes are the whole implementation. The C travels with this
+// file, so `use process;` needs no driver-side list.
+c """
+#define _POSIX_C_SOURCE 200809L
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+#define ZXP_BYTES(a) ((uint8_t *)((a)->e))
+#define ZXP_MAXARGS 64
+
+typedef struct { char **argv; int n; } zxp_cmd;
+
+int64_t zxp_cmd_new(const char *prog) {
+    zxp_cmd *c = (zxp_cmd *)calloc(1, sizeof(zxp_cmd));
+    if (!c) return 0;
+    c->argv = (char **)calloc(ZXP_MAXARGS + 1, sizeof(char *));
+    if (!c->argv || !prog) { free(c); return 0; }
+    c->argv[0] = strdup(prog);
+    c->n = 1;
+    return (int64_t)(uintptr_t)c;
+}
+
+void zxp_cmd_arg(int64_t h, const char *arg) {
+    zxp_cmd *c = (zxp_cmd *)(uintptr_t)h;
+    if (!c || !arg || c->n >= ZXP_MAXARGS) return;
+    c->argv[c->n++] = strdup(arg);
+}
+
+static void zxp_drain(int fd, uint8_t *out, int cap) {
+    int used = 0;
+    for (;;) {
+        ssize_t n = read(fd, out + used, (size_t)(cap - used - 1));
+        if (n <= 0) break;
+        used += (int)n;
+        if (used >= cap - 1) break;
+    }
+    out[used] = 0;
+}
+
+int32_t zxp_cmd_output(int64_t h, zx_arr8192_u8 *so, zx_arr8192_u8 *se) {
+    zxp_cmd *c = (zxp_cmd *)(uintptr_t)h;
+    if (!c || !so || !se) return -1;
+    c->argv[c->n] = NULL;
+    int op[2], ep[2];
+    if (pipe(op) != 0) return -1;
+    if (pipe(ep) != 0) { close(op[0]); close(op[1]); return -1; }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(op[0]); close(op[1]); close(ep[0]); close(ep[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        dup2(op[1], STDOUT_FILENO);
+        dup2(ep[1], STDERR_FILENO);
+        close(op[0]); close(op[1]); close(ep[0]); close(ep[1]);
+        execvp(c->argv[0], c->argv);
+        _exit(127);
+    }
+    close(op[1]);
+    close(ep[1]);
+    zxp_drain(op[0], ZXP_BYTES(so), 8192);
+    zxp_drain(ep[0], ZXP_BYTES(se), 8192);
+    close(op[0]);
+    close(ep[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return -1;
+}
+
+void zxp_cmd_free(int64_t h) {
+    zxp_cmd *c = (zxp_cmd *)(uintptr_t)h;
+    if (!c) return;
+    for (int i = 0; i < c->n; i++) free(c->argv[i]);
+    free(c->argv);
+    free(c);
+}
+"""

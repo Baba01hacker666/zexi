@@ -1,0 +1,172 @@
+// bufio — buffered I/O, modeled on Go's bufio package.
+//
+// The stdlib's `io::read_line` issues one read(2) per byte, which is fine for
+// a terminal and terrible for a file or a socket. A `Reader` keeps an 8 KiB
+// window in C and hands out whole lines from it; the kernel is consulted only
+// when the window runs dry. Modeled on Go's bufio.Reader:
+// https://pkg.go.dev/bufio#Reader
+//
+//     use bufio;
+//     use io;
+//
+//     fn main() -> i32 {
+//         let f = io::open_read("names.txt");
+//         match f {
+//             Ok(fd) => {
+//                 let r = Reader::from_fd(fd);
+//                 loop {
+//                     let line = r.read_line();
+//                     if line.len() == 0 { break; }
+//                     println(line);
+//                 }
+//                 r.close();
+//             },
+//             Err(e) => println(e.message()),
+//         }
+//         0
+//     }
+//
+// `read_line` strips the trailing '\n' and a preceding '\r', and returns an
+// empty String only at end of file. A line longer than the 8 KiB buffer is
+// returned in pieces; use `read_bytes` if that matters.
+
+extern "C" fn zxbr_new(fd: i32) -> i64;
+extern "C" fn zxbr_line(handle: i64, out: &mut [u8; 8192], cap: i32) -> i64;
+extern "C" fn zxbr_read(handle: i64, out: &mut [u8; 8192], cap: i32) -> i64;
+extern "C" fn zxbr_buffered(handle: i64) -> i64;
+extern "C" fn zxbr_close(handle: i64);
+
+// Reader is a buffered view over a raw file descriptor. It does not own the
+// descriptor: close it with `close()` after use, as you would with `sys::close_fd`.
+pub struct Reader { h: i64 }
+
+impl Reader {
+    pub fn from_fd(fd: i32) -> Reader {
+        return Reader { h: zxbr_new(fd) };
+    }
+
+    // read_line returns the next line without its line ending, or an empty
+    // String at end of file.
+    pub fn read_line(&self) -> String {
+        let mut buf: [u8; 8192] = [0; 8192];
+        let n = zxbr_line(self.h, &mut buf, 8192);
+        if n <= 0 {
+            return String::from("");
+        }
+        let mut s = String::new();
+        s.push_bytes(buf[0..n as usize]);
+        return s;
+    }
+
+    // read_bytes reads up to buf.len() bytes, using buffered data first. It
+    // returns the number of bytes placed in buf, or 0 at end of file.
+    pub fn read_bytes(&self, buf: &mut [u8; 8192], cap: i32) -> i64 {
+        return zxbr_read(self.h, buf, cap);
+    }
+
+    // buffered reports how many bytes are still in the user-space window.
+    pub fn buffered(&self) -> i64 {
+        return zxbr_buffered(self.h);
+    }
+
+    pub fn ok(&self) -> bool {
+        return self.h != 0;
+    }
+
+    // close releases the buffer; it does not close the underlying descriptor.
+    pub fn close(&self) {
+        zxbr_close(self.h);
+    }
+}
+
+// The buffer and its cursor live in this module's own C block; `use bufio;`
+// links it with no driver-side changes. One read(2) fills at most 8192 bytes.
+c """
+#define _POSIX_C_SOURCE 200809L
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define ZXBR_CAP 8192
+#define ZXBR_BYTES(a) ((uint8_t *)((a)->e))
+
+typedef struct {
+    int fd;
+    size_t pos, end;
+    char buf[ZXBR_CAP];
+} zxbr_t;
+
+int64_t zxbr_new(int32_t fd) {
+    zxbr_t *r = (zxbr_t *)calloc(1, sizeof(zxbr_t));
+    if (!r) return 0;
+    r->fd = fd;
+    return (int64_t)(uintptr_t)r;
+}
+
+/* Refill the window. Returns 1 on data, 0 at EOF, -1 on error. */
+static int zxbr_fill(zxbr_t *r) {
+    if (r->pos < r->end) return 1;
+    r->pos = r->end = 0;
+    ssize_t n = read(r->fd, r->buf, ZXBR_CAP);
+    if (n < 0) return -1;
+    if (n == 0) return 0;
+    r->end = (size_t)n;
+    return 1;
+}
+
+/* Read one line without its terminator. Returns its length, 0 for an empty
+ * line, -1 at EOF with no data, -2 on error. */
+int64_t zxbr_line(int64_t h, zx_arr8192_u8 *out, int32_t cap) {
+    zxbr_t *r = (zxbr_t *)(uintptr_t)h;
+    if (!r || !out || cap <= 0) return -2;
+    size_t n = 0;
+    for (;;) {
+        if (r->pos >= r->end) {
+            int rc = zxbr_fill(r);
+            if (rc <= 0) return rc == 0 && n > 0 ? (int64_t)n : (rc == 0 ? -1 : -2);
+        }
+        char *nl = (char *)memchr(r->buf + r->pos, '\n', r->end - r->pos);
+        size_t take = nl ? (size_t)(nl - (r->buf + r->pos)) : r->end - r->pos;
+        if (take > (size_t)cap) take = (size_t)cap;
+        memcpy(ZXBR_BYTES(out) + n, r->buf + r->pos, take);
+        r->pos += take;
+        n += take;
+        if (nl) {
+            r->pos++; /* consume the newline */
+            if (n > 0 && ZXBR_BYTES(out)[n - 1] == '\r') n--;
+            return (int64_t)n;
+        }
+        if ((int64_t)n >= cap) return (int64_t)n; /* line longer than the caller's buffer */
+    }
+}
+
+/* Copy buffered bytes first, then read directly for the remainder. */
+int64_t zxbr_read(int64_t h, zx_arr8192_u8 *out, int32_t cap) {
+    zxbr_t *r = (zxbr_t *)(uintptr_t)h;
+    if (!r || !out || cap <= 0) return -2;
+    size_t n = 0;
+    if (r->pos < r->end) {
+        size_t avail = r->end - r->pos;
+        size_t take = avail < (size_t)cap ? avail : (size_t)cap;
+        memcpy(ZXBR_BYTES(out), r->buf + r->pos, take);
+        r->pos += take;
+        n = take;
+    }
+    if ((int64_t)n < cap) {
+        ssize_t got = read(r->fd, ZXBR_BYTES(out) + n, (size_t)cap - n);
+        if (got > 0) n += (size_t)got;
+        else if (got < 0 && n == 0) return -2;
+    }
+    return (int64_t)n;
+}
+
+int64_t zxbr_buffered(int64_t h) {
+    zxbr_t *r = (zxbr_t *)(uintptr_t)h;
+    return r ? (int64_t)(r->end - r->pos) : 0;
+}
+
+void zxbr_close(int64_t h) {
+    free((void *)(uintptr_t)h);
+}
+"""

@@ -246,6 +246,17 @@ Guards carry the protected `T` in their type and must be released explicitly
 with `unlock()` (user-defined `Drop` is not implemented yet). Full semantics in
 [`21-typed-sync.md`](21-typed-sync.md).
 
+## 16.6c `bufio`, `process`, `path`, `time`
+
+Go-shaped, C-backed packages. See [`24-c-backed-stdlib.md`](24-c-backed-stdlib.md).
+
+| module | surface |
+| --- | --- |
+| `bufio` | `Reader::from_fd`, `read_line`, `read_bytes`, `buffered`, `close` |
+| `process` | `Command::new`, `.arg`, `.output()`, `Output { status, stdout, stderr }` |
+| `path` | `join`, `base`, `dir`, `ext`, `clean`, `realpath`, `exists`, `is_dir`, `is_file` |
+| `time` | `now_s`, `now_ms`, `format(epoch, strftime_layout)` |
+
 ## 16.7 `sys`, `io`, `fs`
 
 `sys` is the POSIX substrate and depends on no other standard module; `io` and

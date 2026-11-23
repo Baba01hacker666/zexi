@@ -142,7 +142,11 @@ This repository contains the **initial design and specification** of Zexi: the v
 > its own type parameter (docs/12-generics.md §12.15). For non-blocking I/O,
 > the `async` module runs tasks on fibers: `await(fd)` suspends a task until a
 > descriptor is readable, so a waiting request costs a poll entry instead of a
-> thread (see [`docs/23-async.md`](docs/23-async.md)).
+> thread (see [`docs/23-async.md`](docs/23-async.md)). Four more C-backed
+> packages fill gaps a bigger language would put in its core — `bufio`
+> (buffered lines, Go `bufio.Reader`), `process` (Go `os/exec`), `path` (Go
+> `path/filepath`) and `time` (strftime formatting); see
+> [`docs/24-c-backed-stdlib.md`](docs/24-c-backed-stdlib.md).
 >
 > Not yet implemented: `dyn Trait`, associated types, const generics, full module
 > **isolation** (qualified access, `as` aliases, and `pub` checks work, but the
@@ -365,6 +369,7 @@ for why, its real costs, and the plan to replace it with a native backend.
 - [`docs/21-typed-sync.md`](docs/21-typed-sync.md) — typed `Mutex<T>` / `RwLock<T>`, channel timeouts and `select`, typed/shared channels, and the remaining §5 gaps.
 - [`docs/22-traits.md`](docs/22-traits.md) — trait declarations, impls, bounds, and static dispatch.
 - [`docs/23-async.md`](docs/23-async.md) — stackful tasks, `await`, and the readiness scheduler.
+- [`docs/24-c-backed-stdlib.md`](docs/24-c-backed-stdlib.md) — Go-style `bufio`, `process`, `path` and `time`, implemented in C.
 - [`examples/`](examples/) — ready-to-run Zexi programs plus focused feature examples.
 - [`tests/tour.zx`](tests/tour.zx) — the end-to-end program the test suite compiles and runs.
 - [`tests/syntax.zx`](tests/syntax.zx) — a runnable syntax tour; [`tests/pi.zx`](tests/pi.zx) — 30 digits of π.

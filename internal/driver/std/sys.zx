@@ -1,5 +1,6 @@
 // sys — the POSIX substrate: errno, byte I/O, files, environment, clocks, pid.
-// Import with `use sys;`, `use std::sys;`, `import os;`, or `import time;`.
+// Import with `use sys;`, `use std::sys;`, or `import os;`. Clock formatting
+// lives in the separate `time` module.
 //
 // `sys` depends on nothing else in the standard library; `io`, `fs`, and `net`
 // build on it. A small POSIX C shim (`zxs_*`) is linked only when this module is
