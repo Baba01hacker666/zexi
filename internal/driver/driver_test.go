@@ -3127,6 +3127,147 @@ fn main() -> i32 {
 	}
 }
 
+// TestStdSort checks the C-backed sort package: ascending, a Zexi closure as
+// the less function, reverse, and floating point.
+func TestStdSort(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.zx")
+	src := `use sort;
+
+fn main() -> i32 {
+    let mut v: [i64; 5] = [3, 1, 4, 1, 5];
+    sort::i64(&mut v[0..5]);
+    println(v[0], v[1], v[2], v[3], v[4]);
+    sort::by_i64(&mut v[0..5], |a, b| a > b);
+    println(v[0], v[1], v[2], v[3], v[4]);
+    sort::reverse_i64(&mut v[0..5]);
+    println(v[0], v[1], v[2], v[3], v[4]);
+    let mut f: [f64; 3] = [2.5, 1.5, 3.5];
+    sort::f64(&mut f[0..3]);
+    println(f[0], f[1], f[2]);
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build sort program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running sort program: %v", err)
+	}
+	want := "1 1 3 4 5\n5 4 3 1 1\n1 1 3 4 5\n1.5 2.5 3.5\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestStdLog checks leveled logging: INFO/WARN are emitted, a raised level
+// suppresses INFO, and ERROR still gets through. The timestamp is C-formatted.
+func TestStdLog(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.zx")
+	src := `use log;
+
+fn main() -> i32 {
+    log::info("server started");
+    log::warn(f"slow request: {42}ms");
+    log::set_level(3);
+    log::info("not printed");
+    log::error("boom");
+    println(log::level());
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build log program")
+	}
+	raw, err := exec.Command(out).CombinedOutput()
+	if err != nil {
+		t.Fatalf("running log program: %v", err)
+	}
+	got := string(raw)
+	for _, want := range []string{"INFO: server started", "WARN: slow request: 42ms", "ERROR: boom", "3\n"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in output %q", want, got)
+		}
+	}
+	if strings.Contains(got, "not printed") {
+		t.Errorf("INFO was emitted after raising the level: %q", got)
+	}
+}
+
+// TestStdFlag checks the C-backed flag parser across all accepted spellings.
+func TestStdFlag(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.zx")
+	src := `use flag;
+
+fn main() -> i32 {
+    flag::int("n", 10, "how many");
+    flag::str("name", "world", "who");
+    flag::bool("verbose", false, "chatty");
+    flag::parse();
+    println(flag::get_i64("n"), flag::get_str("name"), flag::get_bool("verbose"));
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build flag program")
+	}
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{nil, "10 world false\n"},
+		{[]string{"-n", "7", "--name=Zexi", "-verbose"}, "7 Zexi true\n"},
+		{[]string{"--n=3", "-name", "hi"}, "3 hi false\n"},
+	} {
+		raw, err := exec.Command(out, tc.args...).Output()
+		if err != nil {
+			t.Fatalf("running flag program with %v: %v", tc.args, err)
+		}
+		if got := string(raw); got != tc.want {
+			t.Fatalf("args %v: got %q, want %q", tc.args, got, tc.want)
+		}
+	}
+}
+
 // TestStdMathConvenience exercises the high-level dependency-free numerical
 // surface: conventional aliases, transcendental helpers, geometry, domain
 // fallbacks, and floating-point classification.

@@ -1,0 +1,95 @@
+// sort — sorting, modeled on Go's sort / slices packages.
+// https://pkg.go.dev/sort
+//
+// C does the heavy lifting with qsort. Plain sorts need no callback; `by_*`
+// variants take a Zexi closure as the less function, passed to C as a function
+// value and called back through a small trampoline. Comparators borrow their
+// arguments, so no Zexi values cross the C boundary.
+//
+//     use sort;
+//
+//     fn main() -> i32 {
+//         let mut v: [i64; 5] = [3, 1, 4, 1, 5];
+//         sort::i64(&mut v[0..5]);
+//         sort::by_i64(&mut v[0..5], |a, b| a > b); // descending
+//         0
+//     }
+//
+// Sorting is in place. Slices of any length are accepted; the ABI passes the
+// (ptr, len) slice by value, so no size-specific code is needed.
+
+extern "C" fn zxs_i64(v: &mut [i64]);
+extern "C" fn zxs_f64(v: &mut [f64]);
+extern "C" fn zxs_by_i64(v: &mut [i64], less: fn(i64, i64) -> bool);
+extern "C" fn zxs_reverse_i64(v: &mut [i64]);
+
+pub fn i64(v: &mut [i64]) {
+    zxs_i64(v);
+}
+
+pub fn f64(v: &mut [f64]) {
+    zxs_f64(v);
+}
+
+// by_i64 sorts with a caller-provided less(a, b) predicate.
+pub fn by_i64(v: &mut [i64], less: fn(i64, i64) -> bool) {
+    zxs_by_i64(v, less);
+}
+
+pub fn reverse_i64(v: &mut [i64]) {
+    zxs_reverse_i64(v);
+}
+
+c """
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdbool.h>
+
+/* A Zexi function value is a closure record whose second word is the code
+ * pointer; the code receives the record as its first argument. */
+typedef struct { long rc; void *fn; } zxs_closure;
+typedef bool (*zxs_fn2)(void *, int64_t, int64_t);
+#define ZXS_CALL2(p, a, b) (((zxs_fn2)((zxs_closure *)(p))->fn)((void *)(p), (a), (b)))
+
+static void *g_less = NULL;
+
+static int zxs_cmp_i64(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a;
+    int64_t y = *(const int64_t *)b;
+    if (g_less) return ZXS_CALL2(g_less, x, y) ? -1 : 1;
+    return (x < y) ? -1 : ((x > y) ? 1 : 0);
+}
+static int zxs_cmp_f64(const void *a, const void *b) {
+    double x = *(const double *)a;
+    double y = *(const double *)b;
+    return (x < y) ? -1 : ((x > y) ? 1 : 0);
+}
+
+void zxs_i64(zx_slice_i64 v) {
+    if (!v.ptr || v.len < 2) return;
+    g_less = NULL;
+    qsort(v.ptr, v.len, sizeof(int64_t), zxs_cmp_i64);
+}
+
+void zxs_f64(zx_slice_f64 v) {
+    if (!v.ptr || v.len < 2) return;
+    qsort(v.ptr, v.len, sizeof(double), zxs_cmp_f64);
+}
+
+void zxs_by_i64(zx_slice_i64 v, void *less) {
+    if (!v.ptr || v.len < 2) return;
+    g_less = less;
+    qsort(v.ptr, v.len, sizeof(int64_t), zxs_cmp_i64);
+    g_less = NULL;
+}
+
+void zxs_reverse_i64(zx_slice_i64 v) {
+    if (!v.ptr || v.len < 2) return;
+    int64_t *p = v.ptr;
+    size_t i = 0, j = v.len - 1;
+    while (i < j) {
+        int64_t t = p[i]; p[i] = p[j]; p[j] = t;
+        i++; j--;
+    }
+}
+"""

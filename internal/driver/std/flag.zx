@@ -1,0 +1,173 @@
+// flag — command-line flag parsing, modeled on Go's flag package.
+// https://pkg.go.dev/flag
+//
+// Register flags before calling parse(), then read them back by name. C owns
+// the flag table and walks argv, so Zexi needs no reflection or string tricks.
+//
+//     use flag;
+//
+//     fn main() -> i32 {
+//         flag::int("n", 10, "how many");
+//         flag::str("name", "world", "who to greet");
+//         flag::bool("verbose", false, "chatty output");
+//         flag::parse();
+//         println(flag::get_i64("n"), flag::get_str("name"), flag::get_bool("verbose"));
+//         0
+//     }
+//
+// Accepted forms: `-n 3`, `--n 3`, `-n=3`, `--n=3` and `-h` / `--help` (which
+// prints the registered usage lines). Parsing stops at the first non-flag
+// argument. Unknown flags are ignored; getters then return the default.
+
+extern "C" fn zxf_int(name: str, def: i64, usage: str);
+extern "C" fn zxf_str(name: str, def: str, usage: str);
+extern "C" fn zxf_bool(name: str, def: bool, usage: str);
+extern "C" fn zxf_parse();
+extern "C" fn zxf_get_i64(name: str) -> i64;
+extern "C" fn zxf_get_str(name: str, out: &mut [u8; 8192]) -> i64;
+extern "C" fn zxf_get_bool(name: str) -> i32;
+
+pub fn int(name: str, def: i64, usage: str) { zxf_int(name, def, usage); }
+pub fn str(name: str, def: str, usage: str) { zxf_str(name, def, usage); }
+pub fn bool(name: str, def: bool, usage: str) { zxf_bool(name, def, usage); }
+pub fn parse() { zxf_parse(); }
+
+pub fn get_i64(name: str) -> i64 { return zxf_get_i64(name); }
+pub fn get_bool(name: str) -> bool { return zxf_get_bool(name) == 1; }
+
+pub fn get_str(name: str) -> String {
+    let mut buf: [u8; 8192] = [0; 8192];
+    let n = zxf_get_str(name, &mut buf);
+    let mut s = String::new();
+    if n > 0 { s.push_bytes(buf[0..n as usize]); }
+    return s;
+}
+
+c """
+#define _POSIX_C_SOURCE 200809L
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+extern int zx_argc;
+extern char **zx_argv;
+
+#define ZXF_MAX 64
+#define ZXF_BYTES(a) ((char *)((a)->e))
+
+typedef enum { ZXF_I64 = 0, ZXF_STR = 1, ZXF_BOOL = 2 } zxf_kind;
+typedef struct {
+    char name[64];
+    char usage[128];
+    zxf_kind kind;
+    int64_t i;
+    char s[8192];
+    int b;
+} zxf_flag;
+
+static zxf_flag g_flags[ZXF_MAX];
+static int g_count = 0;
+
+static zxf_flag *zxf_find(const char *name) {
+    if (!name) return NULL;
+    for (int i = 0; i < g_count; i++) {
+        if (strcmp(g_flags[i].name, name) == 0) return &g_flags[i];
+    }
+    return NULL;
+}
+
+static zxf_flag *zxf_add(const char *name, const char *usage, zxf_kind kind) {
+    if (!name) return NULL;
+    zxf_flag *f = zxf_find(name);
+    if (f) return f;
+    if (g_count >= ZXF_MAX) return NULL;
+    f = &g_flags[g_count++];
+    memset(f, 0, sizeof(*f));
+    snprintf(f->name, sizeof(f->name), "%s", name);
+    if (usage) snprintf(f->usage, sizeof(f->usage), "%s", usage);
+    f->kind = kind;
+    return f;
+}
+
+void zxf_int(const char *name, int64_t def, const char *usage) {
+    zxf_flag *f = zxf_add(name, usage, ZXF_I64);
+    if (f) f->i = def;
+}
+void zxf_str(const char *name, const char *def, const char *usage) {
+    zxf_flag *f = zxf_add(name, usage, ZXF_STR);
+    if (f && def) snprintf(f->s, sizeof(f->s), "%s", def);
+}
+void zxf_bool(const char *name, bool b, const char *usage) {
+    zxf_flag *f = zxf_add(name, usage, ZXF_BOOL);
+    if (f) f->b = b ? 1 : 0;
+}
+
+static void zxf_usage(void) {
+    fprintf(stderr, "flags:\n");
+    for (int i = 0; i < g_count; i++) {
+        fprintf(stderr, "  -%s\t%s\n", g_flags[i].name, g_flags[i].usage);
+    }
+}
+
+static int zxf_set(zxf_flag *f, const char *value) {
+    if (!f || !value) return 0;
+    switch (f->kind) {
+        case ZXF_I64: f->i = strtoll(value, NULL, 10); return 1;
+        case ZXF_STR: snprintf(f->s, sizeof(f->s), "%s", value); return 1;
+        case ZXF_BOOL:
+            f->b = (strcmp(value, "true") == 0 || strcmp(value, "1") == 0 ||
+                    strcmp(value, "yes") == 0) ? 1 : 0;
+            return 1;
+    }
+    return 0;
+}
+
+void zxf_parse(void) {
+    for (int i = 1; i < zx_argc; i++) {
+        char *arg = zx_argv[i];
+        if (!arg || arg[0] != '-' || !arg[1]) break; /* first positional stops parsing */
+        char *name = arg + 1;
+        if (name[0] == '-') name++;
+        if (strcmp(name, "h") == 0 || strcmp(name, "help") == 0) {
+            zxf_usage();
+            break;
+        }
+        char *eq = strchr(name, '=');
+        const char *value = NULL;
+        if (eq) {
+            *eq = 0;
+            value = eq + 1;
+        }
+        zxf_flag *f = zxf_find(name);
+        if (!f) continue;
+        if (!eq) {
+            if (f->kind == ZXF_BOOL) {
+                value = "true";
+            } else if (i + 1 < zx_argc) {
+                value = zx_argv[++i];
+            }
+        }
+        zxf_set(f, value);
+    }
+}
+
+int64_t zxf_get_i64(const char *name) {
+    zxf_flag *f = zxf_find(name);
+    return f ? f->i : 0;
+}
+int64_t zxf_get_str(const char *name, zx_arr8192_u8 *out) {
+    zxf_flag *f = zxf_find(name);
+    if (!f || !out) return 0;
+    size_t n = strlen(f->s);
+    if (n >= 8192) n = 8191;
+    memcpy(ZXF_BYTES(out), f->s, n);
+    ZXF_BYTES(out)[n] = 0;
+    return (int64_t)n;
+}
+int32_t zxf_get_bool(const char *name) {
+    zxf_flag *f = zxf_find(name);
+    return f && f->b ? 1 : 0;
+}
+"""

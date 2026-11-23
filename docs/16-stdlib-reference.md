@@ -246,7 +246,7 @@ Guards carry the protected `T` in their type and must be released explicitly
 with `unlock()` (user-defined `Drop` is not implemented yet). Full semantics in
 [`21-typed-sync.md`](21-typed-sync.md).
 
-## 16.6c `bufio`, `process`, `path`, `time`
+## 16.6c `bufio`, `process`, `path`, `time`, `sort`, `log`, `flag`
 
 Go-shaped, C-backed packages. See [`24-c-backed-stdlib.md`](24-c-backed-stdlib.md).
 
@@ -256,6 +256,9 @@ Go-shaped, C-backed packages. See [`24-c-backed-stdlib.md`](24-c-backed-stdlib.m
 | `process` | `Command::new`, `.arg`, `.output()`, `Output { status, stdout, stderr }` |
 | `path` | `join`, `base`, `dir`, `ext`, `clean`, `realpath`, `exists`, `is_dir`, `is_file` |
 | `time` | `now_s`, `now_ms`, `format(epoch, strftime_layout)` |
+| `sort` | `i64`, `f64`, `by_i64`, `reverse_i64` (in-place on slices) |
+| `log` | `debug`, `info`, `warn`, `error`, `set_level`, `level` |
+| `flag` | `int`, `str`, `bool`, `parse`, `get_i64`, `get_str`, `get_bool` |
 
 ## 16.7 `sys`, `io`, `fs`
 

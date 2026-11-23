@@ -1,0 +1,69 @@
+// log — leveled logging with timestamps, modeled on Go's log / slog packages.
+// https://pkg.go.dev/log/slog
+//
+// C formats the timestamp and writes one line to stderr, so the Zexi side is
+// just four small functions. Messages are plain strings; build them with
+// f-strings when you need values.
+//
+//     use log;
+//
+//     fn main() -> i32 {
+//         log::info("server started");
+//         log::warn(f"slow request: {42}ms");
+//         log::set_level(3);          // ERROR and above only
+//         log::info("not printed");
+//         0
+//     }
+//
+// Levels: DEBUG=0, INFO=1, WARN=2, ERROR=3. The default is INFO.
+
+extern "C" fn zxl_log(level: i32, msg: str);
+extern "C" fn zxl_set_level(level: i32);
+extern "C" fn zxl_level() -> i32;
+
+pub const DEBUG: i32 = 0;
+pub const INFO: i32 = 1;
+pub const WARN: i32 = 2;
+pub const ERROR: i32 = 3;
+
+pub fn debug(msg: str) { zxl_log(0, msg); }
+pub fn info(msg: str) { zxl_log(1, msg); }
+pub fn warn(msg: str) { zxl_log(2, msg); }
+pub fn error(msg: str) { zxl_log(3, msg); }
+
+pub fn set_level(level: i32) { zxl_set_level(level); }
+pub fn level() -> i32 { return zxl_level(); }
+
+c """
+#define _POSIX_C_SOURCE 200809L
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+static int g_level = 1; /* INFO */
+
+static const char *zxl_name(int level) {
+    switch (level) {
+        case 0: return "DEBUG";
+        case 1: return "INFO";
+        case 2: return "WARN";
+        case 3: return "ERROR";
+        default: return "LOG";
+    }
+}
+
+void zxl_log(int32_t level, const char *msg) {
+    if (level < g_level) return;
+    char stamp[32];
+    time_t now = time(NULL);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &lt);
+    fprintf(stderr, "[%s] %s: %s\n", stamp, zxl_name(level), msg ? msg : "");
+    fflush(stderr);
+}
+
+void zxl_set_level(int32_t level) { g_level = level; }
+int32_t zxl_level(void) { return g_level; }
+"""

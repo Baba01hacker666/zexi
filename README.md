@@ -145,7 +145,8 @@ This repository contains the **initial design and specification** of Zexi: the v
 > thread (see [`docs/23-async.md`](docs/23-async.md)). Four more C-backed
 > packages fill gaps a bigger language would put in its core — `bufio`
 > (buffered lines, Go `bufio.Reader`), `process` (Go `os/exec`), `path` (Go
-> `path/filepath`) and `time` (strftime formatting); see
+> `path/filepath`), `time` (strftime formatting), `sort` (with Zexi comparator
+> closures), `log` and `flag`; see
 > [`docs/24-c-backed-stdlib.md`](docs/24-c-backed-stdlib.md).
 >
 > Not yet implemented: `dyn Trait`, associated types, const generics, full module

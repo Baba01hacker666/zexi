@@ -13,6 +13,9 @@ library, which has the same "small core, useful packages" shape.
 | [`process`](../internal/driver/std/process.zx) | `os/exec` | no way to run another program and capture its output |
 | [`path`](../internal/driver/std/path.zx) | `path/filepath` | no path manipulation or `stat` queries |
 | [`time`](../internal/driver/std/time.zx) | `time` | `sys` has clocks but no formatting |
+| [`sort`](../internal/driver/std/sort.zx) | `sort` / `slices` | no sorting of arrays or slices |
+| [`log`](../internal/driver/std/log.zx) | `log` / `log/slog` | no leveled logging |
+| [`flag`](../internal/driver/std/flag.zx) | `flag` | only raw `arg_at` / `arg_count` |
 
 ## 24.1 `bufio`
 
@@ -98,7 +101,44 @@ fn main() -> i32 {
 }
 ```
 
-## 24.5 Why C, and what the limits are
+## 24.5 `sort`, `log`, `flag`
+
+`sort` uses C `qsort` on a `(ptr, len)` slice passed by value, so it handles any
+length. `sort::i64` / `sort::f64` need no callback; `sort::by_i64` passes a Zexi
+closure to C and calls it back through a trampoline (the closure returns C
+`bool`, which the trampoline respects). `reverse_i64` is a plain C loop.
+
+```zx
+use sort;
+
+fn main() -> i32 {
+    let mut v: [i64; 5] = [3, 1, 4, 1, 5];
+    sort::i64(&mut v[0..5]);              // 1 1 3 4 5
+    sort::by_i64(&mut v[0..5], |a, b| a > b);
+    0
+}
+```
+
+`log` writes timestamped lines to stderr with `log::debug/info/warn/error(msg)`
+and a minimum level (`DEBUG=0` … `ERROR=3`, default INFO). Build messages with
+f-strings: `log::warn(f"slow: {ms}ms")`.
+
+`flag` registers flags before `parse()` and reads them back afterward:
+`flag::int`, `flag::str`, `flag::bool`, then `get_i64`, `get_str`, `get_bool`.
+It accepts `-n 3`, `--n 3`, `-n=3`, `--n=3`, bare boolean flags and `-h`.
+
+```zx
+use flag;
+
+fn main() -> i32 {
+    flag::int("n", 10, "how many");
+    flag::parse();
+    println(flag::get_i64("n"));
+    0
+}
+```
+
+## 24.6 Why C, and what the limits are
 
 - Every module carries its own C; none adds a driver-side C blob or a linker
   flag. This keeps the self-extension promise in docs/17 intact.
