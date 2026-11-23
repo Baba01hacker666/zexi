@@ -24,6 +24,7 @@ extern "C" fn zxpa_realpath(p: str, out: &mut [u8; 8192]) -> i64;
 extern "C" fn zxpa_exists(p: str) -> i32;
 extern "C" fn zxpa_is_dir(p: str) -> i32;
 extern "C" fn zxpa_is_file(p: str) -> i32;
+extern "C" fn zxpa_walk(root: str, cb: fn(str, i32) -> i32) -> i32;
 
 // from_buf builds the String C just wrote.
 fn from_buf(buf: &[u8; 8192], n: i64) -> String {
@@ -68,12 +69,21 @@ pub fn exists(p: str) -> bool { return zxpa_exists(p) == 1; }
 pub fn is_dir(p: str) -> bool { return zxpa_is_dir(p) == 1; }
 pub fn is_file(p: str) -> bool { return zxpa_is_file(p) == 1; }
 
+// walk visits root and everything below it, calling cb(path, is_dir) for each
+// entry (including root). Returning a nonzero value from cb stops the walk.
+// The C side uses opendir/readdir and calls back into the Zexi closure.
+pub fn walk(root: str, cb: fn(str, i32) -> i32) -> i32 {
+    return zxpa_walk(root, cb);
+}
+
 c """
 #define _POSIX_C_SOURCE 200809L
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <stdbool.h>
 
 #define ZXPA_BYTES(a) ((char *)((a)->e))
 #define ZXPA_CAP 8192
@@ -182,4 +192,43 @@ int32_t zxpa_exists(const char *p) {
 }
 int32_t zxpa_is_dir(const char *p) { return zxpa_kind(p, 1); }
 int32_t zxpa_is_file(const char *p) { return zxpa_kind(p, 0); }
+
+/* Recursive walk with a callback into Zexi. */
+typedef struct { long rc; void *fn; } zxpa_closure;
+typedef int32_t (*zxpa_fn2)(void *, const char *, int32_t);
+#define ZXPA_CALL2(p, path, isdir) \
+    (((zxpa_fn2)((zxpa_closure *)(p))->fn)((void *)(p), (path), (isdir)))
+
+static void *g_walk_cb = NULL;
+static int g_walk_stop = 0;
+
+static int zxpa_isdir_path(const char *p) {
+    struct stat st;
+    return (stat(p, &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
+}
+
+static void zxpa_walk_dir(const char *dir) {
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL && !g_walk_stop) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        char full[ZXPA_CAP];
+        snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
+        int isdir = zxpa_isdir_path(full);
+        if (ZXPA_CALL2(g_walk_cb, full, isdir) != 0) { g_walk_stop = 1; break; }
+        if (isdir) zxpa_walk_dir(full);
+    }
+    closedir(d);
+}
+
+int32_t zxpa_walk(const char *root, void *cb) {
+    if (!root || !cb) return 0;
+    g_walk_cb = cb;
+    g_walk_stop = 0;
+    int isdir = zxpa_isdir_path(root);
+    if (ZXPA_CALL2(g_walk_cb, root, isdir) == 0 && isdir) zxpa_walk_dir(root);
+    g_walk_cb = NULL;
+    return g_walk_stop ? 1 : 0;
+}
 """

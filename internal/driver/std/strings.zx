@@ -1,0 +1,194 @@
+// strings — string utilities, modeled on Go's strings package.
+// https://pkg.go.dev/strings
+//
+// C does the searching and case conversion; Zexi builds the owned results.
+// `split` is a loop over a C cursor that reports field boundaries, so no
+// quoted or binary data crosses the FFI boundary as a C string.
+//
+//     use strings;
+//
+//     fn main() -> i32 {
+//         println(strings::contains("hello world", "world"));
+//         println(strings::to_upper("hello"));
+//         let parts = strings::split("a,b,c", ",");
+//         println(parts.len());
+//         0
+//     }
+//
+// Output buffers for whole-string results (`to_upper`, `trim`, `replace`) are
+// 8192 bytes; longer results are truncated. `split` borrows the input, so it
+// has no such limit.
+
+extern "C" fn zxst_contains(s: str, sub: str) -> i32;
+extern "C" fn zxst_prefix(s: str, pre: str) -> i32;
+extern "C" fn zxst_suffix(s: str, suf: str) -> i32;
+extern "C" fn zxst_index(s: str, sub: str) -> i64;
+extern "C" fn zxst_upper(s: str, out: &mut [u8; 8192]) -> i64;
+extern "C" fn zxst_lower(s: str, out: &mut [u8; 8192]) -> i64;
+extern "C" fn zxst_trim(s: str, out: &mut [u8; 8192]) -> i64;
+extern "C" fn zxst_replace(s: str, old: str, new: str, out: &mut [u8; 8192]) -> i64;
+extern "C" fn zxst_field(s: str, sep: str, from: i64) -> i64;
+
+pub fn contains(s: str, sub: str) -> bool { return zxst_contains(s, sub) == 1; }
+pub fn has_prefix(s: str, pre: str) -> bool { return zxst_prefix(s, pre) == 1; }
+pub fn has_suffix(s: str, suf: str) -> bool { return zxst_suffix(s, suf) == 1; }
+
+// index returns the byte offset of the first occurrence of sub, or -1.
+pub fn index(s: str, sub: str) -> i64 { return zxst_index(s, sub); }
+
+fn from_buf(buf: &[u8; 8192], n: i64) -> String {
+    let mut s = String::new();
+    if n > 0 { s.push_bytes(buf[0..n as usize]); }
+    return s;
+}
+
+pub fn to_upper(s: str) -> String {
+    let mut buf: [u8; 8192] = [0; 8192];
+    return from_buf(&buf, zxst_upper(s, &mut buf));
+}
+
+pub fn to_lower(s: str) -> String {
+    let mut buf: [u8; 8192] = [0; 8192];
+    return from_buf(&buf, zxst_lower(s, &mut buf));
+}
+
+pub fn trim(s: str) -> String {
+    let mut buf: [u8; 8192] = [0; 8192];
+    return from_buf(&buf, zxst_trim(s, &mut buf));
+}
+
+pub fn replace(s: str, old: str, new: str) -> String {
+    let mut buf: [u8; 8192] = [0; 8192];
+    return from_buf(&buf, zxst_replace(s, old, new, &mut buf));
+}
+
+// split returns the fields of s separated by sep (which may be multiple
+// bytes). Consecutive separators produce empty fields, like Go's strings.Split.
+pub fn split(s: str, sep: str) -> Vec<String> {
+    let mut out = Vec::<String>::new();
+    let bytes = s.as_bytes();
+    let mut from: i64 = 0;
+    loop {
+        let end = zxst_field(s, sep, from);
+        if end < 0 { break; }
+        let mut part = String::new();
+        part.push_bytes(bytes[from as usize..end as usize]);
+        out.push(part);
+        let step = zxst_sep_len(sep);
+        from = end + step;
+        if from > bytes.len() as i64 { break; }
+    }
+    return out;
+}
+
+// join is a plain Zexi fold over borrowed strings; no C state is needed.
+pub fn join(parts: &Vec<String>, sep: str) -> String {
+    let mut out = String::new();
+    let mut i: usize = 0;
+    while i < parts.len() {
+        if i > 0 { out.push_str(sep); }
+        out.push_str(parts[i].as_str());
+        i += 1;
+    }
+    return out;
+}
+
+extern "C" fn zxst_sep_len(sep: str) -> i64;
+
+c """
+#define _POSIX_C_SOURCE 200809L
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#define ZXST_BYTES(a) ((char *)((a)->e))
+#define ZXST_CAP 8192
+
+static int64_t zxst_put(zx_arr8192_u8 *out, const char *s, size_t n) {
+    if (n >= ZXST_CAP) n = ZXST_CAP - 1;
+    memcpy(ZXST_BYTES(out), s, n);
+    ZXST_BYTES(out)[n] = 0;
+    return (int64_t)n;
+}
+
+int32_t zxst_contains(const char *s, const char *sub) {
+    return (s && sub && strstr(s, sub)) ? 1 : 0;
+}
+int32_t zxst_prefix(const char *s, const char *pre) {
+    return (s && pre && strncmp(s, pre, strlen(pre)) == 0) ? 1 : 0;
+}
+int32_t zxst_suffix(const char *s, const char *suf) {
+    if (!s || !suf) return 0;
+    size_t a = strlen(s), b = strlen(suf);
+    return (b <= a && strcmp(s + a - b, suf) == 0) ? 1 : 0;
+}
+int64_t zxst_index(const char *s, const char *sub) {
+    if (!s || !sub) return -1;
+    const char *p = strstr(s, sub);
+    return p ? (int64_t)(p - s) : -1;
+}
+
+int64_t zxst_upper(const char *s, zx_arr8192_u8 *out) {
+    if (!s || !out) return 0;
+    char tmp[ZXST_CAP];
+    size_t n = strlen(s);
+    if (n >= ZXST_CAP) n = ZXST_CAP - 1;
+    for (size_t i = 0; i < n; i++) tmp[i] = (char)toupper((unsigned char)s[i]);
+    return zxst_put(out, tmp, n);
+}
+int64_t zxst_lower(const char *s, zx_arr8192_u8 *out) {
+    if (!s || !out) return 0;
+    char tmp[ZXST_CAP];
+    size_t n = strlen(s);
+    if (n >= ZXST_CAP) n = ZXST_CAP - 1;
+    for (size_t i = 0; i < n; i++) tmp[i] = (char)tolower((unsigned char)s[i]);
+    return zxst_put(out, tmp, n);
+}
+int64_t zxst_trim(const char *s, zx_arr8192_u8 *out) {
+    if (!s || !out) return 0;
+    const char *start = s;
+    while (*start && isspace((unsigned char)*start)) start++;
+    const char *end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) end--;
+    return zxst_put(out, start, (size_t)(end - start));
+}
+int64_t zxst_replace(const char *s, const char *old, const char *new, zx_arr8192_u8 *out) {
+    if (!s || !old || !new || !out || !*old) return zxst_put(out, s, strlen(s));
+    char tmp[ZXST_CAP];
+    size_t used = 0;
+    const char *cur = s;
+    while (*cur && used < ZXST_CAP - 1) {
+        const char *hit = strstr(cur, old);
+        if (!hit) {
+            size_t n = strlen(cur);
+            if (used + n > ZXST_CAP - 1) n = ZXST_CAP - 1 - used;
+            memcpy(tmp + used, cur, n);
+            used += n;
+            break;
+        }
+        size_t n = (size_t)(hit - cur);
+        if (used + n + strlen(new) > ZXST_CAP - 1) break;
+        memcpy(tmp + used, cur, n); used += n;
+        n = strlen(new);
+        memcpy(tmp + used, new, n); used += n;
+        cur = hit + strlen(old);
+    }
+    tmp[used] = 0;
+    return zxst_put(out, tmp, used);
+}
+
+int64_t zxst_sep_len(const char *sep) { return sep ? (int64_t)strlen(sep) : 0; }
+
+/* Return the end offset of the next field starting at `from`, or -1 when
+ * `from` is past the end. The field itself stays in the caller's bytes. */
+int64_t zxst_field(const char *s, const char *sep, int64_t from) {
+    if (!s || !sep || !*sep) return -1;
+    size_t n = strlen(s), sl = strlen(sep);
+    if (from < 0) from = 0;
+    if ((size_t)from > n) return -1;
+    const char *p = strstr(s + from, sep);
+    if (!p) return (int64_t)n;
+    return (int64_t)(p - s);
+}
+"""

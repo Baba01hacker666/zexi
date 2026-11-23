@@ -3268,6 +3268,104 @@ fn main() -> i32 {
 	}
 }
 
+// TestStdStrings checks the C-backed Go-style string helpers, including a
+// multi-field split with a trailing empty field and a join over the result.
+func TestStdStrings(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.zx")
+	src := `use strings;
+
+fn main() -> i32 {
+    println(strings::contains("hello world", "world"));
+    println(strings::has_prefix("hello", "he"), strings::has_suffix("hello", "lo"));
+    println(strings::index("hello", "ll"));
+    println(strings::to_upper("hello"), strings::to_lower("HeLLo"));
+    println(strings::trim("  hi \t"));
+    println(strings::replace("a-b-c", "-", "+"));
+    let parts = strings::split("a,b,c", ",");
+    println(parts.len(), parts[0], parts[1], parts[2]);
+    println(strings::join(&parts, ":"));
+    let e = strings::split("a,b,", ",");
+    println(e.len(), e[2].len());
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build strings program")
+	}
+	raw, err := exec.Command(out).Output()
+	if err != nil {
+		t.Fatalf("running strings program: %v", err)
+	}
+	want := "true\ntrue true\n2\nHELLO hello\nhi\na+b+c\n3 a b c\na:b:c\n3 0\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestStdPathWalk checks the recursive directory walk and its callback, which
+// runs in Zexi from a C readdir loop.
+func TestStdPathWalk(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end build in short mode")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		t.Skip("no C compiler available")
+	}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "tree", "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "tree", "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "tree", "sub", "b.txt"), []byte("b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "main.zx")
+	src := `use path;
+
+fn visit(p: str, is_dir: i32) -> i32 {
+    println(path::base(p), is_dir);
+    0
+}
+
+fn main() -> i32 {
+    println(path::walk(arg_at(1).as_str(), visit));
+    0
+}
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "prog")
+	em := diag.NewEmitter()
+	if _, ok := driver.Build(path, out, driver.Options{}, em); !ok {
+		em.Render(os.Stderr, em.FirstFileID())
+		t.Fatal("failed to build walk program")
+	}
+	raw, err := exec.Command(out, filepath.Join(dir, "tree")).Output()
+	if err != nil {
+		t.Fatalf("running walk program: %v", err)
+	}
+	want := "tree 1\na.txt 0\nsub 1\nb.txt 0\n0\n"
+	if got := string(raw); got != want {
+		t.Fatalf("output mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
 // TestStdMathConvenience exercises the high-level dependency-free numerical
 // surface: conventional aliases, transcendental helpers, geometry, domain
 // fallbacks, and floating-point classification.

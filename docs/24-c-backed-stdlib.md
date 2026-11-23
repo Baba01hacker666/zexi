@@ -16,6 +16,8 @@ library, which has the same "small core, useful packages" shape.
 | [`sort`](../internal/driver/std/sort.zx) | `sort` / `slices` | no sorting of arrays or slices |
 | [`log`](../internal/driver/std/log.zx) | `log` / `log/slog` | no leveled logging |
 | [`flag`](../internal/driver/std/flag.zx) | `flag` | only raw `arg_at` / `arg_count` |
+| [`strings`](../internal/driver/std/strings.zx) | `strings` | no split / trim / case conversion helpers |
+| `path::walk` (in [`path`](../internal/driver/std/path.zx)) | `filepath.Walk` | no recursive directory traversal |
 
 ## 24.1 `bufio`
 
@@ -138,7 +140,45 @@ fn main() -> i32 {
 }
 ```
 
-## 24.6 Why C, and what the limits are
+## 24.6 `strings` and `path::walk`
+
+`strings` follows Go's `strings` package: `contains`, `has_prefix`,
+`has_suffix`, `index`, `to_upper`, `to_lower`, `trim`, `replace`, `split` and
+`join`. C does the searching/case work; `split` is a loop over a C cursor that
+returns field boundaries, so Zexi slices the original bytes and builds owned
+`String`s without copying through a C buffer. Consecutive separators produce
+empty fields, like Go.
+
+```zx
+use strings;
+
+fn main() -> i32 {
+    let parts = strings::split("a,b,c", ",");
+    println(parts.len(), strings::join(&parts, ":"));  // 3 a:b:c
+    0
+}
+```
+
+`path::walk(root, cb)` is Go's `filepath.Walk` shape: C walks with
+`opendir`/`readdir` and calls a Zexi closure `cb(path, is_dir)` for every entry,
+including the root. A nonzero return stops the walk.
+
+<!-- check-only -->
+```zx
+use path;
+
+fn visit(p: str, is_dir: i32) -> i32 {
+    println(path::base(p), is_dir);
+    0
+}
+
+fn main() -> i32 {
+    println(path::walk("/tmp", visit));
+    0
+}
+```
+
+## 24.7 Why C, and what the limits are
 
 - Every module carries its own C; none adds a driver-side C blob or a linker
   flag. This keeps the self-extension promise in docs/17 intact.
